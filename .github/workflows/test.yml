@@ -19,4 +19,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - run: make check test
+      - name: Browser dependencies
+        if: matrix.python == '3.12'
+        run: |
+          python -m pip install playwright==1.55.0
+          python -m playwright install --with-deps chromium
+      - name: Browser interaction and responsive layout
+        if: matrix.python == '3.12'
+        run: python tools/check_ui_browser.py

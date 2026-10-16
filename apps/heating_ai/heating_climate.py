@@ -17,6 +17,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
 from heating_recovery import HeatingRecovery
 from heating_stability import stable_plan
 from heating_environment import observe_floor,observe_gain,reliability,daylight,anchor_weather
+from heating_ui import install_panel
 
 class HeatingClimate(HeatingRecovery,Hass):
     def initialize(self):
@@ -98,6 +99,14 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.listen_state(self.settings_changed,self.cfg[key],attribute="all")
         self.run_every(self.tick,self.datetime()+timedelta(seconds=2),15)
         self.log("Climate controller loaded; allow_actuation=%s",self.cfg.get("allow_actuation",False))
+        try:
+            panel = install_panel(self.cfg)
+            if panel:
+                self.publish("sensor.heating_ui", panel.pop("version"),
+                             friendly_name="Клімат — вебінтерфейс", icon="mdi:home-thermometer",
+                             **panel)
+        except (OSError, ValueError) as exc:
+            self.log("Heating panel unavailable: %s", str(exc), level="WARNING")
     def apply_energy_recovery(self):
         path=self.directory/"recovery-20261009.json"
         if not path.exists():
