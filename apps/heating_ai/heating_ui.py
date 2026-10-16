@@ -11,7 +11,7 @@ ENTITY_KEYS = (
     'room', 'return', 'outside', 'fan', 'weather', 'energy', 'target', 'lower', 'upper',
     'night_target', 'night_lower', 'night_upper', 'sleep_start', 'sleep_end', 'start', 'end',
     'monthly_budget', 'session_limit', 'native_setpoint', 'mode', 'strategy', 'armed',
-    'restore_once', 'fan_control', 'fan_mode', 'fan_speed', 'fan_night_limit',
+    'restore_once', 'fan_control', 'fan_mode', 'fan_speed', 'fan_night_limit', 'fan_intense_speed',
     'ai_auto_apply', 'rollback', 'fan_backup',
 )
 
@@ -68,6 +68,7 @@ def install_panel(cfg):
                    "await import(new URL(module,root));\n")
     entities={key:cfg[key] for key in ENTITY_KEYS if isinstance(cfg.get(key),str) and '.' in cfg[key]}
     entities.setdefault('fan_backup','input_boolean.heating_fan_backup_verified')
+    entities.setdefault('fan_intense_speed','input_number.heating_fan_intense_speed')
     return {'version': VERSION, 'ui_url': url, 'asset_digest': DIGEST,
             'source_directory': str(Path(__file__).resolve().parent),
             'module_hashes': modules, 'release_verified': True,

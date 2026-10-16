@@ -35,6 +35,7 @@
     "upper": "input_number.heating_upper",
     "monthly_budget": "input_number.heating_monthly_budget",
     "fan_speed": "input_number.heating_fan_speed",
+    "fan_intense_speed": "input_number.heating_fan_intense_speed",
     "fan_night_limit": "input_number.heating_fan_night_limit",
     "session_limit": "input_number.heating_session_limit",
     "native_setpoint": "input_number.heating_native_setpoint",
