@@ -23,7 +23,7 @@ class FireplaceCirculationTests(unittest.TestCase):
     def test_initial_phases_do_not_start_circulation_below_five_degrees(self):
         cases=[(2.4,0,'Неактивний',False),(2,.8,'Неактивний',False),(2,.81,'Розпалювання',False),
                (4.9,1,'Розпалювання',False),(5,0,'Горить',True),
-               (10,0,'Інтенсивно горить',True),(8,-1,'Згасає',True),
+               (10,0,'Інтенсивно горить',True),(8,-1,'Згасає',True),(5,-.8,'Горить',True),
                (3.5,-1,'Згасає',False),(10,-1,'Згасає',True)]
         for delta,slope,phase,active in cases:
             with self.subTest(delta=delta,slope=slope):
@@ -77,6 +77,11 @@ class FireplaceCirculationTests(unittest.TestCase):
         restored=self.app();restored.memory=deepcopy(app.memory)
         for stamp in range(10060,10315,15):self.assertTrue(self.cycle(restored,2.4,stamp=stamp)[1])
         self.assertFalse(self.cycle(restored,2.4,stamp=10315)[1])
+
+    def test_decimal_sensor_readings_at_ten_degrees_select_intense_phase(self):
+        app=self.app();app.val=lambda key:32.3
+        with patch('heating_climate.time.time',return_value=10000):app.fireplace(22.3)
+        self.assertEqual(app.published['sensor.heating_fireplace']['state'],'Інтенсивно горить')
 
 
 if __name__=='__main__':unittest.main()

@@ -318,6 +318,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         delta=max(0.,temperature-room) if valid else 0.
         recent=[r for r in self.samples if 0<stamp-r["ts"]<=1800 and number(r.get("fire")) is not None]
         slope=(delta-recent[0]["fire"])*3600/max(300,stamp-recent[0]["ts"]) if recent else 0.
+        # Remove binary floating-point noise at boundaries; keep raw delta for the model.
+        signal=round(delta,6);trend=round(slope,6)
         previous=self.memory.get("fire_phase","Неактивний")
         tracker=self.memory.get('fire_circulation',{})
         was_active=tracker.get('active',self.memory.get('fan_owned',False) and previous in ('Горить','Згасає','Інтенсивно горить'))
@@ -326,10 +328,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         below=number(tracker.get('below_since')) if continuous else None
         active=False
         if valid:
-            if delta>=5:
+            if signal>=5:
                 active=True;below=None
-            elif was_active and not (delta<4 and slope<=-2):
-                if delta<3:
+            elif was_active and not (signal<4 and trend<=-2):
+                if signal<3:
                     below=stamp if below is None else below
                     active=stamp-below<300
                 else:
@@ -339,13 +341,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory['fire_circulation']=dict(active=active,below_since=below,last_valid=stamp if valid else None)
         if not valid:
             phase="Датчик недоступний"
-        elif slope<-.8 and delta>=2:
+        elif trend<-.8 and signal>=2:
             phase="Згасає"
-        elif delta>=10:
+        elif signal>=10:
             phase="Інтенсивно горить"
-        elif delta>=5:
+        elif signal>=5:
             phase="Горить"
-        elif delta>=2 and slope>.8:
+        elif signal>=2 and trend>.8:
             phase="Розпалювання"
         elif active:
             phase="Згасає"
