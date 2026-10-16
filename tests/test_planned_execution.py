@@ -7,7 +7,7 @@ from test_adapter_modulation import HeatingClimate
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42):
         app=HeatingClimate()
         at=datetime(2026,10,14,0,5,tzinfo=ZoneInfo('Europe/Kiev'))
         app.climate_tz=at.tzinfo
@@ -42,13 +42,15 @@ class PlannedExecutionTests(unittest.TestCase):
             plan_stable=True,stability_reason='test',outage_preheat=False,outside_minutes=0,comfort_shortfall=False,
             outage_status='test',heat_segments=[dict(start=at.timestamp(),end=at.timestamp()+1800)] if planned else [],
             schedule_updated=None,schedule_known_until=None,weather_known_until=None,conditional_heat_minutes=0,
-            schedule_complete=True,weather_complete=True,split_comfort_applied=True,session_kwh={},night_air_target=21.5,
+            schedule_complete=True,weather_complete=True,weather_missing_minutes=weather_missing,
+            split_comfort_applied=True,session_kwh={},night_air_target=21.5,
             split_reason='test',morning_min_minutes=30,morning_runs_minutes=[60],curve=[])
         with patch('heating_climate.time.time',return_value=at.timestamp()), \
              patch('heating_climate.stable_plan',return_value=(forecast,{})), \
              patch('heating_climate.coast',return_value=(peak,[])), \
              patch('heating_climate.coast_exceeds_profile',return_value=overheat):
             app.tick_inner()
+        self.forecast_status=app.published['sensor.heating_forecast']
         return actions,app.published['sensor.heating_controller']
 
     def test_midnight_session_runs_at_night_target(self):
@@ -67,5 +69,12 @@ class PlannedExecutionTests(unittest.TestCase):
         self.assertEqual(self.cycle(planned=False)[0],['off'])
     def test_one_shot_keeps_existing_soft_coast_guard(self):
         self.assertEqual(self.cycle(planned=False,once=True)[0],['off'])
+    def test_forecast_diagnostic_is_published_with_tolerated_missing_minutes(self):
+        for missing in (0,42,None):
+            with self.subTest(missing=missing):
+                self.cycle(weather_missing=missing)
+                self.assertEqual(self.forecast_status['weather_missing_minutes'],missing)
+                self.assertTrue(self.forecast_status['weather_complete'])
+                self.assertEqual(self.forecast_status['horizon_hours'],24)
 
 if __name__=='__main__':unittest.main()

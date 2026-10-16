@@ -417,6 +417,15 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
             "morning_priority_applied":bool(split and 'night_target' in settings)}
 
 
+def weather_coverage(forecast, finish):
+    """Allow one hourly interval of held temperature at the end of the horizon."""
+    interval=3600
+    until=max((row['ts']+interval for row in forecast),default=None)
+    return dict(weather_known_until=until,
+                weather_complete=until is not None and until>=finish-interval,
+                weather_missing_minutes=None if until is None else round(max(0.,finish-until)/60,1))
+
+
 def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power_kw=9.0):
     """Prefer the configured window; move blocked heat earlier, never into outages.
 
@@ -429,7 +438,8 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     # with a confirmed uninterrupted supply. Live grid checks still gate commands.
     horizon = 24.
     schedule_until = number(data.get("known_until")) if data.get("valid") else None
-    weather_until = max((r["ts"]+3600 for r in forecast), default=None)
+    coverage = weather_coverage(forecast,now.timestamp()+86400)
+    weather_until = coverage['weather_known_until']
     args = (now, room, floor, outside, fire_delta, model, forecast, settings, power_kw)
     priority=bool(settings.get('split_comfort') and 'night_target' in settings)
     def search(outages=(), extensions=()):
@@ -523,10 +533,9 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
             segment["conditional"] = schedule_until is None or segment["end"] > schedule_until
             if segment["conditional"]:
                 conditional_minutes += (segment["end"]-segment["start"])/60
-    result.update(schedule_known_until=schedule_until, weather_known_until=weather_until,
+    result.update(schedule_known_until=schedule_until, **coverage,
                   conditional_heat_minutes=round(conditional_minutes,1),
                   schedule_complete=schedule_until is not None and schedule_until >= now.timestamp()+86400,
-                  weather_complete=weather_until is not None and weather_until >= now.timestamp()+86400,
                   outage_shifted=shifted, outage_preheat=preheat,
                   outside_minutes=sum(r["outside_minutes"] for r in result["curve"]),
                   outage_status=data.get("reason","Графік не підключений"),

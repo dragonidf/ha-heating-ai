@@ -2,9 +2,12 @@
 import sys
 import types
 import unittest
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 for name in ('appdaemon','appdaemon.plugins','appdaemon.plugins.hass','appdaemon.plugins.hass.hassapi'):
     sys.modules.setdefault(name,types.ModuleType(name))
@@ -59,12 +62,12 @@ class CirculationTests(unittest.TestCase):
         self.assertFalse(app.memory['fan_owned'])
         self.assertEqual(app.published['sensor.heating_fan']['reason'],'Зупинено вручну')
 
-    def test_manual_running_fan_is_not_adopted_when_speed_is_adjusted(self):
+    def test_auto_stops_preexisting_fan_when_fireplace_request_ends(self):
         app=self.app();app.states.update(fan='on',percentage=25)
         app.fan_tick('on',True)
         self.assertFalse(app.memory.get('fan_owned',False))
         app.calls=[];app.fan_tick('on',False)
-        self.assertEqual(app.calls,[])
+        self.assertEqual(app.calls,[('fan/turn_off',dict(entity_id='fan.test'))])
 
     def test_night_limit_and_clamping(self):
         app=self.app();app.states.update(fan_speed=150,fan_night_limit=25)
@@ -100,12 +103,82 @@ class CirculationTests(unittest.TestCase):
         app.fan_tick('on',True)
         self.assertEqual(app.calls[-1][1]['percentage'],70)
 
-    def test_report_distinguishes_manual_running_fan_from_automatic_request(self):
+    def test_auto_report_does_not_mislabel_stale_on_state_as_manual(self):
         app=self.app();app.states.update(fan='on',percentage=42)
         app.fan_tick('on',False)
         self.assertFalse(app.published['sensor.heating_fan']['controller_owned'])
         self.assertEqual(app.published['sensor.heating_fan']['request_source'],'none')
-        self.assertIn('ручне',app.published['sensor.heating_fan']['reason'].lower())
+        self.assertFalse(app.published['sensor.heating_fan']['manual_running'])
+        self.assertEqual(app.published['sensor.heating_fan']['reason'],'Не потрібна')
+        self.assertEqual(app.calls,[('fan/turn_off',dict(entity_id='fan.test'))])
+
+    def test_auto_without_demand_stops_regardless_of_saved_ownership(self):
+        for mode in ('Авто','Автоматично'):
+            for owned in (None,False,True):
+                with self.subTest(mode=mode,owned=owned):
+                    app=self.app();app.states.update(fan='on',fan_mode=mode)
+                    app.memory={} if owned is None else {'fan_owned':owned}
+                    app.memory['night_fan_until']=9999
+                    with patch('heating_climate.time.time',return_value=10000):
+                        app.fan_tick('on',False)
+                    self.assertEqual(app.calls,[('fan/turn_off',dict(entity_id='fan.test'))])
+
+    def test_first_tick_with_legacy_state_and_inactive_fireplace_stops_fan(self):
+        app=self.app();app.states.update(fan='on',fireplace=22.4)
+        keys=('ai_proposal','ai_report','rollback','restore_once','thermostat',
+              'target','lower','upper','start','end','strategy','mode','armed','power_balance')
+        with TemporaryDirectory() as directory:
+            legacy=dict(energy_bins=[dict(day='2026-10-15',kwh=17.5)],last_result='Збережено')
+            (Path(directory)/'state.json').write_text(json.dumps(legacy))
+            app.args={**app.cfg,**{key:'input_text.'+key for key in keys},
+                      'data_dir':directory,'ui_enabled':False,'fireplace_heartbeat':[]}
+            app.listen_event=Mock();app.listen_state=Mock();app.run_every=Mock();app.datetime=app.now
+            app.initialize()
+            self.assertNotIn('fan_owned',app.memory)
+            self.assertNotIn('fire_circulation',app.memory)
+            self.assertEqual(app.memory['energy_bins'],legacy['energy_bins'])
+            self.assertEqual(app.memory['last_result'],legacy['last_result'])
+            with patch('heating_climate.time.time',return_value=10000):
+                app.fan_tick('on',app.fireplace(22)[1])
+        self.assertEqual(app.calls,[('fan/turn_off',dict(entity_id='fan.test'))])
+        self.assertEqual(app.published['binary_sensor.heating_fireplace_active']['state'],'off')
+        app.states['fan']='off';app.fan_tick('on',False)
+        self.assertEqual(app.published['sensor.heating_fan']['state'],'Не потрібна')
+        self.assertFalse(app.published['sensor.heating_fan']['manual_running'])
+
+    def test_manual_mode_stays_on_without_fireplace_or_night_request(self):
+        for state in ('off','on'):
+            with self.subTest(state=state):
+                app=self.app();app.states.update(fan=state,fan_mode='Ручний запуск',percentage=42)
+                app.fan_tick('on',False)
+                self.assertEqual(app.calls,[] if state=='on' else
+                                 [('fan/turn_on',dict(entity_id='fan.test',percentage=42))])
+                self.assertEqual(app.published['sensor.heating_fan']['manual_running'],state=='on')
+                self.assertTrue(app.published['sensor.heating_fan']['requested'])
+
+    def test_auto_stop_respects_disabled_control_and_update_guard(self):
+        for guard in ('permission','fan_control','update'):
+            with self.subTest(guard=guard):
+                app=self.app();app.states['fan']='on'
+                if guard=='permission':app.cfg['allow_actuation']=False
+                elif guard=='fan_control':app.states['fan_control']='off'
+                else:app.update_in_progress=lambda:True
+                app.fan_tick('on',False)
+                self.assertEqual(app.calls,[])
+
+    def test_auto_stop_retries_after_debounce_and_handles_service_errors(self):
+        for fail in (False,True):
+            with self.subTest(fail=fail):
+                app=self.app();app.states['fan']='on'
+                def send(service,**data):
+                    app.calls.append((service,data))
+                    if fail:raise RuntimeError('Fan command failed')
+                app.call_service=send
+                for stamp in (10000,10015,10030):
+                    with patch('heating_climate.time.time',return_value=stamp):
+                        app.fan_tick('on',False)
+                self.assertEqual([c[0] for c in app.calls],['fan/turn_off','fan/turn_off'])
+                if fail:self.assertIn('повторимо',app.published['sensor.heating_fan']['reason'])
 
     def test_fireplace_cooldown_sends_stop_for_the_controller_owned_fan(self):
         app=self.app();app.cfg['fireplace_heartbeat']=[];app.samples=[]
