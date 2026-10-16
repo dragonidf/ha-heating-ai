@@ -12,4 +12,4 @@ Do not edit Sky Radar, inverter/grid detection, energy history or unrelated auto
 
 Cut a release by increasing VERSION and updating CHANGELOG.md in a tested commit. The release workflow publishes only after the main-branch push passes CI. Check the exact released commit. Do not overwrite an existing release/tag.
 
-The initial production patch was installed directly on 2026-10-16, before HACS path migration. Until that migration is verified, a HACS download alone does not update the running app. See docs/installation.md.
+Production was migrated to HACS v0.2.1 on 2026-10-16. Nine individual file symlinks in /config/apps/heating_ai_hacs point to /homeassistant/appdaemon/apps/ha-heating-ai; a directory symlink is not traversed by AppDaemon. The local heating_climate.yaml and /config/heating_data remain unchanged. sensor.heating_ui proved the HACS source path and all nine module hashes; planning_policy_version remained 4. The one-time Supervisor init_commands entry was removed after migration. Read fresh runtime state before future updates; see docs/installation.md.
