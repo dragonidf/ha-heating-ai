@@ -1,0 +1,145 @@
+{
+  "weather": [
+    {
+      "ts": 1791817200,
+      "temperature": 11.5
+    },
+    {
+      "ts": 1791820800,
+      "temperature": 11.1
+    },
+    {
+      "ts": 1791824400,
+      "temperature": 10.8
+    },
+    {
+      "ts": 1791828000,
+      "temperature": 10.5
+    },
+    {
+      "ts": 1791831600,
+      "temperature": 10.5
+    },
+    {
+      "ts": 1791835200,
+      "temperature": 10.4
+    },
+    {
+      "ts": 1791838800,
+      "temperature": 10.3
+    },
+    {
+      "ts": 1791842400,
+      "temperature": 10.2
+    },
+    {
+      "ts": 1791846000,
+      "temperature": 10.1
+    },
+    {
+      "ts": 1791849600,
+      "temperature": 10
+    },
+    {
+      "ts": 1791853200,
+      "temperature": 10.1
+    },
+    {
+      "ts": 1791856800,
+      "temperature": 10
+    },
+    {
+      "ts": 1791860400,
+      "temperature": 9.8
+    },
+    {
+      "ts": 1791864000,
+      "temperature": 9.7
+    },
+    {
+      "ts": 1791867600,
+      "temperature": 9.7
+    },
+    {
+      "ts": 1791871200,
+      "temperature": 9.9
+    },
+    {
+      "ts": 1791874800,
+      "temperature": 10.6
+    },
+    {
+      "ts": 1791878400,
+      "temperature": 11.3
+    },
+    {
+      "ts": 1791882000,
+      "temperature": 12
+    },
+    {
+      "ts": 1791885600,
+      "temperature": 12.5
+    },
+    {
+      "ts": 1791889200,
+      "temperature": 12.8
+    },
+    {
+      "ts": 1791892800,
+      "temperature": 12.8
+    },
+    {
+      "ts": 1791896400,
+      "temperature": 12.1
+    },
+    {
+      "ts": 1791900000,
+      "temperature": 11.7
+    }
+  ],
+  "profile": {
+    "version": 1,
+    "bands": [
+      {
+        "return_c": 23,
+        "return_min": 22,
+        "return_max": 24,
+        "power_kw": 6.405,
+        "minutes": 25,
+        "intervals": 5,
+        "confidence": 0.417
+      },
+      {
+        "return_c": 25,
+        "return_min": 24,
+        "return_max": 26,
+        "power_kw": 6.405,
+        "minutes": 35,
+        "intervals": 7,
+        "confidence": 0.583
+      },
+      {
+        "return_c": 27,
+        "return_min": 26,
+        "return_max": 28,
+        "power_kw": 6.405,
+        "minutes": 60,
+        "intervals": 12,
+        "confidence": 1
+      }
+    ],
+    "intervals": 24,
+    "minutes": 120,
+    "prior_kw": 3,
+    "method": "return_bands_energy_isotonic"
+  },
+  "model": {
+    "floor_air": 0.044238523742432284,
+    "room_loss": 0.012800000000000004,
+    "floor_decay": 0.17279999999999998,
+    "heat_gain": 0.72,
+    "fire_gain": 0.025,
+    "version": 4,
+    "validated": "true"
+  }
+}

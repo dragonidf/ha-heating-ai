@@ -1,0 +1,182 @@
+{
+  "at": "2026-10-14T13:42:08.565127+03:00",
+  "room": 24.1,
+  "floor": 24.8868763,
+  "outside": 15.1,
+  "weather": [
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-14T10:00:00Z",
+      "temperature": 12.4
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-14T11:00:00Z",
+      "temperature": 13
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-14T12:00:00Z",
+      "temperature": 13.2
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-14T13:00:00Z",
+      "temperature": 13.1
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-14T14:00:00Z",
+      "temperature": 12.3
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-14T15:00:00Z",
+      "temperature": 11
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-14T16:00:00Z",
+      "temperature": 9.5
+    },
+    {
+      "condition": "partlycloudy",
+      "datetime": "2026-10-14T17:00:00Z",
+      "temperature": 8
+    },
+    {
+      "condition": "clear-night",
+      "datetime": "2026-10-14T18:00:00Z",
+      "temperature": 6.8
+    },
+    {
+      "condition": "clear-night",
+      "datetime": "2026-10-14T19:00:00Z",
+      "temperature": 6
+    },
+    {
+      "condition": "partlycloudy",
+      "datetime": "2026-10-14T20:00:00Z",
+      "temperature": 5.1
+    },
+    {
+      "condition": "partlycloudy",
+      "datetime": "2026-10-14T21:00:00Z",
+      "temperature": 4.5
+    },
+    {
+      "condition": "clear-night",
+      "datetime": "2026-10-14T22:00:00Z",
+      "temperature": 4
+    },
+    {
+      "condition": "partlycloudy",
+      "datetime": "2026-10-14T23:00:00Z",
+      "temperature": 3.6
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T00:00:00Z",
+      "temperature": 3.5
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T01:00:00Z",
+      "temperature": 3
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T02:00:00Z",
+      "temperature": 3.1
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T03:00:00Z",
+      "temperature": 3.1
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T04:00:00Z",
+      "temperature": 3.2
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T05:00:00Z",
+      "temperature": 3.8
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T06:00:00Z",
+      "temperature": 5.3
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T07:00:00Z",
+      "temperature": 7.3
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T08:00:00Z",
+      "temperature": 9.1
+    },
+    {
+      "condition": "cloudy",
+      "datetime": "2026-10-15T09:00:00Z",
+      "temperature": 10.7
+    }
+  ],
+  "model": {
+    "floor_air": 0.044238523742432284,
+    "room_loss": 0.012800000000000004,
+    "floor_decay": 0.17279999999999998,
+    "heat_gain": 0.72,
+    "fire_gain": 0.025,
+    "version": 4,
+    "validated": "true"
+  },
+  "profile": {
+    "version": 1,
+    "bands": [
+      {
+        "return_c": 23,
+        "return_min": 22,
+        "return_max": 24,
+        "power_kw": 7.887,
+        "minutes": 45,
+        "intervals": 9,
+        "confidence": 0.75
+      },
+      {
+        "return_c": 25,
+        "return_min": 24,
+        "return_max": 26,
+        "power_kw": 7.887,
+        "minutes": 90,
+        "intervals": 18,
+        "confidence": 1
+      },
+      {
+        "return_c": 27,
+        "return_min": 26,
+        "return_max": 28,
+        "power_kw": 6.726,
+        "minutes": 190,
+        "intervals": 38,
+        "confidence": 1
+      },
+      {
+        "return_c": 29,
+        "return_min": 28,
+        "return_max": 30,
+        "power_kw": 5.54,
+        "minutes": 90,
+        "intervals": 18,
+        "confidence": 1
+      }
+    ],
+    "intervals": 83,
+    "minutes": 415,
+    "prior_kw": 3,
+    "method": "return_bands_energy_isotonic"
+  }
+}

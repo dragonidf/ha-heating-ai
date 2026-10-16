@@ -1,0 +1,69 @@
+import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from unittest.mock import patch
+from test_adapter_modulation import HeatingClimate
+
+
+class PlannedExecutionTests(unittest.TestCase):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False):
+        app=HeatingClimate()
+        at=datetime(2026,10,14,0,5,tzinfo=ZoneInfo('Europe/Kiev'))
+        app.climate_tz=at.tzinfo
+        app.now=lambda:at
+        app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly',night_target='night')
+        app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
+        app.model=dict(validated=True,version=4)
+        app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
+        app.outage_signature=(None,None)
+        app.source_temperature=lambda:(room,'Вітальня',room,22.5)
+        app.val=lambda key,default=None,attribute=None:dict(
+            **{'return':22},outside=11,target=22,lower=21.5,upper=22.5,
+            night_target=21.5,night_lower=21,night_upper=22,monthly_budget=0,tariff=1.32).get(key,default)
+        app.raw=lambda key,attribute=None:dict(start='23:00',end='07:00',sleep_start='23:00',sleep_end='07:00',
+            strategy='Тільки в дозволені години',armed='on',mode='Автоматичне керування',thermostat='heat').get(key)
+        app.get_state=lambda *a,**k:None
+        app.heartbeat_fresh=lambda *a:True
+        app.grid_state=lambda:grid
+        app.update_heating_power=lambda:0
+        app.stage_update=lambda *a:None
+        app.fireplace=lambda *a:(0,False)
+        app.once_state=lambda *a:(once,'test')
+        app.sample=lambda *a:None;app.energy_tick=lambda:None;app.fan_tick=lambda *a:None
+        app.resume_temporary_fallback=lambda:None;app.save=lambda:None;app.journal=lambda *a:None
+        app.hour_mae=lambda:0.1;app.summary=lambda:{}
+        app.actual_session_energy=lambda:None
+        app.published={}
+        app.publish=lambda entity,state,**attrs:app.published.update({entity:dict(state=state,**attrs)})
+        actions=[];app.apply_action=lambda action,once:actions.append(action)
+        forecast=dict(heat=planned,minimum=21.3,energy=3,horizon_hours=24,outage_shifted=False,
+            plan_stable=True,stability_reason='test',outage_preheat=False,outside_minutes=0,comfort_shortfall=False,
+            outage_status='test',heat_segments=[dict(start=at.timestamp(),end=at.timestamp()+1800)] if planned else [],
+            schedule_updated=None,schedule_known_until=None,weather_known_until=None,conditional_heat_minutes=0,
+            schedule_complete=True,weather_complete=True,split_comfort_applied=True,session_kwh={},night_air_target=21.5,
+            split_reason='test',morning_min_minutes=30,morning_runs_minutes=[60],curve=[])
+        with patch('heating_climate.time.time',return_value=at.timestamp()), \
+             patch('heating_climate.stable_plan',return_value=(forecast,{})), \
+             patch('heating_climate.coast',return_value=(peak,[])), \
+             patch('heating_climate.coast_exceeds_profile',return_value=overheat):
+            app.tick_inner()
+        return actions,app.published['sensor.heating_controller']
+
+    def test_midnight_session_runs_at_night_target(self):
+        actions,status=self.cycle()
+        self.assertEqual(actions,['heat'])
+        self.assertEqual(status['reason'],'Заплановано нагрів')
+    def test_slightly_above_soft_target_still_obeys_safe_plan(self):
+        self.assertEqual(self.cycle(room=21.6,peak=21.6)[0],['heat'])
+    def test_sleep_upper_still_stops(self):
+        self.assertEqual(self.cycle(room=22)[0],['off'])
+    def test_coast_overheating_still_stops(self):
+        self.assertEqual(self.cycle(overheat=True)[0],['off'])
+    def test_missing_grid_still_stops(self):
+        self.assertEqual(self.cycle(grid='off')[0],['off'])
+    def test_no_planned_heat_does_not_start(self):
+        self.assertEqual(self.cycle(planned=False)[0],['off'])
+    def test_one_shot_keeps_existing_soft_coast_guard(self):
+        self.assertEqual(self.cycle(planned=False,once=True)[0],['off'])
+
+if __name__=='__main__':unittest.main()

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+secrets.yaml
+appdaemon.yaml
+heating_data/
+state.json
+telemetry.jsonl
+*.sqlite*
+*.db*
+*.backup-*
+before/
