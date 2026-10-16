@@ -37,6 +37,8 @@ class HeatingRecovery:
         self.apply_action('fallback',False)
 
     def apply_action(self,action,once):
+        if getattr(self,'update_in_progress',lambda:False)():
+            return
         if not self.cfg.get("allow_actuation",False):
             return
         release=action in ("release","observe")

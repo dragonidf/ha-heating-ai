@@ -17,6 +17,7 @@ class FallbackRecoveryTests(unittest.TestCase):
         app.values=dict(thermostat='heat',mode='Автоматичне керування',armed='on',strategy='Тільки в дозволені години',start='23:00',end='07:00')
         app.attrs=dict(current_temperature=23,temperature=26,min_temp=5,max_temp=35,target_temp_step=.5)
         app.raw=lambda key,attribute=None:dict(attributes=app.attrs) if key=='thermostat' and attribute=='all' else app.values.get(key)
+        app.get_state=lambda *args,**kwargs:None
         app.val=lambda key,default=None,attribute=None:app.attrs.get(attribute,default) if key=='thermostat' else dict(upper=22.5,native_setpoint=26,power=0).get(key,default)
         app.fresh=lambda *args:False
         app.source_temperature=lambda:(21.8,'Вітальня',21.8,23)

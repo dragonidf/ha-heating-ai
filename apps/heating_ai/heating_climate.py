@@ -17,11 +17,15 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
 from heating_recovery import HeatingRecovery
 from heating_stability import stable_plan
 from heating_environment import observe_floor,observe_gain,reliability,daylight,anchor_weather
-from heating_ui import install_panel
+from heating_ui import install_panel, project_fireplace, verify_installation
 
 class HeatingClimate(HeatingRecovery,Hass):
     def initialize(self):
         self.cfg=self.args
+        if self.update_in_progress():
+            self.run_in(self.initialize_after_update,5)
+            return
+        verify_installation()
         self.climate_tz=ZoneInfo(self.cfg.get("timezone","Europe/Kiev"))
         self.directory=Path(self.cfg.get("data_dir","/config/heating_data"))
         self.directory.mkdir(parents=True,exist_ok=True)
@@ -77,6 +81,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.candidate_at=0
         self.next_compute=0
         self.last_sample=0
+        self.fan_command_at=0
         self.command_pending_until=0
         self.listen_event(self.weather_event,"heating_weather_forecast")
         self.listen_event(self.night_event,"heating_fan_night_request")
@@ -98,6 +103,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             if self.cfg.get(key):
                 self.listen_state(self.settings_changed,self.cfg[key],attribute="all")
         self.run_every(self.tick,self.datetime()+timedelta(seconds=2),15)
+        self.runtime_ready=True
         self.log("Climate controller loaded; allow_actuation=%s",self.cfg.get("allow_actuation",False))
         try:
             panel = install_panel(self.cfg)
@@ -107,6 +113,17 @@ class HeatingClimate(HeatingRecovery,Hass):
                              **panel)
         except (OSError, ValueError) as exc:
             self.log("Heating panel unavailable: %s", str(exc), level="WARNING")
+    def initialize_after_update(self,kwargs=None,**extra):
+        self.initialize()
+    def update_in_progress(self):
+        entity=self.cfg.get('hacs_update_entity','update.heating_ai_appdaemon_update')
+        state=self.get_state(entity,attribute='all') or {}
+        progress=state.get('attributes',{}).get('in_progress',False)
+        return progress is True or (number(progress) or 0)>0
+    def terminate(self):
+        # Helpers and thermostat modes are not changed by an app reload.
+        if getattr(self,'runtime_ready',False):
+            self.save()
     def apply_energy_recovery(self):
         path=self.directory/"recovery-20261009.json"
         if not path.exists():
@@ -292,7 +309,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.publish("sensor.heating_fireplace",phase,friendly_name="Камін — стан",
                      temperature=temperature,delta=round(delta,2),trend=round(slope,2),
                      calibrated=False,icon="mdi:fireplace")
-        self.publish("binary_sensor.heating_fireplace_active","on" if active else "off",
+        self.publish("binary_sensor.heating_fireplace_active",None if not valid else "on" if active else "off",
                      friendly_name="Камін — корисне тепло",icon="mdi:fire")
         return delta,active
     def arm_changed(self,entity,attribute,old,new,kwargs=None,**extra):
@@ -375,7 +392,11 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.candidate=None
         self.publish("sensor.heating_boiler_stage",self.stage,friendly_name="Котел — підтверджений ступінь",
                      icon="mdi:water-boiler",measurement_version=3,timestamp=self.now().isoformat())
+        self.publish('binary_sensor.heating_boiler_active',None if power is None else 'on' if power>=1.5 else 'off',
+                     friendly_name='Котел — фактичний нагрів',icon='mdi:water-boiler')
     def tick(self,kwargs=None,**extra):
+        if self.update_in_progress():
+            return
         try:
             self.tick_inner()
         except Exception as exc:
@@ -559,6 +580,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          outage_preheat=forecast["outage_preheat"],outside_minutes=forecast["outside_minutes"],
                          comfort_shortfall=forecast["comfort_shortfall"],outage_status=forecast["outage_status"],
                          heat_segments=forecast["heat_segments"],schedule_updated=forecast["schedule_updated"],
+                         fireplace_segments=project_fireplace(now.timestamp(),fire,fire_active),
                          schedule_known_until=forecast["schedule_known_until"],
                          weather_known_until=forecast["weather_known_until"],
                          conditional_heat_minutes=forecast["conditional_heat_minutes"],
@@ -730,27 +752,57 @@ class HeatingClimate(HeatingRecovery,Hass):
         enabled=bool(self.cfg.get("allow_actuation",False)) and self.raw("fan_control")=="on"
         mode=self.raw("fan_mode")
         request=(fire_active or self.memory.get("night_fan_until",0)>time.time() or mode=="Ручний запуск") and mode!="Зупинити"
-        power_ok=grid=="on" or bool(self.cfg.get("fan_backup_verified",False)) and self.raw("connection")=="on"
+        backup_entity=self.cfg.get('fan_backup','input_boolean.heating_fan_backup_verified')
+        backup_state=self.get_state(backup_entity)
+        backup_verified=backup_state=='on' if backup_state is not None else self.cfg.get('fan_backup_verified',False) is True
+        inverter_ok=self.raw('connection')=='on' and self.heartbeat_fresh(self.cfg.get('inverter_heartbeat',[]),90)
+        power_ok=grid=='on' or backup_verified and inverter_ok
         reason="Камін" if fire_active else "Нічна циркуляція" if self.memory.get("night_fan_until",0)>time.time() else "Ручний запуск" if request else "Не потрібна"
+        if mode=='Зупинити':
+            reason='Зупинено вручну'
         if not power_ok and request:
-            reason="Запит є; резервне живлення вентилятора не підтверджено"
-        percentage=int(self.val("fan_speed",38))
-        if in_window(self.now(),"23:00","07:00"):
-            percentage=min(percentage,int(self.val("fan_night_limit",38)))
-        self.publish("sensor.heating_fan","Спостереження" if not enabled else reason,
-                     friendly_name="Клімат — циркуляція",reason=reason,requested=request,
-                     proposed_percentage=percentage,control_enabled=enabled)
+            reason='Запит є; інвертор недоступний або дані застаріли' if backup_verified else 'Запит є; резервне живлення вентилятора не підтверджено'
         if not enabled:
+            reason='Автоматичну циркуляцію вимкнено'
+        percentage=max(1,min(100,int(self.val("fan_speed",38))))
+        if in_window(self.now(),"23:00","07:00"):
+            percentage=min(percentage,max(1,min(100,int(self.val("fan_night_limit",38)))))
+        state=self.raw('fan')
+        if state not in ('on','off'):
+            reason='Вентилятор недоступний'
+        status=dict(friendly_name="Клімат — циркуляція",reason=reason,requested=request,
+                    proposed_percentage=percentage,control_enabled=enabled,backup_verified=backup_verified,
+                    power_available=power_ok,actual_state=state)
+        self.publish("sensor.heating_fan","Спостереження" if not enabled else reason,**status)
+        if not enabled or state not in ('on','off') or self.update_in_progress():
             return
-        state=self.raw("fan")
+        def send(service):
+            key=(service,percentage if service=='fan/turn_on' else None)
+            if key==getattr(self,'fan_command_key',None) and time.time()-getattr(self,'fan_command_at',0)<30:
+                return False
+            self.fan_command_key=key
+            self.fan_command_at=time.time()
+            try:
+                self.call_service(service,entity_id=self.cfg['fan'],**({'percentage':percentage} if service=='fan/turn_on' else {}))
+                return True
+            except Exception as exc:
+                # A fan error must not put an otherwise healthy boiler into native-auto recovery.
+                self.log('Circulation command failed: %s',exc,level='WARNING')
+                status['reason']='Вентилятор не прийняв команду; повторимо запит'
+                self.publish('sensor.heating_fan',status['reason'],**status)
+                return False
         if request and power_ok:
             if state!="on" or self.val("fan",attribute="percentage")!=percentage:
-                self.call_service("fan/turn_on",entity_id=self.cfg["fan"],percentage=percentage)
-                self.memory["fan_owned"]=True
+                if send('fan/turn_on') and state=='off':
+                    self.memory["fan_owned"]=True
+                    self.save()
         elif self.memory.get("fan_owned") or mode=="Зупинити":
-            if state=="on":
-                self.call_service("fan/turn_off",entity_id=self.cfg["fan"])
-            self.memory["fan_owned"]=False
+            last=getattr(self,'fan_command_key',(None,None))[0]
+            if state=='on' or last=='fan/turn_on':
+                send('fan/turn_off')
+            elif self.memory.get('fan_owned'):
+                self.memory["fan_owned"]=False
+                self.save()
     def daily_learn(self,kwargs=None,**extra):
         candidate=learn(self.model,self.samples)
         if candidate is None:
