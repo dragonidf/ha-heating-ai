@@ -15,6 +15,18 @@ class QuietHandler(SimpleHTTPRequestHandler):
         pass
 
 
+def wait_for_chart_layout(page):
+    # Mobile WebKit can apply a viewport rotation after set_viewport_size returns.
+    # Wait for ResizeObserver to finish the actual layout, rather than a fixed delay.
+    page.wait_for_function('''() => {
+        const svg=document.querySelector('heating-ai-panel')?.shadowRoot.querySelector('.forecast-plot svg');
+        if(!svg)return false;
+        const box=svg.getBoundingClientRect(), label=svg.querySelector('text');
+        return box.height>=250 && Math.abs(box.width-svg.viewBox.baseVal.width)<=1 &&
+            parseFloat(label.getAttribute('font-size'))*label.getScreenCTM().a>=10.5;
+    }''',timeout=5000)
+
+
 def main(engine='chromium'):
     ARTIFACTS.mkdir(exist_ok=True)
     server=ThreadingHTTPServer(('127.0.0.1',0),partial(QuietHandler,directory=str(ROOT)))
@@ -91,7 +103,7 @@ def main(engine='chromium'):
                     page.locator(f'nav [data-tab="{tab}"]').click()
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), (width,tab)
                     if tab=='overview':
-                        page.wait_for_timeout(100)
+                        wait_for_chart_layout(page)
                         svg=page.locator('.chart-card svg')
                         assert svg.bounding_box()['height']>=250, (width,'chart too short')
                         font=svg.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')
@@ -135,7 +147,7 @@ def main(engine='chromium'):
             phone.wait_for_selector('.forecast-plot svg')
             for size in ({'width':390,'height':844},{'width':844,'height':390},{'width':360,'height':800}):
                 phone.set_viewport_size(size)
-                phone.wait_for_timeout(150)
+                wait_for_chart_layout(phone)
                 assert phone.evaluate('document.documentElement.scrollWidth <= innerWidth'), ('mobile',engine,size)
                 chart=phone.locator('.forecast-plot svg')
                 assert chart.bounding_box()['height']>=250
