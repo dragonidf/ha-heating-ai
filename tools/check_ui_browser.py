@@ -28,6 +28,42 @@ def main(engine='chromium'):
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
             page.wait_for_selector('heating-ai-panel >> text=Накопиченого тепла достатньо')
+            assert page.locator('.fireplace-card').count()==1, 'Fireplace must have a visible overview card'
+            assert page.locator('.fireplace-card').bounding_box()['y']<page.locator('.chart-card').bounding_box()['y'], 'Fireplace should precede charts'
+            page.evaluate('''() => {
+                const updated={...mockHass.states,
+                  'sensor.heating_fireplace':{state:'Горить',attributes:{temperature:25.6,delta:4.1,trend:1.2}},
+                  'binary_sensor.heating_fireplace_active':{state:'on',attributes:{}},
+                  'sensor.heating_fan':{state:'Очікування живлення',attributes:{requested:'true',control_enabled:'true',proposed_percentage:42,reason:'Запит є; резервне живлення вентилятора не підтверджено'}}};
+                panel.hass={...mockHass,states:updated};
+            }''')
+            fire=page.locator('.fireplace-card')
+            assert '25,6' in fire.inner_text() and '+4,1' in fire.inner_text()
+            assert 'резервне живлення' in fire.inner_text()
+            assert 'Вимкнено' in fire.inner_text(), 'Pending fan demand must not be presented as actual airflow'
+            page.evaluate("panel.hass={...panel.hass,states:{...panel.hass.states,'sensor.heating_fireplace':{state:'Датчик недоступний',attributes:{temperature:25.6,delta:4.1,trend:1.2}}}}")
+            assert '25,6' not in fire.inner_text() and 'немає даних' in fire.inner_text(), 'Unavailable fireplace must not show stale heat readings'
+            page.locator('[data-settings-target="fireplace-settings"]').click()
+            assert page.locator('#fireplace-settings [data-control="fan_mode"]').is_visible()
+            page.locator('nav [data-tab="overview"]').click()
+            page.evaluate('panel.hass=mockHass')
+            page.locator('[data-press="weather_refresh"]').click()
+            page.wait_for_function('calls.length === 1')
+            assert page.evaluate('calls[0]')=={'domain':'input_button','service':'press','data':{'entity_id':'input_button.heating_forecast_refresh'}}
+            page.evaluate('calls=[]')
+            # All 24 controls from the original climate dashboards remain reachable.
+            expected_controls={
+                'ai_auto_apply','armed','fan_control','restore_once','weather_refresh','rollback',
+                'end','sleep_end','sleep_start','start','fan_night_limit','fan_speed','lower',
+                'monthly_budget','native_setpoint','night_lower','night_target','night_upper',
+                'session_limit','target','upper','fan_mode','mode','strategy',
+            }
+            reachable=set()
+            for tab in ('overview','settings','model'):
+                page.locator(f'nav [data-tab="{tab}"]').click()
+                reachable.update(page.locator('[data-control],[data-press]').evaluate_all('els=>els.map(el=>el.dataset.control || el.dataset.press)'))
+            assert expected_controls<=reachable, ('Missing original controls',expected_controls-reachable)
+            page.locator('nav [data-tab="overview"]').click()
             # A live measurement must not tear down native HA chart subscriptions.
             page.wait_for_function('panel.nativeCards.size === 4')
             page.evaluate('''() => {
@@ -49,7 +85,7 @@ def main(engine='chromium'):
             assert len(page.locator('.columns').evaluate('el=>getComputedStyle(el).gridTemplateColumns.split(" ")'))==1, 'Layout uses viewport instead of panel width'
             page.evaluate("panel.style.removeProperty('width')")
             page.screenshot(path=str(ARTIFACTS/'heating-desktop.png'),full_page=True)
-            for width in (1920,1440,1024,768,430,390,360,320):
+            for width in (1920,1440,1024,768,620,600,430,390,360,320):
                 page.set_viewport_size({'width':width,'height':1000})
                 for tab in ('overview','settings','model'):
                     page.locator(f'nav [data-tab="{tab}"]').click()
@@ -107,7 +143,7 @@ def main(engine='chromium'):
             mobile.close()
             assert not errors, errors
             browser.close()
-        print(f'{engine}: browser checks passed: stable charts, eight widths, readable labels, compact comfort row, mobile rotation, helper writes and errors.')
+        print(f'{engine}: browser checks passed: stable charts, ten widths, readable labels, compact comfort row, fireplace states, all 24 controls, mobile rotation, helper writes and errors.')
     finally:
         server.shutdown()
 
