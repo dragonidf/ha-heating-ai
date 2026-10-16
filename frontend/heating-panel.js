@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -15,6 +15,40 @@ export const chartLayout = width => {
   const w=Math.max(1,Math.round(numeric(width)??880)), height=w<520?350:370;
   return {width:w,height,left:46,right:12,top:24,bottom:height-124,tickIntervals:w<520?2:4};
 };
+// Recorder uses compact {s, lu} records over WebSocket; REST uses ISO timestamps.
+export const normalizeHistory = rows => [...new Map((Array.isArray(rows)?rows:[]).map(row=>{
+  const stamp=row.ts??row.lu??row.lc??row.last_updated??row.last_changed;
+  const ts=typeof stamp==='number'?stamp:Date.parse(stamp)/1000;
+  return [ts,{ts,state:String(row.s??row.state??'unavailable')}];
+}).filter(([ts])=>Number.isFinite(ts))).values()].sort((a,b)=>a.ts-b.ts);
+const activityState = value => ['on','3 кВт','6 кВт','9 кВт'].includes(value)?'on':value==='off'?'off':'unknown';
+export const activityIntervals = (primary,fallback,start,end) => {
+  const a=normalizeHistory(primary),b=normalizeHistory(fallback),out=[];
+  const times=[...new Set([start,end,...a.map(r=>r.ts),...b.map(r=>r.ts)].filter(t=>t>=start&&t<=end))].sort((x,y)=>x-y);
+  let ai=-1,bi=-1;
+  for(let i=0;i<times.length-1;i++) {
+    const t=times[i];while(ai+1<a.length&&a[ai+1].ts<=t)ai++;while(bi+1<b.length&&b[bi+1].ts<=t)bi++;
+    const known=activityState(a[ai]?.state),state=known!=='unknown'?known:activityState(b[bi]?.state);
+    const last=out.at(-1);if(last?.state===state)last.end=times[i+1];else out.push({start:t,end:times[i+1],state});
+  }
+  return out;
+};
+const windowHistory = (rows,start,end) => {
+  const before=rows.filter(r=>r.ts<=start).at(-1),out=rows.filter(r=>r.ts>start&&r.ts<=end);
+  if(before)out.unshift({...before,ts:start});
+  if(out.length&&out.at(-1).ts<end)out.push({...out.at(-1),ts:end});
+  return out;
+};
+export const historyPaths = (rows,start,end,x,y) => {
+  const paths=[];let points=[];
+  for(const row of windowHistory(rows,start,end)) {
+    const value=numeric(row.state);
+    if(value===null){if(points.length){const previous=points.at(-1).split(',').at(-1);points.push(`L${x(row.ts)},${previous}`);paths.push(points.join(' '));}points=[];continue;}
+    points.push(`${points.length?'L':'M'}${x(row.ts)},${y(value)}`);
+  }
+  if(points.length)paths.push(points.join(' '));return paths;
+};
+const historySeries=[['room','Кімната','var(--history-room)'],['return','Обратка','var(--history-return)'],['outside','Надворі','var(--history-outside)']];
 // Keep native chart elements and their ancestors attached while values change.
 // HA chart subscriptions and ResizeObservers depend on a stable DOM lifecycle.
 const patchDOM = (current,next) => {
@@ -45,7 +79,7 @@ const patchDOM = (current,next) => {
 };
 const defaults = {
   controller:'sensor.heating_controller', alive:'binary_sensor.heating_controller_alive', permitted:'binary_sensor.heating_actuation_permitted',
-  heartbeat:'sensor.heating_heartbeat', temperature:'sensor.heating_temperature', power_confirmed:'sensor.heating_power_confirmed', boiler_active:'binary_sensor.heating_boiler_active',
+  heartbeat:'sensor.heating_heartbeat', temperature:'sensor.heating_temperature', power_confirmed:'sensor.heating_power_confirmed', boiler_active:'binary_sensor.heating_boiler_active',boiler_stage:'sensor.heating_boiler_stage',
   grid_status:'sensor.heating_grid', fireplace_status:'sensor.heating_fireplace', fireplace_active:'binary_sensor.heating_fireplace_active',
   energy_24h:'sensor.heating_energy_24h', energy_monthly:'sensor.heating_energy_monthly', forecast:'sensor.heating_forecast',
   outages:'sensor.heating_outage_schedule', model:'sensor.heating_model', environment:'sensor.heating_environment', summary:'sensor.heating_ai_summary',
@@ -61,11 +95,13 @@ const defaults = {
 export class HeatingAIPanel extends HTMLElement {
   constructor() {
     super(); this.attachShadow({mode:'open'}); this.tab='overview'; this.config={}; this.nativeCards=new Map(); this.nativeConfigs=new Map(); this.pending=new Set();
+    this.historyRange=24;this.historyVisible=new Set(['room','return']);this.historyEpoch=0;
     this.shadowRoot.addEventListener('click',e=>this.clicked(e));
     this.shadowRoot.addEventListener('change',e=>this.changed(e));
     this.shadowRoot.addEventListener('focusout',()=>setTimeout(()=>this.render(),0));
+    for(const event of ['pointerdown','pointermove','pointerleave','keydown'])this.shadowRoot.addEventListener(event,e=>this.inspectHistory(e),event==='pointerleave');
   }
-  setConfig(config) { this.config=config || {}; this.nativeCards.clear(); this.nativeConfigs.clear(); this.render(); }
+  setConfig(config) { this.config=config || {}; this.nativeCards.clear(); this.nativeConfigs.clear(); this.historyEpoch++;this.historyData=null;this.historyPending=null;this.historyKey='';this.render(); }
   set panel(panel) { this.setConfig(panel?.config || {}); }
   set hass(value) {
     const previous=this._hass;this._hass=value;
@@ -92,14 +128,16 @@ export class HeatingAIPanel extends HTMLElement {
   }
   disconnectedCallback() {
     clearInterval(this.timer);this.resizeObserver?.disconnect();
-    cancelAnimationFrame(this.resizeFrame);this.resizeFrame=0;this.observedPlot=null;
+    cancelAnimationFrame(this.resizeFrame);this.resizeFrame=0;this.observedPlots=new Set();
+    cancelAnimationFrame(this.historyFrame);this.historyFrame=0;this.historyEpoch++;
+    if(this.historyPending)this.historyAttemptAt=0;
+    this.historyPending=null;
   }
   observePlot() {
-    const plot=this.shadowRoot.querySelector('.forecast-plot');
-    if(plot===this.observedPlot)return;
-    if(this.observedPlot)this.resizeObserver?.unobserve(this.observedPlot);
-    this.observedPlot=plot;
-    if(plot)this.resizeObserver?.observe(plot);
+    const plots=new Set(this.shadowRoot.querySelectorAll('.forecast-plot,.history-plot'));
+    for(const plot of this.observedPlots||[])if(!plots.has(plot))this.resizeObserver?.unobserve(plot);
+    for(const plot of plots)if(!this.observedPlots?.has(plot))this.resizeObserver?.observe(plot);
+    this.observedPlots=plots;
   }
   getCardSize() { return 12; }
   static getStubConfig() { return {}; }
@@ -127,6 +165,82 @@ export class HeatingAIPanel extends HTMLElement {
     if(domain==='input_datetime') control=a.has_date ? `<button data-info="${h(id)}">${h(state)}</button>` : `<input type="time" ${common} step="1" value="${h(state || '')}">`;
     if(domain==='input_button') control=`<button class="action" data-press="${h(key)}" ${disabled?'disabled':''}>${key==='rollback'?'Відновити модель ↶':'Оновити погоду ↻'}</button>`;
     return `<div class="field"><span>${h(label)}${disabled?'<small class="muted">Недоступно або очікуємо підтвердження</small>':''}</span>${control}</div>`;
+  }
+  async loadHistory(force=false) {
+    if(!this.isConnected||this.tab!=='overview'||!this.hass?.callWS)return;
+    const keys=['room','return','outside','boiler_active','boiler_stage','fireplace_active'];
+    const entities=Object.fromEntries(keys.map(key=>[key,this.id(key)]));
+    const ids=[...new Set(Object.values(entities).filter(id=>typeof id==='string'))],signature=JSON.stringify(ids);
+    if(this.historyPending?.signature===signature)return;
+    if(!force&&this.historyKey===signature&&Date.now()-this.historyAttemptAt<60000)return;
+    if(this.historyKey!==signature){this.historyData=null;this.historyCursor=null;}
+    const epoch=++this.historyEpoch,end=Date.now()/1000,start=end-86400;
+    this.historyKey=signature;this.historyAttemptAt=Date.now();this.historyPending={signature,epoch};this.historyError='';
+    this.render();let timeout;
+    try {
+      const response=await Promise.race([this.hass.callWS({type:'history/history_during_period',start_time:new Date(start*1000).toISOString(),end_time:new Date(end*1000).toISOString(),entity_ids:ids,minimal_response:true,no_attributes:true,significant_changes_only:true}),new Promise((_,reject)=>{timeout=setTimeout(()=>reject(new Error('timeout')),20000);})]);
+      if(epoch!==this.historyEpoch)return;
+      this.historyData={start,end,rows:Object.fromEntries(keys.map(key=>[key,normalizeHistory(response?.[entities[key]])]))};
+    } catch {
+      if(epoch===this.historyEpoch)this.historyError='Не вдалося завантажити історію. Перевірте з’єднання та повторіть.';
+    } finally {
+      clearTimeout(timeout);
+      if(epoch===this.historyEpoch){this.historyPending=null;if(this.isConnected)this.render();}
+    }
+  }
+  historyGeometry() {
+    const width=Math.max(1,Math.round(this.shadowRoot.querySelector('.history-plot')?.clientWidth||Math.min(this.clientWidth-80,880)));
+    return {width,height:330,left:46,right:12,top:16,bottom:202,ticks:width<520?2:4};
+  }
+  historyChart() {
+    const header=`<div class="history-tools"><div class="history-ranges" role="group" aria-label="Період історії">${[6,12,24].map(hours=>`<button data-history-range="${hours}" aria-pressed="${this.historyRange===hours}">${hours} год</button>`).join('')}</div><button class="history-refresh" data-history-refresh aria-label="Оновити історію" ${this.historyPending?'disabled':''}>↻</button></div>`;
+    if(!this.historyData)return header+`<div class="history-placeholder" role="status">${h(this.historyError||'Завантажуємо історію…')}</div>`;
+    const data=this.historyData,start=data.end-this.historyRange*3600,end=data.end,g=this.historyGeometry(),right=g.width-g.right;
+    const shown=historySeries.filter(([key])=>this.historyVisible.has(key));
+    const values=shown.flatMap(([key])=>windowHistory(data.rows[key],start,end).map(r=>numeric(r.state)).filter(v=>v!==null));
+    const low=values.length?Math.floor(Math.min(...values)-.5):20,high=values.length?Math.ceil(Math.max(...values)+.5):24;
+    const x=ts=>g.left+(Math.max(start,Math.min(end,ts))-start)/(end-start)*Math.max(1,right-g.left);
+    const y=value=>g.bottom-(value-low)/(high-low)*(g.bottom-g.top);
+    const boiler=activityIntervals(data.rows.boiler_active,data.rows.boiler_stage,start,end);
+    const fire=activityIntervals(data.rows.fireplace_active,[],start,end);
+    const cursor=this.historyCursor===null||this.historyCursor===undefined?null:Math.max(start,Math.min(end,this.historyCursor));
+    const at=(key)=>cursor===null?numeric(this.state(key)):numeric(data.rows[key].filter(r=>r.ts<=cursor).at(-1)?.state);
+    const legend=`<div class="history-legend" role="group" aria-label="Температурні показники">${historySeries.map(([key,label,color])=>`<button data-history-series="${key}" aria-pressed="${this.historyVisible.has(key)}" style="--series-color:${color}"><span><i></i>${label}</span><strong>${fmt(at(key))}<small> °C</small></strong></button>`).join('')}</div>`;
+    let svg=`<div class="history-plot" tabindex="0" role="slider" aria-label="Час на графіку температури, котла й каміна" aria-valuemin="${start}" aria-valuemax="${end}" aria-valuenow="${cursor??end}" aria-valuetext="${h(this.time(cursor??end,true))}"><svg width="${g.width}" height="${g.height}" viewBox="0 0 ${g.width} ${g.height}" role="img" aria-label="Історія температур і фактична робота котла та каміна на спільній часовій шкалі"><defs><pattern id="history-missing" width="6" height="6" patternUnits="userSpaceOnUse"><path d="M-1 1L1 -1M0 6L6 0M5 7L7 5" stroke="currentColor" opacity=".22"/></pattern></defs>`;
+    for(let i=0;i<4;i++) {
+      const value=low+(high-low)*i/3;
+      svg+=`<path d="M${g.left} ${y(value)}H${right}" stroke="currentColor" opacity=".1"/><text x="0" y="${y(value)+4}" fill="currentColor" font-size="12">${fmt(value)}°</text>`;
+    }
+    for(const [key,label,color] of shown)for(const path of historyPaths(data.rows[key],start,end,x,y))svg+=`<path data-history-line="${key}" d="${path}" fill="none" stroke="${color}" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"><title>${h(label)}</title></path>`;
+    for(let i=0;i<=g.ticks;i++)svg+=`<text x="${x(start+i*(end-start)/g.ticks)}" y="225" fill="currentColor" text-anchor="${i===0?'start':i===g.ticks?'end':'middle'}" font-size="12">${h(this.time(start+i*(end-start)/g.ticks))}</text>`;
+    for(const [key,label,segments,top,color] of [['boiler','Котел',boiler,248,'var(--history-return)'],['fireplace','Камін',fire,286,'var(--history-fire)']]) {
+      svg+=`<text x="0" y="${top+13}" fill="currentColor" font-size="12">${label}</text><rect x="${g.left}" y="${top}" width="${Math.max(1,right-g.left)}" height="18" rx="5" fill="currentColor" opacity=".06"/>`;
+      for(const segment of segments)if(segment.state!=='off')svg+=`<rect data-history-lane="${key}" data-state="${segment.state}" x="${x(segment.start)}" y="${top}" width="${Math.max(1,x(segment.end)-x(segment.start))}" height="18" rx="4" fill="${segment.state==='on'?color:'url(#history-missing)'}"><title>${label} · ${h(this.time(segment.start))}–${h(this.time(segment.end))} · ${segment.state==='on'?'працював':'немає даних'}</title></rect>`;
+    }
+    if(cursor!==null)svg+=`<path class="history-crosshair" d="M${x(cursor)} ${g.top}V306" stroke="currentColor" stroke-dasharray="3 4" opacity=".55"/>`;
+    svg+='</svg></div>';
+    const duration=segments=>{const minutes=Math.round(segments.filter(s=>s.state==='on').reduce((sum,s)=>sum+s.end-s.start,0)/60);return minutes>=60?`${Math.floor(minutes/60)} год ${minutes%60} хв`:`${minutes} хв`;};
+    const total=segments=>segments.every(s=>s.state==='unknown')?'немає даних':segments.some(s=>s.state==='on')?(segments.some(s=>s.state==='unknown')?'≥ ':'')+duration(segments):segments.some(s=>s.state==='unknown')?'неповні дані':'0 хв';
+    const missing=[...boiler,...fire].some(s=>s.state==='unknown');
+    const status=(segments,on,off)=>{const state=segments.find(s=>s.start<=cursor&&cursor<s.end)?.state??segments.at(-1)?.state;return state==='on'?on:state==='off'?off:'немає даних';};
+    const readout=cursor===null?'Торкніться графіка, щоб переглянути значення.':`${this.time(cursor,true)} · Котел: ${status(boiler,'працює','вимкнено')} · Камін: ${status(fire,'є тепло','немає тепла')}`;
+    return header+legend+svg+`<div class="history-totals"><span><i style="background:var(--history-return)"></i>Котел <strong>${total(boiler)}</strong></span><span><i style="background:var(--history-fire)"></i>Камін <strong>${total(fire)}</strong></span></div><p class="history-readout muted" aria-live="polite">${h(readout)}</p>${missing?'<p class="muted note">Штрихування — немає історичних даних.</p>':''}${!values.length?'<p class="muted note">Температурні вимірювання за цей період відсутні.</p>':''}${this.historyError?`<p class="warn note" role="status">${h(this.historyError)} Показано попередні дані.</p>`:''}`;
+  }
+  inspectHistory(event) {
+    const plot=event.target.closest?.('.history-plot');if(!plot||!this.historyData)return;
+    if(event.type==='pointerleave'&&event.target!==plot)return;
+    const end=this.historyData.end,start=end-this.historyRange*3600;
+    if(event.type==='keydown') {
+      const key=event.key;if(!['ArrowLeft','ArrowRight','Home','End'].includes(key))return;
+      event.preventDefault();this.historyCursor=key==='Home'?start:key==='End'?end:Math.max(start,Math.min(end,(this.historyCursor??end)+(key==='ArrowLeft'?-300:300)));
+    } else if(event.type==='pointerleave') {
+      if(event.pointerType!=='mouse')return;this.historyCursor=null;
+    } else {
+      const svg=plot.querySelector('svg'),bounds=svg.getBoundingClientRect(),g=this.historyGeometry();
+      const fraction=Math.max(0,Math.min(1,((event.clientX-bounds.left)*g.width/bounds.width-g.left)/Math.max(1,g.width-g.right-g.left)));
+      this.historyCursor=start+fraction*(end-start);
+    }
+    if(!this.historyFrame)this.historyFrame=requestAnimationFrame(()=>{this.historyFrame=0;if(this.isConnected)this.render();});
   }
   forecastChart() {
     const a=this.attrs('forecast'), rows=(Array.isArray(a.curve)?a.curve:[]).filter(r=>numeric(r.ts)!==null&&numeric(r.temperature)!==null);
@@ -177,7 +291,7 @@ export class HeatingAIPanel extends HTMLElement {
     return `<div class="hero card"><div><span class="eyebrow">КОМФОРТ У ВАШОМУ ДОМІ</span><div class="temperature">${fmt(this.state('temperature'))}<span>°C</span></div><p>${h(c.comfort_zone || 'Поточний комфорт')} · ціль ${fmt(c.target_temperature)} °C</p><div class="pill">${heating?'◉ Нагрів':!isTrue(c.quality)?'◌ Очікуємо даних':'◌ Очікування'}</div></div><div class="hero-side"><span class="eyebrow">РІШЕННЯ КОНТРОЛЕРА</span><h2>${h(c.reason || 'Очікуємо даних')}</h2><p class="muted">${h(c.proposed_action || '')}</p><div class="comfort">Межі комфорту <strong>${fmt(c.lower_temperature)}–${fmt(c.upper_temperature)} °C</strong></div></div></div>${this.fireplaceOverview()}
     <div class="metrics">${this.metric('Нагрів зараз',numeric(this.state('power_confirmed'))===null?'—':fmt(Number(this.state('power_confirmed'))/1000),'кВт','Підтверджена потужність','power_confirmed')}${this.metric('Обратка',fmt(this.state('return')),'°C','Показник запасу тепла','return')}${this.metric('Надворі',fmt(this.state('outside')),'°C','Місцевий датчик','outside')}${this.metric('За останні 24 години',fmt(this.state('energy_24h'),2),'кВт·год',`${fmt(s.temperature_min)}–${fmt(s.temperature_max)} °C у кімнаті`,'energy_24h')}</div>
     <div class="columns"><div>${this.section('Наступні 24 години',`<div class="section-meta"><span class="pill ${isTrue(f.comfort_shortfall)?'warn':''}">${stale?'Прогноз застарів':isTrue(f.comfort_shortfall)?'Ризик зниження температури':'План утримує комфорт'}</span><span class="muted">Оновлено ${h(this.time(f.created_at))}</span></div>${this.forecastChart()}<div class="forecast-stats">${this.row('Мінімальна температура',fmt(this.state('forecast'))+' °C')}${this.row('Очікувана енергія',fmt(f.planned_kwh,2)+' кВт·год')}${this.row('Горизонт прогнозу',fmt(f.horizon_hours,0)+' год')}${this.row('Графік мережі відомий до',this.time(o.known_until,true))}</div><p class="muted note">Прогноз — оцінка. Після кінця графіка мережі нагрів умовний; перед виконанням контролер перевіряє фактичну мережу.${!isTrue(f.weather_complete)?' Погодинна погода неповна: далі використано останню відому температуру.':''}</p>`, 'chart-card')}
-    ${this.section('Температура, котел і камін · остання доба','<div class="native" data-native="history"></div>')}
+    ${this.section('Температура й нагрів',this.historyChart(),'history-card')}
     ${this.section('Енергія котла по годинах','<div class="native" data-native="energy"></div>')}
     ${this.section('Електромережа · остання доба','<div class="native" data-native="grid"></div>')}</div>
     <div>${this.section('План нагріву',`<p class="muted">${h(f.split_reason || 'Контролер розраховує оптимальні інтервали.')}</p>${segments.map(s=>`<div class="session"><div><strong>${h(this.time(s.start,true))} → ${h(this.time(s.end))}</strong><span class="muted">${fmt((s.end-s.start)/60,0)} хв${isTrue(s.conditional)?' · умовний інтервал':''}</span></div><span class="heat-dot"></span></div>`).join('')||'<p class="empty">Нагрів не запланований.</p>'}${this.row('Вечір',fmt(f.session_kwh?.evening,2)+' кВт·год')}${this.row('Ранок',fmt(f.session_kwh?.morning,2)+' кВт·год')}${this.row('Інші інтервали',fmt(f.session_kwh?.other,2)+' кВт·год')}${this.row('Умовний нагрів',fmt(f.conditional_heat_minutes,0)+' хв')}${this.row('За межами дозволених годин',fmt(f.outside_minutes,0)+' хв')}${this.row('Перенесено через відключення',isTrue(f.outage_shifted)?'Так':'Ні')}<div class="inset"><strong>Ранковий прогрів</strong>${this.row('Заплановано',fmt(morningMinutes,0)+' хв')}${this.row('Мінімум',fmt(f.morning_min_minutes,0)+' хв')}<p class="muted">${h(stale?'План застарів: потрібен новий розрахунок.':morningMinutes?'Ранковий прогрів зарезервовано.':f.split_reason || 'Ранкового нагріву немає.')}</p></div>`)}
@@ -211,6 +325,7 @@ export class HeatingAIPanel extends HTMLElement {
     patchDOM(this.shadowRoot,template.content);
     this.observePlot();
     this.mountNative();
+    this.loadHistory();
   }
   async mountNative() {
     const slots=[...this.shadowRoot.querySelectorAll('[data-native]')];
@@ -219,7 +334,6 @@ export class HeatingAIPanel extends HTMLElement {
       this.helpers ||= await (this.helpersPromise ||= window.loadCardHelpers());
       const ids=keys=>keys.map(key=>this.id(key)).filter(id=>id&&this.hass.states[id]);
       const configs={
-        history:{type:'history-graph',hours_to_show:24,entities:[...ids(['room','return','outside']),...ids(['boiler_active','fireplace_active']).map(entity=>({entity,name:entity===this.id('boiler_active')?'Котел':'Камін',color:entity===this.id('boiler_active')?'#ffc26d':'#e68b57'}))]},
         energy:{type:'statistics-graph',entities:ids(['energy']),stat_types:['change'],period:'hour',chart_type:'bar',days_to_show:1},
         grid:{type:'history-graph',hours_to_show:24,entities:ids(['grid_status'])},
         weather:{type:'weather-forecast',entity:this.id('weather'),forecast_type:'hourly',forecast_slots:24,show_current:false,show_forecast:true}
@@ -235,7 +349,10 @@ export class HeatingAIPanel extends HTMLElement {
     } catch { this.helpersPromise=null;for(const slot of slots)if(slot.isConnected)slot.textContent='Не вдалося завантажити графік Home Assistant. Оновіть сторінку.'; }
   }
   async clicked(e) {
-    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu]'); if(!el)return;
+    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh]'); if(!el)return;
+    if(el.dataset.historyRange){this.historyRange=Number(el.dataset.historyRange);this.historyCursor=null;this.render();return;}
+    if(el.dataset.historySeries){const key=el.dataset.historySeries;if(this.historyVisible.has(key)){if(this.historyVisible.size>1)this.historyVisible.delete(key);}else this.historyVisible.add(key);this.render();return;}
+    if(el.hasAttribute('data-history-refresh')){this.loadHistory(true);return;}
     if(el.dataset.tab){this.tab=el.dataset.tab;this.error='';this.render();if(el.dataset.settingsTarget)this.shadowRoot.getElementById(el.dataset.settingsTarget)?.scrollIntoView({block:'start'});return;}
     if(el.hasAttribute('data-menu')){this.dispatchEvent(new CustomEvent('hass-toggle-menu',{bubbles:true,composed:true}));return;}
     if(el.dataset.info){this.dispatchEvent(new CustomEvent('hass-more-info',{detail:{entityId:el.dataset.info},bubbles:true,composed:true}));return;}
@@ -268,8 +385,10 @@ export class HeatingAIPanel extends HTMLElement {
   }
 }
 const styles=`
-:host([data-light]){--green:#167c5b}
-:host{display:block;width:100%;min-width:0;container-type:inline-size;color:var(--primary-text-color,#e8eeeb);--green:#69d5b2;--muted:var(--secondary-text-color,#a4b1ab);--surface:var(--ha-card-background,var(--card-background-color,#18221e));--stroke:rgba(140,164,150,.17);font-family:var(--primary-font-family,system-ui),sans-serif;font-size:14px;line-height:1.6}*{box-sizing:border-box}main{width:100%;max-width:1520px;margin:auto;padding:20px 32px 12px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:12px 0 26px}.brand{display:flex;gap:12px;align-items:center}.brand-icon{display:grid;place-items:center;background:#69d5b21c;color:var(--green);width:46px;height:46px;border-radius:15px;font-size:33px}.brand strong{font-size:23px;letter-spacing:-.7px}.brand strong span{color:var(--green)}.brand small{display:block;color:var(--muted);font-size:11px;letter-spacing:.5px}.header-status{display:flex;align-items:center;gap:9px;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green)}.dot.red{background:#f28d9a}.mode{margin-left:12px;color:var(--muted);padding-left:20px;border-left:1px solid var(--stroke)}nav{display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--stroke);margin-bottom:26px;padding-bottom:12px}button,input,select{font:inherit}button,a,input,select{touch-action:manipulation}button{min-height:44px;cursor:pointer;color:inherit;background:transparent;border:1px solid var(--stroke);border-radius:10px;padding:9px 14px}button:hover{border-color:var(--green)}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--green);outline-offset:4px}button:disabled{opacity:.45;cursor:wait}nav button{border:0;color:var(--muted);padding:9px 20px}nav button.selected{background:#69d5b21c;color:var(--green)}a{color:var(--green);text-decoration:none}nav a{margin-left:auto;font-size:12px;color:var(--muted)}.card{background:var(--surface);border:1px solid var(--stroke);border-radius:20px;padding:24px;margin-bottom:20px;min-width:0;box-shadow:0 4px 24px #00000006}h1,h2,p{margin:0}h1{font-size:27px;letter-spacing:-.8px}h2{font-size:16px;font-weight:600;letter-spacing:-.2px;margin-bottom:16px}p{margin:10px 0}.muted,.eyebrow{color:var(--muted)}.eyebrow{font-size:11px;font-weight:500;letter-spacing:1.3px;display:block}.hero{display:grid;grid-template-columns:1fr 1fr;align-items:center;gap:40px;padding:32px 36px;background:radial-gradient(ellipse at 12% 10%,#69d5b21a,transparent 75%),var(--surface)}.temperature{font-size:82px;line-height:1.2;letter-spacing:-5px;font-weight:500;margin-top:10px}.temperature span{font-size:34px;color:var(--green);letter-spacing:-1px;vertical-align:top;margin-left:5px}.hero p{margin:6px 0 16px}.hero-side{border-left:1px solid var(--stroke);padding-left:36px}.hero-side h2{font-size:23px;margin-top:12px;line-height:1.4}.comfort{margin-top:25px;font-size:12px;color:var(--muted)}.comfort strong{display:block;font-size:18px;color:var(--primary-text-color)}.pill{display:inline-block;background:#69d5b215;border:1px solid #69d5b22c;color:var(--green);border-radius:30px;padding:5px 12px;font-size:12px}.warn{color:#c88826;background:#ffc26d15;border-color:#ffc26d40}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}.metric{display:flex;flex-direction:column;align-items:flex-start;text-align:left;gap:12px;padding:22px}.metric strong{font-size:28px;font-weight:500;line-height:1.2;letter-spacing:-.8px}.metric strong small{font-size:13px;color:var(--muted);letter-spacing:0}.metric .muted{font-size:11px}.columns{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(300px,1fr);gap:20px}.section-meta{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:11px;margin-bottom:22px}.forecast-plot{width:100%;min-width:0}.chart-card svg{width:100%;height:auto;max-width:100%;display:block;color:var(--muted)}.legend{display:flex;flex-wrap:wrap;gap:9px 17px;font-size:11px;color:var(--muted);margin:18px 0}.legend span:first-child{color:var(--green)}.legend span:nth-child(2){color:#c88826}.legend span:nth-child(3){color:#dd7c8d}.forecast-stats{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}.row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--stroke);font-size:12px}.row strong{font-weight:500;text-align:right;overflow-wrap:anywhere}.row:last-child{border-bottom:0}.note{font-size:11px;line-height:1.7}.session{display:flex;justify-content:space-between;gap:10px;padding:16px 0;border-bottom:1px solid var(--stroke)}.session strong{font-size:13px}.session .muted{display:block;font-size:11px}.heat-dot{width:9px;height:9px;background:#ffc26d;border-radius:50%;margin-top:8px}.inset{background:#69d5b208;border-radius:12px;padding:16px;margin-top:20px}.large{font-size:32px;letter-spacing:-1px}.large small{font-size:14px;color:var(--muted)}progress{width:100%;height:6px;accent-color:var(--green);margin-top:18px;border:0;border-radius:8px;overflow:hidden}progress::-webkit-progress-bar{background:var(--stroke)}progress::-webkit-progress-value{background:var(--green)}.text-button{border:0;color:var(--green);padding-left:0;font-size:12px;margin-top:12px}.page-title{margin:30px 0}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:0 20px}.field{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:15px 0;border-top:1px solid var(--stroke);font-size:13px}.field small{display:block;font-size:10px}.field input,.field select{background:var(--surface);color:inherit;border:1px solid var(--stroke);border-radius:9px;padding:8px;max-width:220px;min-height:40px}.number{display:flex;align-items:center;gap:8px}.number input{width:85px}.number span{font-size:11px;color:var(--muted)}.toggle{position:relative;display:inline-flex;min-width:44px;min-height:44px;align-items:center}.toggle input{opacity:0;position:absolute;inset:0;width:100%;margin:0}.toggle span{width:44px;height:25px;border-radius:25px;background:var(--stroke);pointer-events:none}.toggle span:after{content:'';display:block;width:19px;height:19px;border-radius:50%;background:#bac8bf;transform:translate(3px,3px)}.toggle input:checked+span{background:#69d5b24c}.toggle input:checked+span:after{background:var(--green);transform:translate(22px,3px)}.toggle:focus-within{outline:2px solid var(--green);border-radius:24px}.table-scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;font-size:11px;color:var(--muted);font-weight:400}td,th{padding:12px 8px;border-bottom:1px solid var(--stroke)}td:not(:first-child),th:not(:first-child){text-align:right}.journal{max-height:600px;overflow:auto}.entry{display:grid;grid-template-columns:90px 1fr;gap:15px;border-bottom:1px solid var(--stroke);padding:14px 0}.entry time{font-size:11px;color:var(--muted)}.entry p{font-size:12px;margin:0}.columns>div{min-width:0}.native{width:100%;max-width:100%;min-width:0;min-height:110px;--ha-card-border-width:0;--ha-card-box-shadow:none}.native>*{display:block;width:100%;max-width:100%;min-width:0}.empty{color:var(--muted);padding:20px 0;font-size:13px}.notice{border-radius:12px;background:#ffc26d15;border:1px solid #ffc26d40;padding:12px 18px;margin-bottom:20px;font-size:13px}.hidden{display:none}footer{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;padding:12px 2px 22px}.menu-button{min-width:44px;border:0;font-size:20px;padding:2px 6px}
+:host([data-light]){--green:#167c5b;--history-room:#167c5b;--history-return:#a26b1b;--history-outside:#5675ab;--history-fire:#bd5f2a}
+:host{display:block;width:100%;min-width:0;container-type:inline-size;color:var(--primary-text-color,#e8eeeb);--green:#69d5b2;--history-room:#69d5b2;--history-return:#e9bd79;--history-outside:#91a9d0;--history-fire:#e68b57;--muted:var(--secondary-text-color,#a4b1ab);--surface:var(--ha-card-background,var(--card-background-color,#18221e));--stroke:rgba(140,164,150,.17);font-family:var(--primary-font-family,system-ui),sans-serif;font-size:14px;line-height:1.6}*{box-sizing:border-box}main{width:100%;max-width:1520px;margin:auto;padding:20px 32px 12px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:12px 0 26px}.brand{display:flex;gap:12px;align-items:center}.brand-icon{display:grid;place-items:center;background:#69d5b21c;color:var(--green);width:46px;height:46px;border-radius:15px;font-size:33px}.brand strong{font-size:23px;letter-spacing:-.7px}.brand strong span{color:var(--green)}.brand small{display:block;color:var(--muted);font-size:11px;letter-spacing:.5px}.header-status{display:flex;align-items:center;gap:9px;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green)}.dot.red{background:#f28d9a}.mode{margin-left:12px;color:var(--muted);padding-left:20px;border-left:1px solid var(--stroke)}nav{display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--stroke);margin-bottom:26px;padding-bottom:12px}button,input,select{font:inherit}button,a,input,select{touch-action:manipulation}button{min-height:44px;cursor:pointer;color:inherit;background:transparent;border:1px solid var(--stroke);border-radius:10px;padding:9px 14px}button:hover{border-color:var(--green)}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--green);outline-offset:4px}button:disabled{opacity:.45;cursor:wait}nav button{border:0;color:var(--muted);padding:9px 20px}nav button.selected{background:#69d5b21c;color:var(--green)}a{color:var(--green);text-decoration:none}nav a{margin-left:auto;font-size:12px;color:var(--muted)}.card{background:var(--surface);border:1px solid var(--stroke);border-radius:20px;padding:24px;margin-bottom:20px;min-width:0;box-shadow:0 4px 24px #00000006}h1,h2,p{margin:0}h1{font-size:27px;letter-spacing:-.8px}h2{font-size:16px;font-weight:600;letter-spacing:-.2px;margin-bottom:16px}p{margin:10px 0}.muted,.eyebrow{color:var(--muted)}.eyebrow{font-size:11px;font-weight:500;letter-spacing:1.3px;display:block}.hero{display:grid;grid-template-columns:1fr 1fr;align-items:center;gap:40px;padding:32px 36px;background:radial-gradient(ellipse at 12% 10%,#69d5b21a,transparent 75%),var(--surface)}.temperature{font-size:82px;line-height:1.2;letter-spacing:-5px;font-weight:500;margin-top:10px}.temperature span{font-size:34px;color:var(--green);letter-spacing:-1px;vertical-align:top;margin-left:5px}.hero p{margin:6px 0 16px}.hero-side{border-left:1px solid var(--stroke);padding-left:36px}.hero-side h2{font-size:23px;margin-top:12px;line-height:1.4}.comfort{margin-top:25px;font-size:12px;color:var(--muted)}.comfort strong{display:block;font-size:18px;color:var(--primary-text-color)}.pill{display:inline-block;background:#69d5b215;border:1px solid #69d5b22c;color:var(--green);border-radius:30px;padding:5px 12px;font-size:12px}.warn{color:#c88826;background:#ffc26d15;border-color:#ffc26d40}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}.metric{display:flex;flex-direction:column;align-items:flex-start;text-align:left;gap:12px;padding:22px}.metric strong{font-size:28px;font-weight:500;line-height:1.2;letter-spacing:-.8px}.metric strong small{font-size:13px;color:var(--muted);letter-spacing:0}.metric .muted{font-size:11px}.columns{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(300px,1fr);gap:20px}.section-meta{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:11px;margin-bottom:22px}.forecast-plot{width:100%;min-width:0}.chart-card svg{width:100%;height:auto;max-width:100%;display:block;color:var(--muted)}.legend{display:flex;flex-wrap:wrap;gap:9px 17px;font-size:11px;color:var(--muted);margin:18px 0}.legend span:first-child{color:var(--green)}.legend span:nth-child(2){color:#c88826}.legend span:nth-child(3){color:#dd7c8d}.forecast-stats{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}.row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--stroke);font-size:12px}.row strong{font-weight:500;text-align:right;overflow-wrap:anywhere}.row:last-child{border-bottom:0}.note{font-size:11px;line-height:1.7}.session{display:flex;justify-content:space-between;gap:10px;padding:16px 0;border-bottom:1px solid var(--stroke)}.session strong{font-size:13px}.session .muted{display:block;font-size:11px}.heat-dot{width:9px;height:9px;background:#ffc26d;border-radius:50%;margin-top:8px}.inset{background:#69d5b208;border-radius:12px;padding:16px;margin-top:20px}.large{font-size:32px;letter-spacing:-1px}.large small{font-size:14px;color:var(--muted)}progress{width:100%;height:6px;accent-color:var(--green);margin-top:18px;border:0;border-radius:8px;overflow:hidden}progress::-webkit-progress-bar{background:var(--stroke)}progress::-webkit-progress-value{background:var(--green)}.text-button{border:0;color:var(--green);padding-left:0;font-size:12px;margin-top:12px}.page-title{margin:30px 0}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:0 20px}.field{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:15px 0;border-top:1px solid var(--stroke);font-size:13px}.field small{display:block;font-size:10px}.field input,.field select{background:var(--surface);color:inherit;border:1px solid var(--stroke);border-radius:9px;padding:8px;max-width:220px;min-height:40px}.number{display:flex;align-items:center;gap:8px}.number input{width:85px}.number span{font-size:11px;color:var(--muted)}.toggle{position:relative;display:inline-flex;min-width:44px;min-height:44px;align-items:center}.toggle input{opacity:0;position:absolute;inset:0;width:100%;margin:0}.toggle span{width:44px;height:25px;border-radius:25px;background:var(--stroke);pointer-events:none}.toggle span:after{content:'';display:block;width:19px;height:19px;border-radius:50%;background:#bac8bf;transform:translate(3px,3px)}.toggle input:checked+span{background:#69d5b24c}.toggle input:checked+span:after{background:var(--green);transform:translate(22px,3px)}.toggle:focus-within{outline:2px solid var(--green);border-radius:24px}.table-scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;font-size:11px;color:var(--muted);font-weight:400}td,th{padding:12px 8px;border-bottom:1px solid var(--stroke)}td:not(:first-child),th:not(:first-child){text-align:right}.journal{max-height:600px;overflow:auto}.entry{display:grid;grid-template-columns:90px 1fr;gap:15px;border-bottom:1px solid var(--stroke);padding:14px 0}.entry time{font-size:11px;color:var(--muted)}.entry p{font-size:12px;margin:0}.columns>div{min-width:0}.native{width:100%;max-width:100%;min-width:0;min-height:110px;--ha-card-border-width:0;--ha-card-box-shadow:none}.native>*{display:block;width:100%;max-width:100%;min-width:0}.empty{color:var(--muted);padding:20px 0;font-size:13px}.notice{border-radius:12px;background:#ffc26d15;border:1px solid #ffc26d40;padding:12px 18px;margin-bottom:20px;font-size:13px}.hidden{display:none}footer{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;padding:12px 2px 22px}.menu-button{min-width:44px;border:0;font-size:20px;padding:2px 6px}
+.history-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:-4px;margin-bottom:12px}.history-ranges{display:flex;gap:4px;padding:3px;border-radius:12px;background:#899b9010}.history-ranges button{border:0;padding:5px 14px;font-size:12px;min-height:38px;color:var(--muted)}.history-ranges button[aria-pressed="true"]{background:#69d5b21c;color:var(--green)}.history-refresh{font-size:24px;width:44px;height:44px;padding:0;border:0;color:var(--muted)}.history-legend{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 18px}.history-legend button{min-width:0;text-align:left;border-color:transparent;padding:9px 10px;background:#899b9007}.history-legend button>span{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}.history-legend i,.history-totals i{display:inline-block;width:7px;height:7px;flex-shrink:0;border-radius:50%;background:var(--series-color)}.history-legend strong{display:block;font-weight:500;font-size:20px;white-space:nowrap}.history-legend strong small{font-size:11px;color:var(--muted)}.history-legend button[aria-pressed="true"]{border-color:var(--stroke)}.history-legend button[aria-pressed="false"] i{background:transparent;border:1px solid var(--series-color)}.history-legend button[aria-pressed="false"] strong{color:var(--muted)}.history-plot{width:100%;min-width:0;touch-action:pan-y}.history-plot:focus-visible{outline:2px solid var(--green);outline-offset:3px;border-radius:6px}.history-plot svg{display:block;width:100%;height:auto;max-width:100%;color:var(--muted);overflow:visible}.history-totals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:8px 0 0;padding-top:10px;border-top:1px solid var(--stroke);font-size:11px;color:var(--muted)}.history-totals>span{min-width:0}.history-totals i{margin-right:7px}.history-totals strong{display:block;color:var(--primary-text-color);font-size:15px;font-weight:500;padding-left:14px}.history-readout{font-size:11px;margin:10px 0 0;min-height:18px}.history-placeholder{min-height:330px;display:grid;place-items:center;font-size:13px;color:var(--muted)}
+@container(max-width:600px){.history-ranges button{min-height:38px;padding:5px 10px}.history-legend{gap:4px}.history-legend button{padding:7px 6px}.history-legend button>span{font-size:10px;gap:4px}.history-legend strong{font-size:18px}.history-tools{margin-bottom:6px}.history-readout{font-size:10px}}
 section[id]{scroll-margin-top:16px}.fireplace-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px;align-items:center}.fireplace-grid>div{min-width:0}.fire-phase{display:flex;align-items:center;gap:8px;text-align:left;border:0;padding:0;max-width:100%;min-height:44px}.fire-phase svg{width:24px;height:28px;flex-shrink:0;fill:none;stroke:var(--muted);stroke-width:1.5}.fire-phase strong{font-size:20px;line-height:1.35;overflow-wrap:anywhere}.fire-block[data-active="true"] .fire-phase{color:#d88b35}.fire-block[data-active="true"] .fire-phase svg{stroke:#e9a851;fill:#e9a85118}.fire-temperature{display:block;font-size:20px}.fire-temperature small{font-size:12px}.circulation-block{border-left:1px solid var(--stroke);padding-left:24px}.fan-actual{display:block;font-size:20px;font-weight:500;margin-top:7px}.fan-reason{font-size:12px;margin:8px 0;overflow-wrap:anywhere}.fan-waiting{color:#c88826;font-size:11px;margin:6px 0}.fire-details{border-top:1px solid var(--stroke);margin-top:14px}.fire-details summary{min-height:44px;display:flex;align-items:center;cursor:pointer;font-size:12px;color:var(--muted)}.fire-details summary::after{content:'＋';margin-left:auto}.fire-details[open] summary::after{content:'−'}.fireplace-card h2{margin-bottom:6px}
 @container(max-width:600px){.fireplace-grid{gap:14px}.fire-phase strong,.fan-actual{font-size:15px}.fire-phase svg{width:22px;height:25px}.fire-temperature{font-size:19px}.fire-temperature small{display:block;font-size:10px}.circulation-block{padding-left:14px}.circulation-block .eyebrow{font-size:9px;letter-spacing:.4px}.fire-details{margin-top:10px}.fire-details summary{font-size:11px}}
 @container(min-width:1600px){main{padding:24px 42px}}@container(max-width:1000px){main{padding:15px 20px}.columns{grid-template-columns:1fr}.hero{gap:25px}.metrics{gap:12px}.metric{padding:17px}.metric strong{font-size:23px}.mode{display:none}}@container(max-width:600px){main{padding:8px 12px}header{padding:8px 2px 18px;gap:10px}.brand strong{font-size:20px}.brand-icon{width:38px;height:38px}.header-status{font-size:10px}.header-status .dot{display:none}nav{gap:3px;margin-bottom:16px}nav button{padding:10px 12px;font-size:12px}nav a{display:none}.hero{grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr);padding:18px;gap:14px;align-items:center}.hero>div{min-width:0}.temperature{font-size:44px;font-size:clamp(38px,12cqi,54px);letter-spacing:-3px;white-space:nowrap}.temperature span{font-size:20px;letter-spacing:-1px;margin-left:3px}.hero p{font-size:11px;line-height:1.5;margin:6px 0 10px}.hero .pill{font-size:10px;letter-spacing:0;padding:4px 8px}.hero-side{padding:0 0 0 14px;border-left:1px solid var(--stroke);border-top:0}.hero-side h2{font-size:15px;line-height:1.4;margin:8px 0}.hero .eyebrow{font-size:10px;letter-spacing:.5px}.comfort{margin-top:10px;font-size:10px}.comfort strong{font-size:14px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{padding:16px;gap:10px;border-radius:16px}.metric strong{font-size:23px}.eyebrow{font-size:9px;letter-spacing:.8px}.card{padding:18px;border-radius:16px;margin-bottom:14px}.columns{gap:0}.settings-grid{grid-template-columns:1fr}.field{gap:12px;font-size:12px}.field select{max-width:170px;font-size:11px}.section-meta{flex-wrap:wrap}.forecast-stats{grid-template-columns:1fr}.entry{grid-template-columns:75px 1fr;gap:10px}h1{font-size:23px}footer span{font-size:9px}}
