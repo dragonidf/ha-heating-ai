@@ -4,6 +4,7 @@ import types
 import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
 
 for name in ('appdaemon','appdaemon.plugins','appdaemon.plugins.hass','appdaemon.plugins.hass.hassapi'):
     sys.modules.setdefault(name,types.ModuleType(name))
@@ -56,6 +57,7 @@ class CirculationTests(unittest.TestCase):
         app.fan_tick('on',True)
         self.assertEqual(app.calls,[('fan/turn_off',dict(entity_id='fan.test'))])
         self.assertFalse(app.memory['fan_owned'])
+        self.assertEqual(app.published['sensor.heating_fan']['reason'],'Зупинено вручну')
 
     def test_manual_running_fan_is_not_adopted_when_speed_is_adjusted(self):
         app=self.app();app.states.update(fan='on',percentage=25)
@@ -69,6 +71,70 @@ class CirculationTests(unittest.TestCase):
         app.now=lambda:datetime(2026,10,16,23,30,tzinfo=ZoneInfo('Europe/Kyiv'))
         app.fan_tick('on',True)
         self.assertEqual(app.calls[0][1]['percentage'],25)
+
+    def test_intense_day_level_returns_to_standard_when_fire_fades(self):
+        app=self.app(**{'input_number.heating_fan_intense_speed':65})
+        app.memory['fire_phase']='Інтенсивно горить'
+        app.fan_tick('on',True)
+        self.assertEqual(app.calls[-1][1]['percentage'],65)
+        self.assertEqual(app.published['sensor.heating_fan']['selected_level'],3)
+        app.states.update(fan='on',percentage=65);app.memory['fire_phase']='Згасає'
+        app.fan_tick('on',True)
+        self.assertEqual(app.calls[-1][1]['percentage'],42)
+        self.assertEqual(app.published['sensor.heating_fan']['selected_level'],2)
+
+    def test_night_level_overrides_intense_burning(self):
+        app=self.app(**{'input_number.heating_fan_intense_speed':65})
+        app.memory['fire_phase']='Інтенсивно горить'
+        app.now=lambda:datetime(2026,10,16,23,tzinfo=ZoneInfo('Europe/Kyiv'))
+        app.fan_tick('on',True)
+        self.assertEqual(app.calls[-1][1]['percentage'],30)
+        self.assertEqual(app.published['sensor.heating_fan']['selected_level'],1)
+
+    def test_missing_intense_helper_has_safe_default_and_custom_mapping_works(self):
+        app=self.app();app.memory['fire_phase']='Інтенсивно горить'
+        app.fan_tick('on',True)
+        self.assertEqual(app.calls[-1][1]['percentage'],60)
+        app.cfg['fan_intense_speed']='input_number.custom_intense'
+        app.states['input_number.custom_intense']=70
+        app.fan_tick('on',True)
+        self.assertEqual(app.calls[-1][1]['percentage'],70)
+
+    def test_report_distinguishes_manual_running_fan_from_automatic_request(self):
+        app=self.app();app.states.update(fan='on',percentage=42)
+        app.fan_tick('on',False)
+        self.assertFalse(app.published['sensor.heating_fan']['controller_owned'])
+        self.assertEqual(app.published['sensor.heating_fan']['request_source'],'none')
+        self.assertIn('ручне',app.published['sensor.heating_fan']['reason'].lower())
+
+    def test_fireplace_cooldown_sends_stop_for_the_controller_owned_fan(self):
+        app=self.app();app.cfg['fireplace_heartbeat']=[];app.samples=[]
+        with patch('heating_climate.time.time',return_value=10000):
+            app.states['fireplace']=27
+            app.fan_tick('on',app.fireplace(22)[1])
+        app.states.update(fan='on',percentage=42,fireplace=24.4)
+        for stamp in range(10015,10316,15):
+            with patch('heating_climate.time.time',return_value=stamp):
+                app.fan_tick('on',app.fireplace(22)[1])
+        self.assertEqual([call[0] for call in app.calls],['fan/turn_on','fan/turn_off'])
+
+    def test_explicit_manual_and_night_requests_are_distinct_from_fireplace(self):
+        app=self.app();app.states['fan_mode']='Ручний запуск'
+        app.fan_tick('on',False)
+        self.assertEqual(app.published['sensor.heating_fan']['request_source'],'manual')
+        self.assertEqual(app.calls[-1][1]['percentage'],42)
+        app=self.app();app.memory['night_fan_until']=10900
+        app.now=lambda:datetime(2026,10,16,23,tzinfo=ZoneInfo('Europe/Kyiv'))
+        with patch('heating_climate.time.time',return_value=10000):app.fan_tick('on',False)
+        self.assertEqual(app.published['sensor.heating_fan']['request_source'],'night')
+        self.assertEqual(app.calls[-1][1]['percentage'],30)
+
+    def test_daytime_standard_resumes_at_seven(self):
+        app=self.app();app.memory['fire_phase']='Горить'
+        app.now=lambda:datetime(2026,10,17,7,tzinfo=ZoneInfo('Europe/Kyiv'))
+        app.fan_tick('on',True)
+        self.assertEqual(app.published['sensor.heating_fan']['selected_level'],2)
+        self.assertEqual(app.calls[-1][1]['percentage'],42)
 
     def test_unavailable_fan_is_not_commanded(self):
         app=self.app();app.states['fan']='unavailable'

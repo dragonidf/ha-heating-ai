@@ -312,26 +312,52 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.model["validated"]=True
         self.save()
     def fireplace(self,room):
+        stamp=time.time()
         temperature=self.val("fireplace")
         valid=temperature is not None and room is not None and self.heartbeat_fresh(self.cfg["fireplace_heartbeat"],4*3600)
         delta=max(0.,temperature-room) if valid else 0.
-        recent=[r for r in self.samples if r["ts"]>time.time()-1800 and number(r.get("fire")) is not None]
-        slope=(delta-recent[0]["fire"])*3600/max(300,time.time()-recent[0]["ts"]) if recent else 0.
+        recent=[r for r in self.samples if 0<stamp-r["ts"]<=1800 and number(r.get("fire")) is not None]
+        slope=(delta-recent[0]["fire"])*3600/max(300,stamp-recent[0]["ts"]) if recent else 0.
+        # Remove binary floating-point noise at boundaries; keep raw delta for the model.
+        signal=round(delta,6);trend=round(slope,6)
         previous=self.memory.get("fire_phase","Неактивний")
+        tracker=self.memory.get('fire_circulation',{})
+        was_active=tracker.get('active',self.memory.get('fan_owned',False) and previous in ('Горить','Згасає','Інтенсивно горить'))
+        last_valid=number(tracker.get('last_valid'))
+        continuous=last_valid is not None and 0<=stamp-last_valid<=90
+        below=number(tracker.get('below_since')) if continuous else None
+        active=False
+        if valid:
+            if signal>=5:
+                active=True;below=None
+            elif was_active and not (signal<4 and trend<=-2):
+                if signal<3:
+                    below=stamp if below is None else below
+                    active=stamp-below<300
+                else:
+                    active=True;below=None
+        if not active:
+            below=None
+        self.memory['fire_circulation']=dict(active=active,below_since=below,last_valid=stamp if valid else None)
         if not valid:
             phase="Датчик недоступний"
-        elif delta>=4:
-            phase="Згасає" if slope<-.8 else "Горить"
-        elif delta>=2 and slope>.8:
+        elif trend<-.8 and signal>=2:
+            phase="Згасає"
+        elif signal>=10:
+            phase="Інтенсивно горить"
+        elif signal>=5:
+            phase="Горить"
+        elif signal>=2 and trend>.8:
             phase="Розпалювання"
-        elif previous in ("Горить","Згасає") and delta>1.5:
+        elif active:
             phase="Згасає"
         else:
             phase="Неактивний"
-        active=phase in ("Горить","Згасає") and delta>=2
         self.memory["fire_phase"]=phase
+        remaining=max(0,int(300-(stamp-below))) if below is not None else 0
         self.publish("sensor.heating_fireplace",phase,friendly_name="Камін — стан",
                      temperature=temperature,delta=round(delta,2),trend=round(slope,2),
+                     circulation_requested=active,cooldown_remaining_seconds=remaining,
                      calibrated=False,icon="mdi:fireplace")
         self.publish("binary_sensor.heating_fireplace_active",None if not valid else "on" if active else "off",
                      friendly_name="Камін — корисне тепло",icon="mdi:fire")
@@ -786,15 +812,24 @@ class HeatingClimate(HeatingRecovery,Hass):
             reason='Запит є; інвертор недоступний або дані застаріли' if backup_verified else 'Запит є; резервне живлення вентилятора не підтверджено'
         if not enabled:
             reason='Автоматичну циркуляцію вимкнено'
-        percentage=max(1,min(100,int(self.val("fan_speed",38))))
-        if in_window(self.now(),"23:00","07:00"):
-            percentage=min(percentage,max(1,min(100,int(self.val("fan_night_limit",38)))))
+        standard=max(1,min(100,int(self.val("fan_speed",38))))
+        intense=number(self.get_state(self.cfg.get('fan_intense_speed','input_number.heating_fan_intense_speed')))
+        intense=max(standard,min(100,int(intense if intense is not None else 60)))
+        night=min(standard,max(1,min(100,int(self.val("fan_night_limit",38)))))
+        level=1 if in_window(self.now(),"23:00","07:00") else 3 if fire_active and self.memory.get('fire_phase')=='Інтенсивно горить' else 2
+        percentage={1:night,2:standard,3:intense}[level]
         state=self.raw('fan')
         if state not in ('on','off'):
             reason='Вентилятор недоступний'
+        elif enabled and mode!='Зупинити' and not request and state=='on' and not self.memory.get('fan_owned'):
+            reason='Ручне увімкнення; автоматичний запит відсутній'
+        source='fireplace' if fire_active and request else 'night' if request and self.memory.get('night_fan_until',0)>time.time() else 'manual' if request else 'none'
         status=dict(friendly_name="Клімат — циркуляція",reason=reason,requested=request,
                     proposed_percentage=percentage,control_enabled=enabled,backup_verified=backup_verified,
-                    power_available=power_ok,actual_state=state)
+                    power_available=power_ok,actual_state=state,selected_level=level,
+                    controller_owned=bool(self.memory.get('fan_owned')),request_source=source,
+                    manual_running=state=='on' and not request and not self.memory.get('fan_owned') and mode!='Зупинити',
+                    level_percentages=dict(night=night,standard=standard,intense=intense))
         self.publish("sensor.heating_fan","Спостереження" if not enabled else reason,**status)
         if not enabled or state not in ('on','off') or self.update_in_progress():
             return

@@ -45,6 +45,15 @@ class PanelTests(unittest.TestCase):
     def test_disabled_panel_has_no_filesystem_effect(self):
         self.assertIsNone(install_panel({'ui_enabled': False, 'ui_www_dir': '/not/a/real/directory'}))
 
+    def test_intense_speed_entity_has_a_default_and_accepts_local_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg={'ui_www_dir':directory}
+            self.assertEqual(install_panel(cfg)['entities']['fan_intense_speed'],
+                             'input_number.heating_fan_intense_speed')
+            cfg['fan_intense_speed']='input_number.other_fireplace_high'
+            self.assertEqual(install_panel(cfg)['entities']['fan_intense_speed'],
+                             'input_number.other_fireplace_high')
+
     def test_rejects_external_panel_url(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):

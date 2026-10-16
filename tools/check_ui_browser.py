@@ -46,21 +46,30 @@ def check_compact_overview(page):
             'sensor.heating_controller':{attributes:{proposed_action:'Нагрів · термостат +2 °C'}}
         })''',[binary,power])
         assert page.locator('.boiler-card').get_attribute('data-heating')==expected
+        if expected=='true':
+            red,green,blue=page.locator('.boiler-card').evaluate("el=>getComputedStyle(el).backgroundImage.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/).slice(1,4).map(Number)")
+            assert red>green*1.5 and blue>green, 'Heating boiler must have a red tint'
     accents=[]
-    for phase,active in [('Неактивний','off'),('Розпалювання','off'),('Горить','on'),('Згасає','on')]:
+    for phase,active in [('Неактивний','off'),('Розпалювання','off'),('Горить','on'),('Інтенсивно горить','on'),('Згасає','on')]:
         page.evaluate('''([phase,active])=>setHeatingScenario({
-            'sensor.heating_fireplace':{state:phase,attributes:{temperature:26.2,delta:4.4}},
+            'sensor.heating_fireplace':{state:phase,attributes:{temperature:21.8+({'Неактивний':.2,'Розпалювання':3,'Горить':6,'Інтенсивно горить':11,'Згасає':4}[phase]),delta:{'Неактивний':.2,'Розпалювання':3,'Горить':6,'Інтенсивно горить':11,'Згасає':4}[phase]}},
             'binary_sensor.heating_fireplace_active':{state:active},
-            'fan.circulation':{state:'on',attributes:{percentage:42}}
+            'sensor.heating_fan':{attributes:{selected_level:phase==='Інтенсивно горить'?3:2,requested:active==='on',manual_running:active==='off'}},
+            'fan.circulation':{state:'on',attributes:{percentage:phase==='Інтенсивно горить'?60:42}}
         })''',[phase,active])
         assert page.locator('.fireplace-card').get_attribute('data-phase')==phase
         assert phase in page.locator('.fireplace-card .fire-phase').inner_text()
-        assert '42 %' in page.locator('.fan-actual').inner_text()
+        assert ('60 %' if phase=='Інтенсивно горить' else '42 %') in page.locator('.fan-actual').inner_text()
         accents.append(page.locator('.fire-phase').evaluate('el=>getComputedStyle(el).color'))
+        if phase!='Неактивний':
+            red,green,blue=page.locator('.fireplace-card').evaluate("el=>getComputedStyle(el).backgroundImage.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/).slice(1,4).map(Number)")
+            assert (red>green*1.5 and blue>green) if phase in ('Горить','Інтенсивно горить') else (red>green>blue*1.5), (phase,'wrong tint')
         if page.viewport_size['width']<=430:
             assert page.locator('.fireplace-card').bounding_box()['height']<225, (phase,'fireplace too tall')
             assert page.locator('.fan-actual').evaluate('el=>el.scrollWidth<=el.clientWidth')
-    assert len(set(accents))==4, 'Fireplace phases need distinct, subtle accents'
+        if page.viewport_size['width']==360:
+            page.locator('.fireplace-card').screenshot(path=str(ARTIFACTS/f'heating-fireplace-{phase}-360.png'))
+    assert len(set(accents))>=3, 'Off, burning and transitional phases need distinct accents'
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true}},'sensor.heating_outage_schedule':{attributes:{known_until:Date.now()/1000+86400}}})")
     assert page.locator('.forecast-warning').count()==0, 'Complete forecast must not show generic warnings'
     assert 'Тло — комфортний діапазон' not in page.locator('.chart-card').inner_text()
@@ -78,6 +87,26 @@ def check_compact_overview(page):
     page.evaluate('panel.hass=mockHass')
 
 
+def check_compact_tabs(page):
+    page.locator('nav [data-tab="settings"]').click()
+    assert page.locator('.settings-page').count()==1
+    levels=page.locator('.circulation-levels [data-control]').evaluate_all('els=>els.map(el=>el.dataset.control)')
+    assert levels==['fan_night_limit','fan_speed','fan_intense_speed'], levels
+    field=page.locator('[data-control="fan_intense_speed"]')
+    field.fill('65');field.press('Tab')
+    page.wait_for_function('calls.some(c=>c.data.entity_id==="input_number.heating_fan_intense_speed")')
+    assert page.evaluate('calls.at(-1).data.value')==65
+    page.evaluate('calls=[];panel.hass=mockHass')
+    page.locator('nav [data-tab="model"]').click()
+    assert page.locator('.model-page .model-stats .compact-metric').count()==4
+    assert page.locator('.model-advanced details').get_attribute('open') is None
+    page.locator('.model-advanced summary').click()
+    assert page.locator('.parameter-grid').is_visible()
+    assert page.locator('.controller-facts').is_visible()
+    page.locator('.model-advanced summary').click()
+    page.locator('nav [data-tab="overview"]').click()
+
+
 def main(engine='chromium'):
     ARTIFACTS.mkdir(exist_ok=True)
     server=ThreadingHTTPServer(('127.0.0.1',0),partial(QuietHandler,directory=str(ROOT)))
@@ -93,6 +122,7 @@ def main(engine='chromium'):
             page.wait_for_selector('heating-ai-panel >> text=Накопиченого тепла достатньо')
             check_compact_overview(page)
             page.wait_for_function('nativeConfigs.length === 2')
+            check_compact_tabs(page)
             page.wait_for_selector('.history-plot svg')
             assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2, 'Past boiler runs must remain visible when the binary sensor is new'
             assert '4 год 0 хв' in page.locator('.history-totals').inner_text()
@@ -133,10 +163,10 @@ def main(engine='chromium'):
             page.wait_for_function('calls.length === 1')
             assert page.evaluate('calls[0]')=={'domain':'input_button','service':'press','data':{'entity_id':'input_button.heating_forecast_refresh'}}
             page.evaluate('calls=[]')
-            # All 24 controls from the original climate dashboards remain reachable.
+            # All 25 controls from the original climate dashboards remain reachable.
             expected_controls={
                 'ai_auto_apply','armed','fan_control','restore_once','weather_refresh','rollback',
-                'end','sleep_end','sleep_start','start','fan_night_limit','fan_speed','lower',
+                'end','sleep_end','sleep_start','start','fan_night_limit','fan_speed','fan_intense_speed','lower',
                 'monthly_budget','native_setpoint','night_lower','night_target','night_upper',
                 'session_limit','target','upper','fan_mode','mode','strategy',
             }
@@ -175,6 +205,11 @@ def main(engine='chromium'):
                     page.locator(f'nav [data-tab="{tab}"]').click()
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), (width,tab)
                     assert page.evaluate('''()=>{const ids=[...panel.shadowRoot.querySelectorAll('[id]')].map(el=>el.id);return ids.length===new Set(ids).size}'''), (width,tab,'duplicate IDs')
+                    if tab in ('settings','model'):
+                        for control in page.locator('.field input,.field select,.field button').all():
+                            assert control.bounding_box()['height']>=40, (width,tab,'small touch target')
+                        if width in (360,390,430,768):
+                            assert page.locator('main').bounding_box()['height']<(2200 if tab=='settings' else 2700), (width,tab,'page not compact')
                     if tab=='overview':
                         if width in (360,430):check_compact_overview(page)
                         wait_for_chart_layout(page)
@@ -284,7 +319,7 @@ def main(engine='chromium'):
             assert page.locator('.boiler-status').inner_text()=='Немає даних'
             assert not errors, errors
             browser.close()
-        print(f'{engine}: browser checks passed: compact grouping/order/heights, boiler and four fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts, instant summary display and all 24 controls.')
+        print(f'{engine}: browser checks passed: compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts, instant summary display and all 25 controls.')
     finally:
         server.shutdown()
 
