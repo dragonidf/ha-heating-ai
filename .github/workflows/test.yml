@@ -27,7 +27,9 @@ jobs:
         if: matrix.python == '3.12'
         run: |
           python -m pip install playwright==1.55.0
-          python -m playwright install --with-deps chromium
+          python -m playwright install --with-deps chromium webkit
       - name: Browser interaction and responsive layout
         if: matrix.python == '3.12'
-        run: python tools/check_ui_browser.py
+        run: |
+          python tools/check_ui_browser.py
+          python tools/check_ui_browser.py --browser webkit

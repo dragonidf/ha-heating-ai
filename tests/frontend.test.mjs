@@ -3,7 +3,15 @@ import assert from 'node:assert/strict';
 globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
-const {numeric,escapeHTML,isTrue,mergeSegments}=await import('../frontend/heating-panel.js');
+const {numeric,escapeHTML,isTrue,mergeSegments,chartLayout}=await import('../frontend/heating-panel.js');
+test('chart keeps a readable height and reduces ticks for narrow containers',()=>{
+  for(const width of [258,320,390,480,720,1440]) {
+    const g=chartLayout(width);
+    assert.equal(g.width,width);assert.ok(g.height>=300);
+    assert.ok(g.bottom>g.top);assert.ok(g.width-g.right>g.left);
+    assert.equal(g.tickIntervals,width<520?2:4);
+  }
+});
 test('unknown measurements never become zero',()=>{
   for(const value of [null,undefined,'',' ','unknown','unavailable',Infinity])assert.equal(numeric(value),null);
   assert.equal(numeric('0'),0);assert.equal(numeric('-2.1'),-2.1);

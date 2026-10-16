@@ -18,7 +18,16 @@ for(const key of ['armed','restore_once','fan_control','ai_auto_apply'])add('inp
 add('input_select.heating_mode','Автоматичне керування',{options:['Автоматичне керування','Спостереження','Штатний auto']});add('input_select.heating_strategy','Нічний тариф',{options:['Нічний тариф','Комфорт']});add('input_select.heating_fan_mode','Автоматично',{options:['Автоматично','Зупинити','Ручний запуск']});add('input_button.heating_model_rollback','2026-10-16T00:00:00');add('sensor.heating_restore_status','Запиту немає');
 window.calls=[];window.failService=false;
 window.mockHass={states,config:{time_zone:'Europe/Kyiv'},callService:async(domain,service,data)=>{window.calls.push({domain,service,data});if(window.failService)throw new Error('Немає доступу');}};
-window.loadCardHelpers=async()=>({createCardElement:config=>{const el=document.createElement('div');el.style='padding:30px;color:#97aaa0;text-align:center;background:#69d5b208;border-radius:12px';el.textContent='Попередній перегляд · '+config.type;return el;}});
+// Canvas fixture exercises intrinsic sizing, DPR, lifecycle and ResizeObserver.
+// These are synthetic chart data, not a replacement for HA Recorder testing.
+class FixtureChart extends HTMLElement {
+  constructor(){super();this.attachShadow({mode:'open'});this.shadowRoot.innerHTML='<style>:host{color:#97aaa0}small{display:block;padding:10px 0;font:11px system-ui}canvas{display:block;width:100%;height:200px}</style><small>Тестові дані · попередній перегляд</small><canvas width="900" height="200"></canvas>';}
+  connectedCallback(){this.observer=new ResizeObserver(()=>this.draw());this.observer.observe(this);this.draw();}
+  disconnectedCallback(){this.observer?.disconnect();}
+  draw(){const canvas=this.shadowRoot.querySelector('canvas'),w=this.getBoundingClientRect().width||300,dpr=devicePixelRatio||1;canvas.width=Math.round(w*dpr);canvas.height=200*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.strokeStyle='#97aaa030';for(let y=20;y<180;y+=40){c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke();}c.strokeStyle='#69d5b2';c.lineWidth=2;c.beginPath();for(let x=0;x<=w;x+=3){const y=110-Math.sin(x/w*6)*45;x?c.lineTo(x,y):c.moveTo(x,y);}c.stroke();}
+}
+customElements.define('fixture-native-chart',FixtureChart);
+window.loadCardHelpers=async()=>({createCardElement:()=>document.createElement('fixture-native-chart')});
 const panel=document.querySelector('heating-ai-panel');panel.setConfig({entities:{room:'sensor.room',return:'sensor.probe',outside:'sensor.outside',fan:'fan.circulation',weather:'weather.home',energy:'sensor.energy'}});panel.hass=window.mockHass;
 window.panel=panel;
 </script></html>
