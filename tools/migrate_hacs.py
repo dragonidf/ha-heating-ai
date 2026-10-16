@@ -72,8 +72,18 @@ def apply(migration, *, appdaemon_stopped=False):
         for source in migration['sources']:
             Path(source).unlink()
             removed.append(source)
-        Path(migration['link']).symlink_to(migration['hacs_dir'],target_is_directory=True)
+        links = Path(migration['link'])
+        links.mkdir()
+        for name in EXPECTED:
+            (links/name).symlink_to(Path(migration['hacs_dir'])/name)
     except BaseException:
+        links = Path(migration['link'])
+        if links.is_dir() and not links.is_symlink():
+            for name in EXPECTED:
+                file = links/name
+                if file.is_symlink():
+                    file.unlink()
+            links.rmdir()
         for source in removed:
             shutil.copy2(backup/Path(source).name,source)
         raise
@@ -86,8 +96,12 @@ def rollback(manifest, *, appdaemon_stopped=False):
     manifest = Path(manifest)
     migration = json.loads(manifest.read_text())
     link = Path(migration['link'])
-    if not link.is_symlink() or link.resolve() != Path(migration['hacs_dir']).resolve():
-        raise ValueError('Migration link changed; automatic rollback refused')
+    if link.is_symlink() or not link.is_dir() or {p.name for p in link.iterdir()} - {'__pycache__'} != set(EXPECTED):
+        raise ValueError('Migration directory changed; automatic rollback refused')
+    for name in EXPECTED:
+        file = link/name
+        if not file.is_symlink() or file.resolve() != (Path(migration['hacs_dir'])/name).resolve():
+            raise ValueError('Migration file link changed; automatic rollback refused')
     for source, expected in migration['sources'].items():
         if Path(source).exists() or digest(manifest.parent/Path(source).name) != expected:
             raise ValueError('Legacy path occupied or backup checksum changed')
@@ -100,7 +114,12 @@ def rollback(manifest, *, appdaemon_stopped=False):
                 raise ValueError('Rollback temporary file already exists')
             shutil.copy2(manifest.parent/Path(source).name,temporary)
             staged.append((temporary,Path(source)))
-        link.unlink()
+        for name in EXPECTED:
+            (link/name).unlink()
+        cache = link/'__pycache__'
+        if cache.exists():
+            shutil.rmtree(cache)
+        link.rmdir()
         for temporary,target in staged:
             temporary.rename(target)
     finally:

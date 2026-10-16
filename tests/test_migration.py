@@ -33,9 +33,16 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):m.apply(plan)
         self.assertTrue((self.app/'heating_climate.py').exists())
 
+    def test_hacs_modules_are_visible_to_appdaemon_directory_scan(self):
+        m.apply(self.plan(),appdaemon_stopped=True)
+        files=list(self.app.rglob('heating_*.py'))
+        self.assertEqual({p.name for p in files},set(m.EXPECTED))
+        self.assertTrue(all(p.is_symlink() for p in files))
+
     def test_migration_and_rollback_preserve_settings_data_and_other_apps(self):
         manifest=m.apply(self.plan(),appdaemon_stopped=True)
-        self.assertTrue((self.app/'heating_ai_hacs').is_symlink())
+        self.assertTrue((self.app/'heating_ai_hacs').is_dir())
+        self.assertFalse((self.app/'heating_ai_hacs').is_symlink())
         self.assertFalse((self.app/'heating_climate.py').exists())
         self.assertEqual((self.app/'local.yaml').read_text(),'private settings')
         self.assertEqual((self.data/'state.json').read_text(),'learned state')
@@ -60,4 +67,4 @@ class MigrationTests(unittest.TestCase):
         manifest=m.apply(self.plan(),appdaemon_stopped=True)
         (manifest.parent/'heating_model.py').write_text('corrupt')
         with self.assertRaises(ValueError):m.rollback(manifest,appdaemon_stopped=True)
-        self.assertTrue((self.app/'heating_ai_hacs').is_symlink())
+        self.assertTrue((self.app/'heating_ai_hacs/heating_model.py').is_symlink())
