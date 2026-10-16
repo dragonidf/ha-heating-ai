@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
+from threading import RLock
 from test_adapter_modulation import HeatingClimate
 
 
@@ -15,6 +16,7 @@ class PlannedExecutionTests(unittest.TestCase):
         app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
         app.model=dict(validated=True,version=4)
         app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
+        app.ai_summary_lock=RLock();app.ai_summary_attributes=None
         app.outage_signature=(None,None)
         app.source_temperature=lambda:(room,'Вітальня',room,22.5)
         app.val=lambda key,default=None,attribute=None:dict(

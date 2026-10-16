@@ -3,6 +3,7 @@ from appdaemon.plugins.hass.hassapi import Hass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
+from threading import RLock
 import json
 import os
 import statistics
@@ -83,9 +84,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.last_sample=0
         self.fan_command_at=0
         self.command_pending_until=0
+        # Serialize the two summary publishers without locking thermal planning.
+        self.ai_summary_lock=RLock()
+        self.ai_summary_attributes=None
         self.listen_event(self.weather_event,"heating_weather_forecast")
         self.listen_event(self.night_event,"heating_fan_night_request")
         self.listen_state(self.proposal_changed,self.cfg["ai_proposal"])
+        self.listen_state(self.ai_report_changed,self.cfg["ai_report"])
         self.listen_state(self.rollback,self.cfg["rollback"])
         self.listen_state(self.arm_changed,self.cfg["restore_once"])
         self.listen_state(self.climate_changed,self.cfg["thermostat"],attribute="all")
@@ -208,6 +213,25 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.save()
     def settings_changed(self,entity,attribute,old,new,kwargs=None,**extra):
         self.next_compute=0
+    def ai_report_changed(self,entity,attribute,old,new,kwargs=None,**extra):
+        if old!=new:
+            self.publish_ai_summary()
+    def publish_ai_summary(self,refresh=False):
+        with self.ai_summary_lock:
+            attributes=self.ai_summary_attributes
+            if attributes is None and not refresh:
+                state=self.get_state("sensor.heating_ai_summary",attribute="all") or {}
+                attributes=dict(state.get("attributes",{}))
+            if refresh or not attributes or not {"model","usable_samples","last_24h","last_result"}<=attributes.keys():
+                current=dict(friendly_name="Клімат — добовий аналіз",model=dict(self.model),
+                             usable_samples=len(transitions(self.samples)),last_24h=self.summary(),
+                             last_result=self.memory.get("last_result"))
+                attributes=current if refresh else {**current,**(attributes or {})}
+            self.ai_summary_attributes=attributes
+            # Read the current helper inside the same lock: a delayed callback must
+            # not overwrite a newer report or cycle attributes with an old event.
+            self.publish("sensor.heating_ai_summary",self.raw("ai_report") or "Перший аналіз очікується",
+                         **attributes)
     def grid_state(self):
         alive=self.raw("connection")=="on" and self.heartbeat_fresh(self.cfg["inverter_heartbeat"],90)
         if not alive:
@@ -662,9 +686,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      power_learning=profile,
                      effective_power_kw=round(effective,3) if effective is not None else None,
                      power_learning_status='Навчання модуляції' if profile['intervals'] else 'Очікуємо підтверджений нагрів')
-        self.publish("sensor.heating_ai_summary",self.raw("ai_report") or "Перший аналіз очікується",
-                     friendly_name="Клімат — добовий аналіз",model=self.model,usable_samples=len(transitions(self.samples)),
-                     last_24h=self.summary(),last_result=self.memory.get("last_result"))
+        self.publish_ai_summary(refresh=True)
         self.memory["planned_heat_segments"]=forecast["heat_segments"] if forecast else []
         self.memory["demand"]=demand
         self.apply_action(action,once)
