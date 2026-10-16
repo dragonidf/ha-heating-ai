@@ -20,9 +20,10 @@
 
 ## Розробка
 
-Python 3.12+, AppDaemon 4 для роботи; тести використовують стандартну бібліотеку та імітацію HA без мережі.
+Python 3.12+, AppDaemon 4 для роботи; тести використовують імітацію HA без мережі. Jinja2 потрібна лише тестам координатора HA, не AppDaemon-застосунку.
 
 ```sh
+python -m pip install -r tests/requirements.txt
 make check test
 ```
 
@@ -35,5 +36,7 @@ make check test
 Після запуску 0.2.0 застосунок встановлює публічні файли інтерфейсу в `www/heating-ai`. Потрібно один раз додати ресурс `/local/heating-ai/loader.js` типу JavaScript module та картку `custom:heating-ai-panel` у панельний dashboard. Його можна закріпити в бічному меню й відкривати ярликом із чинної кліматичної панелі. [Налаштування панелі](docs/web-panel.md).
 
 Оновлення коду й інтерфейсу надходять одним HACS-застосунком; локальний YAML, helpers і навчена модель зберігаються окремо.
+
+Після одноразового підключення [координатора оновлень](docs/automatic-updates.md) достатньо натиснути «Оновити» в HACS: він сам призупинить команди й перезапустить AppDaemon з перевіркою нового циклу. Сам HACS не створює цю автоматику.
 
 Модулі: `heating_model` — модель/план; `heating_stability` — стабільність; `heating_environment` — інерція/зовнішній прогрів; `heating_fallback` та `heating_recovery` — резерв/відновлення; `heating_outages` — графік мережі; `heating_climate` — адаптер HA; `heating_ui` і згенерований `heating_ui_assets` — інтерфейс. Усі дев’ять Python-модулів складають один HACS AppDaemon-застосунок.

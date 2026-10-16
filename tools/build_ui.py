@@ -21,6 +21,14 @@ def build(check=False):
             raise SystemExit('Run python tools/build_ui.py and commit the generated assets')
     else:
         target.write_text(content)
+    modules={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(target.parent.glob('heating_*.py'))}
+    manifest=json.dumps(dict(version=version,module_hashes=modules),sort_keys=True,indent=2)+'\n'
+    release=target.parent/'release.json'
+    if check:
+        if not release.exists() or release.read_text()!=manifest:
+            raise SystemExit('Run python tools/build_ui.py to refresh the nine-module release manifest')
+    else:
+        release.write_text(manifest)
 
 
 if __name__ == '__main__':

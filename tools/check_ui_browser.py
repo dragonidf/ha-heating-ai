@@ -40,6 +40,11 @@ def main(engine='chromium'):
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
             page.wait_for_selector('heating-ai-panel >> text=Накопиченого тепла достатньо')
+            page.wait_for_function('nativeConfigs.length === 4')
+            history=page.evaluate("nativeConfigs.find(c=>c.entities?.some(e=>e.entity==='binary_sensor.heating_fireplace_active'))")
+            assert any(e.get('entity')=='binary_sensor.heating_boiler_active' for e in history['entities'] if isinstance(e,dict)), 'History needs actual boiler and fireplace lanes on the same time axis'
+            assert page.locator('[data-series="fireplace"]').count()==1
+            assert 'оцінка залишкового тепла' in page.locator('[data-series="fireplace"] title').text_content()
             assert page.locator('.fireplace-card').count()==1, 'Fireplace must have a visible overview card'
             assert page.locator('.fireplace-card').bounding_box()['y']<page.locator('.chart-card').bounding_box()['y'], 'Fireplace should precede charts'
             page.evaluate('''() => {
@@ -51,10 +56,13 @@ def main(engine='chromium'):
             }''')
             fire=page.locator('.fireplace-card')
             assert '25,6' in fire.inner_text() and '+4,1' in fire.inner_text()
+            assert not fire.locator('details').get_attribute('open'), 'Technical details should stay collapsed'
+            fire.locator('summary').click()
             assert 'резервне живлення' in fire.inner_text()
             assert 'Вимкнено' in fire.inner_text(), 'Pending fan demand must not be presented as actual airflow'
             page.evaluate("panel.hass={...panel.hass,states:{...panel.hass.states,'sensor.heating_fireplace':{state:'Датчик недоступний',attributes:{temperature:25.6,delta:4.1,trend:1.2}}}}")
-            assert '25,6' not in fire.inner_text() and 'немає даних' in fire.inner_text(), 'Unavailable fireplace must not show stale heat readings'
+            assert fire.locator('details').get_attribute('open') is not None, 'Live readings must preserve expanded details'
+            assert '25,6' not in fire.inner_text() and 'Датчик недоступний' in fire.inner_text(), 'Unavailable fireplace must not show stale heat readings'
             page.locator('[data-settings-target="fireplace-settings"]').click()
             assert page.locator('#fireplace-settings [data-control="fan_mode"]').is_visible()
             page.locator('nav [data-tab="overview"]').click()
@@ -114,6 +122,7 @@ def main(engine='chromium'):
                         bounds=svg.bounding_box()
                         assert all(r['x']>=bounds['x']-1 and r['right']<=bounds['x']+bounds['width']+1 for r in labels), (width,'clipped chart labels')
                         if width<=600:
+                            assert page.locator('.fireplace-card').bounding_box()['height']<250, (width,'fireplace overview should be compact')
                             left=page.locator('.hero>div').first.bounding_box()
                             right=page.locator('.hero-side').bounding_box()
                             assert right['x']>=left['x']+left['width'], (width,'controller decision should share the comfort row')
