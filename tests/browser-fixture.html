@@ -47,4 +47,9 @@ window.nativeConfigs=[];
 window.loadCardHelpers=async()=>({createCardElement:config=>{window.nativeConfigs.push(config);return document.createElement('fixture-native-chart');}});
 const panel=document.querySelector('heating-ai-panel');panel.setConfig({entities:{room:'sensor.room',return:'sensor.probe',outside:'sensor.outside',fan:'fan.circulation',weather:'weather.home',energy:'sensor.energy'}});panel.hass=window.mockHass;
 window.panel=panel;
+window.setHeatingScenario=changes=>{
+  const states={...mockHass.states};
+  for(const [id,row] of Object.entries(changes))states[id]={...states[id],...row,attributes:{...states[id]?.attributes,...row.attributes}};
+  panel.hass={...mockHass,states};
+};
 </script></html>

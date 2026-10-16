@@ -27,6 +27,57 @@ def wait_for_chart_layout(page):
     }''',timeout=5000)
 
 
+def check_compact_overview(page):
+    assert page.locator('.boiler-card').count()==1, 'Boiler metrics must share one card'
+    assert page.locator('.heat-sources>.card').count()==2
+    assert page.locator('.hero .hero-outside').count()==1
+    assert page.locator('.overview>.metrics').count()==0, 'Old standalone metrics must be removed'
+    assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
+    headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
+    assert headings==['Котел','Камін і циркуляція','Наступні 24 години','План нагріву'], headings
+    assert page.locator('.chart-card + .plan-card').count()==1, 'Heating plan must immediately follow the forecast'
+    assert page.locator('.plan-details').get_attribute('open') is None
+    assert '17,50' in page.locator('.boiler-card').inner_text()
+    assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
+    for binary,power,expected in [('on','6000','true'),('off','9000','false'),('unavailable','3000','true'),('unavailable','unavailable','unknown')]:
+        page.evaluate('''([binary,power])=>setHeatingScenario({
+            'binary_sensor.heating_boiler_active':{state:binary},
+            'sensor.heating_power_confirmed':{state:power},
+            'sensor.heating_controller':{attributes:{proposed_action:'Нагрів · термостат +2 °C'}}
+        })''',[binary,power])
+        assert page.locator('.boiler-card').get_attribute('data-heating')==expected
+    accents=[]
+    for phase,active in [('Неактивний','off'),('Розпалювання','off'),('Горить','on'),('Згасає','on')]:
+        page.evaluate('''([phase,active])=>setHeatingScenario({
+            'sensor.heating_fireplace':{state:phase,attributes:{temperature:26.2,delta:4.4}},
+            'binary_sensor.heating_fireplace_active':{state:active},
+            'fan.circulation':{state:'on',attributes:{percentage:42}}
+        })''',[phase,active])
+        assert page.locator('.fireplace-card').get_attribute('data-phase')==phase
+        assert phase in page.locator('.fireplace-card .fire-phase').inner_text()
+        assert '42 %' in page.locator('.fan-actual').inner_text()
+        accents.append(page.locator('.fire-phase').evaluate('el=>getComputedStyle(el).color'))
+        if page.viewport_size['width']<=430:
+            assert page.locator('.fireplace-card').bounding_box()['height']<225, (phase,'fireplace too tall')
+            assert page.locator('.fan-actual').evaluate('el=>el.scrollWidth<=el.clientWidth')
+    assert len(set(accents))==4, 'Fireplace phases need distinct, subtle accents'
+    page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true}},'sensor.heating_outage_schedule':{attributes:{known_until:Date.now()/1000+86400}}})")
+    assert page.locator('.forecast-warning').count()==0, 'Complete forecast must not show generic warnings'
+    assert 'Тло — комфортний діапазон' not in page.locator('.chart-card').inner_text()
+    assert 'Час майбутнього горіння невідомий' not in page.locator('.chart-card').inner_text()
+    page.locator('.forecast-help summary').click()
+    assert 'Час майбутнього горіння невідомий' in page.locator('.chart-card').inner_text()
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), 'Forecast help overflow'
+    page.locator('.forecast-help summary').click()
+    page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}}})")
+    assert 'Графік мережі неповний' in page.locator('.forecast-warning').inner_text()
+    page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:false}}})")
+    assert 'Погодинна погода неповна' in page.locator('.forecast-warning').inner_text()
+    page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{planned_kwh:null}}})")
+    assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
+    page.evaluate('panel.hass=mockHass')
+
+
 def main(engine='chromium'):
     ARTIFACTS.mkdir(exist_ok=True)
     server=ThreadingHTTPServer(('127.0.0.1',0),partial(QuietHandler,directory=str(ROOT)))
@@ -40,7 +91,8 @@ def main(engine='chromium'):
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
             page.wait_for_selector('heating-ai-panel >> text=Накопиченого тепла достатньо')
-            page.wait_for_function('nativeConfigs.length === 3')
+            check_compact_overview(page)
+            page.wait_for_function('nativeConfigs.length === 2')
             page.wait_for_selector('.history-plot svg')
             assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2, 'Past boiler runs must remain visible when the binary sensor is new'
             assert '4 год 0 хв' in page.locator('.history-totals').inner_text()
@@ -95,7 +147,7 @@ def main(engine='chromium'):
             assert expected_controls<=reachable, ('Missing original controls',expected_controls-reachable)
             page.locator('nav [data-tab="overview"]').click()
             # A live measurement must not tear down native HA chart subscriptions.
-            page.wait_for_function('panel.nativeCards.size === 3')
+            page.wait_for_function('panel.nativeCards.size === 2')
             page.evaluate('''() => {
                 window.chartDisconnects=0;
                 window.firstHistory=panel.nativeCards.get('energy');
@@ -122,7 +174,9 @@ def main(engine='chromium'):
                 for tab in ('overview','settings','model'):
                     page.locator(f'nav [data-tab="{tab}"]').click()
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), (width,tab)
+                    assert page.evaluate('''()=>{const ids=[...panel.shadowRoot.querySelectorAll('[id]')].map(el=>el.id);return ids.length===new Set(ids).size}'''), (width,tab,'duplicate IDs')
                     if tab=='overview':
+                        if width in (360,430):check_compact_overview(page)
                         wait_for_chart_layout(page)
                         svg=page.locator('.chart-card svg')
                         assert svg.bounding_box()['height']>=250, (width,'chart too short')
@@ -138,6 +192,20 @@ def main(engine='chromium'):
                         assert history.bounding_box()['height']>=300, (width,'history too short')
                         assert history.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5, (width,'unreadable history labels')
                         assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2
+                        cells=page.locator('.forecast-stats').evaluate('el=>getComputedStyle(el).gridTemplateColumns.split(" ").length')
+                        assert cells==(2 if width<=700 else 4), (width,'forecast metric columns',cells)
+                        for metric in page.locator('.boiler-metrics .compact-metric,.forecast-stats .compact-metric').all():
+                            assert metric.evaluate('el=>el.scrollWidth<=el.clientWidth'), (width,'metric overflow')
+                        forecast_box=page.locator('.chart-card').bounding_box()
+                        plan_box=page.locator('.plan-card').bounding_box()
+                        assert 0<=plan_box['y']-forecast_box['y']-forecast_box['height']<=16, (width,'plan separated from forecast')
+                        if width in (360,390,430):
+                            # v0.2.4 was 4493–4550 px on these same synthetic fixtures.
+                            assert page.locator('main').bounding_box()['height']<3650, (width,'overview did not become compact')
+                            assert page.locator('.hero').bounding_box()['height']<225
+                            assert page.locator('.boiler-card').bounding_box()['height']<175
+                            assert page.locator('.fireplace-card').bounding_box()['height']<225
+                            assert page.locator('.plan-card').bounding_box()['height']<420
                         if width<=600:
                             assert page.locator('.fireplace-card').bounding_box()['height']<250, (width,'fireplace overview should be compact')
                             left=page.locator('.hero>div').first.bounding_box()
@@ -205,9 +273,18 @@ def main(engine='chromium'):
             mobile.close()
             page.evaluate("panel.hass={...mockHass,themes:{darkMode:false}};document.body.style.background='#fafafa';document.body.style.setProperty('--primary-text-color','#17271f');document.body.style.setProperty('--secondary-text-color','#56675d');document.body.style.setProperty('--ha-card-background','#fff')")
             page.locator('.history-card').screenshot(path=str(ARTIFACTS/f'heating-history-light-{engine}.png'))
+            page.locator('.heat-sources').screenshot(path=str(ARTIFACTS/f'heating-sources-light-{engine}.png'))
+            page.locator('nav [data-tab="model"]').click()
+            page.evaluate("setHeatingScenario({'sensor.heating_ai_summary':{state:'Новий AI-звіт без очікування циклу'}})")
+            assert 'Новий AI-звіт без очікування циклу' in page.locator('.content').inner_text()
+            page.locator('nav [data-tab="overview"]').click()
+            page.evaluate('panel.hass={...mockHass,states:{}}')
+            assert page.locator('.boiler-card').get_attribute('data-heating')=='unknown'
+            assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
+            assert page.locator('.boiler-status').inner_text()=='Немає даних'
             assert not errors, errors
             browser.close()
-        print(f'{engine}: browser checks passed: stable charts, ten widths, readable labels, compact comfort row, fireplace states, all 24 controls, mobile rotation, helper writes and errors.')
+        print(f'{engine}: browser checks passed: compact grouping/order/heights, boiler and four fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts, instant summary display and all 24 controls.')
     finally:
         server.shutdown()
 
