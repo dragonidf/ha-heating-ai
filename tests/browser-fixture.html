@@ -18,6 +18,22 @@ for(const key of ['armed','restore_once','fan_control','ai_auto_apply'])add('inp
 add('input_select.heating_mode','Автоматичне керування',{options:['Автоматичне керування','Спостереження','Штатний auto']});add('input_select.heating_strategy','Нічний тариф',{options:['Нічний тариф','Комфорт']});add('input_select.heating_fan_mode','Автоматично',{options:['Автоматично','Зупинити','Ручний запуск']});add('input_button.heating_forecast_refresh','2026-10-16T00:00:00');add('input_button.heating_model_rollback','2026-10-16T00:00:00');add('sensor.heating_restore_status','Запиту немає');
 window.calls=[];window.failService=false;
 window.mockHass={states,config:{time_zone:'Europe/Kyiv'},callService:async(domain,service,data)=>{window.calls.push({domain,service,data});if(window.failService)throw new Error('Немає доступу');}};
+window.historyRequests=[];
+mockHass.callWS=async request=>{
+  historyRequests.push(request);
+  if(window.failHistory)throw new Error('Recorder unavailable');
+  if(window.emptyHistory)return {};
+  const start=Date.parse(request.start_time)/1000,end=Date.parse(request.end_time)/1000,span=end-start;
+  const measured=(s,fraction)=>({s:String(s),lu:start+fraction*span});
+  return {
+    'sensor.room':Array.from({length:97},(_,i)=>measured(21.8+.3*Math.sin(i/96*Math.PI*4),i/96)),
+    'sensor.probe':Array.from({length:97},(_,i)=>measured(24.1+5*Math.exp(-(((i/96-.18)/.08)**2))+3*Math.exp(-(((i/96-.4)/.07)**2)),i/96)),
+    'sensor.outside':Array.from({length:97},(_,i)=>measured(10.5+4*Math.sin(i/96*Math.PI*2),i/96)),
+    'sensor.heating_boiler_stage':[measured('off',0),measured('9 кВт',2/24),measured('off',5/24),measured('6 кВт',9/24),measured('off',10/24)],
+    'binary_sensor.heating_boiler_active':[{s:'off',lu:end-600}],
+    'binary_sensor.heating_fireplace_active':[measured('off',0),measured('on',18/24),measured('off',23/24)]
+  };
+};
 // Canvas fixture exercises intrinsic sizing, DPR, lifecycle and ResizeObserver.
 // These are synthetic chart data, not a replacement for HA Recorder testing.
 class FixtureChart extends HTMLElement {

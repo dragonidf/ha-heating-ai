@@ -3,7 +3,28 @@ import assert from 'node:assert/strict';
 globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
-const {numeric,escapeHTML,isTrue,mergeSegments,chartLayout}=await import('../frontend/heating-panel.js');
+const {numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths}=await import('../frontend/heating-panel.js');
+test('history decoder accepts compact HA states and keeps unknown gaps',()=>{
+  const rows=normalizeHistory([{s:'22',lu:10},{s:'unavailable',lu:20},{state:'23',last_updated:'1970-01-01T00:00:30Z'}]);
+  assert.deepEqual(rows,[{ts:10,state:'22'},{ts:20,state:'unavailable'},{ts:30,state:'23'}]);
+});
+test('boiler history uses old measured stages before the new binary sensor existed',()=>{
+  const old=[{ts:0,state:'off'},{ts:10,state:'9 кВт'},{ts:30,state:'off'}];
+  const recent=[{ts:80,state:'off'}];
+  assert.deepEqual(activityIntervals(recent,old,0,100),[
+    {start:0,end:10,state:'off'},{start:10,end:30,state:'on'},{start:30,end:100,state:'off'}]);
+});
+test('no recorder history is unknown rather than a full day of off',()=>{
+  assert.deepEqual(activityIntervals([],[],0,100),[{start:0,end:100,state:'unknown'}]);
+  assert.deepEqual(activityIntervals([{ts:80,state:'off'}],[],0,100),[{start:0,end:80,state:'unknown'},{start:80,end:100,state:'off'}]);
+});
+test('active primary readings override fallback and unknown readings break lines',()=>{
+  assert.deepEqual(activityIntervals([{ts:0,state:'on'},{ts:30,state:'unavailable'}],[],0,50),[{start:0,end:30,state:'on'},{start:30,end:50,state:'unknown'}]);
+  assert.deepEqual(activityIntervals([{ts:0,state:'off'}],[{ts:0,state:'9 кВт'}],0,50),[{start:0,end:50,state:'off'}]);
+  const paths=historyPaths([{ts:0,state:'22'},{ts:10,state:'unavailable'},{ts:20,state:'23'},{ts:30,state:'24'}],0,40,t=>t,v=>v);
+  assert.equal(paths.length,2);
+  assert.ok(!paths.some(p=>p.includes('0,22 L20,23')));
+});
 test('chart keeps a readable height and reduces ticks for narrow containers',()=>{
   for(const width of [258,320,390,480,720,1440]) {
     const g=chartLayout(width);

@@ -40,9 +40,19 @@ def main(engine='chromium'):
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
             page.wait_for_selector('heating-ai-panel >> text=Накопиченого тепла достатньо')
-            page.wait_for_function('nativeConfigs.length === 4')
-            history=page.evaluate("nativeConfigs.find(c=>c.entities?.some(e=>e.entity==='binary_sensor.heating_fireplace_active'))")
-            assert any(e.get('entity')=='binary_sensor.heating_boiler_active' for e in history['entities'] if isinstance(e,dict)), 'History needs actual boiler and fireplace lanes on the same time axis'
+            page.wait_for_function('nativeConfigs.length === 3')
+            page.wait_for_selector('.history-plot svg')
+            assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2, 'Past boiler runs must remain visible when the binary sensor is new'
+            assert '4 год 0 хв' in page.locator('.history-totals').inner_text()
+            assert page.evaluate("historyRequests[0].entity_ids.includes('sensor.heating_boiler_stage')")
+            assert page.evaluate("!historyRequests[0].entity_ids.includes('sensor.heating_power_confirmed')"), 'Do not load the high-frequency raw power stream'
+            page.locator('[data-history-range="6"]').click()
+            page.locator('[data-history-series="outside"]').click()
+            assert page.locator('[data-history-line="outside"]').count()>0
+            page.locator('.history-plot').focus();page.locator('.history-plot').press('ArrowLeft')
+            page.wait_for_selector('.history-crosshair',state='attached')
+            assert 'Котел:' in page.locator('.history-readout').inner_text() and 'Камін:' in page.locator('.history-readout').inner_text()
+            page.locator('[data-history-range="24"]').click()
             assert page.locator('[data-series="fireplace"]').count()==1
             assert 'оцінка залишкового тепла' in page.locator('[data-series="fireplace"] title').text_content()
             assert page.locator('.fireplace-card').count()==1, 'Fireplace must have a visible overview card'
@@ -85,10 +95,11 @@ def main(engine='chromium'):
             assert expected_controls<=reachable, ('Missing original controls',expected_controls-reachable)
             page.locator('nav [data-tab="overview"]').click()
             # A live measurement must not tear down native HA chart subscriptions.
-            page.wait_for_function('panel.nativeCards.size === 4')
+            page.wait_for_function('panel.nativeCards.size === 3')
             page.evaluate('''() => {
                 window.chartDisconnects=0;
-                window.firstHistory=panel.nativeCards.get('history');
+                window.firstHistory=panel.nativeCards.get('energy');
+                window.historyFetchesBeforeUpdate=historyRequests.length;
                 const observer=new MutationObserver(records=>{
                     for(const record of records) for(const node of record.removedNodes)
                         if(node===firstHistory || node.contains?.(firstHistory)) chartDisconnects++;
@@ -99,6 +110,7 @@ def main(engine='chromium'):
             }''')
             page.wait_for_timeout(100)
             assert page.evaluate('chartDisconnects === 0'), 'Live update disconnected native charts'
+            assert page.evaluate('historyFetchesBeforeUpdate === historyRequests.length'), 'Ordinary live updates must reuse Recorder history'
             # HA sidebar/card width can change without a viewport resize.
             page.evaluate("panel.style.width='720px'")
             page.wait_for_timeout(150)
@@ -121,6 +133,11 @@ def main(engine='chromium'):
                         labels=svg.locator('text').evaluate_all('els=>els.map(el=>{const r=el.getBoundingClientRect();return {x:r.x,right:r.right}})')
                         bounds=svg.bounding_box()
                         assert all(r['x']>=bounds['x']-1 and r['right']<=bounds['x']+bounds['width']+1 for r in labels), (width,'clipped chart labels')
+                        history=page.locator('.history-plot svg')
+                        page.wait_for_function("Math.abs(panel.shadowRoot.querySelector('.history-plot svg').getBoundingClientRect().width-panel.shadowRoot.querySelector('.history-plot svg').viewBox.baseVal.width)<=1")
+                        assert history.bounding_box()['height']>=300, (width,'history too short')
+                        assert history.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5, (width,'unreadable history labels')
+                        assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2
                         if width<=600:
                             assert page.locator('.fireplace-card').bounding_box()['height']<250, (width,'fireplace overview should be compact')
                             left=page.locator('.hero>div').first.bounding_box()
@@ -129,6 +146,7 @@ def main(engine='chromium'):
                             assert page.locator('.temperature').evaluate('el=>el.scrollWidth <= el.clientWidth'), (width,'temperature overflow')
                         if width==390:
                             page.screenshot(path=str(ARTIFACTS/f'heating-mobile-overview-{engine}.png'),full_page=True)
+                            page.locator('.history-card').screenshot(path=str(ARTIFACTS/f'heating-history-mobile-{engine}.png'))
                 if width==390:
                     page.screenshot(path=str(ARTIFACTS/'heating-mobile-model.png'),full_page=True)
             page.locator('nav [data-tab="settings"]').click()
@@ -149,6 +167,25 @@ def main(engine='chromium'):
             page.evaluate("mockHass.states['sensor.heating_controller'].attributes.reason='<img src=x onerror=alert(1)>'; panel.hass=mockHass")
             page.locator('nav [data-tab="overview"]').click()
             assert page.locator('heating-ai-panel img').count()==0
+            page.evaluate('emptyHistory=true');page.locator('[data-history-refresh]').click()
+            page.wait_for_selector('[data-history-lane="boiler"][data-state="unknown"]')
+            assert 'немає даних' in page.locator('.history-totals').inner_text()
+            page.evaluate('emptyHistory=false;failHistory=true;panel.historyData=null;panel.loadHistory(true)')
+            page.wait_for_selector('.history-placeholder >> text=Не вдалося завантажити історію')
+            assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==0
+            page.evaluate('failHistory=false');page.locator('[data-history-refresh]').click()
+            page.wait_for_selector('[data-history-lane="boiler"][data-state="on"]')
+            # Closing the HA view during a request must not suppress the next load.
+            page.evaluate('''() => {
+                panel.hass={...mockHass,callWS:()=>new Promise(resolve=>window.resolveOldHistory=resolve)};
+                panel.historyData=null;panel.loadHistory(true);
+                panel.remove();panel.hass=mockHass;
+                document.body.append(panel);
+            }''')
+            page.wait_for_selector('[data-history-lane="boiler"][data-state="on"]',timeout=5000)
+            page.evaluate('resolveOldHistory({})')
+            page.wait_for_timeout(50)
+            assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2, 'Late history response replaced a fresh load'
             # Phone WebView: touch, high pixel density and rotation in-place.
             mobile=browser.new_context(viewport={'width':390,'height':844},is_mobile=True,has_touch=True,device_scale_factor=3)
             phone=mobile.new_page()
@@ -161,7 +198,13 @@ def main(engine='chromium'):
                 chart=phone.locator('.forecast-plot svg')
                 assert chart.bounding_box()['height']>=250
                 assert chart.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5
+                phone.wait_for_selector('.history-plot svg')
+                phone.locator('.history-plot').tap()
+                phone.wait_for_selector('.history-crosshair',state='attached')
+                assert 'Котел:' in phone.locator('.history-readout').inner_text()
             mobile.close()
+            page.evaluate("panel.hass={...mockHass,themes:{darkMode:false}};document.body.style.background='#fafafa';document.body.style.setProperty('--primary-text-color','#17271f');document.body.style.setProperty('--secondary-text-color','#56675d');document.body.style.setProperty('--ha-card-background','#fff')")
+            page.locator('.history-card').screenshot(path=str(ARTIFACTS/f'heating-history-light-{engine}.png'))
             assert not errors, errors
             browser.close()
         print(f'{engine}: browser checks passed: stable charts, ten widths, readable labels, compact comfort row, fireplace states, all 24 controls, mobile rotation, helper writes and errors.')
