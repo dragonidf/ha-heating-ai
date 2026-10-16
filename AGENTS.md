@@ -4,7 +4,7 @@ Answer the owner in Ukrainian. GitHub is the source of controller code; live HA 
 
 Run `make check test` before committing. Add a failing regression test before a behavioral fix. Keep configuration, thermal coefficients, telemetry, energy counters and manual-control protections intact unless explicitly in scope. Never publish state.json, telemetry, credentials, full site configuration or Recorder databases.
 
-The app is `apps/heating_ai/`; it is deployed on AppDaemon, not in HA Core. All seven Python modules are one HACS app. Keep the local app YAML outside the HACS-managed directory. Tests use fake HA I/O and numerical fixtures; they do not prove physical relay operation.
+The app is `apps/heating_ai/`; it is deployed on AppDaemon, not in HA Core. All nine Python modules are one HACS app. Keep the local app YAML outside the HACS-managed directory. Edit frontend/heating-panel.js, then run python tools/build_ui.py; do not hand-edit heating_ui_assets.py. Tests use fake HA I/O and numerical fixtures; they do not prove physical relay operation.
 
 For production work use the owner's ha-climate-controller skill when available. Read fresh modules and states, back up code before replacing it, pause model commands for a multi-file rollout, restore the original armed/mode state, verify a fresh cycle and planning_policy_version. Do not restart HA for a Python-only update. If File editor access is expanded, restore enforce_basepath=true and stop it afterward. Never execute code on HA through File editor's command endpoint.
 
