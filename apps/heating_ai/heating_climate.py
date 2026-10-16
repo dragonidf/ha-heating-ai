@@ -636,6 +636,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          conditional_heat_minutes=forecast["conditional_heat_minutes"],
                          schedule_complete=forecast["schedule_complete"],
                          weather_complete=forecast["weather_complete"],
+                         weather_missing_minutes=forecast.get("weather_missing_minutes"),
                          split_comfort_applied=forecast["split_comfort_applied"],
                          session_kwh=forecast["session_kwh"],
                          night_air_target=forecast["night_air_target"],
@@ -799,6 +800,7 @@ class HeatingClimate(HeatingRecovery,Hass):
     def fan_tick(self,grid,fire_active):
         enabled=bool(self.cfg.get("allow_actuation",False)) and self.raw("fan_control")=="on"
         mode=self.raw("fan_mode")
+        auto_mode=mode in ('Авто','Автоматично')
         request=(fire_active or self.memory.get("night_fan_until",0)>time.time() or mode=="Ручний запуск") and mode!="Зупинити"
         backup_entity=self.cfg.get('fan_backup','input_boolean.heating_fan_backup_verified')
         backup_state=self.get_state(backup_entity)
@@ -821,14 +823,14 @@ class HeatingClimate(HeatingRecovery,Hass):
         state=self.raw('fan')
         if state not in ('on','off'):
             reason='Вентилятор недоступний'
-        elif enabled and mode!='Зупинити' and not request and state=='on' and not self.memory.get('fan_owned'):
+        elif enabled and not auto_mode and mode!='Зупинити' and not request and state=='on' and not self.memory.get('fan_owned'):
             reason='Ручне увімкнення; автоматичний запит відсутній'
         source='fireplace' if fire_active and request else 'night' if request and self.memory.get('night_fan_until',0)>time.time() else 'manual' if request else 'none'
         status=dict(friendly_name="Клімат — циркуляція",reason=reason,requested=request,
                     proposed_percentage=percentage,control_enabled=enabled,backup_verified=backup_verified,
                     power_available=power_ok,actual_state=state,selected_level=level,
                     controller_owned=bool(self.memory.get('fan_owned')),request_source=source,
-                    manual_running=state=='on' and not request and not self.memory.get('fan_owned') and mode!='Зупинити',
+                    manual_running=state=='on' and mode=='Ручний запуск',
                     level_percentages=dict(night=night,standard=standard,intense=intense))
         self.publish("sensor.heating_fan","Спостереження" if not enabled else reason,**status)
         if not enabled or state not in ('on','off') or self.update_in_progress():
@@ -853,7 +855,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                 if send('fan/turn_on') and state=='off':
                     self.memory["fan_owned"]=True
                     self.save()
-        elif self.memory.get("fan_owned") or mode=="Зупинити":
+        # Auto owns the desired state, even when a reload lost fan_owned.
+        elif auto_mode or self.memory.get("fan_owned") or mode=="Зупинити":
             last=getattr(self,'fan_command_key',(None,None))[0]
             if state=='on' or last=='fan/turn_on':
                 send('fan/turn_off')

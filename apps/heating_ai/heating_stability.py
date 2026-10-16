@@ -6,7 +6,7 @@ The adapter persists the returned reference beside existing plan memory.
 from datetime import datetime, timedelta
 import math
 from heating_model import (plan as optimise, step, outdoor_at, in_window,
-                           modulation_power, morning_runs, morning_runs_valid,comfort_at)
+                           modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage)
 from heating_outages import blocked
 from heating_environment import forecast_step,gain_at,safe_upper
 
@@ -115,7 +115,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         kind='evening' if in_window(tm,'23:00','01:00') else 'morning' if in_window(tm,'05:00','07:00') else 'other'
         mix[kind]+=s['kwh']
     schedule_until=data.get('known_until') if data.get('valid') else None
-    weather_until=max((x['ts']+3600 for x in weather),default=None)
+    coverage=weather_coverage(weather,finish)
     return dict(heat=bool(all_segments and all_segments[0]['start']==start),curve=rows,
                 energy=round(energy,2),minimum=round(low,2),maximum=round(high,2),
                 horizon_hours=24.,validated=bool(model.get('validated')),
@@ -126,10 +126,9 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 night_air_target=(settings['night_lower']+.05 if priority else
                                   max(settings['lower'],settings['target']-.5)),
                 split_reason='Часи сеансів збережено; прогноз оновлено за фактичними вимірами',
-                schedule_known_until=schedule_until,weather_known_until=weather_until,
+                schedule_known_until=schedule_until,**coverage,
                 conditional_heat_minutes=round(sum((s['end']-s['start'])/60 for s in all_segments if s['conditional']),1),
                 schedule_complete=schedule_until is not None and schedule_until>=finish,
-                weather_complete=weather_until is not None and weather_until>=finish,
                 outage_shifted=False,outage_preheat=False,outside_minutes=0.,
                 outage_status=data.get('reason','Графік не підключений'),
                 comfort_shortfall=any(r['temperature']<r['lower'] for r in rows),heat_segments=all_segments,

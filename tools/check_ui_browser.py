@@ -78,10 +78,23 @@ def check_compact_overview(page):
     assert 'Час майбутнього горіння невідомий' in page.locator('.chart-card').inner_text()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), 'Forecast help overflow'
     page.locator('.forecast-help summary').click()
+    for missing in (0,42,59,60):
+        page.evaluate('''missing=>setHeatingScenario({'sensor.heating_forecast':{attributes:{
+            schedule_complete:true,weather_complete:true,weather_missing_minutes:missing}}})''',missing)
+        assert page.locator('.forecast-warning').count()==0, (missing,'Tolerated weather tail must not warn')
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}}})")
     assert 'Графік мережі неповний' in page.locator('.forecast-warning').inner_text()
-    page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:false}}})")
-    assert 'Погодинна погода неповна' in page.locator('.forecast-warning').inner_text()
+    for missing in (61,95,None):
+        page.evaluate('''missing=>setHeatingScenario({'sensor.heating_forecast':{attributes:{
+            schedule_complete:true,weather_complete:false,weather_missing_minutes:missing}}})''',missing)
+        assert 'Погодинна погода неповна' in page.locator('.forecast-warning').inner_text()
+    page.evaluate("""setHeatingScenario({
+        'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true,weather_missing_minutes:42}},
+        'sensor.heating_outage_schedule':{attributes:{warning:'Аварійне відключення'}}})""")
+    warnings=page.locator('.forecast-warning').all_text_contents()
+    assert any('Графік мережі неповний' in warning for warning in warnings)
+    assert any('Аварійне відключення' in warning for warning in warnings)
+    assert all('Погодинна погода неповна' not in warning for warning in warnings)
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{planned_kwh:null}}})")
     assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
     page.evaluate('panel.hass=mockHass')
