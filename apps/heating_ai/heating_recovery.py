@@ -5,6 +5,12 @@ from heating_model import number,in_window
 from heating_outages import schedule,blocked
 
 class HeatingRecovery:
+    def read_outage_schedule(self,now=None):
+        source=self.cfg.get('outage_source') or self.cfg.get('outage_calendar')
+        record=self.get_state(source,attribute='all') if source else None
+        advisory=self.cfg.get('outage_emergency')
+        emergency=self.get_state(advisory) if advisory else None
+        return schedule(record,now or self.now(),self.cfg.get('outage_max_age',10800),emergency=emergency)
     def active_upper(self):
         if (self.cfg.get('night_upper') and
                 in_window(self.now(),self.raw('sleep_start') or '23:00',self.raw('sleep_end') or '07:00')):
@@ -56,8 +62,7 @@ class HeatingRecovery:
             action='off'
         elapsed=time.time()-self.memory.get("command_at",0)
         room=self.source_temperature()[0]
-        outage=schedule(self.get_state(self.cfg["outage_calendar"],attribute="all"),self.now(),
-                        self.cfg.get("outage_max_age",10800)) if self.cfg.get("outage_calendar") else {}
+        outage=self.read_outage_schedule()
         scheduled_off=bool(outage.get("valid") and blocked(time.time(),time.time()+15,outage["outages"]))
         if scheduled_off and action=="heat":
             action="off"

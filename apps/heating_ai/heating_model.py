@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import math
 from heating_environment import forecast_step,safe_upper
 import statistics
-from heating_outages import blocked, covered
+from heating_outages import blocked, covered, availability, schedule_covered
 
 DEFAULT_MODEL = {"floor_air": .035, "room_loss": .025, "floor_decay": .12,
                  "heat_gain": .50, "fire_gain": .025, "version": 1, "validated": False}
@@ -432,7 +432,7 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     Only a comfort deficit caused by a planned outage can enable a bounded
     exception to the strict window. No outage data means the ordinary plan.
     """
-    data = settings.get("outage_schedule") or {}
+    data = availability(settings.get("outage_schedule") or {},now.timestamp(),now.timestamp()+86400)
     outages = data.get("outages", []) if data.get("valid") else []
     # Always show the next day; do not confuse an unpublished outage schedule
     # with a confirmed uninterrupted supply. Live grid checks still gate commands.
@@ -527,15 +527,16 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     for row in result["curve"]:
         wanted,lo,hi,zone=comfort_at(datetime.fromtimestamp(row['ts']-.001,now.tzinfo),settings)
         row.update(target=wanted,lower=lo,upper=hi,comfort_zone=zone)
-        row["schedule_known"] = schedule_until is not None and row["ts"] <= schedule_until
+        row["schedule_known"] = schedule_covered(data,row['ts']-1800,row['ts'])
         row["weather_known"] = weather_until is not None and row["ts"] <= weather_until
         for segment in row["heat_segments"]:
-            segment["conditional"] = schedule_until is None or segment["end"] > schedule_until
+            segment["conditional"] = not schedule_covered(data,segment['start'],segment['end'])
             if segment["conditional"]:
                 conditional_minutes += (segment["end"]-segment["start"])/60
     result.update(schedule_known_until=schedule_until, **coverage,
                   conditional_heat_minutes=round(conditional_minutes,1),
-                  schedule_complete=schedule_until is not None and schedule_until >= now.timestamp()+86400,
+                  schedule_complete=schedule_covered(data,now.timestamp(),now.timestamp()+86400),
+                  outage_mode=data.get('mode','scheduled' if data.get('valid') else 'unknown'),
                   outage_shifted=shifted, outage_preheat=preheat,
                   outside_minutes=sum(r["outside_minutes"] for r in result["curve"]),
                   outage_status=data.get("reason","Графік не підключений"),

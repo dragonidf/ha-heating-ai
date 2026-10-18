@@ -51,6 +51,7 @@
     "rollback": "input_button.heating_model_rollback",
     "power_balance": "sensor.your_power_balance",
     "outage_calendar": "calendar.your_outage_calendar",
+    "outage_source": "sensor.your_svitlo_status",
     "outage_emergency": "binary_sensor.your_outage_emergency",
     "outage_max_age": 10800,
     "outage_advance_limit": 180,

@@ -4,6 +4,10 @@ import argparse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'apps/heating_ai'))
+from heating_ui import system_fields
+from heating_model import DEFAULT_MODEL
 from playwright.sync_api import sync_playwright
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -95,6 +99,20 @@ def check_compact_overview(page):
     assert any('Графік мережі неповний' in warning for warning in warnings)
     assert any('Аварійне відключення' in warning for warning in warnings)
     assert all('Погодинна погода неповна' not in warning for warning in warnings)
+    page.evaluate("""setHeatingScenario({
+        'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true,outage_mode:'normal'}},
+        'sensor.heating_outage_schedule':{attributes:{mode:'normal',warning:null,emergency:false,outages:[]}}})""")
+    assert page.locator('.forecast-warning').count()==0, 'Normal mode must not warn about absent schedule'
+    assert page.locator('[data-forecast-metric="schedule"] strong').inner_text()=='Не очікуються'
+    page.evaluate("""setHeatingScenario({
+        'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true,outage_mode:'normal'}},
+        'sensor.heating_outage_schedule':{attributes:{mode:'unknown',warning:'Графік недоступний'}}})""")
+    assert 'Графік недоступний' in page.locator('.forecast-warning').all_text_contents()
+    assert any('Графік мережі неповний' in text for text in page.locator('.forecast-warning').all_text_contents())
+    page.evaluate("""setHeatingScenario({
+        'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}},
+        'sensor.heating_outage_schedule':{attributes:{mode:'scheduled',emergency:true,warning:'Аварійні відключення: графік не гарантує світло'}}})""")
+    assert any('Аварійні відключення' in text for text in page.locator('.forecast-warning').all_text_contents())
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{planned_kwh:null}}})")
     assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
     page.evaluate('panel.hass=mockHass')
@@ -120,6 +138,64 @@ def check_compact_tabs(page):
     page.locator('nav [data-tab="overview"]').click()
 
 
+def check_system_settings(page):
+    page.locator('nav [data-tab="settings"]').click()
+    panel=page.locator('.system-settings')
+    assert panel.get_attribute('open') is None
+    panel.locator(':scope>summary').click()
+    assert page.evaluate('systemRequests.length')==0
+    fields=page.locator('[data-system-key]')
+    assert fields.count()==25, fields.count()  # 20 config values and five thermal coefficients.
+    for summary in panel.locator('.system-group>summary').all():summary.click()
+    assert panel.locator('.system-help').count()==57
+    page.locator('[data-system-help="fire_start_delta"]').click()
+    assert page.locator('.system-dialog').is_visible()
+    assert '5' in page.locator('.system-dialog').inner_text()
+    page.keyboard.press('Escape')
+    assert page.locator('.system-dialog').count()==0
+    assert page.evaluate('systemRequests.length')==0, 'Reading settings/help must not write'
+    help_keys=panel.locator('[data-system-help]').evaluate_all('els=>els.map(el=>el.dataset.systemHelp)')
+    for key in help_keys:
+        page.evaluate("key=>[...panel.shadowRoot.querySelectorAll('[data-system-help]')].find(el=>el.dataset.systemHelp===key).click()",key)
+        assert page.locator('.system-dialog h2').inner_text().strip()
+        assert 'undefined' not in page.locator('.system-dialog').inner_text()
+        page.locator('[data-system-close]').click()
+    assert page.evaluate('systemRequests.length')==0
+    before=page.evaluate("panel.hass.states['sensor.heating_system_settings'].attributes.fields.find(f=>f.key==='outage_max_age').value")
+    field=page.locator('[data-system-key="outage_max_age"]')
+    field.fill('7200');field.press('Tab')
+    assert page.evaluate('systemRequests.length')==0, 'Editing a draft must not apply it'
+    assert page.evaluate("panel.hass.states['sensor.heating_system_settings'].attributes.fields.find(f=>f.key==='outage_max_age').value")==before
+    page.locator('[data-system-save]').click()
+    page.wait_for_function('systemRequests.length===1')
+    assert page.evaluate('systemRequests[0].path')=='events/heating_system_settings'
+    assert page.evaluate('systemRequests[0].data.values')=={'outage_max_age':7200}
+    page.wait_for_function("document.querySelector('heating-ai-panel').shadowRoot.querySelector('.system-message').textContent.includes('Зміни збережено')")
+    page.evaluate('failSystem=true')
+    field.fill('3600');field.press('Tab');page.locator('[data-system-save]').click()
+    assert 'Не вдалося' in page.locator('.system-message').inner_text()
+    page.evaluate('failSystem=false')
+    page.locator('[data-system-reset]').click()
+    assert field.input_value()=='7200'
+    for width in (430,390,360,320):
+        page.set_viewport_size({'width':width,'height':850})
+        assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+        for control in page.locator('[data-system-key],.system-help').all():
+            assert control.bounding_box()['height']>=40
+        page.locator('[data-system-help="floor_air"]').click()
+        box=page.locator('.system-dialog').bounding_box()
+        assert box['x']>=0 and box['x']+box['width']<=width
+        if width==390:page.locator('.system-dialog').screenshot(path=str(ARTIFACTS/'heating-system-help-390.png'))
+        page.locator('[data-system-close]').click()
+        if width==390:panel.screenshot(path=str(ARTIFACTS/'heating-system-settings-390.png'))
+    # Close nested groups so the main density checks still inspect the default layout.
+    for summary in panel.locator('.system-group>summary').all():summary.click()
+    panel.locator(':scope>summary').click()
+    page.set_viewport_size({'width':1440,'height':1100})
+    page.evaluate('systemRequests=[];calls=[]')
+    page.locator('nav [data-tab="overview"]').click()
+
+
 def main(engine='chromium'):
     ARTIFACTS.mkdir(exist_ok=True)
     server=ThreadingHTTPServer(('127.0.0.1',0),partial(QuietHandler,directory=str(ROOT)))
@@ -133,9 +209,14 @@ def main(engine='chromium'):
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
             page.wait_for_selector('heating-ai-panel >> text=Накопиченого тепла достатньо')
+            page.evaluate('''fields=>{
+                mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,fields}}};
+                panel.hass={...mockHass};
+            }''',system_fields({},DEFAULT_MODEL))
             check_compact_overview(page)
             page.wait_for_function('nativeConfigs.length === 2')
             check_compact_tabs(page)
+            check_system_settings(page)
             page.wait_for_selector('.history-plot svg')
             assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2, 'Past boiler runs must remain visible when the binary sensor is new'
             assert '4 год 0 хв' in page.locator('.history-totals').inner_text()

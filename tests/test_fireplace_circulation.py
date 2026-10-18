@@ -83,5 +83,16 @@ class FireplaceCirculationTests(unittest.TestCase):
         with patch('heating_climate.time.time',return_value=10000):app.fireplace(22.3)
         self.assertEqual(app.published['sensor.heating_fireplace']['state'],'Інтенсивно горить')
 
+    def test_explicit_tuning_changes_thresholds_without_changing_defaults(self):
+        app=self.app();app.cfg.update(fire_start_delta=6,fire_intense_delta=12,fire_cooldown_seconds=420)
+        self.assertFalse(self.cycle(app,5)[1])
+        self.assertTrue(self.cycle(app,6)[1])
+        self.cycle(app,10,stamp=10015)
+        self.assertEqual(app.published['sensor.heating_fireplace']['state'],'Горить')
+        self.cycle(app,12,stamp=10030)
+        self.assertEqual(app.published['sensor.heating_fireplace']['state'],'Інтенсивно горить')
+        for stamp in range(10045,10465,15):self.assertTrue(self.cycle(app,2.9,stamp=stamp)[1])
+        self.assertFalse(self.cycle(app,2.9,stamp=10465)[1])
+
 
 if __name__=='__main__':unittest.main()

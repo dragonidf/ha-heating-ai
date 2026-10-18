@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import math
 from heating_model import (plan as optimise, step, outdoor_at, in_window,
                            modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage)
-from heating_outages import blocked
+from heating_outages import blocked, availability, schedule_covered
 from heating_environment import forecast_step,gain_at,safe_upper
 
 
@@ -15,7 +15,8 @@ def policy(settings):
     keys=('target','lower','upper','start','end','strategy','split_comfort',
           'morning_min_minutes','day_price','night_price','budget_multiplier',
           'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin')
-    return {**{k:settings.get(k) for k in keys},'environment_policy_version':4}
+    return {**{k:settings.get(k) for k in keys},'environment_policy_version':4,
+            'outage_mode':(settings.get('outage_schedule') or {}).get('mode')}
 
 
 def reference(now, room, floor, outside, fire, model, weather, settings, result):
@@ -42,7 +43,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     if priority and not split:
         # A safety fallback without a morning reservation must be reconsidered.
         return None
-    data=settings.get('outage_schedule') or {}
+    data=availability(settings.get('outage_schedule') or {},start,finish)
     outages=data.get('outages',[]) if data.get('valid') else []
     segments=[dict(s,start=max(start,s['start']),end=min(finish,s['end']))
               for s in segments if s['end']>start and s['start']<finish]
@@ -88,7 +89,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 if r>hi or f>50:
                     return None
                 s=dict(start=t,end=u,power_kw=round(kw,3),kwh=kw*dt)
-                s['conditional']=not data.get('valid') or data.get('known_until',0)<u
+                s['conditional']=not schedule_covered(data,t,u)
                 heats.append(s);used+=s['kwh']
         energy+=used;all_segments.extend(heats)
         wanted,lo,hi,zone=comfort_at(datetime.fromtimestamp(b-.001,now.tzinfo),settings)
@@ -96,7 +97,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                          target=wanted,lower=lo,upper=hi,comfort_zone=zone,
                          **{'return':round(f,2)},heat=bool(heats),kwh=round(used,4),
                          heat_segments=heats,outside_minutes=0.,
-                         schedule_known=bool(data.get('valid') and data.get('known_until',0)>=b),
+                         schedule_known=schedule_covered(data,a,b),
                          weather_known=bool(weather and max(x['ts'] for x in weather)+3600>=b)))
     if not morning_runs_valid(rows,now,settings.get('morning_min_minutes',30),
                               settings.get('morning_elapsed_minutes',0)):
@@ -128,7 +129,8 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 split_reason='Часи сеансів збережено; прогноз оновлено за фактичними вимірами',
                 schedule_known_until=schedule_until,**coverage,
                 conditional_heat_minutes=round(sum((s['end']-s['start'])/60 for s in all_segments if s['conditional']),1),
-                schedule_complete=schedule_until is not None and schedule_until>=finish,
+                schedule_complete=schedule_covered(data,start,finish),
+                outage_mode=data.get('mode','scheduled' if data.get('valid') else 'unknown'),
                 outage_shifted=False,outage_preheat=False,outside_minutes=0.,
                 outage_status=data.get('reason','Графік не підключений'),
                 comfort_shortfall=any(r['temperature']<r['lower'] for r in rows),heat_segments=all_segments,
