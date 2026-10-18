@@ -10,6 +10,7 @@ for name in ('appdaemon','appdaemon.plugins','appdaemon.plugins.hass','appdaemon
     sys.modules.setdefault(name,types.ModuleType(name))
 sys.modules['appdaemon.plugins.hass.hassapi'].Hass=object
 from heating_climate import HeatingClimate
+from heating_outages import schedule, signature
 
 class AdapterModulationTests(unittest.TestCase):
     def fast_tick(self,at,segments,once=False):
@@ -22,7 +23,7 @@ class AdapterModulationTests(unittest.TestCase):
         app.samples=[]
         app.power_source='balance'
         app.next_compute=at.timestamp()+300
-        app.outage_signature=(None,None)
+        app.outage_signature=signature(schedule(None,at))
         app.now=lambda:at
         app.source_temperature=lambda:(21.8,'Вітальня',21.8,22)
         app.val=lambda key,default=None,attribute=None:dict(return_=24,**{'return':24},outside=10,

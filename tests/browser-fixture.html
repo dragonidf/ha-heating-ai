@@ -17,7 +17,17 @@ for(const key of ['sleep_start','sleep_end','start','end'])add('input_datetime.h
 for(const key of ['armed','restore_once','fan_control','ai_auto_apply'])add('input_boolean.heating_'+key,key==='armed'?'on':'off');
 add('input_select.heating_mode','Автоматичне керування',{options:['Автоматичне керування','Спостереження','Штатний auto']});add('input_select.heating_strategy','Нічний тариф',{options:['Нічний тариф','Комфорт']});add('input_select.heating_fan_mode','Автоматично',{options:['Автоматично','Зупинити','Ручний запуск']});add('input_button.heating_forecast_refresh','2026-10-16T00:00:00');add('input_button.heating_model_rollback','2026-10-16T00:00:00');add('sensor.heating_restore_status','Запиту немає');
 window.calls=[];window.failService=false;
+window.systemRequests=[];window.failSystem=false;
 window.mockHass={states,config:{time_zone:'Europe/Kyiv'},callService:async(domain,service,data)=>{window.calls.push({domain,service,data});if(window.failService)throw new Error('Немає доступу');}};
+mockHass.callApi=async(method,path,data)=>{
+  systemRequests.push({method,path,data});if(window.failSystem)throw new Error('Немає доступу');
+  // Fake acknowledgement only. Real event handling/validation has Python tests.
+  const old=mockHass.states['sensor.heating_system_settings'];
+  mockHass.states={...mockHass.states,'sensor.heating_system_settings':{...old,attributes:{...old.attributes,
+    revision:old.attributes.revision+1,last_request_id:data.request_id,last_success:true,
+    fields:old.attributes.fields.map(f=>({...f,value:Object.hasOwn(data.values,f.key)?data.values[f.key]:f.value}))}}};
+  panel.hass={...mockHass};
+};
 window.historyRequests=[];
 mockHass.callWS=async request=>{
   historyRequests.push(request);
