@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.2.8';
+const VERSION = '0.2.9';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -9,6 +9,11 @@ export const mergeSegments = rows => (Array.isArray(rows) ? rows : []).filter(r 
   else out.push({...row});
   return out;
 }, []);
+const icon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${{
+  home:'<path d="m3 10 9-7 9 7v10H3Z"/><path d="M9 20v-7h6v7"/>',
+  menu:'<path d="M4 6h16M4 12h16M4 18h16"/>',
+  refresh:'<path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 1-2-5l3 3"/>'
+}[name]||''}</svg>`;
 const h = escapeHTML;
 const fmt = (v,d=1) => numeric(v) === null ? '—' : Number(v).toLocaleString('uk-UA',{maximumFractionDigits:d,minimumFractionDigits:d});
 export const chartLayout = width => {
@@ -198,7 +203,7 @@ export class HeatingAIPanel extends HTMLElement {
     return {width,height:330,left:46,right:12,top:16,bottom:202,ticks:width<520?2:4};
   }
   historyChart() {
-    const header=`<div class="history-tools"><div class="history-ranges" role="group" aria-label="Період історії">${[6,12,24].map(hours=>`<button data-history-range="${hours}" aria-pressed="${this.historyRange===hours}">${hours} год</button>`).join('')}</div><button class="history-refresh" data-history-refresh aria-label="Оновити історію" ${this.historyPending?'disabled':''}>↻</button></div>`;
+    const header=`<div class="history-tools"><div class="history-ranges" role="group" aria-label="Період історії">${[6,12,24].map(hours=>`<button data-history-range="${hours}" aria-pressed="${this.historyRange===hours}">${hours} год</button>`).join('')}</div><button class="history-refresh" data-history-refresh aria-label="Оновити історію" ${this.historyPending?'disabled':''}>${icon('refresh')}</button></div>`;
     if(!this.historyData)return header+`<div class="history-placeholder" role="status">${h(this.historyError||'Завантажуємо історію…')}</div>`;
     const data=this.historyData,start=data.end-this.historyRange*3600,end=data.end,g=this.historyGeometry(),right=g.width-g.right;
     const shown=historySeries.filter(([key])=>this.historyVisible.has(key));
@@ -218,7 +223,7 @@ export class HeatingAIPanel extends HTMLElement {
     }
     for(const [key,label,color] of shown)for(const path of historyPaths(data.rows[key],start,end,x,y))svg+=`<path data-history-line="${key}" d="${path}" fill="none" stroke="${color}" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"><title>${h(label)}</title></path>`;
     for(let i=0;i<=g.ticks;i++)svg+=`<text x="${x(start+i*(end-start)/g.ticks)}" y="225" fill="currentColor" text-anchor="${i===0?'start':i===g.ticks?'end':'middle'}" font-size="12">${h(this.time(start+i*(end-start)/g.ticks))}</text>`;
-    for(const [key,label,segments,top,color] of [['boiler','Котел',boiler,248,'var(--history-return)'],['fireplace','Камін',fire,286,'var(--history-fire)']]) {
+    for(const [key,label,segments,top,color] of [['boiler','Котел',boiler,248,'var(--source-red)'],['fireplace','Камін',fire,286,'var(--history-fire)']]) {
       svg+=`<text x="0" y="${top+13}" fill="currentColor" font-size="12">${label}</text><rect x="${g.left}" y="${top}" width="${Math.max(1,right-g.left)}" height="18" rx="5" fill="currentColor" opacity=".06"/>`;
       for(const segment of segments)if(segment.state!=='off')svg+=`<rect data-history-lane="${key}" data-state="${segment.state}" x="${x(segment.start)}" y="${top}" width="${Math.max(1,x(segment.end)-x(segment.start))}" height="18" rx="4" fill="${segment.state==='on'?color:'url(#history-missing)'}"><title>${label} · ${h(this.time(segment.start))}–${h(this.time(segment.end))} · ${segment.state==='on'?'працював':'немає даних'}</title></rect>`;
     }
@@ -229,7 +234,7 @@ export class HeatingAIPanel extends HTMLElement {
     const missing=[...boiler,...fire].some(s=>s.state==='unknown');
     const status=(segments,on,off)=>{const state=segments.find(s=>s.start<=cursor&&cursor<s.end)?.state??segments.at(-1)?.state;return state==='on'?on:state==='off'?off:'немає даних';};
     const readout=cursor===null?'Торкніться графіка, щоб переглянути значення.':`${this.time(cursor,true)} · Котел: ${status(boiler,'працює','вимкнено')} · Камін: ${status(fire,'є тепло','немає тепла')}`;
-    return header+legend+svg+`<div class="history-totals"><span><i style="background:var(--history-return)"></i>Котел <strong>${total(boiler)}</strong></span><span><i style="background:var(--history-fire)"></i>Камін <strong>${total(fire)}</strong></span></div><p class="history-readout muted" aria-live="polite">${h(readout)}</p>${missing?'<p class="muted note">Штрихування — немає історичних даних.</p>':''}${!values.length?'<p class="muted note">Температурні вимірювання за цей період відсутні.</p>':''}${this.historyError?`<p class="warn note" role="status">${h(this.historyError)} Показано попередні дані.</p>`:''}`;
+    return header+legend+svg+`<div class="history-totals"><span><i style="background:var(--source-red)"></i>Котел <strong>${total(boiler)}</strong></span><span><i style="background:var(--history-fire)"></i>Камін <strong>${total(fire)}</strong></span></div><p class="history-readout muted" aria-live="polite">${h(readout)}</p>${missing?'<p class="muted note">Штрихування — немає історичних даних.</p>':''}${!values.length?'<p class="muted note">Температурні вимірювання за цей період відсутні.</p>':''}${this.historyError?`<p class="warn note" role="status">${h(this.historyError)} Показано попередні дані.</p>`:''}`;
   }
   inspectHistory(event) {
     const plot=event.target.closest?.('.history-plot');if(!plot||!this.historyData)return;
@@ -258,24 +263,24 @@ export class HeatingAIPanel extends HTMLElement {
     const right=g.width-g.right;
     const x=t=>g.left+Math.max(0,Math.min(1,(t-start)/86400))*Math.max(1,right-g.left);
     const y=t=>g.bottom-(t-low)/(high-low)*(g.bottom-g.top);
-    let svg=`<div class="forecast-plot"><svg width="${g.width}" height="${g.height}" viewBox="0 0 ${g.width} ${g.height}" role="img" aria-label="Прогноз температури, комфортні межі, нагрів, залишкове тепло каміна і відключення на 24 години"><defs><linearGradient id="curve-fill" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#69d5b2" stop-opacity=".2"/><stop offset="1" stop-color="#69d5b2" stop-opacity="0"/></linearGradient></defs>`;
+    let svg=`<div class="forecast-plot"><svg width="${g.width}" height="${g.height}" viewBox="0 0 ${g.width} ${g.height}" role="img" aria-label="Прогноз температури, комфортні межі, нагрів, залишкове тепло каміна і відключення на 24 години"><defs><linearGradient id="curve-fill" x1="0" y1="0" x2="0" y2="1"><stop stop-color="var(--history-room)" stop-opacity=".2"/><stop offset="1" stop-color="var(--history-room)" stop-opacity="0"/></linearGradient></defs>`;
     let prev=start;
     for(const r of rows) {
-      if(numeric(r.lower)!==null&&numeric(r.upper)!==null) svg+=`<rect x="${x(prev)}" y="${y(r.upper)}" width="${Math.max(0,x(r.ts)-x(prev))}" height="${Math.max(0,y(r.lower)-y(r.upper))}" fill="#69d5b2" opacity=".09"/>`;
+      if(numeric(r.lower)!==null&&numeric(r.upper)!==null) svg+=`<rect x="${x(prev)}" y="${y(r.upper)}" width="${Math.max(0,x(r.ts)-x(prev))}" height="${Math.max(0,y(r.lower)-y(r.upper))}" fill="var(--history-room)" opacity=".09"/>`;
       prev=r.ts;
     }
     const known=numeric(a.schedule_known_until);
-    if(known!==null&&known<end) svg+=`<rect x="${x(known)}" y="${g.top}" width="${Math.max(0,right-x(known))}" height="${g.bottom+79-g.top}" fill="#ffc26d" opacity=".07"/>`;
+    if(known!==null&&known<end) svg+=`<rect x="${x(known)}" y="${g.top}" width="${Math.max(0,right-x(known))}" height="${g.bottom+79-g.top}" fill="var(--source-red)" opacity=".07"/>`;
     for(let i=0;i<4;i++) { const t=low+(high-low)*i/3; svg+=`<path d="M${g.left} ${y(t)}H${right}" stroke="currentColor" opacity=".08"/><text x="0" y="${y(t)+4}" fill="currentColor" font-size="12">${fmt(t)}°</text>`; }
     const path=rows.map((r,i)=>`${i?'L':'M'}${x(r.ts).toFixed(2)},${y(r.temperature).toFixed(2)}`).join(' ');
-    svg+=`<path d="${path} L${x(rows.at(-1).ts)},${g.bottom+8} L${x(rows[0].ts)},${g.bottom+8} Z" fill="url(#curve-fill)"/><path d="${path}" fill="none" stroke="#69d5b2" stroke-width="3" stroke-dasharray="5 4" vector-effect="non-scaling-stroke"/>`;
+    svg+=`<path d="${path} L${x(rows.at(-1).ts)},${g.bottom+8} L${x(rows[0].ts)},${g.bottom+8} Z" fill="url(#curve-fill)"/><path d="${path}" fill="none" stroke="var(--history-room)" stroke-width="3" stroke-dasharray="5 4" vector-effect="non-scaling-stroke"/>`;
     for(const r of rows) svg+=`<circle cx="${x(r.ts)}" cy="${y(r.temperature)}" r="6" fill="transparent"><title>${h(this.time(r.ts))} · ${fmt(r.temperature)} °C</title></circle>`;
     svg+=`<text x="0" y="${g.bottom+35}" fill="currentColor" font-size="11">Котел</text><text x="0" y="${g.bottom+60}" fill="currentColor" font-size="11">Камін*</text><text x="0" y="${g.bottom+85}" fill="currentColor" font-size="11">Мережа</text>`;
-    for(const s of mergeSegments(a.heat_segments)) if(s.end>start&&s.start<end) svg+=`<rect x="${x(s.start)}" y="${g.bottom+22}" width="${Math.max(1,x(s.end)-x(s.start))}" height="15" rx="4" fill="#ffc26d" opacity="${isTrue(s.conditional)?.45:1}"><title>${h(this.time(s.start))}–${h(this.time(s.end))}${isTrue(s.conditional)?' · умовно':''}</title></rect>`;
-    for(const s of mergeSegments(a.fireplace_segments)) if(s.end>start&&s.start<end) svg+=`<rect data-series="fireplace" x="${x(s.start)}" y="${g.bottom+47}" width="${Math.max(1,x(s.end)-x(s.start))}" height="15" rx="4" fill="#e68b57" opacity=".6"><title>${h(this.time(s.start))}–${h(this.time(s.end))} · оцінка залишкового тепла, а не майбутнього горіння</title></rect>`;
-    for(const s of mergeSegments(this.attrs('outages').outages)) if(s.end>start&&s.start<end) svg+=`<rect x="${x(s.start)}" y="${g.bottom+72}" width="${Math.max(1,x(s.end)-x(s.start))}" height="15" rx="4" fill="#f28d9a"><title>Відключення ${h(this.time(s.start))}–${h(this.time(s.end))}</title></rect>`;
+    for(const s of mergeSegments(a.heat_segments)) if(s.end>start&&s.start<end) svg+=`<rect x="${x(s.start)}" y="${g.bottom+22}" width="${Math.max(1,x(s.end)-x(s.start))}" height="15" rx="4" fill="var(--source-red)" opacity="${isTrue(s.conditional)?.45:1}"><title>${h(this.time(s.start))}–${h(this.time(s.end))}${isTrue(s.conditional)?' · умовно':''}</title></rect>`;
+    for(const s of mergeSegments(a.fireplace_segments)) if(s.end>start&&s.start<end) svg+=`<rect data-series="fireplace" x="${x(s.start)}" y="${g.bottom+47}" width="${Math.max(1,x(s.end)-x(s.start))}" height="15" rx="4" fill="var(--history-fire)" opacity=".6"><title>${h(this.time(s.start))}–${h(this.time(s.end))} · оцінка залишкового тепла, а не майбутнього горіння</title></rect>`;
+    for(const s of mergeSegments(this.attrs('outages').outages)) if(s.end>start&&s.start<end) svg+=`<rect x="${x(s.start)}" y="${g.bottom+72}" width="${Math.max(1,x(s.end)-x(s.start))}" height="15" rx="4" fill="var(--source-red)"><title>Відключення ${h(this.time(s.start))}–${h(this.time(s.end))}</title></rect>`;
     for(let i=0;i<=g.tickIntervals;i++) svg+=`<text x="${x(start+i*86400/g.tickIntervals)}" y="${g.height-8}" text-anchor="${i===0?'start':i===g.tickIntervals?'end':'middle'}" fill="currentColor" font-size="12">${h(this.time(start+i*86400/g.tickIntervals))}</text>`;
-    return svg+'</svg></div><div class="legend"><span>● Прогноз</span><span>● Котел</span><span style="color:#e68b57">● Камін*</span><span style="color:#dd7c8d">● Відключення</span></div>';
+    return svg+'</svg></div><div class="legend"><span>● Прогноз</span><span>● Котел</span><span style="color:var(--history-fire)">● Камін*</span><span style="color:var(--source-red)">● Відключення</span></div>';
   }
   compactMetric(label,value,unit='',entity='',key='') {
     const tag=entity?'button':'div';
@@ -285,7 +290,7 @@ export class HeatingAIPanel extends HTMLElement {
     const binary=this.state('boiler_active'),power=numeric(this.state('power_confirmed'));
     const heating=binary==='on'?true:binary==='off'?false:power===null?null:power>=1500;
     const summary=this.attrs('summary').last_24h||{};
-    return `<section class="card boiler-card" data-heating="${heating??'unknown'}"><div class="card-heading"><h2>Котел</h2><span class="pill boiler-status">${heating===true?'◉ Гріє':heating===false?'◌ Очікування':'Немає даних'}</span></div><div class="boiler-metrics">${this.compactMetric('Потужність',fmt(power===null?null:power/1000),'кВт','power_confirmed')}${this.compactMetric('Обратка',fmt(this.state('return')),'°C','return')}${this.compactMetric('За 24 год',fmt(this.state('energy_24h'),2),'кВт·год','energy_24h')}</div><p class="boiler-note muted">У кімнаті за добу ${fmt(summary.temperature_min)}–${fmt(summary.temperature_max)} °C</p></section>`;
+    return `<section class="card boiler-card" data-heating="${heating??'unknown'}"><div class="card-heading"><h2>Котел</h2><span class="pill boiler-status">${heating===true?'Гріє':heating===false?'Очікування':'Немає даних'}</span></div><div class="boiler-metrics">${this.compactMetric('Потужність',fmt(power===null?null:power/1000),'кВт','power_confirmed')}${this.compactMetric('Обратка',fmt(this.state('return')),'°C','return')}${this.compactMetric('За 24 год',fmt(this.state('energy_24h'),2),'кВт·год','energy_24h')}</div><p class="boiler-note muted">У кімнаті за добу ${fmt(summary.temperature_min)}–${fmt(summary.temperature_max)} °C</p></section>`;
   }
   fireplaceOverview() {
     const phase=this.state('fireplace_status'),fire=this.attrs('fireplace_status'),fan=this.attrs('fan_status');
@@ -294,7 +299,7 @@ export class HeatingAIPanel extends HTMLElement {
     const waiting=isTrue(fan.requested)&&this.state('fan')==='off';
     const signed=value=>numeric(value)===null?'—':(Number(value)>0?'+':'')+fmt(value);
     const reason=fan.reason||(!['unknown','unavailable'].includes(this.state('fan_status'))?this.state('fan_status'):'Очікуємо даних про циркуляцію');
-    return `<section class="card fireplace-card" data-phase="${h(phase)}"><div class="card-heading"><h2>Камін і циркуляція</h2><button class="fire-phase" data-info="${h(this.id('fireplace_status'))}" aria-label="Подробиці стану каміна"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2c1 5-5 6-3 11 1-1 2-2 2-4 4 3 6 6 4 9-2 4-9 3-10-1-2-5 2-8 2-11 1 1 2 2 2 3 1-3 3-4 3-7Z"/></svg><strong>${h(valid?phase:phase==='Датчик недоступний'?phase:'Немає даних')}</strong></button></div><div class="fireplace-grid"><div class="fire-block" data-active="${active}"><span class="eyebrow">ТЕМПЕРАТУРА КАМІНА</span><strong class="fire-temperature">${fmt(valid?fire.temperature:null)} °C <small class="muted">${valid&&numeric(fire.delta)!==null?signed(fire.delta)+' °C до кімнати':'—'}</small></strong></div><div class="circulation-block"><span class="eyebrow">ЦИРКУЛЯЦІЯ</span><strong class="fan-actual">${running?`Увімкнено · ${fmt(this.attrs('fan').percentage,0)} %`:this.state('fan')==='off'?'Вимкнено':'Немає даних'}</strong>${waiting?'<p class="fan-waiting">Очікує запуску</p>':''}${running&&isTrue(fan.manual_running)?'<p class="fan-level muted">Ручне увімкнення</p>':running&&isTrue(fan.requested)&&numeric(fan.selected_level)!==null?`<p class="fan-level muted">Рівень ${fmt(fan.selected_level,0)} · ${Number(fan.selected_level)===1?'Ніч':Number(fan.selected_level)===3?'Інтенсив':'Стандарт'}</p>`:''}</div></div><details class="fire-details"><summary>Подробиці та налаштування</summary><p class="fan-reason">${h(reason)}</p>${this.row('Корисне тепло',active?'Є':valid?'Немає':'Немає даних')}${this.row('Зміна різниці',signed(valid?fire.trend:null)+' °C/год')}${this.row('Режим циркуляції',this.entity('fan_mode')?this.state('fan_mode'):'—')}${this.row('Рівень циркуляції',fmt(fan.selected_level,0))}${this.row('Швидкість за планом',fmt(fan.proposed_percentage,0)+' %')}${numeric(fire.cooldown_remaining_seconds)>0?this.row('До вимкнення',fmt(fire.cooldown_remaining_seconds/60,1)+' хв'):''}<button class="text-button" data-tab="settings" data-settings-target="fireplace-settings">Налаштувати циркуляцію ↗</button></details></section>`;
+    return `<section class="card fireplace-card" data-phase="${h(phase)}"><div class="card-heading"><h2>Камін і циркуляція</h2><button class="fire-phase" data-info="${h(this.id('fireplace_status'))}" aria-label="Подробиці стану каміна"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2c1 5-5 6-3 11 1-1 2-2 2-4 4 3 6 6 4 9-2 4-9 3-10-1-2-5 2-8 2-11 1 1 2 2 2 3 1-3 3-4 3-7Z"/></svg><strong>${h(valid?phase:phase==='Датчик недоступний'?phase:'Немає даних')}</strong></button></div><div class="fireplace-grid"><div class="fire-block" data-active="${active}"><span class="eyebrow">Температура каміна</span><strong class="fire-temperature">${fmt(valid?fire.temperature:null)} °C <small class="muted">${valid&&numeric(fire.delta)!==null?signed(fire.delta)+' °C до кімнати':'—'}</small></strong></div><div class="circulation-block"><span class="eyebrow">Циркуляція</span><strong class="fan-actual">${running?`Увімкнено · ${fmt(this.attrs('fan').percentage,0)} %`:this.state('fan')==='off'?'Вимкнено':'Немає даних'}</strong>${waiting?'<p class="fan-waiting">Очікує запуску</p>':''}${running&&isTrue(fan.manual_running)?'<p class="fan-level muted">Ручне увімкнення</p>':running&&isTrue(fan.requested)&&numeric(fan.selected_level)!==null?`<p class="fan-level muted">Рівень ${fmt(fan.selected_level,0)} · ${Number(fan.selected_level)===1?'Ніч':Number(fan.selected_level)===3?'Інтенсив':'Стандарт'}</p>`:''}</div></div><details class="fire-details"><summary>Подробиці та налаштування</summary><p class="fan-reason">${h(reason)}</p>${this.row('Корисне тепло',active?'Є':valid?'Немає':'Немає даних')}${this.row('Зміна різниці',signed(valid?fire.trend:null)+' °C/год')}${this.row('Режим циркуляції',this.entity('fan_mode')?this.state('fan_mode'):'—')}${this.row('Рівень циркуляції',fmt(fan.selected_level,0))}${this.row('Швидкість за планом',fmt(fan.proposed_percentage,0)+' %')}${numeric(fire.cooldown_remaining_seconds)>0?this.row('До вимкнення',fmt(fire.cooldown_remaining_seconds/60,1)+' хв'):''}<button class="text-button" data-tab="settings" data-settings-target="fireplace-settings">Налаштувати циркуляцію ↗</button></details></section>`;
   }
   forecastOverview() {
     const f=this.attrs('forecast'),o=this.attrs('outages'),known=f.schedule_known_until??o.known_until;
@@ -318,7 +323,7 @@ export class HeatingAIPanel extends HTMLElement {
   }
   overview() {
     const c=this.attrs('controller'),budget=numeric(this.state('monthly_budget')),used=numeric(this.state('energy_monthly'));
-    return `<div class="overview"><div class="hero card"><div><span class="eyebrow">КОМФОРТ У ВАШОМУ ДОМІ</span><div class="temperature">${fmt(this.state('temperature'))}<span>°C</span></div><p class="hero-target"><span>${h(c.comfort_zone||'Поточний комфорт')}</span><span>Ціль <strong>${fmt(c.target_temperature)} °C</strong></span></p><button class="hero-outside" data-info="${h(this.id('outside'))}"><span>Надворі</span> <strong>${fmt(this.state('outside'))} °C</strong></button></div><div class="hero-side"><span class="eyebrow">РІШЕННЯ КОНТРОЛЕРА</span><h2>${h(c.reason||'Очікуємо даних')}</h2><p class="muted">${h(c.proposed_action||'')}</p><div class="comfort">Межі комфорту <strong>${fmt(c.lower_temperature)}–${fmt(c.upper_temperature)} °C</strong></div></div></div><div class="heat-sources">${this.boilerOverview()}${this.fireplaceOverview()}</div>${this.forecastOverview()}${this.heatingPlan()}<div class="columns"><div>${this.section('Температура й нагрів',this.historyChart(),'history-card')}${this.section('Енергія котла по годинах','<div class="native" data-native="energy"></div>')}</div><div>${this.section('Енергія за місяць',`<div class="large">${fmt(used,1)} <small>кВт·год</small></div><progress max="${budget!==null&&budget>0?budget:1}" value="${used??0}" aria-label="Місячна енергія"></progress><p class="muted">Орієнтир ${fmt(budget,0)} кВт·год${budget&&used!==null?' · '+fmt(used/budget*100,0)+' %':''}</p>`)}${this.section('Погода на наступну добу','<div class="native" data-native="weather"></div>'+this.field('weather_refresh','Оновити погодинну погоду'))}</div></div></div>`;
+    return `<div class="overview"><div class="hero card"><div><h1 class="eyebrow">Комфорт у вашому домі</h1><div class="temperature">${fmt(this.state('temperature'))}<span>°C</span></div><p class="hero-target"><span>${h(c.comfort_zone||'Поточний комфорт')}</span><span>Ціль <strong>${fmt(c.target_temperature)} °C</strong></span></p><button class="hero-outside" data-info="${h(this.id('outside'))}"><span>Надворі</span> <strong>${fmt(this.state('outside'))} °C</strong></button></div><div class="hero-side"><span class="eyebrow">Рішення контролера</span><h2>${h(c.reason||'Очікуємо даних')}</h2><p class="muted">${h(c.proposed_action||'')}</p><div class="comfort">Межі комфорту <strong>${fmt(c.lower_temperature)}–${fmt(c.upper_temperature)} °C</strong></div></div></div><div class="heat-sources">${this.boilerOverview()}${this.fireplaceOverview()}</div>${this.forecastOverview()}${this.heatingPlan()}<div class="columns"><div>${this.section('Температура й нагрів',this.historyChart(),'history-card')}${this.section('Енергія котла по годинах','<div class="native" data-native="energy"></div>')}</div><div>${this.section('Енергія за місяць',`<div class="large">${fmt(used,1)} <small>кВт·год</small></div><progress max="${budget!==null&&budget>0?budget:1}" value="${used??0}" aria-label="Місячна енергія"></progress><p class="muted">Орієнтир ${fmt(budget,0)} кВт·год${budget&&used!==null?' · '+fmt(used/budget*100,0)+' %':''}</p>`)}${this.section('Погода на наступну добу','<div class="native" data-native="weather"></div>'+this.field('weather_refresh','Оновити погодинну погоду'))}</div></div></div>`;
   }
   settings() {
     const fields=items=>items.map(([key,label])=>this.field(key,label)).join('');
@@ -404,7 +409,7 @@ export class HeatingAIPanel extends HTMLElement {
     if(!this.hass) return;
     const beat=Date.parse(this.state('heartbeat')), alive=this.state('alive')==='on'&&Number.isFinite(beat)&&Date.now()-beat<90000;
     const quality=isTrue(this.attrs('controller').quality), grid=this.attrs('grid_status').raw;
-    const html=`<style>${styles}</style><main><header><div class="brand"><span class="brand-icon">⌂</span><div><strong>Heating <span>AI</span></strong><small>Клімат вашого дому</small></div></div><div class="header-status"><span class="dot ${alive?'':'red'}"></span>${alive?'Контролер онлайн':'Перевірте контролер'}<span class="mode">${h(this.state('mode'))}</span><button class="menu-button" data-menu aria-label="Відкрити меню Home Assistant">☰</button></div></header><nav aria-label="Розділи клімату">${[['overview','Огляд'],['settings','Налаштування'],['model','Модель і ШІ']].map(([key,label])=>`<button data-tab="${key}" aria-current="${this.tab===key?'page':'false'}" class="${this.tab===key?'selected':''}">${label}</button>`).join('')}<a href="/climate-control">Поточні панелі ↗</a></nav><div class="notice ${this.error?'':'hidden'}" role="alert">${h(this.error || '')}</div><div class="notice ${alive&&quality&&grid==='on'?'hidden':''}" role="status">${!alive?'Немає свіжого підтвердження роботи контролера.':!quality?'Контролеру бракує актуальних вимірювань.':'Нагрів очікує підтвердження електромережі.'}</div><div class="content">${this.tab==='settings'?this.settings():this.tab==='model'?this.model():this.overview()}</div><footer>Тепло під контролем <span>Home Assistant · Heating AI ${VERSION}</span></footer></main>`;
+    const html=`<style>${styles}</style><main><header><div class="brand"><span class="brand-icon">${icon('home')}</span><div><strong>Heating <span>AI</span></strong><small>Клімат вашого дому</small></div></div><div class="header-status"><span class="dot ${alive?'':'red'}"></span>${alive?'Контролер онлайн':'Перевірте контролер'}<span class="mode">${h(this.state('mode'))}</span><button class="menu-button" data-menu aria-label="Відкрити меню Home Assistant">${icon('menu')}</button></div></header><nav aria-label="Розділи клімату">${[['overview','Огляд'],['settings','Налаштування'],['model','Модель і ШІ']].map(([key,label])=>`<button data-tab="${key}" aria-current="${this.tab===key?'page':'false'}" class="${this.tab===key?'selected':''}">${label}</button>`).join('')}<a href="/climate-control">Поточні панелі ↗</a></nav><div class="notice ${this.error?'':'hidden'}" role="alert">${h(this.error || '')}</div><div class="notice ${alive&&quality&&grid==='on'?'hidden':''}" role="status">${!alive?'Немає свіжого підтвердження роботи контролера.':!quality?'Контролеру бракує актуальних вимірювань.':'Нагрів очікує підтвердження електромережі.'}</div><div class="content">${this.tab==='settings'?this.settings():this.tab==='model'?this.model():this.overview()}</div><footer>Тепло під контролем <span>Home Assistant · Heating AI ${VERSION}</span></footer></main>`;
     const template=document.createElement('template');template.innerHTML=html;
     patchDOM(this.shadowRoot,template.content);
     const dialog=this.shadowRoot.querySelector('.system-dialog');
@@ -480,28 +485,581 @@ export class HeatingAIPanel extends HTMLElement {
   }
 }
 const styles=`
-:host([data-light]){--source-red:#b74c56;--source-yellow:#9c7425;--green:#167c5b;--history-room:#167c5b;--history-return:#a26b1b;--history-outside:#5675ab;--history-fire:#bd5f2a}
-:host{display:block;width:100%;min-width:0;container-type:inline-size;color:var(--primary-text-color,#e8eeeb);--source-red:#e88e97;--source-yellow:#dfbd72;--green:#69d5b2;--history-room:#69d5b2;--history-return:#e9bd79;--history-outside:#91a9d0;--history-fire:#e68b57;--muted:var(--secondary-text-color,#a4b1ab);--surface:var(--ha-card-background,var(--card-background-color,#18221e));--stroke:rgba(140,164,150,.17);font-family:var(--primary-font-family,system-ui),sans-serif;font-size:14px;line-height:1.6}*{box-sizing:border-box}main{width:100%;max-width:1520px;margin:auto;padding:20px 32px 12px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:12px 0 26px}.brand{display:flex;gap:12px;align-items:center}.brand-icon{display:grid;place-items:center;background:#69d5b21c;color:var(--green);width:46px;height:46px;border-radius:15px;font-size:33px}.brand strong{font-size:23px;letter-spacing:-.7px}.brand strong span{color:var(--green)}.brand small{display:block;color:var(--muted);font-size:11px;letter-spacing:.5px}.header-status{display:flex;align-items:center;gap:9px;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green)}.dot.red{background:#f28d9a}.mode{margin-left:12px;color:var(--muted);padding-left:20px;border-left:1px solid var(--stroke)}nav{display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--stroke);margin-bottom:26px;padding-bottom:12px}button,input,select{font:inherit}button,a,input,select{touch-action:manipulation}button{min-height:44px;cursor:pointer;color:inherit;background:transparent;border:1px solid var(--stroke);border-radius:10px;padding:9px 14px}button:hover{border-color:var(--green)}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--green);outline-offset:4px}button:disabled{opacity:.45;cursor:wait}nav button{border:0;color:var(--muted);padding:9px 20px}nav button.selected{background:#69d5b21c;color:var(--green)}a{color:var(--green);text-decoration:none}nav a{margin-left:auto;font-size:12px;color:var(--muted)}.card{background:var(--surface);border:1px solid var(--stroke);border-radius:20px;padding:24px;margin-bottom:20px;min-width:0;box-shadow:0 4px 24px #00000006}h1,h2,p{margin:0}h1{font-size:27px;letter-spacing:-.8px}h2{font-size:16px;font-weight:600;letter-spacing:-.2px;margin-bottom:16px}p{margin:10px 0}.muted,.eyebrow{color:var(--muted)}.eyebrow{font-size:11px;font-weight:500;letter-spacing:1.3px;display:block}.hero{display:grid;grid-template-columns:1fr 1fr;align-items:center;gap:40px;padding:32px 36px;background:radial-gradient(ellipse at 12% 10%,#69d5b21a,transparent 75%),var(--surface)}.temperature{font-size:82px;line-height:1.2;letter-spacing:-5px;font-weight:500;margin-top:10px}.temperature span{font-size:34px;color:var(--green);letter-spacing:-1px;vertical-align:top;margin-left:5px}.hero p{margin:6px 0 16px}.hero-side{border-left:1px solid var(--stroke);padding-left:36px}.hero-side h2{font-size:23px;margin-top:12px;line-height:1.4}.comfort{margin-top:25px;font-size:12px;color:var(--muted)}.comfort strong{display:block;font-size:18px;color:var(--primary-text-color)}.pill{display:inline-block;background:#69d5b215;border:1px solid #69d5b22c;color:var(--green);border-radius:30px;padding:5px 12px;font-size:12px}.warn{color:#c88826;background:#ffc26d15;border-color:#ffc26d40}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}.metric{display:flex;flex-direction:column;align-items:flex-start;text-align:left;gap:12px;padding:22px}.metric strong{font-size:28px;font-weight:500;line-height:1.2;letter-spacing:-.8px}.metric strong small{font-size:13px;color:var(--muted);letter-spacing:0}.metric .muted{font-size:11px}.columns{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(300px,1fr);gap:20px}.section-meta{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:11px;margin-bottom:22px}.forecast-plot{width:100%;min-width:0}.chart-card svg{width:100%;height:auto;max-width:100%;display:block;color:var(--muted)}.legend{display:flex;flex-wrap:wrap;gap:9px 17px;font-size:11px;color:var(--muted);margin:18px 0}.legend span:first-child{color:var(--green)}.legend span:nth-child(2){color:#c88826}.legend span:nth-child(3){color:#dd7c8d}.forecast-stats{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}.row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--stroke);font-size:12px}.row strong{font-weight:500;text-align:right;overflow-wrap:anywhere}.row:last-child{border-bottom:0}.note{font-size:11px;line-height:1.7}.session{display:flex;justify-content:space-between;gap:10px;padding:16px 0;border-bottom:1px solid var(--stroke)}.session strong{font-size:13px}.session .muted{display:block;font-size:11px}.heat-dot{width:9px;height:9px;background:#ffc26d;border-radius:50%;margin-top:8px}.inset{background:#69d5b208;border-radius:12px;padding:16px;margin-top:20px}.large{font-size:32px;letter-spacing:-1px}.large small{font-size:14px;color:var(--muted)}progress{width:100%;height:6px;accent-color:var(--green);margin-top:18px;border:0;border-radius:8px;overflow:hidden}progress::-webkit-progress-bar{background:var(--stroke)}progress::-webkit-progress-value{background:var(--green)}.text-button{border:0;color:var(--green);padding-left:0;font-size:12px;margin-top:12px}.page-title{margin:30px 0}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:0 20px}.field{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:15px 0;border-top:1px solid var(--stroke);font-size:13px}.field small{display:block;font-size:10px}.field input,.field select{background:var(--surface);color:inherit;border:1px solid var(--stroke);border-radius:9px;padding:8px;max-width:220px;min-height:40px}.number{display:flex;align-items:center;gap:8px}.number input{width:85px}.number span{font-size:11px;color:var(--muted)}.toggle{position:relative;display:inline-flex;min-width:44px;min-height:44px;align-items:center}.toggle input{opacity:0;position:absolute;inset:0;width:100%;margin:0}.toggle span{width:44px;height:25px;border-radius:25px;background:var(--stroke);pointer-events:none}.toggle span:after{content:'';display:block;width:19px;height:19px;border-radius:50%;background:#bac8bf;transform:translate(3px,3px)}.toggle input:checked+span{background:#69d5b24c}.toggle input:checked+span:after{background:var(--green);transform:translate(22px,3px)}.toggle:focus-within{outline:2px solid var(--green);border-radius:24px}.table-scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;font-size:11px;color:var(--muted);font-weight:400}td,th{padding:12px 8px;border-bottom:1px solid var(--stroke)}td:not(:first-child),th:not(:first-child){text-align:right}.journal{max-height:600px;overflow:auto}.entry{display:grid;grid-template-columns:90px 1fr;gap:15px;border-bottom:1px solid var(--stroke);padding:14px 0}.entry time{font-size:11px;color:var(--muted)}.entry p{font-size:12px;margin:0}.columns>div{min-width:0}.native{width:100%;max-width:100%;min-width:0;min-height:110px;--ha-card-border-width:0;--ha-card-box-shadow:none}.native>*{display:block;width:100%;max-width:100%;min-width:0}.empty{color:var(--muted);padding:20px 0;font-size:13px}.notice{border-radius:12px;background:#ffc26d15;border:1px solid #ffc26d40;padding:12px 18px;margin-bottom:20px;font-size:13px}.hidden{display:none}footer{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;padding:12px 2px 22px}.menu-button{min-width:44px;border:0;font-size:20px;padding:2px 6px}
-.history-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:-4px;margin-bottom:12px}.history-ranges{display:flex;gap:4px;padding:3px;border-radius:12px;background:#899b9010}.history-ranges button{border:0;padding:5px 14px;font-size:12px;min-height:38px;color:var(--muted)}.history-ranges button[aria-pressed="true"]{background:#69d5b21c;color:var(--green)}.history-refresh{font-size:24px;width:44px;height:44px;padding:0;border:0;color:var(--muted)}.history-legend{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 18px}.history-legend button{min-width:0;text-align:left;border-color:transparent;padding:9px 10px;background:#899b9007}.history-legend button>span{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}.history-legend i,.history-totals i{display:inline-block;width:7px;height:7px;flex-shrink:0;border-radius:50%;background:var(--series-color)}.history-legend strong{display:block;font-weight:500;font-size:20px;white-space:nowrap}.history-legend strong small{font-size:11px;color:var(--muted)}.history-legend button[aria-pressed="true"]{border-color:var(--stroke)}.history-legend button[aria-pressed="false"] i{background:transparent;border:1px solid var(--series-color)}.history-legend button[aria-pressed="false"] strong{color:var(--muted)}.history-plot{width:100%;min-width:0;touch-action:pan-y}.history-plot:focus-visible{outline:2px solid var(--green);outline-offset:3px;border-radius:6px}.history-plot svg{display:block;width:100%;height:auto;max-width:100%;color:var(--muted);overflow:visible}.history-totals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:8px 0 0;padding-top:10px;border-top:1px solid var(--stroke);font-size:11px;color:var(--muted)}.history-totals>span{min-width:0}.history-totals i{margin-right:7px}.history-totals strong{display:block;color:var(--primary-text-color);font-size:15px;font-weight:500;padding-left:14px}.history-readout{font-size:11px;margin:10px 0 0;min-height:18px}.history-placeholder{min-height:330px;display:grid;place-items:center;font-size:13px;color:var(--muted)}
-@container(max-width:600px){.history-ranges button{min-height:38px;padding:5px 10px}.history-legend{gap:4px}.history-legend button{padding:7px 6px}.history-legend button>span{font-size:10px;gap:4px}.history-legend strong{font-size:18px}.history-tools{margin-bottom:6px}.history-readout{font-size:10px}}
+/* The surrounding HA theme owns the palette, typography and surface shape. */
+:host {
+  display:block;width:100%;min-width:0;container-type:inline-size;
+  color:var(--primary-text-color,#e8e8e8);
+  --green:var(--primary-color,#69d5b2);
+  --muted:var(--secondary-text-color,#b4b4b4);
+  --surface:var(--ha-card-background,var(--card-background-color,#1c1c1c));
+  --raised:color-mix(in srgb,var(--primary-text-color,#e8e8e8) 5%,var(--surface));
+  --stroke:var(--ha-card-border-color,var(--divider-color,rgba(155,155,155,.2)));
+  --control-stroke:color-mix(in srgb,var(--primary-text-color,#e8e8e8) 25%,var(--surface));
+  --card-radius:var(--ha-card-border-radius,20px);
+  --source-red:#ffb4ab;--source-yellow:#f1cf86;
+  --history-room:var(--green);--history-return:#e9bd79;
+  --history-outside:var(--muted);--history-fire:var(--source-yellow);
+  --heat-fill:color-mix(in srgb,#c9505c 12%,var(--surface));
+  --warm-fill:color-mix(in srgb,#c9a04b 10%,var(--surface));
+  --ease-out:cubic-bezier(.23,1,.32,1);
+  font-family:var(--ha-font-family-body,var(--primary-font-family,Roboto,system-ui,sans-serif));
+  font-size:14px;line-height:1.5;font-variant-numeric:tabular-nums;
+  color-scheme:dark;caret-color:var(--green);
+}
+
+:host([data-light]) {
+  --source-red:#9c3039;--source-yellow:#815c17;
+  --green:color-mix(in srgb,var(--primary-color,#167c5b) 70%,var(--primary-text-color,#212121));
+  --history-return:#96621c;color-scheme:light;
+}
+
+*{box-sizing:border-box}
+main{width:100%;max-width:1360px;margin:auto;padding:16px 28px 12px}
+header{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0 16px}
+.brand{display:flex;gap:10px;align-items:center;min-width:0}
+.brand-icon{display:grid;place-items:center;color:var(--green);width:36px;height:40px;flex:none}
+.brand strong{font-size:22px;font-weight:600;letter-spacing:-.5px;line-height:1.3}
+.brand strong span{color:var(--green)}
+.brand small{display:block;color:var(--muted);font-size:12px;letter-spacing:0}
+.header-status{display:flex;align-items:center;gap:8px;font-size:12px;white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
+.dot.red{background:var(--source-red)}
+.mode{margin-left:12px;color:var(--muted);padding-left:20px;border-left:1px solid var(--stroke)}
+nav{display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--stroke);margin-bottom:16px;padding-bottom:8px}
+button,input,select{font:inherit}
+button,a,input,select{touch-action:manipulation}
+button{min-height:44px;cursor:pointer;color:inherit;background:transparent;border:1px solid var(--control-stroke);border-radius:14px;padding:9px 14px;transition:transform 120ms var(--ease-out)}
+button:hover{border-color:var(--control-stroke)}
+button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--green);outline-offset:4px}
+button:disabled{color:var(--muted);background:var(--raised);cursor:default}
+nav button{border:0;color:var(--muted);padding:9px 18px;font-size:14px;font-weight:500}
+nav button.selected{background:var(--raised);color:var(--primary-text-color,#e8e8e8)}
+a{color:var(--green);text-decoration:none}
+nav a{margin-left:auto;font-size:12px;color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--stroke);border-radius:var(--card-radius);padding:20px;margin-bottom:12px;min-width:0;box-shadow:var(--ha-card-box-shadow,none)}
+h1,h2,p{margin:0}
+h1{font-size:24px;line-height:1.3;font-weight:600;letter-spacing:-.5px}
+h2{font-size:16px;font-weight:600;letter-spacing:0;line-height:1.4;margin-bottom:12px;text-wrap:balance}
+p{margin:10px 0}
+.muted,.eyebrow{font-size:12px;font-weight:400;letter-spacing:0;line-height:1.4;display:block}
+.eyebrow{font-size:11px;font-weight:500;letter-spacing:1.3px;display:block}
+.hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:center;gap:24px;background:var(--surface)}
+.temperature{font-size:64px;line-height:1.1;letter-spacing:-2px;font-weight:500;margin-top:8px}
+.temperature span{font-size:24px;color:var(--muted);letter-spacing:0;vertical-align:top;margin-left:4px;line-height:1.5}
+.hero p{margin:6px 0 16px}
+.hero-side{border-left:1px solid var(--stroke);padding-left:24px}
+.hero-side h2{font-size:22px;margin:8px 0;line-height:1.35}
+.comfort{margin-top:25px;font-size:12px;color:var(--muted)}
+.comfort strong{display:block;font-size:18px;color:var(--primary-text-color)}
+.pill{display:inline-block;background:var(--raised);border:1px solid transparent;color:var(--primary-text-color,#e8e8e8);border-radius:999px;padding:4px 10px;font-size:12px;line-height:1.4}
+.warn{color:var(--source-yellow);background:var(--warm-fill);border-color:var(--stroke)}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}
+.metric{display:flex;flex-direction:column;align-items:flex-start;text-align:left;gap:12px;padding:22px}
+.metric strong{font-size:28px;font-weight:500;line-height:1.2;letter-spacing:-.8px}
+.metric strong small{font-size:13px;color:var(--muted);letter-spacing:0}
+.metric .muted{font-size:11px}
+.columns{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(300px,1fr);gap:20px}
+.section-meta{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px;margin-bottom:12px}
+.forecast-plot{width:100%;min-width:0}
+.chart-card svg{width:100%;height:auto;max-width:100%;display:block;color:var(--muted)}
+.legend{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:12px;color:var(--muted);margin:12px 0}
+.legend span:first-child{color:var(--green)}
+.legend span:nth-child(2){color:var(--source-red)}
+.legend span:nth-child(3){color:var(--source-yellow)}
+.forecast-stats{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}
+.row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--stroke);font-size:12px}
+.row strong{font-weight:500;text-align:right;overflow-wrap:anywhere}
+.row:last-child{border-bottom:0}
+.note{font-size:12px;line-height:1.6}
+.session{display:flex;justify-content:space-between;gap:10px;padding:16px 0;border-bottom:1px solid var(--stroke)}
+.session strong{font-size:13px}
+.session .muted{display:block;font-size:11px}
+.heat-dot{width:7px;height:7px;flex:none;background:var(--source-red);border-radius:50%;margin-top:8px}
+.inset{background:var(--raised);border-radius:14px;padding:16px;margin-top:16px}
+.large{font-size:32px;letter-spacing:-1px}
+.large small{font-size:14px;color:var(--muted)}
+progress{width:100%;height:6px;accent-color:var(--green);margin-top:18px;border:0;border-radius:8px;overflow:hidden}
+progress::-webkit-progress-bar{background:var(--stroke)}
+progress::-webkit-progress-value{background:var(--green)}
+.text-button{border:0;color:var(--green);padding-left:0;font-size:12px;margin-top:12px}
+.page-title{margin:30px 0}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:0 20px}
+.field{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:15px 0;border-top:1px solid var(--stroke);font-size:13px}
+.field small{display:block;font-size:11px}
+.field input,.field select{background:var(--raised);color:inherit;border:1px solid var(--control-stroke);border-radius:12px;padding:8px 10px;max-width:220px;min-height:44px}
+.number{display:flex;align-items:center;gap:8px}
+.number input{width:85px}
+.number span{font-size:11px;color:var(--muted)}
+.toggle{position:relative;display:inline-flex;min-width:44px;min-height:44px;align-items:center}
+.toggle input{opacity:0;position:absolute;inset:0;width:100%;margin:0}
+.toggle span{width:44px;height:26px;border-radius:26px;background:var(--control-stroke);pointer-events:none}
+.toggle span:after{content:'';display:block;width:20px;height:20px;border-radius:50%;background:var(--primary-text-color,#e8e8e8);transform:translate(3px,3px);transition:transform 160ms var(--ease-out)}
+.toggle input:checked+span{background:var(--green)}
+.toggle input:checked+span:after{background:var(--surface);transform:translate(21px,3px)}
+.toggle:focus-within{outline:2px solid var(--green);border-radius:24px}
+.table-scroll{overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-size:11px;color:var(--muted);font-weight:400}
+td,th{padding:12px 8px;border-bottom:1px solid var(--stroke)}
+td:not(:first-child),th:not(:first-child){text-align:right}
+.journal{max-height:600px;overflow:auto}
+.entry{display:grid;grid-template-columns:90px 1fr;gap:15px;border-bottom:1px solid var(--stroke);padding:14px 0}
+.entry time{font-size:11px;color:var(--muted)}
+.entry p{font-size:12px;margin:0}
+.columns>div{min-width:0}
+.native{width:100%;max-width:100%;min-width:0;min-height:110px;--ha-card-border-width:0;--ha-card-box-shadow:none}
+.native>*{display:block;width:100%;max-width:100%;min-width:0}
+.empty{color:var(--muted);padding:20px 0;font-size:13px}
+.notice{border-radius:14px;background:var(--warm-fill);border:1px solid var(--stroke);color:var(--source-yellow);padding:12px 16px;margin-bottom:12px;font-size:13px}
+.hidden{display:none}
+footer{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:11px;padding:12px 2px 16px}
+.menu-button{min-width:44px;border:0;font-size:20px;padding:2px 6px}
+
+.history-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:-4px;margin-bottom:12px}
+.history-ranges{display:flex;gap:2px;padding:2px;border-radius:14px;background:var(--raised)}
+.history-ranges button{border:0;padding:6px 14px;font-size:12px;min-height:44px;color:var(--muted)}
+.history-ranges button[aria-pressed="true"]{background:var(--surface);color:var(--primary-text-color,#e8e8e8)}
+.history-refresh{font-size:24px;width:44px;height:44px;padding:0;border:0;color:var(--muted)}
+.history-legend{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 18px}
+.history-legend button{min-width:0;text-align:left;border-color:transparent;padding:8px 10px;background:transparent;border-radius:12px}
+.history-legend button>span{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.history-legend i,.history-totals i{display:inline-block;width:7px;height:7px;flex-shrink:0;border-radius:50%;background:var(--series-color)}
+.history-legend strong{display:block;font-weight:500;font-size:20px;white-space:nowrap}
+.history-legend strong small{font-size:11px;color:var(--muted)}
+.history-legend button[aria-pressed="true"]{border-color:var(--control-stroke);background:var(--raised)}
+.history-legend button[aria-pressed="false"] i{background:transparent;border:1px solid var(--series-color)}
+.history-legend button[aria-pressed="false"] strong{color:var(--muted)}
+.history-plot{width:100%;min-width:0;touch-action:pan-y}
+.history-plot:focus-visible{outline:2px solid var(--green);outline-offset:3px;border-radius:6px}
+.history-plot svg{display:block;width:100%;height:auto;max-width:100%;color:var(--muted);overflow:visible}
+.history-totals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:8px 0 0;padding-top:10px;border-top:1px solid var(--stroke);font-size:11px;color:var(--muted)}
+.history-totals>span{min-width:0}
+.history-totals i{margin-right:7px}
+.history-totals strong{display:block;color:var(--primary-text-color);font-size:15px;font-weight:500;padding-left:14px}
+.history-readout{font-size:11px;margin:10px 0 0;min-height:18px}
+.history-placeholder{min-height:330px;display:grid;place-items:center;font-size:13px;color:var(--muted)}
+
+@container(max-width:600px){.history-ranges button{min-height:44px;padding:5px 10px}
+.history-legend{gap:4px}
+.history-legend button{padding:7px 6px}
+.history-legend button>span{font-size:11px;gap:4px}
+.history-legend strong{font-size:18px}
+.history-tools{margin-bottom:6px}
+.history-readout{font-size:11px}
+}
+
 section[id]{scroll-margin-top:16px}
-@container(min-width:1600px){main{padding:24px 42px}}@container(max-width:1000px){main{padding:15px 20px}.columns{grid-template-columns:1fr}.hero{gap:25px}.metrics{gap:12px}.metric{padding:17px}.metric strong{font-size:23px}.mode{display:none}}@container(max-width:600px){main{padding:8px 12px}header{padding:8px 2px 18px;gap:10px}.brand strong{font-size:20px}.brand-icon{width:38px;height:38px}.header-status{font-size:10px}.header-status .dot{display:none}nav{gap:3px;margin-bottom:16px}nav button{padding:10px 12px;font-size:12px}nav a{display:none}.hero{grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr);padding:18px;gap:14px;align-items:center}.hero>div{min-width:0}.temperature{font-size:44px;font-size:clamp(38px,12cqi,54px);letter-spacing:-3px;white-space:nowrap}.temperature span{font-size:20px;letter-spacing:-1px;margin-left:3px}.hero p{font-size:11px;line-height:1.5;margin:6px 0 10px}.hero .pill{font-size:10px;letter-spacing:0;padding:4px 8px}.hero-side{padding:0 0 0 14px;border-left:1px solid var(--stroke);border-top:0}.hero-side h2{font-size:15px;line-height:1.4;margin:8px 0}.hero .eyebrow{font-size:10px;letter-spacing:.5px}.comfort{margin-top:10px;font-size:10px}.comfort strong{font-size:14px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{padding:16px;gap:10px;border-radius:16px}.metric strong{font-size:23px}.eyebrow{font-size:9px;letter-spacing:.8px}.card{padding:18px;border-radius:16px;margin-bottom:14px}.columns{gap:0}.settings-grid{grid-template-columns:1fr}.field{gap:12px;font-size:12px}.field select{max-width:170px;font-size:11px}.section-meta{flex-wrap:wrap}.forecast-stats{grid-template-columns:1fr}.entry{grid-template-columns:75px 1fr;gap:10px}h1{font-size:23px}footer span{font-size:9px}}
-.overview .card{padding:18px;margin-bottom:12px}.overview h2{margin-bottom:12px}.overview .columns{gap:14px}.overview .hero{padding:24px;gap:24px}.overview .hero-side{padding-left:24px}.overview .hero-target{margin:4px 0 0;display:flex;flex-wrap:wrap;gap:2px 8px}.hero-target>span{white-space:nowrap}.hero-target strong{font-weight:500}.hero-outside{display:flex;align-items:center;gap:8px;min-height:44px;padding:0;border:0;font-size:12px;color:var(--muted)}.hero-outside strong{font-size:15px;font-weight:500;color:var(--primary-text-color)}.overview .comfort{margin-top:12px}.heat-sources{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:12px}.heat-sources>.card{margin:0;min-width:0}.card-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.overview .card-heading h2{margin:0}.boiler-status{font-size:11px;white-space:nowrap;padding:3px 9px;color:var(--muted);background:transparent;border-color:var(--stroke)}.boiler-card[data-heating="true"]{border-color:#db69746b;background:linear-gradient(110deg,#c9505c24,#c9505c0d),var(--surface);box-shadow:0 0 20px #c9505c0b}.boiler-card[data-heating="true"] .boiler-status{color:var(--source-red);background:#c9505c16;border-color:#db697440}.boiler-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:8px}.compact-metric{min-width:0;text-align:left;padding:8px 0;border:0;border-radius:8px}.compact-metric>span{display:block;font-size:11px;line-height:1.4}.compact-metric>strong{display:block;font-size:19px;font-weight:500;line-height:1.35;margin-top:4px;overflow-wrap:anywhere}.compact-metric small{font-size:11px;font-weight:400;color:var(--muted)}.boiler-metrics .compact-metric strong{font-size:24px}.boiler-metrics .compact-metric small{display:block;font-size:10px}.boiler-note{font-size:10px;line-height:1.5;margin:4px 0 0}
-.fireplace-card{--fire-accent:var(--muted)}.fireplace-card[data-phase="Розпалювання"]{--fire-accent:var(--source-yellow);border-color:#d9b55360;background:linear-gradient(110deg,#c9a04b22,#c9a04b0b),var(--surface)}.fireplace-card[data-phase="Горить"]{--fire-accent:var(--source-red);border-color:#db69746b;background:linear-gradient(110deg,#c9505c24,#c9505c0d),var(--surface)}.fireplace-card[data-phase="Інтенсивно горить"]{--fire-accent:var(--source-red);border-color:#db697480;background:linear-gradient(110deg,#c9505c34,#c9505c17),var(--surface)}.fireplace-card[data-phase="Згасає"]{--fire-accent:var(--source-yellow);border-color:#d9b55345;background:linear-gradient(110deg,#c9a04b18,#c9a04b08),var(--surface)}.fire-phase{display:flex;align-items:center;justify-content:flex-end;gap:5px;text-align:right;border:0;padding:0;max-width:58%;min-height:44px;color:var(--fire-accent)}.fire-phase svg{width:18px;height:22px;flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.5}.fire-phase strong{font-size:13px;font-weight:500;line-height:1.3;overflow-wrap:anywhere}.fireplace-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:14px;align-items:start;margin:6px 0 0}.fireplace-grid>div{min-width:0}.fireplace-grid .eyebrow{font-size:10px;letter-spacing:.5px}.fire-temperature{display:block;font-size:22px;font-weight:500;line-height:1.3;margin-top:4px}.fire-temperature small{display:block;font-size:11px;font-weight:400;margin-top:2px}.circulation-block{border-left:1px solid var(--stroke);padding-left:14px}.fan-actual{display:block;font-size:17px;font-weight:500;line-height:1.4;margin-top:4px}.fan-reason{font-size:12px;margin:8px 0;overflow-wrap:anywhere}.fan-level{font-size:10px;margin:2px 0 0}.fan-waiting{color:#c88826;font-size:11px;margin:2px 0 0}.fire-details{border-top:1px solid var(--stroke);margin-top:10px}.fire-details summary,.plan-details summary{min-height:44px;display:flex;align-items:center;cursor:pointer;font-size:12px;color:var(--muted)}.fire-details summary::after,.plan-details summary::after{content:'＋';margin-left:auto}.fire-details[open] summary::after,.plan-details[open] summary::after{content:'−'}
-.overview .section-meta{margin:6px 0 10px;gap:8px}.overview .section-meta .pill{font-size:11px}.overview .legend{margin:10px 0;gap:6px 14px}.overview .forecast-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}.forecast-stats .compact-metric{background:#899b9008;padding:9px 10px}.forecast-stats .compact-metric>span{font-size:10px}.forecast-stats .compact-metric>strong{font-size:16px}.forecast-warning{margin:8px 0 0;padding:4px 8px;border-radius:7px}.forecast-help{position:relative;flex-shrink:0}.forecast-help summary{width:44px;min-height:44px;display:grid;place-items:center;cursor:pointer;color:var(--muted);list-style:none;font-size:19px}.forecast-help summary::-webkit-details-marker{display:none}.forecast-help>div{position:absolute;top:44px;right:0;z-index:3;width:min(340px,calc(100cqi - 72px));padding:14px;background:var(--surface);border:1px solid var(--stroke);border-radius:12px;box-shadow:0 8px 30px #0003;font-size:12px}.forecast-help p{margin:8px 0 0}
-.plan-reason{font-size:12px;line-height:1.5;margin:0 0 8px}.sessions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:0 16px}.overview .session{padding:8px 0}.session strong{font-size:12px}.session .muted{font-size:11px}.plan-morning{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px 12px;font-size:12px;padding:10px 0}.plan-morning strong{font-weight:500}.plan-morning small{font-size:10px}.plan-details{border-top:1px solid var(--stroke)}.plan-breakdown{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px 16px}.plan-breakdown .compact-metric>strong{font-size:16px}.overview .empty{padding:8px 0;margin:0;font-size:12px}
-@container(max-width:900px){.heat-sources{grid-template-columns:1fr}}
-@container(max-width:700px){.overview .forecast-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.plan-breakdown{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@container(max-width:600px){.overview .card{padding:14px 16px;margin-bottom:10px}.heat-sources{gap:10px;margin-bottom:10px}.heat-sources>.card{margin:0}.overview h2{font-size:15px;margin-bottom:10px}.overview .hero{padding:16px;gap:12px}.overview .hero-side{padding-left:12px}.overview .hero-side h2{margin:6px 0;font-size:14px}.overview .hero p{font-size:10px;line-height:1.5}.overview .hero-outside{font-size:10px;gap:6px}.hero-outside strong{font-size:13px}.overview .comfort{font-size:10px;margin-top:8px}.overview .comfort strong{font-size:13px}.overview .hero .eyebrow{font-size:9px;letter-spacing:.4px}.boiler-metrics{gap:8px;margin-top:4px}.boiler-metrics .compact-metric strong{font-size:22px}.boiler-metrics .compact-metric>span{font-size:10px}.boiler-note{font-size:10px;margin-top:2px}.fire-phase strong{font-size:12px}.fireplace-grid .eyebrow{font-size:9px;letter-spacing:.3px}.fire-temperature{font-size:20px}.fire-temperature small{font-size:10px}.fan-actual{font-size:15px}.fire-details{margin-top:8px}.fire-details summary,.plan-details summary{font-size:11px}.forecast-stats .compact-metric{padding:8px}.forecast-stats .compact-metric strong{font-size:15px}.overview .section-meta{font-size:10px}.overview .section-meta .pill{font-size:10px;padding:3px 8px}}
 
-.compact-page .page-title{margin:10px 0 14px}.compact-page h1{font-size:24px}.compact-page h2{margin-bottom:10px;font-size:15px}.compact-page .card{padding:16px;margin:0}.settings-page .settings-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.comfort-settings,.circulation-settings{grid-column:1/-1}.comfort-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.comfort-groups fieldset{min-width:0;border:0;padding:0;margin:0}.comfort-groups legend{font-size:11px;color:var(--muted);padding:0}.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px;align-items:end}.control-grid.thirds{grid-template-columns:repeat(3,minmax(0,1fr))}.compact-page .field{min-width:0;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:5px;padding:7px 0;border:0;font-size:12px}.compact-page .field>span{font-size:11px;line-height:1.4}.compact-page .field .number{width:100%;min-width:0;gap:5px}.compact-page .number input{flex:1;min-width:0}.compact-page .field input:not([type="checkbox"]),.compact-page .field select{width:100%;min-width:0;max-width:none;min-height:44px;font-size:13px;padding:7px 8px}.compact-page .field:has(.toggle){flex-direction:row;align-items:center;justify-content:space-between;min-height:58px;gap:8px}.compact-page .field:has(.toggle)>span{font-size:12px}.compact-page .toggle{flex-shrink:0}.settings-status{border-top:1px solid var(--stroke);padding-top:6px;margin-top:6px}.settings-status .row{padding:6px 0;font-size:11px}.circulation-config{display:grid;grid-template-columns:minmax(240px,1fr) minmax(0,1.4fr);gap:20px;align-items:end}.inline-help{margin-top:6px;border-top:1px solid var(--stroke)}.inline-help summary,.model-advanced summary{min-height:44px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;color:var(--muted);font-size:12px;gap:8px}.inline-help summary::after,.model-advanced summary::after{content:'＋';margin-left:auto}.inline-help[open] summary::after,.model-advanced details[open] summary::after{content:'−'}.inline-help p{font-size:11px;margin:6px 0;line-height:1.6}
-.model-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:12px!important}.model-stats .compact-metric{padding:4px 0}.model-stats .compact-metric strong{font-size:21px}.model-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.model-grid>.card{min-width:0}.model-grid .ai-report{grid-column:1/-1}.report-text,.learning-result{font-size:13px;line-height:1.6;margin:0 0 6px;overflow-wrap:anywhere}.report-meta,.model-meta{font-size:10px;margin:4px 0 8px}.report-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.fact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 16px}.model-page .compact-metric>span{font-size:10px}.model-page .compact-metric>strong{font-size:16px;margin-top:3px}.model-page .compact-metric small{font-size:10px}.model-page .model-stats strong{font-size:20px}.model-page .compact-metric{padding:6px 0}.model-page td,.model-page th{padding:7px 6px;font-size:12px}.model-page th{font-size:10px}.model-page .journal{max-height:320px}.model-page .entry{grid-template-columns:80px minmax(0,1fr);gap:10px;padding:8px 0}.model-page .entry time{font-size:10px}.model-page .entry p{font-size:12px}.action-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.action-buttons .field>span{display:none}.action-buttons .field{padding:4px 0}.action-buttons .field .action{font-size:12px;width:100%;padding:8px;min-height:44px}.model-advanced summary{color:var(--primary-text-color);font-size:13px;font-weight:500}.parameter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 16px}.parameter-grid .row{min-width:0;padding:7px 0;font-size:11px}.parameter-grid .row>span{overflow-wrap:anywhere}.controller-facts{grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--stroke);margin-top:10px;padding-top:6px}.model-advanced .note{margin:8px 0 0}.model-page .empty{padding:10px 0;margin:0}
-@container(max-width:900px){.settings-page .settings-grid{grid-template-columns:1fr}.circulation-config{grid-template-columns:1fr;gap:4px}.model-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@container(max-width:700px){.comfort-groups{grid-template-columns:1fr;gap:14px}.model-grid{grid-template-columns:1fr}.model-stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px}.model-grid .ai-report{grid-column:auto}}
-@container(max-width:600px){.compact-page .page-title{margin:4px 0 12px}.compact-page h1{font-size:22px}.compact-page .card{padding:14px 16px}.settings-page .settings-grid,.model-grid{gap:10px}.control-grid{gap:3px 10px}.control-grid.thirds{gap:3px 8px}.compact-page .field{padding:6px 0}.compact-page .field>span{font-size:10px}.compact-page .field input:not([type="checkbox"]),.compact-page .field select{font-size:12px}.compact-page .field:has(.toggle)>span{font-size:11px}.circulation-levels .field>span{min-height:28px}.fact-grid{gap:2px 12px}.report-stats{gap:8px}.report-stats .compact-metric strong{font-size:14px}.model-page .model-stats strong{font-size:18px}.model-page .compact-metric>strong{font-size:15px}.action-buttons{gap:8px}.model-page .entry{grid-template-columns:72px minmax(0,1fr)}.inline-help summary{font-size:11px}}
+@container(min-width:1600px){main{padding:24px 42px}
+}
+@container(max-width:1000px){main{padding:15px 20px}
+.columns{grid-template-columns:1fr}
+.hero{gap:25px}
+.metrics{gap:12px}
+.metric{padding:17px}
+.metric strong{font-size:23px}
+.mode{display:none}
+}
+@container(max-width:600px){main{padding:8px 12px}
+header{padding:8px 2px 18px;gap:10px}
+.brand strong{font-size:20px}
+.brand-icon{width:26px;height:38px}
+.header-status{font-size:11px}
+.header-status .dot{display:block}
+nav{gap:3px;margin-bottom:16px}
+nav button{padding:10px 12px;font-size:12px}
+nav a{display:none}
+.hero{grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr);padding:18px;gap:14px;align-items:center}
+.hero>div{min-width:0}
+.temperature{font-size:44px;font-size:42px;letter-spacing:-1.5px;white-space:nowrap}
+.temperature span{font-size:20px;letter-spacing:-1px;margin-left:3px}
+.hero p{font-size:11px;line-height:1.5;margin:6px 0 10px}
+.hero .pill{font-size:11px;letter-spacing:0;padding:4px 8px}
+.hero-side{padding:0 0 0 14px;border-left:1px solid var(--stroke);border-top:0}
+.hero-side h2{font-size:15px;line-height:1.4;margin:8px 0}
+.hero .eyebrow{font-size:12px;letter-spacing:0}
+.comfort{margin-top:10px;font-size:11px}
+.comfort strong{font-size:14px}
+.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.metric{padding:16px;gap:10px;border-radius:16px}
+.metric strong{font-size:23px}
+.eyebrow{font-size:11px;letter-spacing:.8px}
+.card{padding:18px;border-radius:var(--card-radius);margin-bottom:14px}
+.columns{gap:0}
+.settings-grid{grid-template-columns:1fr}
+.field{gap:12px;font-size:12px}
+.field select{max-width:170px;font-size:11px}
+.section-meta{flex-wrap:wrap}
+.forecast-stats{grid-template-columns:1fr}
+.entry{grid-template-columns:75px 1fr;gap:10px}
+h1{font-size:23px}
+footer span{font-size:11px}
+}
 
-.system-settings{margin-top:14px!important}.system-settings>summary,.system-group>summary{min-height:48px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-weight:600;gap:10px}.system-settings[open]>summary>span{transform:rotate(45deg)}.system-body{border-top:1px solid var(--stroke);padding-top:6px}.system-group{border-bottom:1px solid var(--stroke)}.system-group>summary{font-size:13px;font-weight:500}.system-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 18px;padding:6px 0 16px}.system-field{min-width:0;display:flex;flex-direction:column;gap:5px}.system-label{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;line-height:1.4}.system-help{flex-shrink:0;border:0;color:var(--green);min-width:44px;min-height:44px;padding:8px;font-size:15px}.system-field input{width:100%;min-width:0;min-height:44px;border:1px solid var(--stroke);border-radius:9px;background:var(--surface);color:inherit;padding:8px;font:inherit}.system-field .number{width:100%;min-width:0}.system-field .number input{flex:1;width:0}.system-field .number span{white-space:nowrap}.system-entity{text-align:left;padding:8px 10px;font-size:13px;overflow-wrap:anywhere}.system-entity small{color:var(--muted)}.system-fixed{display:flex;align-items:center;min-height:44px;color:var(--muted);font-size:13px}.system-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:8px;padding-top:12px}.system-message{flex:1 1 180px;font-size:12px;color:var(--muted)}.system-dialog{position:fixed;width:min(92vw,560px);max-height:85vh;overflow:auto;border:1px solid var(--stroke);border-radius:18px;padding:20px;background:var(--surface);color:var(--primary-text-color,#e8eeeb);box-shadow:0 12px 60px #0007;font:inherit}.system-dialog::backdrop{background:#0008}.system-dialog-heading{display:flex;gap:12px;align-items:center;justify-content:space-between}.system-dialog h2{margin:0;font-size:17px}.system-dialog p{font-size:13px;line-height:1.65;overflow-wrap:anywhere}.system-dialog button{min-width:44px;min-height:44px;font-size:22px}.system-dialog-heading button{flex-shrink:0}@container(max-width:900px){.system-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}}@container(max-width:430px){.system-grid{grid-template-columns:1fr}.system-settings>summary{font-size:14px}.system-label{font-size:12px}.system-actions button{flex:1 1 120px}.system-dialog{padding:16px}}
+.overview .card{padding:18px;margin-bottom:12px}
+.overview h2{margin-bottom:12px}
+.overview .columns{gap:14px}
+.overview .hero{padding:24px;gap:24px}
+.overview .hero-side{padding-left:24px}
+.overview .hero-target{margin:4px 0 0;display:flex;flex-wrap:wrap;gap:2px 8px}
+.hero-target>span{white-space:normal}
+.hero-target strong{font-weight:500}
+.hero-outside{display:flex;align-items:center;gap:8px;min-height:44px;padding:0;border:0;font-size:12px;color:var(--muted)}
+.hero-outside strong{font-size:15px;font-weight:500;color:var(--primary-text-color)}
+.overview .comfort{margin-top:12px}
+.heat-sources{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:12px}
+.heat-sources>.card{margin:0;min-width:0}
+.card-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}
+.overview .card-heading h2{margin:0}
+.boiler-status{font-size:12px;white-space:nowrap;padding:3px 0 3px 9px;color:var(--muted);background:transparent;border:0}
+.boiler-card[data-heating="true"]{border-color:color-mix(in srgb,var(--source-red) 32%,var(--stroke));background:var(--heat-fill)}
+.boiler-card[data-heating="true"] .boiler-status{color:var(--source-red);background:transparent;border-color:transparent}
+.boiler-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:8px}
+.compact-metric{min-width:0;text-align:left;padding:8px 0;border:0;border-radius:8px}
+.compact-metric>span{display:block;font-size:11px;line-height:1.4}
+.compact-metric>strong{display:block;font-size:19px;font-weight:500;line-height:1.35;margin-top:4px;overflow-wrap:anywhere}
+.compact-metric small{font-size:11px;font-weight:400;color:var(--muted)}
+.boiler-metrics .compact-metric strong{font-size:24px}
+.boiler-metrics .compact-metric small{display:block;font-size:11px}
+.boiler-note{font-size:11px;line-height:1.5;margin:4px 0 0}
 
+.fireplace-card{--fire-accent:var(--muted)}
+.fireplace-card[data-phase="Розпалювання"]{--fire-accent:var(--source-yellow);border-color:color-mix(in srgb,var(--source-yellow) 25%,var(--stroke));background:var(--warm-fill)}
+.fireplace-card[data-phase="Горить"]{--fire-accent:var(--source-red);border-color:color-mix(in srgb,var(--source-red) 32%,var(--stroke));background:var(--heat-fill)}
+.fireplace-card[data-phase="Інтенсивно горить"]{--fire-accent:var(--source-red);border-color:color-mix(in srgb,var(--source-red) 42%,var(--stroke));background:color-mix(in srgb,#c9505c 18%,var(--surface))}
+.fireplace-card[data-phase="Згасає"]{--fire-accent:var(--source-yellow);border-color:color-mix(in srgb,var(--source-yellow) 18%,var(--stroke));background:color-mix(in srgb,#c9a04b 7%,var(--surface))}
+.fire-phase{display:flex;align-items:center;justify-content:flex-end;gap:5px;text-align:right;border:0;padding:0;max-width:58%;min-height:44px;color:var(--fire-accent)}
+.fire-phase svg{width:18px;height:22px;flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.5}
+.fire-phase strong{font-size:13px;font-weight:500;line-height:1.3;overflow-wrap:anywhere}
+.fireplace-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:14px;align-items:start;margin:6px 0 0}
+.fireplace-grid>div{min-width:0}
+.fireplace-grid .eyebrow{font-size:11px;letter-spacing:.5px}
+.fire-temperature{display:block;font-size:22px;font-weight:500;line-height:1.3;margin-top:4px}
+.fire-temperature small{display:block;font-size:11px;font-weight:400;margin-top:2px}
+.circulation-block{border-left:1px solid var(--stroke);padding-left:14px}
+.fan-actual{display:block;font-size:17px;font-weight:500;line-height:1.4;margin-top:4px}
+.fan-reason{font-size:12px;margin:8px 0;overflow-wrap:anywhere}
+.fan-level{font-size:11px;margin:2px 0 0}
+.fan-waiting{color:var(--source-yellow);font-size:12px;margin:2px 0 0}
+.fire-details{border-top:1px solid var(--stroke);margin-top:10px}
+.fire-details summary,.plan-details summary{min-height:44px;display:flex;align-items:center;cursor:pointer;font-size:12px;color:var(--muted)}
+.fire-details summary::after,.plan-details summary::after{content:'＋';margin-left:auto}
+.fire-details[open] summary::after,.plan-details[open] summary::after{content:'−'}
+
+.overview .section-meta{margin:6px 0 10px;gap:8px}
+.overview .section-meta .pill{font-size:11px}
+.overview .legend{margin:10px 0;gap:6px 14px}
+.overview .forecast-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
+.forecast-stats .compact-metric{background:transparent;padding:8px 10px 8px 0;border-radius:0}
+.forecast-stats .compact-metric>span{font-size:12px}
+.forecast-stats .compact-metric>strong{font-size:18px}
+.forecast-warning{margin:8px 0 0;padding:8px 10px;border-radius:10px}
+.forecast-help{position:relative;flex-shrink:0}
+.forecast-help summary{width:44px;min-height:44px;display:grid;place-items:center;cursor:pointer;color:var(--muted);list-style:none;font-size:19px}
+.forecast-help summary::-webkit-details-marker{display:none}
+.forecast-help>div{position:absolute;top:44px;right:0;z-index:3;width:min(340px,calc(100cqi - 72px));padding:14px;background:var(--surface);border:1px solid var(--stroke);border-radius:12px;box-shadow:0 8px 30px #0003;font-size:12px}
+.forecast-help p{margin:8px 0 0}
+
+.plan-reason{font-size:12px;line-height:1.5;margin:0 0 8px}
+.sessions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:0 16px}
+.overview .session{padding:8px 0}
+.session strong{font-size:12px}
+.session .muted{font-size:11px}
+.plan-morning{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px 12px;font-size:12px;padding:10px 0}
+.plan-morning strong{font-weight:500}
+.plan-morning small{font-size:11px}
+.plan-details{border-top:1px solid var(--stroke)}
+.plan-breakdown{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px 16px}
+.plan-breakdown .compact-metric>strong{font-size:16px}
+.overview .empty{padding:8px 0;margin:0;font-size:12px}
+
+@container(max-width:900px){.heat-sources{grid-template-columns:1fr}
+}
+
+@container(max-width:700px){.overview .forecast-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+.plan-breakdown{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+@container(max-width:600px){.overview .card{padding:14px 16px;margin-bottom:10px}
+.heat-sources{gap:10px;margin-bottom:10px}
+.heat-sources>.card{margin:0}
+.overview h2{font-size:15px;margin-bottom:10px}
+.overview .hero{padding:16px;gap:12px}
+.overview .hero-side{padding-left:12px}
+.overview .hero-side h2{margin:6px 0;font-size:14px}
+.overview .hero p{font-size:12px;line-height:1.4}
+.overview .hero-outside{font-size:11px;gap:6px}
+.hero-outside strong{font-size:13px}
+.overview .comfort{font-size:11px;margin-top:8px}
+.overview .comfort strong{font-size:13px}
+.overview .hero .eyebrow{font-size:12px;letter-spacing:0}
+.boiler-metrics{gap:8px;margin-top:4px}
+.boiler-metrics .compact-metric strong{font-size:22px}
+.boiler-metrics .compact-metric>span{font-size:11px}
+.boiler-note{font-size:11px;margin-top:2px}
+.fire-phase strong{font-size:12px}
+.fireplace-grid .eyebrow{font-size:12px;letter-spacing:0}
+.fire-temperature{font-size:20px}
+.fire-temperature small{font-size:11px}
+.fan-actual{font-size:15px}
+.fire-details{margin-top:8px}
+.fire-details summary,.plan-details summary{font-size:11px}
+.forecast-stats .compact-metric{padding:8px 0}
+.forecast-stats .compact-metric strong{font-size:15px}
+.overview .section-meta{font-size:11px}
+.overview .section-meta .pill{font-size:11px;padding:3px 8px}
+}
+
+
+.compact-page .page-title{margin:10px 0 14px}
+.compact-page h1{font-size:24px}
+.compact-page h2{margin-bottom:10px;font-size:15px}
+.compact-page .card{padding:16px;margin:0}
+.settings-page .settings-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
+.comfort-settings,.circulation-settings{grid-column:1/-1}
+.comfort-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
+.comfort-groups fieldset{min-width:0;border:0;padding:0;margin:0}
+.comfort-groups legend{font-size:11px;color:var(--muted);padding:0}
+.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px;align-items:end}
+.control-grid.thirds{grid-template-columns:repeat(3,minmax(0,1fr))}
+.compact-page .field{min-width:0;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:5px;padding:7px 0;border:0;font-size:12px}
+.compact-page .field>span{font-size:12px;line-height:1.4}
+.compact-page .field .number{width:100%;min-width:0;gap:5px}
+.compact-page .number input{flex:1;min-width:0}
+.compact-page .field input:not([type="checkbox"]),.compact-page .field select{width:100%;min-width:0;max-width:none;min-height:44px;font-size:14px;padding:8px 10px}
+.compact-page .field:has(.toggle){flex-direction:row;align-items:center;justify-content:space-between;min-height:58px;gap:8px}
+.compact-page .field:has(.toggle)>span{font-size:12px}
+.compact-page .toggle{flex-shrink:0}
+.settings-status{border-top:1px solid var(--stroke);padding-top:6px;margin-top:6px}
+.settings-status .row{padding:6px 0;font-size:11px}
+.circulation-config{display:grid;grid-template-columns:minmax(240px,1fr) minmax(0,1.4fr);gap:20px;align-items:end}
+.inline-help{margin-top:6px;border-top:1px solid var(--stroke)}
+.inline-help summary,.model-advanced summary{min-height:44px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;color:var(--muted);font-size:12px;gap:8px}
+.inline-help summary::after,.model-advanced summary::after{content:'＋';margin-left:auto}
+.inline-help[open] summary::after,.model-advanced details[open] summary::after{content:'−'}
+.inline-help p{font-size:11px;margin:6px 0;line-height:1.6}
+
+.model-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:12px!important}
+.model-stats .compact-metric{padding:4px 0}
+.model-stats .compact-metric strong{font-size:21px}
+.model-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
+.model-grid>.card{min-width:0}
+.model-grid .ai-report{grid-column:1/-1}
+.report-text,.learning-result{font-size:13px;line-height:1.6;margin:0 0 6px;overflow-wrap:anywhere}
+.report-meta,.model-meta{font-size:11px;margin:4px 0 8px}
+.report-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.fact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 16px}
+.model-page .compact-metric>span{font-size:11px}
+.model-page .compact-metric>strong{font-size:16px;margin-top:3px}
+.model-page .compact-metric small{font-size:11px}
+.model-page .model-stats strong{font-size:20px}
+.model-page .compact-metric{padding:6px 0}
+.model-page td,.model-page th{padding:7px 6px;font-size:12px}
+.model-page th{font-size:11px}
+.model-page .journal{max-height:320px}
+.model-page .entry{grid-template-columns:80px minmax(0,1fr);gap:10px;padding:8px 0}
+.model-page .entry time{font-size:11px}
+.model-page .entry p{font-size:12px}
+.action-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.action-buttons .field>span{display:none}
+.action-buttons .field{padding:4px 0}
+.action-buttons .field .action{font-size:12px;width:100%;padding:8px;min-height:44px}
+.model-advanced summary{color:var(--primary-text-color);font-size:13px;font-weight:500}
+.parameter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 16px}
+.parameter-grid .row{min-width:0;padding:7px 0;font-size:11px}
+.parameter-grid .row>span{overflow-wrap:anywhere}
+.controller-facts{grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--stroke);margin-top:10px;padding-top:6px}
+.model-advanced .note{margin:8px 0 0}
+.model-page .empty{padding:10px 0;margin:0}
+
+@container(max-width:900px){.settings-page .settings-grid{grid-template-columns:1fr}
+.circulation-config{grid-template-columns:1fr;gap:4px}
+.model-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+@container(max-width:700px){.comfort-groups{grid-template-columns:1fr;gap:14px}
+.model-grid{grid-template-columns:1fr}
+.model-stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px}
+.model-grid .ai-report{grid-column:auto}
+}
+
+@container(max-width:600px){.compact-page .page-title{margin:4px 0 12px}
+.compact-page h1{font-size:22px}
+.compact-page .card{padding:14px 16px}
+.settings-page .settings-grid,.model-grid{gap:10px}
+.control-grid{gap:3px 10px}
+.control-grid.thirds{gap:3px 8px}
+.compact-page .field{padding:6px 0}
+.compact-page .field>span{font-size:12px}
+.compact-page .field input:not([type="checkbox"]),.compact-page .field select{font-size:12px}
+.compact-page .field:has(.toggle)>span{font-size:11px}
+.circulation-levels .field>span{min-height:28px}
+.fact-grid{gap:2px 12px}
+.report-stats{gap:8px}
+.report-stats .compact-metric strong{font-size:14px}
+.model-page .model-stats strong{font-size:18px}
+.model-page .compact-metric>strong{font-size:15px}
+.action-buttons{gap:8px}
+.model-page .entry{grid-template-columns:72px minmax(0,1fr)}
+.inline-help summary{font-size:11px}
+}
+
+
+.system-settings{margin-top:14px!important}
+.system-settings>summary,.system-group>summary{min-height:48px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-weight:600;gap:10px}
+.system-settings[open]>summary>span{transform:rotate(45deg)}
+.system-body{border-top:1px solid var(--stroke);padding-top:6px}
+.system-group{border-bottom:1px solid var(--stroke)}
+.system-group>summary{font-size:13px;font-weight:500}
+.system-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 18px;padding:6px 0 16px}
+.system-field{min-width:0;display:flex;flex-direction:column;gap:5px}
+.system-label{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;line-height:1.4}
+.system-help{flex-shrink:0;border:0;color:var(--green);min-width:44px;min-height:44px;padding:8px;font-size:15px}
+.system-field input{width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
+.system-field .number{width:100%;min-width:0}
+.system-field .number input{flex:1;width:0}
+.system-field .number span{white-space:nowrap}
+.system-entity{text-align:left;padding:8px 10px;font-size:13px;overflow-wrap:anywhere}
+.system-entity small{color:var(--muted)}
+.system-fixed{display:flex;align-items:center;min-height:44px;color:var(--muted);font-size:13px}
+.system-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:8px;padding-top:12px}
+.system-message{flex:1 1 180px;font-size:12px;color:var(--muted)}
+.system-dialog{position:fixed;width:min(92vw,560px);max-height:85vh;overflow:auto;border:1px solid var(--stroke);border-radius:var(--card-radius);padding:20px;background:var(--surface);color:var(--primary-text-color,#e8e8e8);box-shadow:0 12px 48px #0005;font:inherit}
+.system-dialog::backdrop{background:#0008}
+.system-dialog-heading{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.system-dialog h2{margin:0;font-size:17px}
+.system-dialog p{font-size:13px;line-height:1.65;overflow-wrap:anywhere}
+.system-dialog button{min-width:44px;min-height:44px;font-size:22px}
+.system-dialog-heading button{flex-shrink:0}
+@container(max-width:900px){.system-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}
+}
+@container(max-width:430px){.system-grid{grid-template-columns:1fr}
+.system-settings>summary{font-size:14px}
+.system-label{font-size:12px}
+.system-actions button{flex:1 1 120px}
+.system-dialog{padding:16px}
+}
+
+
+
+/* One spacing rhythm and a common touch/focus vocabulary on all three tabs. */
+.icon{width:20px;height:20px;display:block;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+.brand-icon .icon{width:30px;height:30px}
+
+.menu-button,.history-refresh{display:grid;place-items:center}
+
+.hero .eyebrow{letter-spacing:0;text-transform:none;font-weight:400}
+.fireplace-grid .eyebrow{text-transform:none;letter-spacing:0}
+
+.hero h1.eyebrow{font-size:14px}
+
+.hero-side .comfort{font-size:12px}
+
+.boiler-status::before{content:'';display:inline-block;width:6px;height:6px;border:1px solid currentColor;border-radius:50%;margin-right:6px;vertical-align:middle}
+
+.boiler-card[data-heating="true"] .boiler-status::before{background:currentColor}
+
+.boiler-metrics .compact-metric+.compact-metric{border-left:1px solid var(--stroke);padding-left:12px;border-radius:0}
+
+.boiler-note{font-size:12px}
+
+.overview .forecast-stats{border-top:1px solid var(--stroke);padding-top:4px}
+
+.forecast-help>div{transform-origin:top right;line-height:1.6}
+
+.forecast-help summary:focus-visible,summary:focus-visible{outline:2px solid var(--green);outline-offset:3px;border-radius:6px}
+
+.forecast-help summary{list-style:none}
+
+.system-help{color:var(--muted);border:1px solid var(--control-stroke);border-radius:50%;padding:0;min-width:32px;min-height:32px;box-shadow:0 0 0 6px transparent;margin:6px}
+
+.system-actions button{min-height:44px}
+
+[data-system-save]:not(:disabled){background:var(--primary-text-color,#e8e8e8);color:var(--surface);border-color:transparent;font-weight:500}
+
+.field input:disabled,.field select:disabled,.system-field input:disabled{color:var(--muted);opacity:1;-webkit-text-fill-color:var(--muted)}
+
+.toggle:has(input:disabled){opacity:.65}
+.toggle:has(input:focus-visible) span:after{transition:none}
+
+.table-scroll,.journal{scrollbar-width:thin;scrollbar-color:var(--control-stroke) transparent}
+
+::selection{background:color-mix(in srgb,var(--green) 28%,transparent);color:var(--primary-text-color,#e8e8e8)}
+
+progress::-moz-progress-bar{background:var(--green)}
+
+/* No entrances or chart animation on recurring telemetry updates. */
+@media(hover:hover) and (pointer:fine){
+  button:not(:disabled):hover{background:var(--raised)}
+
+  .hero-outside:hover,.fire-phase:hover{background:transparent;color:var(--primary-text-color,#e8e8e8)}
+
+  button:not(:disabled):not(:focus-visible):active{transform:scale(.98)}
+
+}
+
+@media(pointer:coarse){button:not(:disabled):not(:focus-visible):active{transform:scale(.98)}
+}
+
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}
+}
+
+@container(max-width:600px){
+  main{padding:8px 12px}
+
+  header{padding:4px 0 10px}
+
+  .brand{gap:8px}
+.brand small{font-size:11px}
+.header-status{font-size:11px;gap:6px}
+
+  nav{margin-bottom:12px;padding-bottom:6px;gap:2px}
+
+  nav button{flex:1;min-height:44px;padding:9px 6px;font-size:13px}
+
+  .overview .hero{gap:12px}
+.overview .hero .eyebrow{font-size:11px}
+
+  .overview .hero h1.eyebrow{font-size:12px}
+
+  .hero-side h2{overflow-wrap:anywhere}
+.overview .comfort{font-size:11px}
+
+  .hero-side .comfort strong{font-size:14px}
+
+  .boiler-metrics .compact-metric+.compact-metric{padding-left:10px}
+
+  .boiler-note{font-size:11px}
+
+  .compact-metric>span,.history-legend button>span{font-size:12px}
+
+  .overview .section-meta{font-size:11px;align-items:flex-start}
+
+  .section-meta>.muted{text-align:right}
+
+  .forecast-stats .compact-metric strong{font-size:17px}
+
+  .forecast-stats .compact-metric>span{font-size:12px}
+
+  .forecast-warning{font-size:12px}
+
+  .history-legend{gap:6px}
+.history-legend button{padding:7px 6px}
+
+  .history-legend strong{font-size:18px}
+
+  .system-help{min-width:44px;min-height:44px;margin:0}
+
+  .system-field{gap:4px}
+  .compact-page .field input:not([type="checkbox"]),.compact-page .field select,.system-field input{font-size:16px}
+
+}
+
+@container(max-width:350px){
+  .temperature{font-size:38px}
+  .temperature span{font-size:17px}
+}
 `;
 if(!customElements.get('heating-ai-panel'))customElements.define('heating-ai-panel',HeatingAIPanel);
 window.customCards=window.customCards||[];

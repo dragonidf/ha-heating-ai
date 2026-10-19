@@ -31,6 +31,62 @@ def wait_for_chart_layout(page):
     }''',timeout=5000)
 
 
+def background_rgb(locator):
+    # Canvas resolves both rgb() and modern color(srgb ...) from CSS color-mix.
+    return locator.evaluate('''el=>{
+        const c=document.createElement('canvas').getContext('2d');
+        c.fillStyle=getComputedStyle(el).backgroundColor;c.fillRect(0,0,1,1);
+        return [...c.getImageData(0,0,1,1).data].slice(0,3);
+    }''')
+
+
+def check_theme_and_motion(page):
+    original=page.evaluate("document.body.style.cssText")
+    for name,dark,ground,surface,ink,muted,accent,radius in [
+        ('native-dark',True,'#111111','#1c1c1c','#e1e1e1','#aaaaaa','#80c7ef','20px'),
+        ('material-dark',True,'#141218','#211f26','#e6e0e9','#cac4d0','#d0bcff','24px'),
+        ('native-light',False,'#fafafa','#ffffff','#212121','#606060','#03a9f4','16px'),
+        ('material-light',False,'#fef7ff','#f3edf7','#1d1b20','#49454f','#6750a4','24px'),
+    ]:
+        page.evaluate('''([dark,ground,surface,ink,muted,accent,radius])=>{
+            Object.entries({'background':ground,'--ha-card-background':surface,
+              '--primary-text-color':ink,'--secondary-text-color':muted,
+              '--primary-color':accent,'--ha-card-border-radius':radius}).forEach(([k,v])=>document.body.style.setProperty(k,v));
+            panel.hass={...mockHass,themes:{darkMode:dark}};
+        }''',[dark,ground,surface,ink,muted,accent,radius])
+        assert page.locator('.hero').evaluate('el=>getComputedStyle(el).borderRadius')==radius, name
+        assert page.locator('.hero').evaluate("el=>getComputedStyle(el).backgroundImage==='none'"), name
+        colors=page.locator('.hero').evaluate('''el=>{
+            const c=document.createElement('canvas').getContext('2d');
+            const rgb=color=>{c.fillStyle=color;c.fillRect(0,0,1,1);return [...c.getImageData(0,0,1,1).data].slice(0,3)};
+            return [rgb(getComputedStyle(el).backgroundColor),rgb(getComputedStyle(el).color),rgb(getComputedStyle(el.querySelector('.hero-outside')).color)];
+        }''')
+        def lum(rgb):
+            values=[v/255 for v in rgb]
+            linear=[v/12.92 if v<=.04045 else ((v+.055)/1.055)**2.4 for v in values]
+            return sum(v*k for v,k in zip(linear,[.2126,.7152,.0722]))
+        for text in colors[1:]:
+            a,b=sorted([lum(colors[0]),lum(text)])
+            assert (b+.05)/(a+.05)>=4.5, (name,'text contrast')
+        assert page.locator('.forecast-plot path[stroke-dasharray]').evaluate('el=>getComputedStyle(el).stroke')==page.locator('[data-history-line="room"]').first.evaluate('el=>getComputedStyle(el).stroke'), (name,'room series color differs between charts')
+        for width in (390,1440):
+            page.set_viewport_size({'width':width,'height':1000})
+            for tab in ('overview','settings','model'):
+                page.locator(f'nav [data-tab="{tab}"]').click()
+                assert page.locator('h1').count()==1, (name,tab,'missing/duplicate page heading')
+                assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (name,tab)
+            page.locator('nav [data-tab="overview"]').click()
+            assert page.locator('.hero').evaluate('el=>getComputedStyle(el).borderRadius')==radius, (name,width)
+            if name in ('material-dark','material-light'):
+                page.screenshot(path=str(ARTIFACTS/f'heating-theme-{name}-{width}.png'),full_page=True)
+    page.evaluate("css=>{document.body.style.cssText=css;panel.hass={...mockHass,themes:{darkMode:true}}}",original)
+    page.emulate_media(reduced_motion='reduce')
+    assert page.locator('nav button').first.evaluate("el=>getComputedStyle(el).transitionDuration")=='0s'
+    assert page.locator('.hero').evaluate("el=>getComputedStyle(el).animationName")=='none'
+    page.emulate_media(reduced_motion='no-preference')
+    assert page.evaluate('calls.length===0'), 'Theme and motion checks must not actuate anything'
+
+
 def check_compact_overview(page):
     assert page.locator('.boiler-card').count()==1, 'Boiler metrics must share one card'
     assert page.locator('.heat-sources>.card').count()==2
@@ -51,8 +107,9 @@ def check_compact_overview(page):
         })''',[binary,power])
         assert page.locator('.boiler-card').get_attribute('data-heating')==expected
         if expected=='true':
-            red,green,blue=page.locator('.boiler-card').evaluate("el=>getComputedStyle(el).backgroundImage.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/).slice(1,4).map(Number)")
-            assert red>green*1.5 and blue>green, 'Heating boiler must have a red tint'
+            red,green,blue=background_rgb(page.locator('.boiler-card'))
+            assert red>green and blue>green, 'Heating boiler must have a red tint'
+            assert page.locator('.boiler-card').evaluate("el=>getComputedStyle(el).backgroundImage==='none'"), 'Source highlight should be a calm flat tint'
     accents=[]
     for phase,active in [('Неактивний','off'),('Розпалювання','off'),('Горить','on'),('Інтенсивно горить','on'),('Згасає','on')]:
         page.evaluate('''([phase,active])=>setHeatingScenario({
@@ -66,8 +123,8 @@ def check_compact_overview(page):
         assert ('60 %' if phase=='Інтенсивно горить' else '42 %') in page.locator('.fan-actual').inner_text()
         accents.append(page.locator('.fire-phase').evaluate('el=>getComputedStyle(el).color'))
         if phase!='Неактивний':
-            red,green,blue=page.locator('.fireplace-card').evaluate("el=>getComputedStyle(el).backgroundImage.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/).slice(1,4).map(Number)")
-            assert (red>green*1.5 and blue>green) if phase in ('Горить','Інтенсивно горить') else (red>green>blue*1.5), (phase,'wrong tint')
+            red,green,blue=background_rgb(page.locator('.fireplace-card'))
+            assert (red>green and blue>green) if phase in ('Горить','Інтенсивно горить') else (red>green>blue), (phase,'wrong tint')
         if page.viewport_size['width']<=430:
             assert page.locator('.fireplace-card').bounding_box()['height']<225, (phase,'fireplace too tall')
             assert page.locator('.fan-actual').evaluate('el=>el.scrollWidth<=el.clientWidth')
@@ -218,6 +275,7 @@ def main(engine='chromium'):
             check_compact_tabs(page)
             check_system_settings(page)
             page.wait_for_selector('.history-plot svg')
+            check_theme_and_motion(page)
             assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2, 'Past boiler runs must remain visible when the binary sensor is new'
             assert '4 год 0 хв' in page.locator('.history-totals').inner_text()
             assert page.evaluate("historyRequests[0].entity_ids.includes('sensor.heating_boiler_stage')")
