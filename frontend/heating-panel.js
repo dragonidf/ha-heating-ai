@@ -1056,6 +1056,10 @@ progress::-moz-progress-bar{background:var(--green)}
 
 }
 
+@container(max-width:350px){
+  .temperature{font-size:38px}
+  .temperature span{font-size:17px}
+}
 `;
 if(!customElements.get('heating-ai-panel'))customElements.define('heating-ai-panel',HeatingAIPanel);
 window.customCards=window.customCards||[];
