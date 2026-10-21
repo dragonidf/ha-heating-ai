@@ -206,6 +206,14 @@ def check_compact_tabs(page):
     page.evaluate('calls=[];panel.hass=mockHass')
     page.locator('nav [data-tab="model"]').click()
     assert page.locator('.model-page .model-stats .compact-metric').count()==4
+    page.evaluate("""setHeatingScenario({'sensor.heating_model':{attributes:{
+        parameters:{validated:true,version:4},last_result:'legacy',
+        learning_attempt:{time:'2026-10-21T20:45:00+03:00',status:'rejected',reason:'Немає поліпшення holdout'}}}})""")
+    message=page.locator('.learning-result').inner_text()
+    assert 'кандидат відхилено; чинна модель працює' in message and '20:45' in message
+    page.evaluate("setHeatingScenario({'sensor.heating_model':{attributes:{learning_attempt:{time:'2026-10-21T20:45:00+03:00',status:'pending',reason:'Потрібні підтверджені виміри'}}}})")
+    assert 'кандидат перевіряється; чинна модель працює' in page.locator('.learning-result').inner_text()
+    page.evaluate('panel.hass=mockHass')
     assert page.locator('.model-advanced details').get_attribute('open') is None
     page.locator('.model-advanced summary').click()
     assert page.locator('.parameter-grid').is_visible()
