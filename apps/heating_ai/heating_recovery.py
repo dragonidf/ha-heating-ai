@@ -21,7 +21,9 @@ class HeatingRecovery:
         try:
             rows=await self.get_history(entity_id='sensor.heating_decision',
                 start_time=datetime.fromtimestamp(time.time()-1200,timezone.utc),
-                minimal_response=False,no_attributes=False,significant_changes_only=False)
+                # None omits presence-based REST flags, including on older
+                # AppDaemon transports that encode False as a query parameter.
+                minimal_response=None,no_attributes=None,significant_changes_only=None)
             records=[r for group in (rows or []) for r in group if isinstance(r,dict)]
             seen={}
             verified=False
@@ -40,9 +42,11 @@ class HeatingRecovery:
         except Exception as exc:
             status='unverified: '+str(exc)
         self.memory['decision_recorder_status']=status
+        state_error=self.memory.get('state_load_error')
         self.publish('sensor.heating_diagnostics',
-            'Журнал доступний' if status=='verified_same_state_attributes' else 'Перевірте історію Recorder',
-            recorder_status=status,storage_degraded=bool(getattr(self,'decision_journal',None) and self.decision_journal.error),
+            'Помилка читання стану' if state_error else 'Журнал доступний' if status=='verified_same_state_attributes' else 'Перевірте історію Recorder',
+            recorder_status=status,state_load_error=state_error,
+            storage_degraded=bool(state_error or getattr(self,'decision_journal',None) and self.decision_journal.error),
             note='Перевіряється повна історія атрибутів; фільтри й термін зберігання не змінюються')
 
     def decision_event(self,event,action=None,reason=None,force=False,snapshot=None):
@@ -89,7 +93,7 @@ class HeatingRecovery:
                 execution='automatic' if mode=='Автоматичне керування' and armed and self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if actual is not None and actual>=1500 else 'idle',
                 measurements=context.get('measurements',{}),sources=sources,
                 policy={k:settings.get(k) for k in ('target','lower','upper','night_target','night_lower','night_upper','sleep_start','sleep_end','start','end','strategy','morning_min_minutes')},
-                reserve=reserve,coast_peak=context.get('coast_peak'),
+                reserve=reserve,coast_peak=context.get('coast_peak'),learning_attempt=self.memory.get('learning_attempt'),
                 model_version=self.model.get('version'),command=command,
                 inputs=self.memory.get('decision_input_refs',{}),
                 weather_received_at=self.memory.get('weather_at'),
@@ -115,8 +119,9 @@ class HeatingRecovery:
             compact=journal.append(record,snapshot,stamp)
             self.memory['last_decision_id']=compact['decision_id']
             self.publish('sensor.heating_decision',record['action'] or 'unknown',**compact)
-            self.publish('sensor.heating_diagnostics','Помилка збереження' if journal.error else 'Журнал доступний',
-                         storage_degraded=bool(journal.error),error=journal.error,retention_days=journal.retention/86400,
+            state_error=self.memory.get('state_load_error')
+            self.publish('sensor.heating_diagnostics','Помилка читання стану' if state_error else 'Помилка збереження' if journal.error else 'Журнал доступний',
+                         storage_degraded=bool(state_error or journal.error),error=state_error or journal.error,retention_days=journal.retention/86400,
                          attribute_budget_bytes=8192,last_decision_id=compact['decision_id'],
                          recorder_status=self.memory.get('decision_recorder_status','pending'))
         except Exception as exc:
@@ -213,8 +218,10 @@ class HeatingRecovery:
         outside=(self.raw('strategy')=='Тільки в дозволені години' and
                  not in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))
         room=self.source_temperature()[0]
-        sleep_hot=self.cfg.get('night_upper') and room is not None and room>=self.active_upper()
-        target=(current-2 if current is not None else number(attrs.get('min_temp')) or 5) if outside or sleep_hot else self.val('native_setpoint',26)
+        hot=room is not None and room>=self.active_upper()
+        outage=self.read_outage_schedule()
+        scheduled_off=bool(outage.get('valid') and blocked(time.time(),time.time()+15,outage.get('outages',[])))
+        target=(current-2 if current is not None else number(attrs.get('min_temp')) or 5) if outside or hot or scheduled_off else self.val('native_setpoint',26)
         step=number(attrs.get('target_temp_step')) or .5
         target=round(target/step)*step
         return max(number(attrs.get('min_temp')) or 5,min(number(attrs.get('max_temp')) or 35,target))
@@ -234,6 +241,11 @@ class HeatingRecovery:
             return
         if not self.cfg.get("allow_actuation",False):
             return
+        # Inputs may change while a full plan is being computed. Recheck manual
+        # permission at dispatch, not only in the earlier decide() call.
+        if action in ('heat','fallback') and (self.raw('armed')!='on' or
+                self.raw('mode') in ('Спостереження','Вимкнено')):
+            action='observe'
         release=action in ("release","observe")
         if release:
             self.memory.pop('temporary_fallback',None)
@@ -251,7 +263,8 @@ class HeatingRecovery:
         room=self.source_temperature()[0]
         outage=self.read_outage_schedule()
         scheduled_off=bool(outage.get("valid") and blocked(time.time(),time.time()+15,outage["outages"]))
-        if scheduled_off and action=="heat":
+        if action=='heat' and (scheduled_off or self.grid_state()!='on' or
+                              room is not None and room>=self.active_upper()):
             action="off"
         urgent=release or action=="fallback" or (action=="off" and (
             scheduled_off or self.grid_state()!="on" or (room is not None and room>=self.active_upper()) or
@@ -262,6 +275,9 @@ class HeatingRecovery:
         current=self.val("thermostat",attribute="current_temperature")
         if action!="fallback" and (current is None or not 5<=current<=40 or
                                      self.raw('thermostat') in ('unknown','unavailable',None)):
+            if release:
+                self.notify_once('Ручна пауза збережена; без температури термостата auto заблокований')
+                return
             if self.grid_state()!="on":
                 self.notify_once("Немає актуальної температури термостата; команду не виконано, auto без мережі заблокований")
                 return

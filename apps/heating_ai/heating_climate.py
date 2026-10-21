@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from threading import RLock
+from uuid import uuid4
 import json
 import os
 import statistics
@@ -16,7 +17,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning
-from heating_stability import stable_plan
+from heating_stability import stable_plan,replay
 from heating_environment import observe_floor,observe_gain,reliability,daylight,anchor_weather
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings)
@@ -33,16 +34,14 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.directory.mkdir(parents=True,exist_ok=True)
         self.statefile=self.directory/"state.json"
         self.telemetry=self.directory/"telemetry.jsonl"
-        try:
-            self.memory=json.loads(self.statefile.read_text())
-        except (OSError,ValueError):
-            self.memory={}
+        self.memory=self.load_state()
         self.model=self.memory.get("model",dict(DEFAULT_MODEL))
         self.decision_journal=DecisionJournal(self.directory)
         self.run_every(self.verify_decision_history,self.datetime()+timedelta(seconds=420),600)
         self.memory.pop('morning_observation',None)  # no integration across restart gaps
         # Unobserved downtime invalidates prospective error validation.
         self.memory['reserve_predictions']=[]
+        self.memory['predictions']=[]  # never validate across an unobserved restart gap
         self.release_version=json.loads((Path(__file__).resolve().parent/'release.json').read_text())['version']
         self.restore_system_settings()
         self.memory.setdefault("energy_bins",list(self.cfg.get("energy_history",[])))
@@ -82,7 +81,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['solar_observer']=solar
             self.memory['environment_version']=1
             self.memory['predictions']=[]
-        self.apply_energy_recovery()
+        if not self.memory.get('state_load_error'):
+            self.apply_energy_recovery()
         self.power_source="unavailable"
         self.fallback_interval=False
         self.stage="off"
@@ -184,6 +184,28 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.log("Recovered %.5f kWh and %s samples",recovery["kwh"],changed)
     def now(self):
         return datetime.now(self.climate_tz)
+    def load_state(self):
+        try:
+            data=json.loads(self.statefile.read_text())
+            if not isinstance(data,dict):
+                raise ValueError('State must be an object')
+            model=data.get('model',DEFAULT_MODEL)
+            if (not isinstance(model,dict) or any(isinstance(model.get(k),bool) or
+                    not isinstance(model.get(k),(int,float)) or number(model[k]) is None or
+                    not lo<=model[k]<=hi for k,(lo,hi) in BOUNDS.items()) or
+                    not isinstance(model.get('version'),int) or not isinstance(model.get('validated'),bool)):
+                raise ValueError('Invalid saved model')
+            if any(key in data and not isinstance(data[key],list) for key in ('weather','energy_bins','journal')):
+                raise ValueError('Invalid saved state collections')
+            return data
+        except FileNotFoundError:
+            return {}
+        except (OSError,ValueError,TypeError) as exc:
+            # Preserve the damaged file for recovery; never replace lost model /
+            # energy state with a seemingly successful empty bootstrap.
+            self.cfg['allow_actuation']=False
+            self.log('State could not be loaded; commands disabled: %s',exc,level='ERROR')
+            return dict(state_load_error=str(exc),learning_storage_error='Не прочитано стан: '+str(exc))
     def raw(self,key,attribute=None):
         return self.get_state(self.cfg[key],attribute=attribute)
     def val(self,key,default=None,attribute=None):
@@ -201,6 +223,8 @@ class HeatingClimate(HeatingRecovery,Hass):
     def heartbeat_fresh(self,entities,seconds):
         return any(self.fresh(entity,seconds) for entity in entities)
     def save(self):
+        if self.memory.get('state_load_error'):
+            return
         self.memory["model"]=self.model
         self.memory["weather"]=self.weather
         temp=self.statefile.with_suffix(".tmp")
@@ -258,7 +282,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         except (ValueError,TypeError) as exc:
             error=str(exc)
         self.system_settings_result=dict(last_request_id=request if isinstance(request,str) else None,
-                                         last_success=success,last_error=error)
+                                         last_success=success,last_error=error,model_pending=bool(self.memory.get('pending_model')))
         self.publish_system_settings()
     def ai_report_changed(self,entity,attribute,old,new,kwargs=None,**extra):
         if old!=new:
@@ -324,6 +348,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         row['heating_requested']=self.memory.get('last_command')=='heat'
         row['heat_command_at']=self.memory.get('command_at') if row['heating_requested'] else None
         row['grid']=self.grid_state()
+        row['fire_valid']=self.memory.get('fire_phase')!='Датчик недоступний'
         self.fallback_interval=False
         previous=self.samples[-1] if self.samples else None
         if previous and previous.get("measurement_version")==3:
@@ -344,7 +369,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory["thermostat_bias"]=round(statistics.median(r["thermostat"]-r["room"] for r in pairs),2)
         pending=self.memory.setdefault("predictions",[])
         matured=[p for p in pending if p["ts"]<=stamp]
-        if room is not None and source=="Вітальня":
+        if room is not None and source=="Вітальня" and quality and row['grid']=='on' and not row['power_estimated']:
             errors=self.memory.setdefault("hour_errors",[])
             for p in matured:
                 energy=self.val("energy")
@@ -352,11 +377,19 @@ class HeatingClimate(HeatingRecovery,Hass):
                          abs(energy-p["start_energy"]-p.get("expected_energy",0))<=.5)
                 if stamp-p["ts"]<=420 and p["version"]==self.model["version"] and matched:
                     errors.append(abs(p["temperature"]-room))
+                    candidate=self.memory.get('pending_model')
+                    if candidate and p.get('learning_attempt_id')==candidate['attempt_id']:
+                        candidate.setdefault('errors',[]).append(dict(old=abs(p['temperature']-room),
+                            new=abs(p['candidate_temperature']-room)))
             del errors[:-48]
         self.memory["predictions"]=[p for p in pending if p["ts"]>stamp]
-        if (len(self.memory.get("hour_errors",[]))>=12 and self.hour_mae()<=.3
+        self.confirm_learning_candidate()
+        if (not self.model.get('validated') and len(self.memory.get("hour_errors",[]))>=12 and self.hour_mae()<=.3
                 and self.memory.get("previous_model") and len(transitions(self.samples))>=96):
             self.model["validated"]=True
+            self.memory['learning_success']=dict(time=self.now().isoformat(),model_version=self.model['version'],
+                hour_mae=self.hour_mae(),source='Початкова годинна перевірка')
+            self.next_compute=0
         self.save()
     def fireplace(self,room):
         p=system_values(self.cfg)
@@ -721,6 +754,14 @@ class HeatingClimate(HeatingRecovery,Hass):
                 expected_energy=sum(r["kwh"] for r in forecast["curve"][:2])
                 self.memory.setdefault("predictions",[]).append({**one_hour,"version":self.model["version"],
                     "start_energy":self.val("energy"),"expected_energy":expected_energy})
+                candidate=self.memory.get('pending_model')
+                if candidate and candidate['base_version']==self.model['version']:
+                    shadow=replay(now,room,floor,outside,fire,candidate['candidate'],usable_weather,settings,
+                        forecast['heat_segments'],forecast['split_comfort_applied'],3.,reserve_checked=True)
+                    point=next((r for r in (shadow or {}).get('curve',[]) if r['ts']==one_hour['ts']),None)
+                    if point:
+                        self.memory['predictions'][-1].update(learning_attempt_id=candidate['attempt_id'],
+                                                            candidate_temperature=point['temperature'])
         else:
             self.publish("sensor.heating_forecast","unavailable",friendly_name="Клімат — мінімум прогнозу",curve=[],
                          reason="Недостатньо актуальних даних або некоректні межі")
@@ -779,6 +820,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                      usable_pairs=len(transitions(self.samples)),hour_mae=self.hour_mae(),
                      thermostat_bias=self.memory.get("thermostat_bias"),last_analysis=self.memory.get("last_analysis"),
                      last_result=self.memory.get("last_result","Навчання ще не виконувалось"),
+                     learning_attempt=self.memory.get('learning_attempt'),learning_success=self.memory.get('learning_success'),
+                     learning_storage_error=self.memory.get('learning_storage_error'),
                      journal=self.memory.get("journal",[])[-12:],
                      power_learning=profile,
                      effective_power_kw=round(effective,3) if effective is not None else None,
@@ -948,29 +991,119 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.memory["fan_owned"]=False
                 self.save()
     def daily_learn(self,kwargs=None,**extra):
-        candidate=learn(self.model,self.samples)
-        if candidate is None:
-            self.memory["last_result"]="Недостатньо даних для навчання"
-        else:
+        if self.memory.get('state_load_error'):
+            return
+        try:
+            baseline=self.learning_baseline()
+            candidate=learn(self.model,self.samples,baseline)
             self.consider(candidate,"Локальне навчання",apply=True)
-        self.memory["last_analysis"]=self.now().isoformat()
-        self.telemetry.write_text("".join(json.dumps(r,ensure_ascii=False,allow_nan=False)+"\n" for r in self.samples))
-        self.save()
+            self.memory["last_analysis"]=self.now().isoformat()
+            temp=self.telemetry.with_suffix('.learning.tmp')
+            temp.write_text("".join(json.dumps(r,ensure_ascii=False,allow_nan=False)+"\n" for r in self.samples))
+            os.replace(temp,self.telemetry)
+            self.memory.pop('learning_storage_error',None)
+            self.save()
+        except (OSError,ValueError,TypeError) as exc:
+            self.memory['learning_storage_error']=str(exc)
+            self.log('Learning failed; current model retained: %s',exc,level='WARNING')
         self.next_compute=0
-    def consider(self,candidate,source,apply=False):
-        accepted,reason,error=validate_candidate(self.model,candidate,self.samples)
+    def learning_baseline(self):
+        date=self.now().date().isoformat()
+        day=self.memory.get('learning_day')
+        if not day or day.get('date')!=date:
+            day=dict(date=date,baseline={key:self.model[key] for key in BOUNDS})
+            self.memory['learning_day']=day
+        return day['baseline']
+    def consider(self,candidate,source,apply=False,rejection=None):
+        baseline=self.learning_baseline()
+        details={}
+        accepted,reason,error=validate_candidate(self.model,candidate or {},self.samples,baseline=baseline,diagnostics=details)
+        if rejection:
+            accepted=False;reason=rejection
+        if self.memory.get('state_load_error'):
+            accepted=False;reason='Навчання призупинено: пошкоджений збережений стан'
+        old=dict(self.model)
+        values={k:(number((candidate or {}).get(k)) if not isinstance((candidate or {}).get(k),bool) else (candidate or {})[k]) for k in BOUNDS}
+        pending=self.memory.get('pending_model')
+        if accepted and apply and pending and pending['base_version']==old['version'] and all(
+                pending['candidate'][k]==values[k] for k in BOUNDS):
+            return True  # repeated events do not restart prospective validation
+        attempt=dict(attempt_id=uuid4().hex,time=self.now().isoformat(),source=source,model_version=old['version'],
+            old={k:old[k] for k in BOUNDS},candidate=values,
+            delta={k:values[k]-old[k] if isinstance(values[k],(int,float)) and not isinstance(values[k],bool) else None for k in BOUNDS},
+            relative_delta={k:(values[k]-old[k])/abs(old[k]) if old[k] and isinstance(values[k],(int,float)) and not isinstance(values[k],bool) else None for k in BOUNDS},
+            baseline=dict(baseline),baseline_date=self.memory['learning_day']['date'],
+            status='proposed' if accepted else 'rejected',reason=reason,**details)
+        self.memory['learning_attempt']=attempt
         if accepted and apply:
-            self.memory["previous_model"]=dict(self.model)
-            candidate["version"]=self.model["version"]+1
-            candidate["validated"]=False
-            self.model=candidate
-            self.memory["hour_errors"]=[]
-            self.memory["predictions"]=[]
-            reason="Застосовано кандидат; перевіряємо годинний прогноз у спостереженні"
+            candidate={**old,**values,'version':old['version']+1,'validated':False}
+            if old.get('validated'):
+                self.memory['pending_model']=dict(attempt_id=attempt['attempt_id'],base_version=old['version'],
+                    candidate=candidate,errors=[])
+                reason='Кандидат очікує перевірки годинного прогнозу; чинна модель працює'
+                attempt.update(status='pending',reason=reason)
+                self.memory['pending_model']['attempt']=dict(attempt)
+            else:
+                self.memory['previous_model']=old
+                self.model=candidate
+                self.memory['hour_errors']=[];self.memory['predictions']=[]
+                reason='Кандидат для початкового навчання; перевіряємо годинний прогноз'
+                attempt.update(status='initial_validation',reason=reason)
         self.memory["last_result"]=source+": "+reason
-        self.journal(self.memory["last_result"],"model")
-        self.save()
+        try:
+            self.memory.pop('learning_storage_error',None)
+            self.journal(self.memory["last_result"],"model")
+            self.save()
+        except OSError as exc:
+            self.model=old;self.memory['model']=old
+            self.memory.pop('pending_model',None)
+            self.memory['learning_storage_error']=str(exc)
+            attempt.update(status='storage_error',reason='Не вдалося зберегти спробу; чинна модель працює')
+            reason=attempt['reason']
+            self.memory['last_result']=source+': '+reason
+            accepted=False
+        self.decision_event('learning_attempt',reason=reason,force=True)
         return accepted
+    def confirm_learning_candidate(self):
+        pending=self.memory.get('pending_model')
+        if not pending or len(pending.get('errors',[]))<12:
+            return
+        candidate=pending['candidate'];old=dict(self.model)
+        baseline=self.learning_baseline();details={}
+        accepted,reason,_=validate_candidate(old,candidate,self.samples,baseline=baseline,diagnostics=details)
+        errors=pending['errors'][-12:]
+        old_mae=statistics.mean(r['old'] for r in errors);new_mae=statistics.mean(r['new'] for r in errors)
+        if accepted and pending['base_version']!=old['version']:
+            accepted=False;reason='Чинна модель змінилася під час перевірки кандидата'
+        if accepted and not (new_mae<=.3 and new_mae<old_mae*.98):
+            accepted=False;reason='Кандидат не поліпшує підтверджений годинний прогноз'
+        attempt=dict(pending.get('attempt',self.memory.get('learning_attempt',{})))
+        attempt.update(**details,old_hour_mae=old_mae,new_hour_mae=new_mae,confirmation_time=self.now().isoformat(),
+            status='applied' if accepted else 'rejected',reason='Підтверджено годинним прогнозом' if accepted else reason)
+        self.memory['learning_attempt']=attempt
+        self.memory.pop('pending_model',None)
+        changed_keys=('previous_model','hour_errors','predictions','reserve_errors','reserve_predictions','learning_success')
+        prior={key:self.memory.get(key) for key in changed_keys}
+        if accepted:
+            self.memory['previous_model']=old
+            self.model=dict(candidate,version=old['version']+1,validated=True)
+            self.memory['hour_errors']=[r['new'] for r in errors];self.memory['predictions']=[]
+            self.memory['reserve_errors']=[];self.memory['reserve_predictions']=[]
+            self.memory['learning_success']=dict(attempt_id=pending['attempt_id'],time=self.now().isoformat(),
+                model_version=self.model['version'],old_holdout_error=details.get('old_holdout_error'),
+                new_holdout_error=details.get('new_holdout_error'),hour_mae=new_mae)
+            self.next_compute=0
+        try:
+            self.memory.pop('learning_storage_error',None)
+            self.save()
+        except OSError as exc:
+            self.model=old;self.memory['model']=old
+            for key,value in prior.items():
+                if value is None:self.memory.pop(key,None)
+                else:self.memory[key]=value
+            self.memory['learning_storage_error']=str(exc)
+            attempt.update(status='storage_error',reason='Не вдалося зберегти кандидата; чинна модель працює')
+        self.decision_event('learning_confirmation',reason=attempt['reason'],force=True)
     def proposal_changed(self,entity,attribute,old,new,kwargs=None,**extra):
         if not new or new==self.memory.get("last_proposal"):
             return
@@ -981,12 +1114,13 @@ class HeatingClimate(HeatingRecovery,Hass):
             candidate={**self.model,**proposed}
             self.consider(candidate,"ШІ",apply=self.raw("ai_auto_apply")=="on")
         except (TypeError,ValueError) as exc:
-            self.memory["last_result"]="Пропозицію ШІ відхилено: "+str(exc)
-            self.journal(self.memory["last_result"],"model")
+            self.consider({},'ШІ',rejection='Некоректна пропозиція: '+str(exc))
         self.memory["last_proposal"]=new
         self.save()
         self.next_compute=0
     def rollback(self,entity,attribute,old,new,kwargs=None,**extra):
+        self.learning_baseline()  # explicit rollback never rebases the automatic daily allowance
+        self.memory.pop('pending_model',None)
         previous=self.memory.get("previous_model")
         if previous:
             self.memory["previous_model"]=dict(self.model)

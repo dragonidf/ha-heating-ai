@@ -245,3 +245,18 @@ class AdapterEvidenceTests(unittest.TestCase):
         self.assertEqual(len(pending[0]['segments']),1)
         self.assertEqual(pending[0]['segments'][0],dict(start=start,end=start+3600))
         self.assertEqual(pending[0]['expected_energy'],3.)
+
+class RecorderFilterCompatibilityTests(unittest.TestCase):
+    def test_presence_based_history_flags_are_omitted_instead_of_false(self):
+        import asyncio
+        from heating_recovery import HeatingRecovery
+        app=HeatingRecovery();app.memory={};app.publish=lambda *a,**k:None
+        required=dict(plan_id='p',cycle_id='c',sources={},measurements={},policy={},reserve={},command={},inputs={},reason='r',schema_version=1)
+        async def history(**kwargs):
+            # HA REST flags enable filtering by presence, even for '=False'.
+            if any(kwargs.get(key) is not None for key in ('minimal_response','no_attributes','significant_changes_only')):
+                return [[dict(state='off',attributes={})]]
+            return [[dict(state='off',attributes=dict(required,decision_id=value)) for value in ('a','b')]]
+        app.get_history=history
+        asyncio.run(app.verify_decision_history())
+        self.assertEqual(app.memory['decision_recorder_status'],'verified_same_state_attributes')

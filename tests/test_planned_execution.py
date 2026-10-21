@@ -7,7 +7,7 @@ from test_adapter_modulation import HeatingClimate
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None):
         app=HeatingClimate()
         at=datetime(2026,10,14,0,5,tzinfo=ZoneInfo('Europe/Kiev'))
         app.climate_tz=at.tzinfo
@@ -16,6 +16,9 @@ class PlannedExecutionTests(unittest.TestCase):
         app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
         app.model=dict(validated=True,version=4)
         app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
+        if weather_age is not None:
+            app.weather=[dict(ts=at.timestamp()+i*3600,temperature=11.) for i in range(24)]
+            app.memory['weather_at']=at.timestamp()-weather_age
         app.ai_summary_lock=RLock();app.ai_summary_attributes=None
         app.outage_signature=(None,None)
         app.source_temperature=lambda:(room,'Вітальня',room,22.5)
@@ -60,6 +63,7 @@ class PlannedExecutionTests(unittest.TestCase):
                 app.tick_inner()
             self.planner_calls=planner.call_count
             self.planner_settings=planner.call_args.args[7]
+            self.planner_weather=planner.call_args.args[6]
         self.forecast_status=app.published['sensor.heating_forecast']
         self.outage_status=app.published['sensor.heating_outage_schedule']
         return actions,app.published['sensor.heating_controller']
@@ -68,6 +72,11 @@ class PlannedExecutionTests(unittest.TestCase):
         actions,status=self.cycle()
         self.assertEqual(actions,['heat'])
         self.assertEqual(status['reason'],'Заплановано нагрів')
+    def test_stale_weather_cache_never_reaches_the_planner_as_fresh(self):
+        self.cycle(weather_age=3600)
+        self.assertEqual(len(self.planner_weather),24)
+        self.cycle(weather_age=10801)
+        self.assertEqual(self.planner_weather,[])
     def test_slightly_above_soft_target_still_obeys_safe_plan(self):
         self.assertEqual(self.cycle(room=21.6,peak=21.6)[0],['heat'])
     def test_sleep_upper_still_stops(self):

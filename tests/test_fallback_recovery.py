@@ -126,3 +126,41 @@ class FallbackRecoveryTests(unittest.TestCase):
         self.assertTrue(app.memory['recovering_from_fallback'])
 
 if __name__=='__main__':unittest.main()
+
+class FallbackSafetyRegressionTests(unittest.TestCase):
+    app=FallbackRecoveryTests.app
+    run_action=FallbackRecoveryTests.run_action
+    def test_fallback_above_day_upper_uses_waiting_setpoint_without_sleep_helper(self):
+        app=self.app(23)
+        app.source_temperature=lambda:(23.,'Вітальня',23.,23.)
+        self.run_action(app,'fallback')
+        self.assertLessEqual(app.attrs['temperature'],21.)
+    def test_fallback_during_published_outage_does_not_request_native_heat(self):
+        app=self.app(23)
+        app.read_outage_schedule=lambda:dict(valid=True,outages=[dict(start=app.at.timestamp()-60,end=app.at.timestamp()+600)])
+        self.run_action(app,'fallback')
+        self.assertLessEqual(app.attrs['temperature'],21.)
+
+class FinalDispatchGuardTests(unittest.TestCase):
+    app=FallbackRecoveryTests.app
+    run_action=FallbackRecoveryTests.run_action
+    def test_grid_or_upper_change_before_dispatch_vetoes_planned_heat(self):
+        for grid,room in [('off',21.8),('unknown',21.8),('on',23.)]:
+            with self.subTest(grid=grid,room=room):
+                app=self.app(23,grid=grid)
+                app.source_temperature=lambda:(room,'Вітальня',room,23.)
+                self.run_action(app,'heat')
+                self.assertLessEqual(app.attrs['temperature'],21.)
+    def test_manual_disarm_or_observe_before_dispatch_blocks_heat_and_fallback(self):
+        for action in ('heat','fallback'):
+            for guard in ('armed','mode'):
+                with self.subTest(action=action,guard=guard):
+                    app=self.app(23)
+                    app.values[guard]='off' if guard=='armed' else 'Спостереження'
+                    self.run_action(app,action)
+                    self.assertFalse(any(c[0]=='climate/set_hvac_mode' and c[1].get('hvac_mode')=='auto' for c in app.calls))
+                    self.assertLessEqual(app.attrs['temperature'],21.)
+    def test_manual_pause_with_missing_thermostat_temperature_never_enters_auto(self):
+        app=self.app(23);app.values['armed']='off';app.attrs['current_temperature']=None
+        self.run_action(app,'fallback')
+        self.assertFalse(any(c[0]=='climate/set_hvac_mode' and c[1].get('hvac_mode')=='auto' for c in app.calls))

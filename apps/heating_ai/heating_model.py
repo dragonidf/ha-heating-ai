@@ -868,11 +868,20 @@ def solve(rows, outputs, prior):
 
 def transitions(samples):
     result=[]
+    last_end=0.
+    probe_start=datetime.fromisoformat('2026-10-07T00:00:00+03:00').timestamp()
     for a,b in zip(samples,samples[1:]):
-        dt=(b["ts"]-a["ts"])/3600
+        start,finish=number(a.get('ts')),number(b.get('ts'))
+        if start is None or finish is None or start<probe_start or start<last_end:
+            continue
+        dt=(finish-start)/3600
         if not (3/60 <= dt <= 7/60) or not a.get("quality") or not b.get("quality"):
             continue
         if any(number(a.get(k)) is None or number(b.get(k)) is None for k in ("room","return","outside","power")):
+            continue
+        if any(r.get('power_estimated') or str(r.get('power_source','balance')).startswith('fallback') or
+               r.get('fire_valid') is False or number(r.get('fire',0)) is None or r.get('fire',0)>2 or
+               r.get('external_gain',0)>.1 for r in (a,b)):
             continue
         # Daytime gains and stagnant pipes cannot identify floor transfer/loss.
         # Keep the records for energy, modulation and external-gain learning.
@@ -883,10 +892,13 @@ def transitions(samples):
             if a.get("measurement_version")!=3 or number(b.get("interval_power")) is None:
                 continue
             a = dict(a, power=b["interval_power"])
+        if not 0<=a['power']<=10.5:
+            continue
         # Drop sensor jumps and uncertain wood/solar contributions from thermal identification.
         if abs(b["room"]-a["room"]) > .6 or abs(b["return"]-a["return"]) > 5 or a.get("fire",0)>2:
             continue
         result.append((a,b,dt))
+        last_end=finish
     return result
 
 def error(model, pairs):
@@ -896,26 +908,48 @@ def error(model, pairs):
         errors.append(abs(room-b["room"]))
     return sum(errors)/len(errors) if errors else None
 
-def validate_candidate(model, candidate, samples):
+def learning_bounds(value):
+    """One shared ±20% rule. A zero baseline stays zero, without an absolute escape."""
+    return value*(1-.20),value*(1+.20)
+
+
+def learning_change_allowed(value,baseline):
+    if isinstance(value,bool) or number(value) is None or number(baseline) is None:
+        return False
+    if baseline==0:
+        return value==0
+    low,high=learning_bounds(baseline)
+    # Eight ULPs of the baseline cover multiplication/subtraction roundoff;
+    # for floor_air=.044 this is ~5.6e-17, not an extra learning allowance.
+    tolerance=8*math.ulp(abs(baseline))
+    return low-tolerance<=value<=high+tolerance
+
+
+def validate_candidate(model, candidate, samples, baseline=None, diagnostics=None):
     pairs=transitions(samples)
+    holdout=pairs[int(len(pairs)*.75):]
+    if diagnostics is not None:
+        diagnostics.update(train_count=len(pairs)-len(holdout),holdout_count=len(holdout),
+                           old_holdout_error=None,new_holdout_error=None)
     if len(pairs)<96 or sum(a["power"]>1.5 for a,_,_ in pairs)<12:
         return False,"Недостатньо придатних даних нагріву та охолодження",None
     if max(a["return"] for a,_,_ in pairs)-min(a["return"] for a,_,_ in pairs)<3:
         return False,"Недостатня зміна обратки для ідентифікації",None
     for key,(lo,hi) in BOUNDS.items():
         value=number(candidate.get(key))
-        if value is None or not lo<=value<=hi:
+        if isinstance(candidate.get(key),bool) or not isinstance(candidate.get(key),(int,float)) or value is None or not lo<=value<=hi:
             return False,f"Параметр {key} поза допустимими межами",None
         old=model[key]
-        if abs(value-old)>max(.005,abs(old)*.20):
+        if not learning_change_allowed(value,old) or not learning_change_allowed(value,(baseline or model)[key]):
             return False,f"Завелика добова зміна {key}",None
-    holdout=pairs[int(len(pairs)*.75):]
     old_error,new_error=error(model,holdout),error(candidate,holdout)
-    if new_error is None or new_error>old_error*.98 or new_error>.25:
+    if diagnostics is not None:
+        diagnostics.update(old_holdout_error=old_error,new_holdout_error=new_error)
+    if old_error is None or old_error<=0 or new_error is None or new_error>old_error*.98 or new_error>.25:
         return False,"Немає підтвердженого поліпшення на відкладених даних",new_error
     return True,"Кандидат пройшов перевірку; потрібна перевірка довгого прогнозу",new_error
 
-def learn(model, samples):
+def learn(model, samples, baseline=None):
     pairs=transitions(samples)
     train=pairs[:int(len(pairs)*.75)]
     if not train:
@@ -926,7 +960,8 @@ def learn(model, samples):
     candidate=dict(model)
     for k,value in zip(("floor_air","room_loss"),coefficients):
         lo,hi=BOUNDS[k]
-        candidate[k]=max(lo,min(hi,max(model[k]*.8,min(model[k]*1.2,value))))
+        low,high=learning_bounds(model[k]);day_low,day_high=learning_bounds((baseline or model)[k])
+        candidate[k]=max(lo,low,day_low,min(hi,high,day_high,value))
     # The return sensor is a proxy; identify its response only during actual boiler operation.
     heated=[pair for pair in train if pair[0]["power"]>1.5]
     if len(heated)>=12:
@@ -935,7 +970,8 @@ def learn(model, samples):
         coefficients=solve(rows,y,[model["heat_gain"],model["floor_decay"]])
         for k,value in zip(("heat_gain","floor_decay"),coefficients):
             lo,hi=BOUNDS[k]
-            candidate[k]=max(lo,min(hi,max(model[k]*.8,min(model[k]*1.2,value))))
+            low,high=learning_bounds(model[k]);day_low,day_high=learning_bounds((baseline or model)[k])
+            candidate[k]=max(lo,low,day_low,min(hi,high,day_high,value))
     return candidate
 
 def decide(mode, armed, allow_actuation, room, probe_ok, grid, thermostat_ok, power_ok,

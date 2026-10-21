@@ -1,5 +1,7 @@
 """Opening settings is read-only; explicit edits are bounded and persisted."""
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from unittest.mock import Mock, patch
 from copy import deepcopy
 from test_adapter_modulation import HeatingClimate
@@ -11,6 +13,7 @@ class SystemSettingsTests(unittest.TestCase):
     def app(self):
         app=HeatingClimate();app.cfg={'allow_actuation':False};app.model=dict(DEFAULT_MODEL)
         app.memory={};app.next_compute=123456;app.save=Mock();app.journal=Mock();app.log=Mock()
+        app.now=lambda:datetime(2026,10,21,12,tzinfo=ZoneInfo('Europe/Kiev'))
         app.update_in_progress=lambda:False
         app.published={};app.publish=lambda entity,state,**attrs:app.published.update({entity:dict(state=state,**attrs)})
         return app

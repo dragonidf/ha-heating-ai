@@ -24,6 +24,15 @@ jobs:
           node-version: '22'
       - run: python -m pip install -r tests/requirements.txt
       - run: make check test
+      - name: Bounded controller and journal measurements
+        if: matrix.python == '3.12'
+        run: python tools/check_validation.py --output "$RUNNER_TEMP/heating-validation.json"
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.12'
+        with:
+          name: controller-validation-metrics
+          path: ${{ runner.temp }}/heating-validation.json
+          retention-days: 14
       - name: Browser dependencies
         if: matrix.python == '3.12'
         run: |

@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.2.12';
+const VERSION = '0.2.13';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -377,7 +377,7 @@ export class HeatingAIPanel extends HTMLElement {
   syncSystemSettings() {
     const a=this.attrs('system_settings');
     if(this.systemPending&&a.last_request_id===this.systemPending) {
-      if(isTrue(a.last_success)){this.systemDraft={};this.systemMessage='Зміни збережено';}
+      if(isTrue(a.last_success)){this.systemDraft={};this.systemMessage=isTrue(a.model_pending)?'Налаштування прийнято; кандидат моделі очікує перевірки':'Зміни збережено';}
       else this.systemMessage=a.last_error||'Зміни відхилено';
       this.systemPending=null;clearTimeout(this.systemTimeout);
     }
@@ -396,10 +396,12 @@ export class HeatingAIPanel extends HTMLElement {
   model() {
     const a=this.attrs('model'),env=this.attrs('environment'),p=a.power_learning||{},s=this.attrs('summary').last_24h||{},f=this.attrs('forecast');
     const updated=this.entity('summary')?.last_updated;
+    const attempt=a.learning_attempt;
+    const learning=attempt?`Остання спроба навчання ${this.time(attempt.time,true)}: ${{rejected:'кандидат відхилено',pending:'кандидат перевіряється',applied:'кандидат застосовано',proposed:'пропозицію перевірено',initial_validation:'початкова перевірка',storage_error:'помилка збереження'}[attempt.status]||'стан невідомий'}; ${isTrue(a.parameters?.validated)?'чинна модель працює':'модель збирає дані'}. ${attempt.reason||''}`:a.last_result||'Навчання ще не виконувалось';
     const facts=items=>items.map(([label,value,unit])=>this.compactMetric(label,value,unit||'')).join('');
     return `<div class="model-page compact-page"><div class="page-title"><h1>Модель і ШІ</h1></div><section class="card model-stats">${this.compactMetric('Модель v'+(a.parameters?.version??'—'),this.state('model'),'','model')}${this.compactMetric('Годинна похибка',fmt(a.hour_mae,3),'°C','model')}${this.compactMetric('Придатні інтервали',fmt(a.usable_pairs,0),'','model')}${this.compactMetric('Запас тепла',fmt(this.state('environment')),'°C','environment')}</section><div class="model-grid">
     ${this.section('Висновок за добу',`<p class="report-text">${h(this.state('summary'))}</p><div class="report-meta muted">Оновлено ${h(this.time(updated,true))}</div>${!Number.isFinite(Date.parse(updated))||Date.now()-Date.parse(updated)>660000?'<p class="warn pill">Дані звіту застаріли</p>':''}<div class="report-stats">${facts([['Охоплення',fmt(s.hours_collected),'год'],['Придатні проби',`${fmt(s.valid_samples,0)} / ${fmt(s.samples,0)}`],['Якість проб',numeric(s.coverage)===null?'—':fmt(s.coverage*100,0),'%']])}</div>`, 'ai-report')}
-    ${this.section('Результат навчання',`<p class="learning-result">${h(a.last_result||'Навчання ще не виконувалось')}</p><div class="fact-grid">${facts([['Останній аналіз',this.time(a.last_analysis,true)],['Кількість проб',fmt(a.samples,0)]])}</div>`)}
+    ${this.section('Результат навчання',`<p class="learning-result">${h(learning)}</p>${a.learning_storage_error?`<p class="warn note">Помилка збереження навчання: ${h(a.learning_storage_error)}</p>`:''}<div class="fact-grid">${facts([['Останній аналіз',this.time(a.last_analysis,true)],['Останній успіх',this.time(a.learning_success?.time,true)],['Кількість проб',fmt(a.samples,0)]])}</div>`)}
     ${this.section('Дії',`${this.field('ai_auto_apply','Застосовувати перевірені пропозиції')}<div class="action-buttons">${this.field('rollback','Попередня модель')}${this.field('weather_refresh','Оновити погоду')}</div><div class="report-meta muted">Погодинні дані до ${h(this.time(f.weather_known_until,true))}</div>`, 'model-actions')}
     ${this.section('Модуляція котла',`<p class="model-meta muted">${h(a.power_learning_status||'')} · ${fmt(p.intervals,0)} інтервалів · ${fmt(p.minutes,0)} хв</p><div class="table-scroll"><table><thead><tr><th>Обратка</th><th>Потужність</th><th>Досвід</th></tr></thead><tbody>${(p.bands||[]).map(b=>`<tr><td>${fmt(b.return_min,0)}–${fmt(b.return_max,0)} °C</td><td>${fmt(b.measured_kw)} кВт</td><td>${fmt(b.minutes,0)} хв</td></tr>`).join('')||'<tr><td colspan="3">Очікуємо підтверджених сеансів.</td></tr>'}</tbody></table></div>`)}
     ${this.section('Підлога й погода',`<div class="fact-grid">${facts([['Виміряна обратка',fmt(env.raw_return),'°C'],['Зовнішній прогрів',fmt(env.external_gain_c_per_hour,3),'°C/год'],['Сонячна складова',isTrue(env.solar_validated)?'Перевірена':'Навчається'],['Днів спостережень',fmt(env.solar_learning_days,0)],['Поточна похибка',fmt(a.reliability?.recent_mae,2),'°C'],['Корекція погоди',fmt(f.local_weather_bias),'°C']])}</div>${isTrue(a.reliability?.degraded)?`<p class="warn pill">Точність знижена · запас ${fmt(env.upper_margin)} °C</p>`:''}`)}
