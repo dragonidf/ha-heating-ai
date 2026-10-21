@@ -117,6 +117,18 @@ class ReservePolicyTests(unittest.TestCase):
         self.assertTrue(r['reserve_sufficient'])
         self.assertLessEqual(p['maximum'],settings['upper'])
 
+    def test_unknown_current_heat_cannot_be_certified_by_known_next_window(self):
+        now=datetime(2026,10,21,6,30,tzinfo=self.tz)
+        next_at=now.replace(hour=23,minute=0).timestamp()
+        settings=dict(self.settings,reserve_errors=[dict(hours=24,error=.02,validated=True)]*12,
+            outage_schedule=dict(mode='scheduled',valid=True,outages=[],known_until=next_at+86400,
+                slots=[dict(start=next_at,end=next_at+86400,off=False)]))
+        weather=[dict(ts=now.timestamp()+i*3600,temperature=10) for i in range(40)]
+        p=plan(now,21.4,22,10,0,dict(self.model,room_loss=.006),weather,settings,9)
+        self.assertTrue(p['morning_reserve']['predicted_sufficient'])
+        self.assertTrue(p['morning_reserve']['conditional'])
+        self.assertIsNone(p['morning_reserve']['reserve_sufficient'])
+
 
 if __name__=='__main__':
     unittest.main()

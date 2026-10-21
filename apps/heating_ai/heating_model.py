@@ -368,7 +368,10 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
     planned=sum((s['end']-s['start'])/60 for s in cycle_segments)
     required=(number(settings.get('morning_min_minutes')) or 0.) if settings.get('_reserve_needed') else 0.
     complete=(metrics['deficit_degree_hours']<=.00001)
-    known=(not context['next_heat_conditional'] and
+    data=availability(settings.get('outage_schedule') or {},now.timestamp(),context['assessment_until'])
+    heat_known=all(schedule_covered(data,s['start'],min(s['end'],context['assessment_until']))
+        for row in rows for s in row['heat_segments'] if s['start']<context['assessment_until'])
+    known=(heat_known and not context['next_heat_conditional'] and
            weather_coverage(weather,context['assessment_until'])['weather_complete'] and margin is not None)
     reason=(None if complete else 'Не знайдено безпечного плану без дефіциту до наступного вікна: обмежені години, потужність і верхні межі')
     cancellation=(None if planned else 'Запас достатній без ранкового нагріву' if not required else
