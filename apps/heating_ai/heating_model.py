@@ -296,9 +296,10 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
             first=first if first is not None else previous
             deficit+=short*(stop-previous)/3600
             minutes+=(stop-previous)/60
-            if zone=='День':
-                day_deficit+=short*(stop-previous)/3600;day_minutes+=(stop-previous)/60
-                day_depth=max(day_depth,short)
+            day_short=max(0.,lo-value)
+            if zone=='День' and day_short>.001:
+                day_deficit+=day_short*(stop-previous)/3600;day_minutes+=(stop-previous)/60
+                day_depth=max(day_depth,day_short)
         minimum=min(minimum,value);maximum=max(maximum,value)
         previous=stop
         if stop>=until:
