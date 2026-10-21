@@ -28,7 +28,16 @@ class DayNightTests(unittest.TestCase):
             p=plan(self.at.replace(minute=minute),22,23.5,10,0,self.x['model'],self.x['weather'],self.s,3)
             self.assertTrue(p['morning_runs_minutes'],minute)
             self.assertGreater(p['session_kwh']['morning'],p['session_kwh']['evening'],minute)
-            self.assertTrue(all(m>=30 for m in p['morning_runs_minutes']))
+            # A long night session may cross 05:00; its morning-only tail can
+            # be shorter than 30 min without being a short physical session.
+            self.assertGreaterEqual(p['morning_reserve']['planned_minutes'],30)
+            runs=[]
+            for seg in p['heat_segments']:
+                if runs and seg['start']<=runs[-1][1]+1:runs[-1][1]=seg['end']
+                else:runs.append([seg['start'],seg['end']])
+            self.assertTrue(all((b-a)/60>=30-.001 for a,b in runs
+                if datetime.fromtimestamp(a,self.at.tzinfo).hour<7 and
+                   datetime.fromtimestamp(b-.001,self.at.tzinfo).hour>=5))
     def test_expected_warming_does_not_replan(self):
         p,ref=stable_plan(self.at,22,23.5,10,0,self.x['model'],self.x['weather'],self.s,3)
         def groups(p):
