@@ -6,7 +6,7 @@ from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from heating_model import plan,comfort_at,SEARCH_POLICY_VERSION,search_input_key
+from heating_model import plan,comfort_at,trajectory_metrics,SEARCH_POLICY_VERSION,search_input_key
 from heating_stability import stable_plan,reference,replay,expected
 
 
@@ -190,3 +190,13 @@ class SufficiencySearchTests(unittest.TestCase):
         point=ref['curve'][1]['_fine'][2]
         self.assertEqual(expected(ref,point['ts'],'temperature','room'),point['temperature'])
         self.assertEqual(expected(ref,point['ts'],'return','floor'),point['return'])
+
+    def test_day_violation_excludes_the_uncertainty_buffer(self):
+        at=self.now.replace(hour=12,minute=0,second=0)
+        for value,minutes,depth in [(21.1,0.,0.),(20.8,5.,.2)]:
+            with self.subTest(temperature=value):
+                result=trajectory_metrics(at,21.2,[dict(ts=at.timestamp()+300,temperature=value)],
+                                          self.settings,at.timestamp()+300,margin=.25)
+                self.assertGreater(result['deficit_degree_hours'],0)  # reserve shortfall can still exist
+                self.assertEqual(result['day_deficit_minutes'],minutes)
+                self.assertAlmostEqual(result['day_max_shortfall'],depth)
