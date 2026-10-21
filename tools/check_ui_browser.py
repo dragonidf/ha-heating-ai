@@ -172,6 +172,20 @@ def check_compact_overview(page):
     assert any('Аварійні відключення' in text for text in page.locator('.forecast-warning').all_text_contents())
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{planned_kwh:null}}})")
     assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
+    # Automatic completion is separate from the future plan and manual power.
+    page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{morning_reserve:{
+        planned_minutes:30,confirmed_completed_minutes:0,confirmed_kwh:0,manual_completed_minutes:12,
+        reserve_sufficient:null,predicted_sufficient:true}}}})""")
+    metrics=page.locator('[data-reserve-execution]')
+    assert 'Заплановано вранці' in metrics.inner_text()
+    assert 'Автоматично виконано' in metrics.inner_text()
+    assert 'Ручний нагрів вранці' in metrics.inner_text()
+    values=metrics.locator('strong').all_text_contents()
+    assert values==['30,0 хв','0,0 хв','0,00 кВт·год','12,0 хв'],values
+    assert 'бракує перевірки потрібного горизонту' in page.locator('.plan-card').inner_text()
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+    page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{morning_reserve:null}}})")
+    assert page.locator('[data-reserve-execution]').count()==0
     page.evaluate('panel.hass=mockHass')
 
 

@@ -5,8 +5,10 @@ The adapter persists the returned reference beside existing plan memory.
 """
 from datetime import datetime, timedelta
 import math
+from uuid import uuid4
 from heating_model import (plan as optimise, step, outdoor_at, in_window,
-                           modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage)
+                           modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
+                           reserve_context,attach_reserve,coast_reserve_needed,local_boundary)
 from heating_outages import blocked, availability, schedule_covered
 from heating_environment import forecast_step,gain_at,safe_upper
 
@@ -22,10 +24,12 @@ def policy(settings):
 def reference(now, room, floor, outside, fire, model, weather, settings, result):
     return dict(at=now.timestamp(),room=room,floor=floor,outside=outside,fire=fire,
                 model=dict(model),policy=policy(settings),weather=list(weather),
-                segments=[dict(s) for s in result['heat_segments']],
+                segments=[dict(s) for r in result.get('_calculation_curve',result['curve']) for s in r['heat_segments']],
+                plan_id=result.get('plan_id'),parent_plan_id=result.get('parent_plan_id'),
+                morning_reserve=result.get('morning_reserve'),
                 split=result.get('split_comfort_applied',False),
                 minimum=result['minimum'],maximum=result['maximum'],
-                profile=settings.get('modulation_profile'),curve=list(result['curve']),
+                profile=settings.get('modulation_profile'),curve=list(result.get('_calculation_curve',result['curve'])),
                 environment=settings.get('environment',{}))
 
 def expected(previous,stamp,key,initial):
@@ -38,7 +42,13 @@ def expected(previous,stamp,key,initial):
 
 def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9.):
     """Integrate at <=5 min, splitting at exact session and forecast boundaries."""
-    start=now.timestamp(); finish=start+86400
+    start=now.timestamp(); public_finish=start+86400
+    context=reserve_context(now,settings,model)
+    priority=bool(settings.get('split_comfort') and 'night_target' in settings)
+    count=max(48,math.ceil((context['assessment_until']-start)/1800)) if priority and context else 48
+    finish=start+count*1800
+    settings=dict(settings,_reserve_context=context,_reserve_needed=bool(context and
+        coast_reserve_needed(now,room,floor,outside,fire,model,weather,settings,context,power_kw)))
     priority=bool(settings.get('split_comfort') and 'night_target' in settings)
     if priority and not split:
         # A safety fallback without a morning reservation must be reconsidered.
@@ -57,19 +67,19 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
             return None
     boundaries={s[k] for s in segments for k in ('start','end')}
     boundaries.update(r['ts'] for r in weather if start<r['ts']<finish)
-    for day in range(3):
+    for day in range(5):
         for key in ('start','end','sleep_start','sleep_end'):
             value=settings.get(key)
             if value:
-                boundary=(now+timedelta(days=day)).replace(hour=int(value[:2]),minute=int(value[3:5]),second=0,microsecond=0).timestamp()
+                boundary=local_boundary(now.date()+timedelta(days=day),value,now.tzinfo).timestamp()
                 if start<boundary<finish:
                     boundaries.add(boundary)
     rows=[]; r,f=room,floor; low=high=room; energy=0.; all_segments=[]
-    for block in range(48):
+    for block in range(count):
         a=start+1800*block; b=a+1800
         cuts=sorted({a,b,*[a+300*j for j in range(1,6)],
                      *[t for t in boundaries if a<t<b]})
-        heats=[]; used=0.
+        heats=[]; used=0.; fine=[]
         for t,u in zip(cuts,cuts[1:]):
             active=any(s['start']<=t and s['end']>=u for s in segments)
             tm=datetime.fromtimestamp(t,now.tzinfo); dt=(u-t)/3600
@@ -83,6 +93,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
             r,f=forecast_step(r,f,outdoor_at(weather,tm,outside),kw if active else 0.,
                      fire*math.exp(-(t-start)/7200),model,dt,tm,weather,settings)
             low=min(low,r); high=max(high,r)
+            fine.append(dict(ts=u,temperature=r,**{'return':f}))
             if r>max(room,hi)+.01 and (active or all_segments):
                 return None
             if active:
@@ -96,28 +107,30 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         rows.append(dict(ts=b,temperature=round(r,2),return_=round(f,2),
                          target=wanted,lower=lo,upper=hi,comfort_zone=zone,
                          **{'return':round(f,2)},heat=bool(heats),kwh=round(used,4),
-                         heat_segments=heats,outside_minutes=0.,
+                         heat_segments=heats,outside_minutes=0.,_fine=fine,
                          schedule_known=schedule_covered(data,a,b),
                          weather_known=bool(weather and max(x['ts'] for x in weather)+3600>=b)))
-    if not morning_runs_valid(rows,now,settings.get('morning_min_minutes',30),
+    if not priority and not morning_runs_valid(rows,now,settings.get('morning_min_minutes',30),
                               settings.get('morning_elapsed_minutes',0)):
         return None
-    morning_end=now.replace(hour=7,minute=0,second=0,microsecond=0)
-    if morning_end<=now:
-        morning_end+=timedelta(days=1)
-    minimum=settings.get('morning_min_minutes',30)
-    if (priority and settings.get('morning_elapsed_minutes',0)<minimum and
-            now<=morning_end-timedelta(minutes=minimum) and
-            not morning_runs(rows,now.tzinfo)):
-        return None
+    if priority and settings['_reserve_needed'] and context and context['morning_end'] and context['morning_end']>start:
+        current=[s for s in all_segments if context['morning_start']<=s['start']<context['morning_end']]
+        if settings.get('confirmed_completed_minutes',0)<settings.get('morning_min_minutes',30) and not current:
+            return None
+    calculation_rows=rows
+    rows=[r for r in rows if r['ts']<=public_finish+.001]
+    all_segments=[s for r in rows for s in r['heat_segments']]
+    energy=sum(r['kwh'] for r in rows)
+    low=min([room]+[p['temperature'] for r in rows for p in r['_fine']])
+    high=max([room]+[p['temperature'] for r in rows for p in r['_fine']])
     mix=dict(evening=0.,morning=0.,other=0.)
     for s in all_segments:
         tm=datetime.fromtimestamp(s['start'],now.tzinfo)
         kind='evening' if in_window(tm,'23:00','01:00') else 'morning' if in_window(tm,'05:00','07:00') else 'other'
         mix[kind]+=s['kwh']
     schedule_until=data.get('known_until') if data.get('valid') else None
-    coverage=weather_coverage(weather,finish)
-    return dict(heat=bool(all_segments and all_segments[0]['start']==start),curve=rows,
+    coverage=weather_coverage(weather,public_finish)
+    result=dict(heat=bool(all_segments and all_segments[0]['start']==start),curve=rows,
                 energy=round(energy,2),minimum=round(low,2),maximum=round(high,2),
                 horizon_hours=24.,validated=bool(model.get('validated')),
                 morning_min_minutes=settings.get('morning_min_minutes',30),
@@ -134,7 +147,10 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 outage_shifted=False,outage_preheat=False,outside_minutes=0.,
                 outage_status=data.get('reason','Графік не підключений'),
                 comfort_shortfall=any(r['temperature']<r['lower'] for r in rows),heat_segments=all_segments,
-                schedule_updated=data.get('updated'),plan_stable=True)
+                schedule_updated=data.get('updated'),plan_stable=True,_calculation_curve=calculation_rows)
+    attach_reserve(now,room,model,weather,settings,result,context)
+    result['curve']=[{k:v for k,v in row.items() if k!='_fine'} for row in rows]
+    return result
 
 
 def stable_plan(now, room, floor, outside, fire, model, weather, settings, power_kw=9., previous=None):
@@ -161,16 +177,28 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
         if small and not changed_weather and not changed_power and not changed_gain:
             result=replay(now,room,floor,outside,fire,model,weather,settings,
                           previous['segments'],previous['split'],power_kw)
-            common_min=(min((r['temperature'] for r in result['curve']
-                            if r['ts']<=previous['at']+86400),default=result['minimum'])
-                        if result else None)
-            # A worsening predicted deficit or upper excursion overrides holding.
-            if (result and common_min>=min(settings['lower'],previous['minimum'])-.1
-                    and result['maximum']<=max(settings['upper'],room)+.01):
-                result['stability_reason']='Невеликі зміни вимірів; часи сеансів збережено'
-                return result,previous
+            if result and result['maximum']<=max(settings['upper'],room)+.01:
+                reserve=result.get('morning_reserve',{})
+                improved=None
+                # A previously optimised trajectory with unchanged inputs is
+                # not new evidence of a deficit: retain its exact reservation.
+                drift=(abs(room-expected(previous,now.timestamp(),'temperature','room'))>=.02 or
+                       abs(floor-expected(previous,now.timestamp(),'return','floor'))>=.1 or
+                       not previous.get('morning_reserve'))
+                if drift and settings.get('split_comfort') and 'night_target' in settings and reserve.get('deficit_degree_hours',0)>.001:
+                    alternative=optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
+                    if alternative.get('morning_reserve',{}).get('deficit_degree_hours',0)<reserve['deficit_degree_hours']-.01:
+                        improved=alternative
+                if improved is None:
+                    result.update(stability_reason='Невеликі зміни вимірів; часи сеансів збережено',
+                                  plan_id=previous.get('plan_id') or uuid4().hex,
+                                  parent_plan_id=previous.get('parent_plan_id'))
+                    # Persist the identifier even when upgrading a legacy reference.
+                    previous=dict(previous,plan_id=result['plan_id'])
+                    return result,previous
         reason='Нові умови, зміна запасу тепла або обмежень — план перебудовано'
     result=optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
-    result.update(plan_stable=False,stability_reason=reason)
+    result.update(plan_stable=False,stability_reason=reason,plan_id=uuid4().hex,
+                  parent_plan_id=previous.get('plan_id') if previous else None)
     return result,reference(now,room,floor,outside,fire,model,weather,settings,result)
 

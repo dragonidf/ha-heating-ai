@@ -15,7 +15,7 @@ from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile)
-from heating_recovery import HeatingRecovery
+from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning
 from heating_stability import stable_plan
 from heating_environment import observe_floor,observe_gain,reliability,daylight,anchor_weather
 from heating_ui import (install_panel, project_fireplace, verify_installation,
@@ -38,6 +38,12 @@ class HeatingClimate(HeatingRecovery,Hass):
         except (OSError,ValueError):
             self.memory={}
         self.model=self.memory.get("model",dict(DEFAULT_MODEL))
+        self.decision_journal=DecisionJournal(self.directory)
+        self.run_every(self.verify_decision_history,self.datetime()+timedelta(seconds=420),600)
+        self.memory.pop('morning_observation',None)  # no integration across restart gaps
+        # Unobserved downtime invalidates prospective error validation.
+        self.memory['reserve_predictions']=[]
+        self.release_version=json.loads((Path(__file__).resolve().parent/'release.json').read_text())['version']
         self.restore_system_settings()
         self.memory.setdefault("energy_bins",list(self.cfg.get("energy_history",[])))
         self.memory.setdefault("energy_last",self.cfg.get("energy_seed"))
@@ -217,6 +223,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.save()
     def settings_changed(self,entity,attribute,old,new,kwargs=None,**extra):
         self.next_compute=0
+        if old!=new:
+            self.decision_event('settings_change',reason='Змінено параметр '+entity,force=True)
     def restore_system_settings(self):
         overrides=self.memory.get('system_settings',{})
         if overrides:
@@ -537,15 +545,16 @@ class HeatingClimate(HeatingRecovery,Hass):
         if signature != getattr(self,"outage_signature",None):
             self.next_compute=0
             self.outage_signature=signature
+            self.schedule_received_at=now.timestamp()
         settings["split_comfort"] = True
         settings["morning_min_minutes"] = self.cfg.get("morning_min_minutes",30)
-        settings["morning_elapsed_minutes"] = 0.
         command_at=number(self.memory.get("command_at"))
-        if (in_window(now,"05:00","07:00") and power is not None and power>=1500
-                and self.memory.get("last_command")=="heat" and command_at is not None
-                and in_window(datetime.fromtimestamp(command_at,self.climate_tz),"05:00","07:00")
-                and datetime.fromtimestamp(command_at,self.climate_tz).date()==now.date()):
-            settings["morning_elapsed_minutes"] = min(30.,max(0.,(now.timestamp()-command_at)/60))
+        automatic=(self.raw('mode')=='Автоматичне керування' and permitted and
+                   self.memory.get('owned',False) and self.memory.get('last_command')=='heat')
+        settings.update(confirmed_morning(self.memory,now,settings,power,self.val('energy'),grid,
+                                         automatic,getattr(self,'power_source','unknown')))
+        self.validate_reserve_predictions(now,room,power,quality=source=='Вітальня' and room is not None and probe_ok and power is not None and outside is not None)
+        settings['reserve_errors']=self.memory.get('reserve_errors',[])
         settings["outage_schedule"] = outage_data
         settings["outage_advance_limit"] = self.cfg.get("outage_advance_limit",180)
         emergency = outage_data['emergency']
@@ -636,6 +645,16 @@ class HeatingClimate(HeatingRecovery,Hass):
             action=decide(self.raw("mode"),self.raw("armed")=="on",bool(self.cfg.get("allow_actuation",False)),
                           room,probe_ok,grid,self.raw("thermostat") not in ("unknown","unavailable",None),
                           power is not None,self.model.get("validated",False),demand,valid)
+            if getattr(self,'decision_context',None):
+                self.decision_context.update(planned_demand=bool(any(s['start']<=now.timestamp()<s['end'] for s in segments)),
+                    demand=demand,action=action,
+                    reason='Немає мережі' if grid=='off' else 'Стан мережі не підтверджено' if grid=='unknown' else
+                        'Досягнуто верхню межу' if room is not None and room>=upper else
+                        'Планове відключення' if outage_now else self.decision_context.get('reason'),
+                    measurements=dict(room=room,raw_return=probe,estimated_floor=floor,outside=outside,fire=fire),
+                    inhibitions=[key for key,value in dict(grid=grid!='on',upper=room is not None and room>=upper,
+                        outage=outage_now,manual=not permitted or self.raw('mode')!='Автоматичне керування').items() if value])
+            self.decision_event('tick_change',action=action)
             self.apply_action(action,False)
             self.fan_tick(grid,fire_active)
             self.publish("sensor.heating_heartbeat",now.isoformat(),friendly_name="Клімат — останній цикл",device_class="timestamp")
@@ -648,12 +667,15 @@ class HeatingClimate(HeatingRecovery,Hass):
         usable_weather=self.weather if time.time()-self.memory.get("weather_at",0)<self.cfg.get('weather_max_age',10800) else []
         usable_weather,weather_bias=anchor_weather(usable_weather,now.timestamp(),outside) if outside is not None else ([],0.)
         settings['environment_weather']=usable_weather
+        previous_reference=self.memory.get('plan_reference')
         forecast=None
+        snapshot=None
         peak=None
         coast_overheat=False
         if quality and valid:
             forecast,plan_reference=stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
                           power_kw=3.0,previous=self.memory.get('plan_reference'))
+            snapshot=self.remember_plan_inputs(now,room,floor,outside,fire,usable_weather,settings,forecast,previous_reference)
             self.memory['plan_reference']=plan_reference
             peak,_=coast(room,floor,outside,fire,self.model)
             coast_overheat=coast_exceeds_profile(now,room,floor,outside,fire,self.model,settings)
@@ -686,7 +708,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                          split_reason=forecast["split_reason"],
                          morning_min_minutes=forecast["morning_min_minutes"],
                          morning_runs_minutes=forecast["morning_runs_minutes"],
-                         planning_policy_version=4,
+                         planning_policy_version=4,morning_policy_version=1,
+                         morning_reserve=forecast.get('morning_reserve'),plan_id=forecast.get('plan_id'),
                          power_model='return_modulation_v1',effective_power_kw=round(effective,3),
                          power_learning_intervals=profile['intervals'],
                          power_learning_minutes=profile['minutes'],
@@ -720,12 +743,15 @@ class HeatingClimate(HeatingRecovery,Hass):
         action=decide(self.raw("mode"),self.raw("armed")=="on",bool(self.cfg.get("allow_actuation",False)),
                       room,probe_ok,grid,self.raw("thermostat") not in ("unknown","unavailable",None),
                       power is not None,self.model.get("validated",False),demand,valid)
+        reserve=(forecast or {}).get('morning_reserve',{})
         reason=("Немає мережі" if grid=="off" else "Стан мережі не підтверджено" if grid=="unknown" else
                 "Некоректні межі температури або часу" if not valid else
                 "Недостатньо актуальних вимірювань" if not quality else
                 "Планове відключення 3.1 — нагрів не планується" if outage_now else
                 "Завчасний нагрів перед відключенням 3.1" if demand and preheat else
                 "Ранковий підігрів підлоги" if demand and morning_comfort else
+                reserve['impossibility_reason'] if not demand and reserve.get('impossibility_reason') else
+                'Запас до наступного вікна умовний: недостатньо перевірених даних' if not demand and reserve.get('reserve_sufficient') is None and reserve else
                 "Нагрів не потрібен / запас тепла" if peak is not None and peak>=target and room>=lower and not demand else
                 "Одноразовий нагрів після повернення мережі" if once else
                 "Заплановано нагрів" if demand else "Накопиченого тепла достатньо / очікування вікна")
@@ -759,6 +785,19 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.publish_ai_summary(refresh=True)
         self.memory["planned_heat_segments"]=forecast["heat_segments"] if forecast else []
         self.memory["demand"]=demand
+        self.decision_context=dict(settings=settings,forecast=forecast,action=action,reason=reason,
+            planned_demand=planned_heat,demand=demand,coast_peak=peak,
+            measurements=dict(room=room,raw_return=probe,estimated_floor=floor,outside=outside,fire=fire,
+                              external_gain=settings.get('environment',{}).get('solar',{}).get('observed_gain')),
+            previous_reserve=(previous_reference or {}).get('morning_reserve'),
+            inhibitions=[key for key,value in dict(grid=grid!='on',upper=room is not None and room>=upper,
+                inertia=coast_overheat,outage=outage_now,quality=not quality,settings=not valid,
+                manual=not permitted or self.raw('mode')!='Автоматичне керування').items() if value])
+        if snapshot is None:
+            snapshot=self.remember_plan_inputs(now,room,floor,outside,fire,usable_weather,settings,forecast,previous_reference)
+        self.decision_event('full_recompute',force=True,snapshot=snapshot)
+        if forecast:
+            self.validate_reserve_predictions(now,room,power,quality and source=='Вітальня',forecast)
         self.apply_action(action,once)
         self.fan_tick(grid,fire_active)
         self.journal(reason)

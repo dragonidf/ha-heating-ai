@@ -37,7 +37,9 @@ class DayNightTests(unittest.TestCase):
                 if g and abs(g[-1][1]-s['start'])<.001:g[-1][1]=s['end']
                 else:g.append([s['start'],s['end']])
             return g
-        initial=groups(p)
+        # The internal assessment can extend beyond the public 24 h. As the
+        # chart rolls, compare it with the same complete persisted sessions.
+        initial=groups({'heat_segments':ref['segments']})
         for minute in range(5,85,5):
             now=self.at+timedelta(minutes=minute)
             room=expected(ref,now.timestamp(),'temperature','room')
@@ -45,7 +47,8 @@ class DayNightTests(unittest.TestCase):
             q,newref=stable_plan(now,room,floor,10,0,self.x['model'],self.x['weather'],self.s,3,ref)
             self.assertTrue(q['plan_stable'],minute)
             self.assertEqual(ref,newref)
-            self.assertEqual(groups(q),[[max(a,now.timestamp()),b] for a,b in initial if b>now.timestamp()])
+            self.assertEqual(groups(q),[[max(a,now.timestamp()),min(b,now.timestamp()+86400)]
+                for a,b in initial if b>now.timestamp() and a<now.timestamp()+86400])
             self.assertTrue(q['morning_runs_minutes'])
     def test_night_heat_never_predicts_above_sleep_upper(self):
         p=plan(self.at,21.8,24,10,0,self.x['model'],self.x['weather'],self.s,3)
