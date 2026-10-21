@@ -183,6 +183,11 @@ def check_compact_overview(page):
     values=metrics.locator('strong').all_text_contents()
     assert values==['30,0 хв','0,0 хв','0,00 кВт·год','12,0 хв'],values
     assert 'бракує перевірки потрібного горизонту' in page.locator('.plan-card').inner_text()
+    page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{morning_reserve:{
+        reserve_sufficient:false,predicted_sufficient:false,day_deficit_minutes:95,day_max_shortfall:.42,
+        impossibility_reason:'Знайдений план має дефіцит; розширений пошук виконаний, фізичну неможливість не доведено'}}}})""")
+    text=page.locator('.plan-card').inner_text()
+    assert '95 хв' in text and '0,42 °C' in text and 'фізичну неможливість не доведено' in text
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{morning_reserve:null}}})")
     assert page.locator('[data-reserve-execution]').count()==0

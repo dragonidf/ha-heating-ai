@@ -1,0 +1,97 @@
+{
+  "description": "Synthetic constant-outdoor replay of review section 4; live modulation bands, no weather/solar/anchor cache.",
+  "now": "2026-10-21T21:15:24+03:00",
+  "room": 21.6,
+  "floor": 21.9205,
+  "outside": 12.3,
+  "fire": 0,
+  "model": {
+    "floor_air": 0.044238523742432284,
+    "room_loss": 0.012800000000000004,
+    "floor_decay": 0.17279999999999998,
+    "heat_gain": 0.72,
+    "fire_gain": 0.025,
+    "version": 4,
+    "validated": true
+  },
+  "profile": {
+    "version": 1,
+    "bands": [
+      {
+        "return_c": 21,
+        "return_min": 20,
+        "return_max": 22,
+        "power_kw": 8.038,
+        "measured_kw": 9.105,
+        "minutes": 10,
+        "intervals": 2,
+        "confidence": 0.167,
+        "stage_minutes": {
+          "9": 9.99746466477712
+        }
+      },
+      {
+        "return_c": 23,
+        "return_min": 22,
+        "return_max": 24,
+        "power_kw": 8.038,
+        "measured_kw": 8.421,
+        "minutes": 105,
+        "intervals": 21,
+        "confidence": 1,
+        "stage_minutes": {
+          "9": 105.00272306998569
+        }
+      },
+      {
+        "return_c": 25,
+        "return_min": 24,
+        "return_max": 26,
+        "power_kw": 7.598,
+        "measured_kw": 7.598,
+        "minutes": 220,
+        "intervals": 44,
+        "confidence": 1,
+        "stage_minutes": {
+          "6": 40.003758247693376,
+          "9": 145.00413920879365
+        }
+      },
+      {
+        "return_c": 27,
+        "return_min": 26,
+        "return_max": 28,
+        "power_kw": 5.912,
+        "measured_kw": 5.912,
+        "minutes": 565,
+        "intervals": 113,
+        "confidence": 1,
+        "stage_minutes": {
+          "3": 40.0005020181338,
+          "6": 204.9997389276823,
+          "9": 204.98975946108501
+        }
+      },
+      {
+        "return_c": 29,
+        "return_min": 28,
+        "return_max": 30,
+        "power_kw": 5.356,
+        "measured_kw": 5.356,
+        "minutes": 105,
+        "intervals": 21,
+        "confidence": 1,
+        "stage_minutes": {
+          "3": 15.001615087191265,
+          "6": 29.99944896697998,
+          "9": 34.99790945847829
+        }
+      }
+    ],
+    "intervals": 201,
+    "minutes": 1005,
+    "prior_kw": 3,
+    "method": "return_bands_energy_isotonic",
+    "last_sample_at": 1792606524.5053766
+  }
+}

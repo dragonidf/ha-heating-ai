@@ -8,7 +8,8 @@ import math
 from uuid import uuid4
 from heating_model import (plan as optimise, step, outdoor_at, in_window,
                            modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
-                           reserve_context,attach_reserve,coast_reserve_needed,local_boundary)
+                           reserve_context,attach_reserve,coast_reserve_needed,local_boundary,
+                           SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics)
 from heating_outages import blocked, availability, schedule_covered
 from heating_environment import forecast_step,gain_at,safe_upper
 
@@ -18,7 +19,8 @@ def policy(settings):
           'morning_min_minutes','day_price','night_price','budget_multiplier',
           'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin')
     return {**{k:settings.get(k) for k in keys},'environment_policy_version':4,
-            'outage_mode':(settings.get('outage_schedule') or {}).get('mode')}
+            'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
+            'search_policy_version':SEARCH_POLICY_VERSION}
 
 
 def reference(now, room, floor, outside, fire, model, weather, settings, result):
@@ -27,20 +29,23 @@ def reference(now, room, floor, outside, fire, model, weather, settings, result)
                 segments=[dict(s) for r in result.get('_calculation_curve',result['curve']) for s in r['heat_segments']],
                 plan_id=result.get('plan_id'),parent_plan_id=result.get('parent_plan_id'),
                 morning_reserve=result.get('morning_reserve'),
+                search={k:result.get(k) for k in (*SEARCH_FIELDS,'candidate_rejections')},
+                search_check_key=result.get('search_check_key'),
                 split=result.get('split_comfort_applied',False),
                 minimum=result['minimum'],maximum=result['maximum'],
                 profile=settings.get('modulation_profile'),curve=list(result.get('_calculation_curve',result['curve'])),
                 environment=settings.get('environment',{}))
 
 def expected(previous,stamp,key,initial):
-    points=[(previous['at'],previous[initial])]+[(r['ts'],r[key]) for r in previous.get('curve',[])]
+    points=[(previous['at'],previous[initial])]+[(p['ts'],p[key])
+        for r in previous.get('curve',[]) for p in r.get('_fine',[r])]
     for (a,v),(b,w) in zip(points,points[1:]):
         if a<=stamp<=b:
             return v+(w-v)*(stamp-a)/(b-a)
     return points[-1][1]
 
 
-def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9.):
+def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False):
     """Integrate at <=5 min, splitting at exact session and forecast boundaries."""
     start=now.timestamp(); public_finish=start+86400
     context=reserve_context(now,settings,model)
@@ -50,7 +55,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     settings=dict(settings,_reserve_context=context,_reserve_needed=bool(context and
         coast_reserve_needed(now,room,floor,outside,fire,model,weather,settings,context,power_kw)))
     priority=bool(settings.get('split_comfort') and 'night_target' in settings)
-    if priority and not split:
+    if priority and not split and not reserve_checked:
         # A safety fallback without a morning reservation must be reconsidered.
         return None
     data=availability(settings.get('outage_schedule') or {},start,finish)
@@ -115,7 +120,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         return None
     if priority and settings['_reserve_needed'] and context and context['morning_end'] and context['morning_end']>start:
         current=[s for s in all_segments if context['morning_start']<=s['start']<context['morning_end']]
-        if settings.get('confirmed_completed_minutes',0)<settings.get('morning_min_minutes',30) and not current:
+        if settings.get('confirmed_completed_minutes',0)<settings.get('morning_min_minutes',30) and not current and not reserve_checked:
             return None
     calculation_rows=rows
     rows=[r for r in rows if r['ts']<=public_finish+.001]
@@ -155,6 +160,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
 
 def stable_plan(now, room, floor, outside, fire, model, weather, settings, power_kw=9., previous=None):
     reason='Перший план'
+    improved=None
     if previous:
         # Compare with the last optimisation, not the previous 5-minute sample.
         # Small changes therefore accumulate and cannot freeze the plan forever.
@@ -175,29 +181,35 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
                                     {'environment':previous.get('environment',{})}))>=.1
                          for h in (0,3,12,18))
         if small and not changed_weather and not changed_power and not changed_gain:
+            key=search_input_key(now,room,floor,outside,fire,model,weather,settings)
+            checked=previous.get('search_check_key')==key
             result=replay(now,room,floor,outside,fire,model,weather,settings,
-                          previous['segments'],previous['split'],power_kw)
+                          previous['segments'],previous['split'],power_kw,reserve_checked=checked)
             if result and result['maximum']<=max(settings['upper'],room)+.01:
                 reserve=result.get('morning_reserve',{})
                 improved=None
-                # A previously optimised trajectory with unchanged inputs is
-                # not new evidence of a deficit: retain its exact reservation.
-                drift=(abs(room-expected(previous,now.timestamp(),'temperature','room'))>=.02 or
-                       abs(floor-expected(previous,now.timestamp(),'return','floor'))>=.1 or
-                       not previous.get('morning_reserve'))
-                if drift and settings.get('split_comfort') and 'night_target' in settings and reserve.get('deficit_degree_hours',0)>.001:
+                result.update(previous.get('search',{}))
+                if settings.get('split_comfort') and 'night_target' in settings and reserve.get('deficit_degree_hours',0)>.00001 and not checked:
                     alternative=optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
-                    if alternative.get('morning_reserve',{}).get('deficit_degree_hours',0)<reserve['deficit_degree_hours']-.01:
+                    other=alternative.get('morning_reserve',{}).get('deficit_degree_hours',0)
+                    if other<reserve['deficit_degree_hours']-.00001:
                         improved=alternative
+                    else:
+                        result.update({k:alternative.get(k) for k in (*SEARCH_FIELDS,'candidate_rejections')})
+                        previous=dict(previous,search_check_key=key,
+                            search={k:result.get(k) for k in (*SEARCH_FIELDS,'candidate_rejections')})
+                apply_search_diagnostics(now,settings,result)
                 if improved is None:
-                    result.update(stability_reason='Невеликі зміни вимірів; часи сеансів збережено',
+                    result.update(stability_reason=('Розширений пошук не знайшов кращого запасу; перевірку збережено'
+                                      if reserve.get('deficit_degree_hours',0)>.00001 else
+                                      'Невеликі зміни вимірів; часи сеансів збережено'),
                                   plan_id=previous.get('plan_id') or uuid4().hex,
                                   parent_plan_id=previous.get('parent_plan_id'))
                     # Persist the identifier even when upgrading a legacy reference.
                     previous=dict(previous,plan_id=result['plan_id'])
                     return result,previous
         reason='Нові умови, зміна запасу тепла або обмежень — план перебудовано'
-    result=optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
+    result=improved if improved is not None else optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
     result.update(plan_stable=False,stability_reason=reason,plan_id=uuid4().hex,
                   parent_plan_id=previous.get('plan_id') if previous else None)
     return result,reference(now,room,floor,outside,fire,model,weather,settings,result)

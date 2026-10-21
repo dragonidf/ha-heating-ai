@@ -709,6 +709,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          morning_min_minutes=forecast["morning_min_minutes"],
                          morning_runs_minutes=forecast["morning_runs_minutes"],
                          planning_policy_version=4,morning_policy_version=1,
+                         search_policy_version=forecast.get('search_policy_version'),search_status=forecast.get('search_status'),
                          morning_reserve=forecast.get('morning_reserve'),plan_id=forecast.get('plan_id'),
                          power_model='return_modulation_v1',effective_power_kw=round(effective,3),
                          power_learning_intervals=profile['intervals'],

@@ -1,9 +1,13 @@
 """Predictive heating: deterministic model, bounded learning and safety decisions."""
 from datetime import datetime, timedelta
 import math
+import hashlib
+import json
 from heating_environment import forecast_step,safe_upper
 import statistics
 from heating_outages import blocked, covered, availability, schedule_covered
+
+SEARCH_POLICY_VERSION = 2
 
 DEFAULT_MODEL = {"floor_air": .035, "room_loss": .025, "floor_decay": .12,
                  "heat_gain": .50, "fire_gain": .025, "version": 1, "validated": False}
@@ -278,6 +282,7 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
     rows=[point for row in rows for point in row.get('_fine',[row])]
     previous=now.timestamp(); first=None; deficit=0.; minutes=0.; minimum=room
     maximum=room
+    day_deficit=0.;day_minutes=0.;day_depth=0.
     for row in rows:
         stop=min(row['ts'],until)
         if stop<=previous:
@@ -291,13 +296,17 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
             first=first if first is not None else previous
             deficit+=short*(stop-previous)/3600
             minutes+=(stop-previous)/60
+            if zone=='День':
+                day_deficit+=short*(stop-previous)/3600;day_minutes+=(stop-previous)/60
+                day_depth=max(day_depth,short)
         minimum=min(minimum,value);maximum=max(maximum,value)
         previous=stop
         if stop>=until:
             break
     return dict(minimum_before_next_heat=round(minimum,3),
                 first_comfort_violation_at=first,deficit_degree_hours=round(deficit,5),
-                deficit_minutes=round(minutes,2),predicted_maximum=round(maximum,3))
+                deficit_minutes=round(minutes,2),day_deficit_degree_hours=round(day_deficit,5),
+                day_deficit_minutes=round(day_minutes,2),day_max_shortfall=round(day_depth,3),predicted_maximum=round(maximum,3))
 
 
 def coast_reserve_needed(now, room, floor, outside, fire, model, weather, settings, context, power_kw=3.):
@@ -390,7 +399,7 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
         for row in rows for s in row['heat_segments'] if s['start']<context['assessment_until'])
     known=(heat_known and not context['next_heat_conditional'] and
            weather_coverage(weather,context['assessment_until'])['weather_complete'] and margin is not None)
-    reason=(None if complete else 'Не знайдено безпечного плану без дефіциту до наступного вікна: обмежені години, потужність і верхні межі')
+    reason=(None if complete else 'Знайдений план має дефіцит; фізичну неможливість не доведено')
     cancellation=(None if planned else 'Запас достатній без ранкового нагріву' if not required else
                   'Ранковий резерв недоступний або небезпечний за поточними обмеженнями')
     result['morning_reserve']=dict(context,**metrics,morning_required_minutes=required,
@@ -409,12 +418,66 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
     return result
 
 
-def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, power_kw=9.0, outages=(), extensions=(), hours_override=None, split=False, energy_limit=None, forbid_morning=False, minimum_required=None):
+SEARCH_FIELDS=('search_policy_version','search_status','alternatives_evaluated','search_passes',
+    'expanded_search_performed','early_heat_rejected_reason','terminal_reserve_checked',
+    'initial_deficit_degree_hours','alternative_deficit_degree_hours','search_check_key')
+
+
+def search_input_key(now,room,floor,outside,fire,model,weather,settings):
+    cycle=heating_cycle(now,settings)
+    keys=('target','lower','upper','night_target','night_lower','night_upper','start','end','sleep_start',
+          'sleep_end','strategy','split_comfort','morning_min_minutes','upper_margin','day_price','night_price',
+          'budget_multiplier','reserve_errors')
+    outage=settings.get('outage_schedule') or {}
+    solar=(settings.get('environment') or {}).get('solar',{})
+    data=dict(version=SEARCH_POLICY_VERSION,cycle=cycle,room=round(room,2),floor=round(floor,1),
+        outside=round(outside,1),fire=round(fire,1),model=model,weather=weather,
+        settings={k:settings.get(k) for k in keys},outage={k:outage.get(k) for k in ('mode','valid','outages','slots','known_until')},
+        profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
+        environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain')})
+    return hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def apply_search_diagnostics(now,settings,result):
+    reserve=result.get('morning_reserve')
+    if not reserve:return result
+    rows=result.get('_calculation_curve',result['curve'])
+    cycle_end=reserve['cycle_end'];cycle_start=reserve['cycle_start']
+    segments=[s for r in rows for s in r['heat_segments'] if cycle_start<=s['start']<cycle_end]
+    data=availability(settings.get('outage_schedule') or {},now.timestamp(),cycle_end)
+    pieces=[];cursor=max(now.timestamp(),cycle_start)
+    for outage in sorted(data.get('outages',[]),key=lambda o:o['start']):
+        if outage['end']<=cursor or outage['start']>=cycle_end:continue
+        if outage['start']>cursor:pieces.append((cursor,min(cycle_end,outage['start'])))
+        cursor=max(cursor,outage['end'])
+    if cursor<cycle_end:pieces.append((cursor,cycle_end))
+    last=max((b for a,b in pieces if b>a),default=None)
+    constraints=[]
+    for key,count in (result.get('candidate_rejections') or {}).items():
+        if count:constraints.append(dict(constraint=key,evidence='candidate_rejected',count=count))
+    if data.get('outages'):constraints.append(dict(constraint='outage_mask',evidence='published_intervals'))
+    if settings.get('strategy')=='Тільки в дозволені години':
+        constraints.append(dict(constraint='allowed_window',evidence='configured_window'))
+    reserve.update({key:result.get(key) for key in SEARCH_FIELDS})
+    reserve.update(end_cycle_planned_kwh=round(sum(s.get('kwh',0.) for s in segments),4),
+        last_available_energy_at=last,binding_constraints=constraints,
+        physical_impossibility_proven=False,
+        search_limitation='Bounded beam search; candidate rejection is not proof that every feasible plan was checked')
+    if reserve['deficit_degree_hours']>.00001:
+        checked='виконаний' if result.get('expanded_search_performed') else 'не виконаний'
+        reserve['impossibility_reason']=('Знайдений план має дефіцит; розширений пошук '+checked+
+                                        ', фізичну неможливість не доведено')
+    return result
+
+
+def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, power_kw=9.0, outages=(), extensions=(), hours_override=None, split=False, energy_limit=None, forbid_morning=False, minimum_required=None, beam_width=None):
     """24h beam search in half-hour blocks; comfort dominates tariff cost."""
     hours = min(24., max(0., (forecast[-1]["ts"] - now.timestamp()) / 3600 + 1)) if forecast else 6
     if hours_override is not None:
         hours = hours_override
     count = max(1, int(hours * 2))
+    width=beam_width or (48 if split else 12)
+    evaluated=0;rejections=dict(upper_temperature=0,energy_limit=0)
     # score, room, floor, decisions, curve, energy, min_temperature, max_temperature
     beams = [(0., room, floor, [], [], 0., room, room, 0.)]
     night_target=max(settings["lower"], settings["target"]-.5)
@@ -422,7 +485,6 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     anchor=settings.get('modulation_anchor')
     reserved=set()
     reserved_exact=None
-    morning_available=None
     minimum=number(settings.get('morning_min_minutes')) or 0
     elapsed=number(settings.get('morning_elapsed_minutes')) or 0
     cycle_policy=bool(settings.get('split_comfort') and 'night_target' in settings)
@@ -433,7 +495,6 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
         if not exact:
             return None
         reserved_exact=tuple(datetime.fromtimestamp(t,now.tzinfo) for t in exact)
-        morning_available=datetime.fromtimestamp(max(now.timestamp(),context['morning_start']),now.tzinfo)
     def session_kind(stamp):
         tm=datetime.fromtimestamp(stamp, now.tzinfo)
         if in_window(tm,"23:00","01:00"):
@@ -476,23 +537,8 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
         choices = [False, True] if any(masks) else [False]
         candidates = []
         for score, r, f, decisions, curve, energy, low, high, deficit in beams:
-            early_needed=True
-            if split and 'night_target' in settings and morning_available and when<morning_available:
-                # Earlier input is only a bridge to the available morning window.
-                cr,cf,t=r,f,when
-                early_needed=False
-                while t<morning_available:
-                    end=min(elapsed_at(t,900),morning_available)
-                    cr,cf=forecast_step(cr,cf,outdoor_at(forecast,t,outside),0.,
-                        fire_delta*math.exp(-(t.timestamp()-now.timestamp())/7200),model,
-                        (end.timestamp()-t.timestamp())/3600,t,forecast,settings)
-                    if cr<comfort_at(end,settings)[1]+.05:
-                        early_needed=True
-                        break
-                    t=end
             for heat in choices:
-                if heat and not early_needed:
-                    continue
+                evaluated+=1
                 nr, nf, penalty = r, f, 0.
                 shortage=deficit; fine=[]
                 used, outside_minutes, unsafe = 0., 0., False
@@ -541,11 +587,15 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                             unsafe = True
                         if 'night_target' in settings and split:
                             # Store daytime heat as late as feasible in the cheap window.
-                            # Early heat remains possible when required by sleep comfort.
+                            # Earlier heat remains possible for the full day/response reserve.
                             minutes=tm.hour*60+tm.minute
                             until_morning=(420-minutes)%1440
                             penalty += effective_kw*dt * min(1.,until_morning/480) * 20
-                if unsafe or (energy_limit is not None and energy+used>energy_limit+.001):
+                if unsafe:
+                    rejections['upper_temperature']+=1
+                    continue
+                if energy_limit is not None and energy+used>energy_limit+.001:
+                    rejections['energy_limit']+=1
                     continue
                 if split and used and session_kind(when.timestamp())=="other":
                     penalty += used*.8
@@ -580,7 +630,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
             if key not in seen:
                 seen.add(key)
                 beams.append(candidate)
-            if len(beams) == (48 if split else 12):
+            if len(beams) == width:
                 break
     minimum=number(settings.get("morning_min_minutes")) or 0
     elapsed=number(settings.get("morning_elapsed_minutes")) or 0
@@ -616,7 +666,9 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     return {"heat":bool(best[4][0]["heat_segments"] and best[4][0]["heat_segments"][0]["start"] == now.timestamp()),"curve":best[4],"energy":round(best[5],2),
             "minimum":round(best[6],2),"maximum":round(best[7],2),
             "horizon_hours":round(count/2,1),"validated":bool(model.get("validated")),
-            "morning_priority_applied":bool(split and 'night_target' in settings)}
+            "morning_priority_applied":bool(split and 'night_target' in settings),
+            "search_score":best[0],"search_deficit":best[8],"alternatives_evaluated":evaluated,
+            "beam_width":width,"candidate_rejections":rejections}
 
 
 def weather_coverage(forecast, finish):
@@ -652,12 +704,42 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     args = (now, room, floor, outside, fire_delta, model, forecast, settings, power_kw)
     priority=bool(settings.get('split_comfort') and 'night_target' in settings)
     def search(outages=(), extensions=()):
-        if priority:
-            candidate=_plan(*args,outages=outages,extensions=extensions,
-                            hours_override=horizon,split=True)
-            if candidate is not None:
-                return candidate
-        return _plan(*args,outages=outages,extensions=extensions,hours_override=horizon)
+        candidate=_plan(*args,outages=outages,extensions=extensions,
+                        hours_override=horizon,split=priority)
+        if candidate is None:
+            candidate=_plan(*args,outages=outages,extensions=extensions,hours_override=horizon)
+        def deficit(c):
+            return trajectory_metrics(now,room,c['curve'],settings,
+                context['assessment_until'] if context else now.timestamp()+86400,
+                settings.get('_reserve_margin',0.))['deficit_degree_hours']
+        initial=deficit(candidate)
+        evidence=[dict(beam_width=candidate['beam_width'],deficit_degree_hours=initial,
+                       alternatives_evaluated=candidate['alternatives_evaluated'])]
+        counts=candidate['alternatives_evaluated']
+        if priority and initial>.00001:
+            # No prefix pruning: every earlier allowed interval remains available.
+            # A wider pass is bounded and runs only when the first pass has deficit.
+            for split in (True,False):
+                alternative=_plan(*args,outages=outages,extensions=extensions,hours_override=horizon,
+                                  split=split,beam_width=192)
+                if alternative is None:
+                    continue
+                alternative_deficit=deficit(alternative)
+                counts+=alternative['alternatives_evaluated']
+                evidence.append(dict(beam_width=192,split=split,deficit_degree_hours=alternative_deficit,
+                                     alternatives_evaluated=alternative['alternatives_evaluated']))
+                if (alternative_deficit,alternative['search_score'])<(deficit(candidate),candidate['search_score']):
+                    candidate=alternative
+                if deficit(candidate)<=.00001:
+                    break
+        candidate.update(search_policy_version=SEARCH_POLICY_VERSION,
+            search_status='feasible_found' if deficit(candidate)<=.00001 else 'deficit_after_expanded_search' if len(evidence)>1 else 'deficit_unexpanded',
+            alternatives_evaluated=counts,search_passes=evidence,expanded_search_performed=len(evidence)>1,
+            early_heat_rejected_reason='Лише перевірки безпеки; ранній нагрів має м’який пріоритет',
+            terminal_reserve_checked=bool(context),initial_deficit_degree_hours=initial,
+            alternative_deficit_degree_hours=min((e['deficit_degree_hours'] for e in evidence[1:]),default=None),
+            search_check_key=search_input_key(now,room,floor,outside,fire_delta,model,forecast,settings))
+        return candidate
     ordinary = search()
     result = search(outages=outages) if outages else ordinary
     extensions = []
@@ -730,7 +812,7 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
                   session_kwh={k:round(v,3) for k,v in session_kwh.items()},
                   night_air_target=(settings['night_lower']+.05 if priority else
                                     max(settings["lower"],settings["target"]-.5)),
-                  split_reason=("Основне накопичення тепла ближче до ранку; раніше — за потребою нічного комфорту"
+                  split_reason=("Нагрів якомога ближче до останнього доступного ранку; раніше — для достатнього запасу на день"
                                 if split_applied and 'night_target' in settings else
                                 "Вечірній і ранковий нагрів у межах енергопотреби" if split_applied else
                                 "Запас тепла не потребує примусового ранкового нагріву" if result['energy']<1.5 and not priority else
@@ -760,6 +842,7 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
                   heat_segments=segments, schedule_updated=data.get("updated"))
     result['_calculation_curve']=[dict(r) for r in result['_calculation_curve']]
     result['curve']=[{k:v for k,v in r.items() if k!='_fine'} for r in result['curve']]
+    apply_search_diagnostics(now,settings,result)
     return result
 
 
