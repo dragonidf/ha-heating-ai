@@ -28,7 +28,10 @@ class HeatingRecovery:
             for record in records:
                 attributes=record.get('attributes',{})
                 identifier=attributes.get('decision_id')
-                if identifier and attributes.get('schema_version') and 'reason' in attributes:
+                required={'reason','plan_id','cycle_id','sources','measurements','policy','reserve','command','inputs'}
+                preserved=(required<=attributes.keys() or
+                    attributes.get('external_attributes') in (True,'true') and attributes.get('attributes_snapshot_id'))
+                if identifier and attributes.get('schema_version') and preserved:
                     state=record.get('state')
                     if state in seen and seen[state]!=identifier:
                         verified=True

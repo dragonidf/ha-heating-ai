@@ -156,8 +156,9 @@ class RecorderVerificationTests(unittest.TestCase):
         from heating_recovery import HeatingRecovery
         app=HeatingRecovery();app.memory={};states=[]
         app.publish=lambda *args,**kw:states.append((args,kw))
-        app.get_history=AsyncMock(return_value=[[dict(state='off',attributes=dict(decision_id='a',schema_version=1,reason='old')),
-            dict(state='off',attributes=dict(decision_id='b',schema_version=1,reason='new'))]])
+        required=dict(plan_id='p',cycle_id='cycle',sources={},measurements={},policy={},reserve={},command={},inputs={})
+        app.get_history=AsyncMock(return_value=[[dict(state='off',attributes=dict(required,decision_id='a',schema_version=1,reason='old')),
+            dict(state='off',attributes=dict(required,decision_id='b',schema_version=1,reason='new'))]])
         asyncio.run(app.verify_decision_history())
         self.assertEqual(app.memory['decision_recorder_status'],'verified_same_state_attributes')
         kwargs=app.get_history.call_args.kwargs
@@ -165,6 +166,10 @@ class RecorderVerificationTests(unittest.TestCase):
         self.assertFalse(kwargs['significant_changes_only'])
         self.assertFalse(kwargs['no_attributes'])
         app.get_history=AsyncMock(return_value=[[dict(state='off',attributes={})]])
+        asyncio.run(app.verify_decision_history())
+        self.assertTrue(app.memory['decision_recorder_status'].startswith('unverified'))
+        app.get_history=AsyncMock(return_value=[[dict(state='off',attributes=dict(decision_id='a',schema_version=1,reason='old')),
+            dict(state='off',attributes=dict(decision_id='b',schema_version=1,reason='new'))]])
         asyncio.run(app.verify_decision_history())
         self.assertTrue(app.memory['decision_recorder_status'].startswith('unverified'))
 
