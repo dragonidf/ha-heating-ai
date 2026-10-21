@@ -48,7 +48,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     count=max(48,math.ceil((context['assessment_until']-start)/1800)) if priority and context else 48
     finish=start+count*1800
     settings=dict(settings,_reserve_context=context,_reserve_needed=bool(context and
-        coast_reserve_needed(now,room,floor,outside,fire,model,weather,settings,context)))
+        coast_reserve_needed(now,room,floor,outside,fire,model,weather,settings,context,power_kw)))
     priority=bool(settings.get('split_comfort') and 'night_target' in settings)
     if priority and not split:
         # A safety fallback without a morning reservation must be reconsidered.

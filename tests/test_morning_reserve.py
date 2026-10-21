@@ -64,6 +64,7 @@ class ReservePolicyTests(unittest.TestCase):
         p=plan(now,21.4,22,10,0,self.model,[],self.settings,9)
         r=p['morning_reserve']
         self.assertGreater(r['no_morning_counterfactual']['deficit_degree_hours'],0)
+        self.assertEqual(r['no_morning_counterfactual']['assessment_until'],r['assessment_until'])
         self.assertTrue(p['heat'])
         self.assertLess(r['deficit_degree_hours'],r['no_morning_counterfactual']['deficit_degree_hours'])
         self.assertFalse(r['reserve_sufficient'])  # cannot promise impossible comfort

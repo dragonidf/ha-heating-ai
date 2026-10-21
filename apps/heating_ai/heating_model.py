@@ -300,18 +300,35 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
                 deficit_minutes=round(minutes,2),predicted_maximum=round(maximum,3))
 
 
-def coast_reserve_needed(now, room, floor, outside, fire, model, weather, settings, context):
+def coast_reserve_needed(now, room, floor, outside, fire, model, weather, settings, context, power_kw=3.):
     r,f=room,floor; stamp=now.timestamp();rows=[]
-    # The no-morning counterfactual is an all-coast trajectory to the next
-    # opportunity. Later optional heat may help only after that opportunity.
-    end=context['next_predicted_available_heat_at'] or context['assessment_until']
+    # Coast to the next opportunity, then permit a safe recovery there. Assess
+    # the same response-delay horizon as the candidate: reaching the next
+    # window above lower does not prove comfort throughout thermal recovery.
+    end=context['assessment_until']
+    next_heat=context['next_predicted_available_heat_at']
+    data=availability(settings.get('outage_schedule') or {},now.timestamp(),end)
+    outages=data.get('outages',[]) if data.get('valid') else []
     while stamp<end:
         stop=min(stamp+300,end)
         tm=datetime.fromtimestamp(stamp,now.tzinfo)
-        r,f=forecast_step(r,f,outdoor_at(weather,tm,outside),0.,
-            fire*math.exp(-(stamp-now.timestamp())/7200),model,(stop-stamp)/3600,tm,weather,settings)
+        _,lo,hi,zone=comfort_at(tm,settings)
+        hi=safe_upper(hi,zone,settings)
+        active=(next_heat is not None and stamp>=next_heat and r<hi and f<50 and
+                in_window(tm,settings['start'],settings['end']) and
+                in_window(datetime.fromtimestamp(stop-.001,now.tzinfo),settings['start'],settings['end']) and
+                not blocked(stamp,stop,outages))
+        kw=modulation_power(f,settings.get('modulation_profile'),3.,settings.get('modulation_anchor'),
+                            (stamp-now.timestamp())/60) if settings.get('modulation_profile') is not None else power_kw
+        args=(outdoor_at(weather,tm,outside),fire*math.exp(-(stamp-now.timestamp())/7200),
+              model,(stop-stamp)/3600,tm,weather,settings)
+        nr,nf=forecast_step(r,f,args[0],kw if active else 0.,*args[1:])
+        if active and (nr>hi or nf>50):
+            nr,nf=forecast_step(r,f,args[0],0.,*args[1:])
+        r,f=nr,nf
         rows.append(dict(ts=stop,temperature=r));stamp=stop
     metrics=trajectory_metrics(now,room,rows,settings,end)
+    metrics.update(assessment_until=end,scenario='coast_then_safe_next_window_recovery')
     settings['_no_morning_metrics']=metrics
     return metrics['deficit_degree_hours']>0
 
@@ -627,7 +644,7 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     horizon=max(24.,math.ceil((context['assessment_until']-now.timestamp())/1800)/2) if priority and context else 24.
     settings['_reserve_context']=context
     settings['_reserve_margin']=uncertainty_reserve(settings,horizon) or 0.
-    settings['_reserve_needed']=bool(context and coast_reserve_needed(now,room,floor,outside,fire_delta,model,forecast,settings,context))
+    settings['_reserve_needed']=bool(context and coast_reserve_needed(now,room,floor,outside,fire_delta,model,forecast,settings,context,power_kw))
 
     schedule_until = number(data.get("known_until")) if data.get("valid") else None
     coverage = weather_coverage(forecast,now.timestamp()+86400)
