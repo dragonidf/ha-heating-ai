@@ -208,6 +208,7 @@ class AdapterEvidenceTests(unittest.TestCase):
             attrs=decisions[0][2]
             self.assertNotIn('external_attributes',attrs)
             self.assertLessEqual(len(json.dumps(attrs,ensure_ascii=False).encode()),8192)
+            self.assertEqual(attrs['energy_counter_kwh'],3000)
             self.assertEqual(attrs['sources']['room']['reported_at'],measured)
             self.assertEqual(attrs['sources']['room']['age_seconds'],720)
             self.assertNotEqual(attrs['recorded_at'],measured)

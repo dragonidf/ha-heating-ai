@@ -57,14 +57,14 @@ class HeatingRecovery:
             reserve=forecast.get('morning_reserve',{})
             mode=self.raw('mode');armed=self.raw('armed')=='on'
             sources={}
-            for key in ('room','return','outside','fireplace','power_balance','thermostat'):
+            for key in ('room','return','outside','fireplace','power_balance','thermostat','energy'):
                 entity=self.cfg.get(key)
                 state=self.get_state(entity,attribute='all') if entity else None
                 state=state if isinstance(state,dict) else {}
                 reported=state.get('last_reported') or state.get('last_updated')
                 try:
                     age=max(0.,stamp-datetime.fromisoformat(reported.replace('Z','+00:00')).timestamp())
-                except (TypeError,ValueError):
+                except (AttributeError,TypeError,ValueError):
                     age=None
                 available=state.get('state') not in (None,'unknown','unavailable')
                 max_age=self.cfg.get(key+'_max_age',300 if key=='power_balance' else 14400 if key=='room' else 1200)
@@ -83,7 +83,7 @@ class HeatingRecovery:
                 demand=context.get('demand'),inhibitions=context.get('inhibitions',[]),
                 mode=mode,armed=armed,permitted=bool(self.cfg.get('allow_actuation')) and armed,
                 grid=self.grid_state(),grid_evidence='existing inverter connection, input voltage and heartbeat guards',
-                power_w=actual,power_source=getattr(self,'power_source','unknown'),
+                power_w=actual,energy_counter_kwh=self.val('energy'),power_source=getattr(self,'power_source','unknown'),
                 power_estimated=getattr(self,'power_source','').startswith('fallback'),
                 physical_heating=actual is not None and actual>=1500,
                 execution='automatic' if mode=='Автоматичне керування' and armed and self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if actual is not None and actual>=1500 else 'idle',
@@ -105,6 +105,7 @@ class HeatingRecovery:
             signature=dict(record)
             signature.pop('sources')
             signature.pop('power_w')
+            signature.pop('energy_counter_kwh')
             signature.pop('measurements')
             signature['source_quality']={k:(v['quality'],v['available']) for k,v in sources.items()}
             fingerprint=hashlib.sha256(json.dumps(signature,sort_keys=True,default=str).encode()).hexdigest()
