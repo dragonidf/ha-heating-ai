@@ -173,11 +173,19 @@ class HeatingRecovery:
             self.memory['reserve_validation_at']=stamp
             rows=forecast.get('_calculation_curve',forecast['curve'])
             segments=[s for r in rows for s in r['heat_segments']]
+            # Validation needs on/off intervals, not a duplicate of every 5-min
+            # modulation sample in every pending horizon saved to state.json.
+            intervals=[]
+            for segment in sorted(segments,key=lambda s:s['start']):
+                if intervals and segment['start']<=intervals[-1]['end']+.001:
+                    intervals[-1]['end']=max(intervals[-1]['end'],segment['end'])
+                else:
+                    intervals.append(dict(start=segment['start'],end=segment['end']))
             for hours in (6,12,24,36):
                 point=next((r for r in rows if r['ts']>=stamp+hours*3600),None)
                 if point:
                     pending.append(dict(ts=point['ts'],hours=(point['ts']-stamp)/3600,
-                        temperature=point['temperature'],model=dict(self.model),valid=True,segments=segments,
+                        temperature=point['temperature'],model=dict(self.model),valid=True,segments=intervals,
                         start_energy=self.val('energy'),expected_energy=sum(s.get('kwh',0.)*
                             max(0.,min(s['end'],point['ts'])-s['start'])/(s['end']-s['start'])
                             for s in segments if s['start']<point['ts'])))

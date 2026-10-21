@@ -229,3 +229,18 @@ class AdapterEvidenceTests(unittest.TestCase):
         app.memory['reserve_predictions']=[dict(point,valid=True)]
         app.validate_reserve_predictions(now,21.3,3000,True) # manual/unplanned heat
         self.assertEqual(len(app.memory['reserve_errors']),1)
+
+    def test_long_horizon_validation_stores_merged_execution_intervals(self):
+        from heating_recovery import HeatingRecovery
+        app=HeatingRecovery();app.memory={};app.model=dict(DEFAULT_MODEL,version=4)
+        app.raw=lambda key:'on' if key=='armed' else 'Автоматичне керування'
+        app.grid_state=lambda:'on';app.val=lambda key:100.
+        now=datetime(2026,10,21,23,tzinfo=ZoneInfo('Europe/Kiev'))
+        start=now.timestamp()
+        segments=[dict(start=start+i*300,end=start+(i+1)*300,kwh=.25) for i in range(12)]
+        forecast=dict(curve=[dict(ts=start+6*3600,temperature=21.4,heat_segments=segments)])
+        app.validate_reserve_predictions(now,21.4,3000,True,forecast)
+        pending=app.memory['reserve_predictions']
+        self.assertEqual(len(pending[0]['segments']),1)
+        self.assertEqual(pending[0]['segments'][0],dict(start=start,end=start+3600))
+        self.assertEqual(pending[0]['expected_energy'],3.)
