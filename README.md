@@ -1,6 +1,6 @@
 # Heating AI
 
-Кліматичний контролер Home Assistant на AppDaemon: інерція теплої підлоги, модуляція котла, денний і нічний комфорт, погода, камін та відключення електрики.
+Кліматичний контролер Home Assistant на AppDaemon: інерція теплої підлоги, модуляція котла, денний і нічний комфорт, погода, камін та відключення електрики. розробка під персональний ha, на іншому сервері працювати не буде через відсутність потрібних датчиків
 
 [![Tests](https://github.com/dragonidf/ha-heating-ai/actions/workflows/test.yml/badge.svg)](https://github.com/dragonidf/ha-heating-ai/actions/workflows/test.yml)
 
