@@ -1,6 +1,10 @@
 """Conservative, labelled power estimate used only during primary meter faults."""
 from heating_model import number
 
+def estimated_power(source):
+    # A confirmed loss of boiler supply proves zero; thermostat inference does not.
+    return str(source or '').startswith('fallback') and source!='fallback_grid_off'
+
 def fallback_power(primary, failed, mode, target, current, phases, input_fresh,
                    manual_kw=None, grid_off=False):
     if not failed and number(primary) is not None:

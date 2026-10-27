@@ -6,19 +6,19 @@ The adapter persists the returned reference beside existing plan memory.
 from datetime import datetime, timedelta
 import math
 from uuid import uuid4
-from heating_model import (plan as optimise, step, outdoor_at, in_window,
+from heating_model import (held_action,number,plan as optimise, step, outdoor_at, in_window,
                            modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
                            reserve_context,attach_reserve,coast_reserve_needed,local_boundary,
                            SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics)
 from heating_outages import blocked, availability, schedule_covered
-from heating_environment import forecast_step,gain_at,safe_upper
+from heating_environment import forecast_step,gain_at,safe_upper,ENVIRONMENT_POLICY_VERSION
 
 
 def policy(settings):
     keys=('target','lower','upper','start','end','strategy','split_comfort',
           'morning_min_minutes','day_price','night_price','budget_multiplier',
           'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin')
-    return {**{k:settings.get(k) for k in keys},'environment_policy_version':4,
+    return {**{k:settings.get(k) for k in keys},'environment_policy_version':ENVIRONMENT_POLICY_VERSION,
             'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
             'search_policy_version':SEARCH_POLICY_VERSION}
 
@@ -45,12 +45,12 @@ def expected(previous,stamp,key,initial):
     return points[-1][1]
 
 
-def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False):
+def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False,context_override=None):
     """Integrate at <=5 min, splitting at exact session and forecast boundaries."""
     start=now.timestamp(); public_finish=start+86400
-    context=reserve_context(now,settings,model)
+    context=context_override or reserve_context(now,settings,model)
     priority=bool(settings.get('split_comfort') and 'night_target' in settings)
-    count=max(48,math.ceil((context['assessment_until']-start)/1800)) if priority and context else 48
+    count=max(48,math.ceil((context['assessment_until']-start)/1800)) if (priority or context_override) and context else 48
     finish=start+count*1800
     settings=dict(settings,_reserve_context=context,_reserve_needed=bool(context and
         coast_reserve_needed(now,room,floor,outside,fire,model,weather,settings,context,power_kw)))
@@ -80,33 +80,46 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 if start<boundary<finish:
                     boundaries.add(boundary)
     rows=[]; r,f=room,floor; low=high=room; energy=0.; all_segments=[]
+    actuator=settings.get('actuator') or {};command=actuator.get('action');command_at=actuator.get('changed_at',0.)
     for block in range(count):
         a=start+1800*block; b=a+1800
         cuts=sorted({a,b,*[a+300*j for j in range(1,6)],
                      *[t for t in boundaries if a<t<b]})
         heats=[]; used=0.; fine=[]
-        for t,u in zip(cuts,cuts[1:]):
-            active=any(s['start']<=t and s['end']>=u for s in segments)
-            tm=datetime.fromtimestamp(t,now.tzinfo); dt=(u-t)/3600
-            kw=(modulation_power(f,settings.get('modulation_profile'),3.,
-                                settings.get('modulation_anchor'),(t-start)/60)
-                if settings.get('modulation_profile') is not None else power_kw)
-            wanted,lo,hi,zone=comfort_at(tm,settings)
-            hi=safe_upper(hi,zone,settings)
-            if active and (r>=hi or f>=50):
-                return None
-            r,f=forecast_step(r,f,outdoor_at(weather,tm,outside),kw if active else 0.,
-                     fire*math.exp(-(t-start)/7200),model,dt,tm,weather,settings)
-            low=min(low,r); high=max(high,r)
-            fine.append(dict(ts=u,temperature=r,**{'return':f}))
-            if r>max(room,hi)+.01 and (active or all_segments):
-                return None
-            if active:
-                if r>hi or f>50:
+        for begin,finish in zip(cuts,cuts[1:]):
+            deadline=(number(command_at) or 0)+(600 if command=='heat' else 900)
+            pieces=[begin,deadline,finish] if actuator and begin<deadline<finish else [begin,finish]
+            for t,u in zip(pieces,pieces[1:]):
+                active=any(s['start']<=t and s['end']>=u for s in segments)
+                tm=datetime.fromtimestamp(t,now.tzinfo); dt=(u-t)/3600
+                kw=(modulation_power(f,settings.get('modulation_profile'),3.,
+                                    settings.get('modulation_anchor'),(t-start)/60)
+                    if settings.get('modulation_profile') is not None else power_kw)
+                wanted,lo,hi,zone=comfort_at(tm,settings)
+                hi=safe_upper(hi,zone,settings)
+                if actuator:
+                    permitted=(not blocked(t,u,outages) and (settings['strategy']!='Тільки в дозволені години' or
+                        in_window(tm,settings['start'],settings['end']) and
+                        in_window(datetime.fromtimestamp(u-.001,now.tzinfo),settings['start'],settings['end'])))
+                    stop=not permitted or r>=hi or actuator.get('safety_stop') and t<start+300
+                    wanted='heat' if active and not stop else 'off'
+                    applied=held_action(command,command_at,t,wanted,urgent=stop)
+                    if applied!=command:command,command_at=applied,t
+                    active=applied=='heat' and permitted
+                if active and (r>=hi or f>=50):
                     return None
-                s=dict(start=t,end=u,power_kw=round(kw,3),kwh=kw*dt)
-                s['conditional']=not schedule_covered(data,t,u)
-                heats.append(s);used+=s['kwh']
+                r,f=forecast_step(r,f,outdoor_at(weather,tm,outside),kw if active else 0.,
+                         fire*math.exp(-(t-start)/7200),model,dt,tm,weather,settings)
+                low=min(low,r); high=max(high,r)
+                fine.append(dict(ts=u,temperature=r,**{'return':f}))
+                if r>max(room,hi)+.01 and (active or all_segments):
+                    return None
+                if active:
+                    if r>hi or f>50:
+                        return None
+                    s=dict(start=t,end=u,power_kw=round(kw,3),kwh=kw*dt)
+                    s['conditional']=not schedule_covered(data,t,u)
+                    heats.append(s);used+=s['kwh']
         energy+=used;all_segments.extend(heats)
         wanted,lo,hi,zone=comfort_at(datetime.fromtimestamp(b-.001,now.tzinfo),settings)
         rows.append(dict(ts=b,temperature=round(r,2),return_=round(f,2),
@@ -156,6 +169,42 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     attach_reserve(now,room,model,weather,settings,result,context)
     result['curve']=[{k:v for k,v in row.items() if k!='_fine'} for row in rows]
     return result
+
+
+def stress_scenarios(now,room,floor,outside,fire,model,weather,settings,nominal,power_kw=3.):
+    """Frozen-plan sensitivity, never an outage prediction or an actuation request."""
+    rows=[]
+    calculation=nominal.get('_calculation_curve')
+    segments=([s for r in calculation for s in r['heat_segments']] if calculation is not None else
+              nominal.get('heat_segments',[]))
+    context=nominal.get('morning_reserve')
+    delta=max(0.,min(10.,number(settings.get('risk_cold_delta')) if number(settings.get('risk_cold_delta')) is not None else 2.))
+    low_solar={**(settings.get('environment') or {}),'solar':{}}
+    cold=[dict(r,temperature=r['temperature']-delta) for r in weather]
+    cases=[('cold_low_solar',dict(settings,environment=low_solar),segments,outside-delta,cold)]
+    data=settings.get('outage_schedule') or {}
+    if data.get('mode')=='unknown' or data.get('emergency'):
+        end=(context or {}).get('cycle_end',now.timestamp()+86400)
+        for key,default in (('risk_blackout_short_minutes',60),('risk_blackout_long_minutes',120)):
+            minutes=max(5.,min(480.,number(settings.get(key)) or default))
+            start=max(now.timestamp(),end-minutes*60);trimmed=[]
+            for segment in segments:
+                for a,b in ((segment['start'],min(start,segment['end'])),(max(end,segment['start']),segment['end'])):
+                    if b>a:trimmed.append(dict(segment,start=a,end=b))
+            outage=dict(data,mode='scheduled',valid=True,outages=[*data.get('outages',[]),dict(start=start,end=end)])
+            # Evaluate curtailed delivery, even when it can no longer meet the
+            # nominal minimum run. This never changes the actual plan's policy.
+            cases.append(('blackout_'+format(minutes,'g'),dict(settings,outage_schedule=outage,morning_min_minutes=0),trimmed,outside,weather))
+    for name,scenario,requests,out,weather_rows in cases:
+        result=replay(now,room,floor,out,fire,model,weather_rows,scenario,requests,
+                      nominal.get('split_comfort_applied',False),power_kw,reserve_checked=True,context_override=context)
+        rows.append(dict(name=name,hypothetical=True,scope='frozen_plan_without_replanning',
+            assessment_until=(context or {}).get('assessment_until',now.timestamp()+86400),
+            available=result is not None,energy=result.get('energy') if result else None,
+            minimum=result.get('minimum') if result else None,maximum=result.get('maximum') if result else None,
+            deficit_degree_hours=(result.get('morning_reserve') or {}).get('deficit_degree_hours') if result else None,
+            reason=None if result else 'Scenario violates existing safety or exception constraints'))
+    return rows
 
 
 def stable_plan(now, room, floor, outside, fire, model, weather, settings, power_kw=9., previous=None):

@@ -16,6 +16,7 @@
     "outside": "sensor.your_outside",
     "fireplace": "sensor.your_fireplace",
     "fan": "fan.your_fan",
+    "ventilation": {},
     "grid": "binary_sensor.your_grid",
     "connection": "binary_sensor.your_connection",
     "grid_voltage": "sensor.your_grid_voltage",

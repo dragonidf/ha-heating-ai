@@ -11,13 +11,13 @@ import statistics
 import time
 import calendar
 import shutil
-from heating_fallback import fallback_power, repair_samples
+from heating_fallback import fallback_power, repair_samples,estimated_power
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning
-from heating_stability import stable_plan,replay
+from heating_stability import stable_plan,replay,stress_scenarios
 from heating_environment import observe_floor,observe_gain,reliability,daylight,anchor_weather
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings)
@@ -40,7 +40,14 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.run_every(self.verify_decision_history,self.datetime()+timedelta(seconds=420),600)
         self.memory.pop('morning_observation',None)  # no integration across restart gaps
         # Unobserved downtime invalidates prospective error validation.
+        pending_count=len(self.memory.get('reserve_predictions',[]))
+        if pending_count:
+            rejections=self.memory.setdefault('forecast_validation_rejections',{})
+            rejections['restart_gap']=rejections.get('restart_gap',0)+pending_count
         self.memory['reserve_predictions']=[]
+        self.memory.pop('peak_watch',None)
+        self.memory.pop('peak_observation',None)
+        self.memory.pop('cycle_energy_observation',None)
         self.memory['predictions']=[]  # never validate across an unobserved restart gap
         self.release_version=json.loads((Path(__file__).resolve().parent/'release.json').read_text())['version']
         self.restore_system_settings()
@@ -95,6 +102,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         # Serialize the two summary publishers without locking thermal planning.
         self.ai_summary_lock=RLock()
         self.ai_summary_attributes=None
+        ventilation=self.cfg.get('ventilation',{})
+        if isinstance(ventilation,dict):
+            for binding in ventilation.values():
+                if isinstance(binding,dict):
+                    for entity in {binding.get('entity'),binding.get('power_entity')}-{None}:
+                        if isinstance(entity,str):self.listen_state(self.ventilation_changed,entity)
+        self.ventilation_tick()
         self.listen_event(self.weather_event,"heating_weather_forecast")
         self.listen_event(self.night_event,"heating_fan_night_request")
         self.listen_event(self.system_settings_changed,'heating_system_settings')
@@ -330,7 +344,50 @@ class HeatingClimate(HeatingRecovery,Hass):
         if thermostat is not None and bias is not None and self.raw("thermostat") not in ("unavailable","unknown",None):
             return thermostat-bias,"Термостат · резерв",primary,thermostat
         return None,"Немає перевіреного датчика",primary,thermostat
-    def sample(self,room,probe,outside,power,fire,source,primary,thermostat,quality):
+    def ventilation_changed(self,entity,attribute,old,new,kwargs=None,**extra):
+        self.ventilation_tick()
+    def ventilation_tick(self,stamp=None):
+        stamp=time.time() if stamp is None else stamp
+        states=getattr(self,'ventilation_states',{})
+        elapsed=max(0.,stamp-getattr(self,'ventilation_at',stamp))
+        totals=getattr(self,'ventilation_totals',{})
+        for name,old in states.items():
+            row=totals.setdefault(name,dict(seconds=0.,on=0.,unknown=0.,supply_on=0.,supply_unknown=0.,
+                                            powered_on=0.,grid_on=0.,grid_unknown=0.))
+            row['seconds']+=elapsed
+            known=elapsed<=45
+            row['on']+=elapsed if known and old['relay']=='on' else 0.
+            row['unknown']+=elapsed if not known or old['relay'] not in ('on','off') else 0.
+            row['supply_on']+=elapsed if known and old['supply']=='on' else 0.
+            row['supply_unknown']+=elapsed if not known or old['supply'] not in ('on','off') else 0.
+            row['powered_on']+=elapsed if known and old['relay']=='on' and old['supply']=='on' else 0.
+            row['grid_on']+=elapsed if known and old['grid']=='on' else 0.
+            row['grid_unknown']+=elapsed if not known or old['grid']=='unknown' else 0.
+        bindings=self.cfg.get('ventilation',{})
+        states={}
+        if isinstance(bindings,dict):
+            for name,binding in bindings.items():
+                if not isinstance(binding,dict) or not isinstance(binding.get('entity'),str):continue
+                states[name]=dict(relay=self.get_state(binding['entity']),
+                    supply=self.get_state(binding['power_entity']) if isinstance(binding.get('power_entity'),str) else 'unknown',
+                    grid=self.grid_state(),entity=binding['entity'])
+        self.ventilation_states=states;self.ventilation_totals=totals;self.ventilation_at=stamp
+    def ventilation_sample(self,stamp):
+        self.ventilation_tick(stamp)
+        result={}
+        for name,row in self.ventilation_totals.items():
+            seconds=row['seconds']
+            result[name]=dict(entity=self.ventilation_states.get(name,{}).get('entity'),seconds=round(seconds,1),
+                on_fraction=round(row['on']/seconds,4) if seconds else None,
+                unknown_fraction=round(row['unknown']/seconds,4) if seconds else None,
+                supply_on_fraction=round(row['supply_on']/seconds,4) if seconds else None,
+                supply_unknown_fraction=round(row['supply_unknown']/seconds,4) if seconds else None,
+                powered_relay_on_fraction=round(row['powered_on']/seconds,4) if seconds and row['supply_unknown']==0 else None,
+                grid_on_fraction=round(row['grid_on']/seconds,4) if seconds else None,
+                grid_unknown_fraction=round(row['grid_unknown']/seconds,4) if seconds else None)
+        self.ventilation_totals={}
+        return result
+    def sample(self,room,probe,outside,power,fire,source,primary,thermostat,quality,settings=None):
         stamp=time.time()
         if stamp-self.last_sample<290:
             return
@@ -349,6 +406,16 @@ class HeatingClimate(HeatingRecovery,Hass):
         row['heat_command_at']=self.memory.get('command_at') if row['heating_requested'] else None
         row['grid']=self.grid_state()
         row['fire_valid']=self.memory.get('fire_phase')!='Датчик недоступний'
+        row['ventilation']=self.ventilation_sample(stamp)
+        record=self.raw('room',attribute='all') if self.cfg.get('room') else None
+        if isinstance(record,dict):
+            reported=record.get('last_reported') or record.get('last_updated')
+            row['room_timestamp_kind']='last_reported' if record.get('last_reported') else 'last_updated'
+            try:row['room_reported_at']=datetime.fromisoformat(reported.replace('Z','+00:00')).timestamp()
+            except (AttributeError,ValueError,TypeError):row['room_reported_at']=None
+        if settings:
+            row['comfort_policy']={k:settings[k] for k in ('target','lower','upper','night_target','night_lower',
+                'night_upper','sleep_start','sleep_end') if k in settings}
         self.fallback_interval=False
         previous=self.samples[-1] if self.samples else None
         if previous and previous.get("measurement_version")==3:
@@ -500,7 +567,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         if source!=getattr(self,"power_source",None):
             self.power_estimator.update(stamp,None)
         self.power_source=source
-        self.fallback_interval=getattr(self,"fallback_interval",False) or source.startswith("fallback")
+        self.fallback_interval=getattr(self,"fallback_interval",False) or estimated_power(source)
         if raw is None:
             self.measurement_valid_since=stamp
         power=self.power_estimator.update(stamp,raw)
@@ -514,7 +581,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      measurement_version=3,threshold_w=2000,confirmation_seconds=10,
                      averaging_seconds=20,raw_balance_w=primary,
                      averaged_balance_w=self.power_estimator.average,
-                     power_source=source,estimated=source.startswith("fallback"),primary_failed=bool(failed),
+                     power_source=source,estimated=estimated_power(source),primary_failed=bool(failed),
                      requested_heating=active,fallback_raw_w=raw if source.startswith("fallback") else None,
                      timestamp=self.now().isoformat())
         return power
@@ -541,6 +608,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.log('Temporary auto also failed: %s',recovery_error,level='ERROR')
     def tick_inner(self):
         now=self.now()
+        self.ventilation_tick(now.timestamp())
         if now.hour==10 and self.memory.get("learn_morning_date")!=now.date().isoformat():
             self.memory["learn_morning_date"]=now.date().isoformat()
             self.daily_learn()
@@ -586,10 +654,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                    self.memory.get('owned',False) and self.memory.get('last_command')=='heat')
         settings.update(confirmed_morning(self.memory,now,settings,power,self.val('energy'),grid,
                                          automatic,getattr(self,'power_source','unknown')))
-        self.validate_reserve_predictions(now,room,power,quality=source=='Вітальня' and room is not None and probe_ok and power is not None and outside is not None)
-        settings['reserve_errors']=self.memory.get('reserve_errors',[])
         settings["outage_schedule"] = outage_data
         settings["outage_advance_limit"] = self.cfg.get("outage_advance_limit",180)
+        settings.update({k:system_values(self.cfg)[k] for k in ('risk_cold_delta','risk_blackout_short_minutes','risk_blackout_long_minutes')})
         emergency = outage_data['emergency']
         outage_now = bool(outage_data.get("valid") and blocked(now.timestamp(),now.timestamp()+15,outage_data["outages"]))
         upcoming = [o for o in outage_data.get("outages",[]) if o["end"] > now.timestamp()]
@@ -617,8 +684,15 @@ class HeatingClimate(HeatingRecovery,Hass):
         once,once_text=self.once_state(grid,room,target,permitted and probe_ok and power is not None and valid)
         self.publish("sensor.heating_restore_status",once_text,friendly_name="Клімат — одноразовий запуск")
         quality=room is not None and probe_ok and outside is not None and power is not None
-        self.sample(room,probe,outside,None if power is None else power/1000,fire,source,primary,thermostat,quality)
+        self.sample(room,probe,outside,None if power is None else power/1000,fire,source,primary,thermostat,quality,settings)
         self.energy_tick()
+        self.observe_cycle_energy(now,settings,power,self.val('energy'),grid,automatic)
+        measured_fire=None if self.memory.get('fire_phase')=='Датчик недоступний' else fire
+        self.validate_reserve_predictions(now,room,power,
+            quality=source=='Вітальня' and room is not None and power is not None and outside is not None,
+            measurements=dict(floor=self.memory.get('floor_observer',{}).get('estimate',probe),outside=outside,fire=measured_fire))
+        self.observe_stop_peak(now,room,power,source=='Вітальня' and room is not None)
+        settings['reserve_errors']=self.memory.get('reserve_errors',[])
         profile=self.memory.get('modulation_profile',dict(bands=[]))
         settings['modulation_profile']=profile
         floor=probe
@@ -629,8 +703,13 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['floor_observer']=thermal
             weather_state=self.raw('weather',attribute='all') if self.cfg.get('weather') else None
             condition=weather_state.get('state') if isinstance(weather_state,dict) else None
+            room_state=self.raw('room',attribute='all') or {}
+            reported=room_state.get('last_reported') or room_state.get('last_updated') if isinstance(room_state,dict) else None
+            try:reported=datetime.fromisoformat(reported.replace('Z','+00:00')).timestamp()
+            except (AttributeError,ValueError,TypeError):reported=None
             solar=observe_gain(self.memory.get('solar_observer'),now.timestamp(),room,floor,
-                               outside,fire,power>=1500,self.model,self.climate_tz,condition)
+                               outside,fire,power>=1500,self.model,self.climate_tz,condition,
+                               secondary=thermostat,reported_at=reported)
             self.memory['solar_observer']=solar
             settings['environment']={'solar':dict(solar)}
             # Quantise the safety reserve so tiny MAE changes do not replan.
@@ -667,19 +746,30 @@ class HeatingClimate(HeatingRecovery,Hass):
                 abs(effective-prior_effective)>=1.5 and
                 time.time()-self.memory.get('last_plan_at',0)>=60):
             self.next_compute=0
+        usable_weather=self.weather if time.time()-self.memory.get("weather_at",0)<self.cfg.get('weather_max_age',10800) else []
+        usable_weather,weather_bias=anchor_weather(usable_weather,now.timestamp(),outside) if outside is not None else ([],0.)
+        settings['environment_weather']=usable_weather
+        peak=None;coast_overheat=False
+        if quality and valid:
+            peak,_=coast(room,floor,outside,fire,self.model)
+            coast_overheat=coast_exceeds_profile(now,room,floor,outside,fire,self.model,settings)
+        settings['actuator']=dict(action=self.memory.get('last_command'),changed_at=command_at or 0.,
+            safety_stop=grid!='on' or not permitted or self.raw('mode')!='Автоматичне керування' or
+                        room is not None and room>=upper or coast_overheat and not once)
         if time.time()<self.next_compute:
             demand=bool(self.memory.get("demand",False))
             segments=self.memory.get("planned_heat_segments",[])
             demand = demand and any(s["start"] <= now.timestamp() < s["end"] for s in segments)
             if once:
                 demand=True
-            if outage_now or (room is not None and room>=upper):
+            if outage_now or (room is not None and room>=upper) or coast_overheat and not once:
                 demand=False
             action=decide(self.raw("mode"),self.raw("armed")=="on",bool(self.cfg.get("allow_actuation",False)),
                           room,probe_ok,grid,self.raw("thermostat") not in ("unknown","unavailable",None),
                           power is not None,self.model.get("validated",False),demand,valid)
             if getattr(self,'decision_context',None):
                 self.decision_context.update(planned_demand=bool(any(s['start']<=now.timestamp()<s['end'] for s in segments)),
+                    coast_peak=peak,coast_overheat=coast_overheat and not once,
                     demand=demand,action=action,
                     reason='Немає мережі' if grid=='off' else 'Стан мережі не підтверджено' if grid=='unknown' else
                         'Досягнуто верхню межу' if room is not None and room>=upper else
@@ -697,24 +787,32 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory['last_plan_at']=time.time()
         self.memory['planned_effective_kw']=effective
         self.publish_system_settings()
-        usable_weather=self.weather if time.time()-self.memory.get("weather_at",0)<self.cfg.get('weather_max_age',10800) else []
-        usable_weather,weather_bias=anchor_weather(usable_weather,now.timestamp(),outside) if outside is not None else ([],0.)
-        settings['environment_weather']=usable_weather
         previous_reference=self.memory.get('plan_reference')
         forecast=None
         snapshot=None
-        peak=None
-        coast_overheat=False
         if quality and valid:
             forecast,plan_reference=stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
                           power_kw=3.0,previous=self.memory.get('plan_reference'))
+            forecast['cycle_energy']=self.cycle_budget(now,forecast,dict(weather=usable_weather,
+                grid={k:outage_data.get(k) for k in ('mode','valid','outages')},
+                thermal_state=dict(room=room,floor=floor,fire=fire,coast_peak=peak,
+                    gain={k:settings.get('environment',{}).get('solar',{}).get(k) for k in ('coefficient','validated','observed_gain')}),
+                power=dict(bands=[{k:b.get(k) for k in ('return_min','return_max','measured_kw')} for b in profile.get('bands',[])],anchor=anchor),
+                manual=dict(mode=self.raw('mode'),armed=self.raw('armed')),
+                fallback=bool(self.memory.get('temporary_fallback')),model=self.model))
+            try:
+                forecast['stress_scenarios']=stress_scenarios(now,room,floor,outside,fire,self.model,usable_weather,settings,forecast)
+            except Exception as exc:
+                # Optional shadow diagnostics cannot interrupt boiler control.
+                self.log('Stress diagnostics failed: %s',exc,level='WARNING')
+                forecast['stress_scenarios']=[dict(name='unavailable',available=False,hypothetical=True)]
             snapshot=self.remember_plan_inputs(now,room,floor,outside,fire,usable_weather,settings,forecast,previous_reference)
             self.memory['plan_reference']=plan_reference
-            peak,_=coast(room,floor,outside,fire,self.model)
-            coast_overheat=coast_exceeds_profile(now,room,floor,outside,fire,self.model,settings)
             self.publish("sensor.heating_forecast",forecast["minimum"],friendly_name="Клімат — мінімум прогнозу",
                          unit_of_measurement="°C",device_class="temperature",curve=forecast["curve"],
                          actual_curve=[{"ts":r["ts"],"temperature":r["room"]} for r in self.samples[-72:] if r.get("room") is not None],
+                         cycle_energy=forecast['cycle_energy'],
+                         stress_scenarios=forecast['stress_scenarios'],
                          planned_kwh=forecast["energy"],horizon_hours=forecast["horizon_hours"],
                          validated=self.model.get("validated",False) and not environment_quality['degraded'],
                          structural_model_validated=self.model.get('validated',False),
@@ -822,6 +920,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      last_result=self.memory.get("last_result","Навчання ще не виконувалось"),
                      learning_attempt=self.memory.get('learning_attempt'),learning_success=self.memory.get('learning_success'),
                      learning_storage_error=self.memory.get('learning_storage_error'),
+                     forecast_validation=self.validation_summary(),
                      journal=self.memory.get("journal",[])[-12:],
                      power_learning=profile,
                      effective_power_kw=round(effective,3) if effective is not None else None,
@@ -830,6 +929,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory["planned_heat_segments"]=forecast["heat_segments"] if forecast else []
         self.memory["demand"]=demand
         self.decision_context=dict(settings=settings,forecast=forecast,action=action,reason=reason,
+            coast_overheat=coast_overheat and not once,
             planned_demand=planned_heat,demand=demand,coast_peak=peak,
             measurements=dict(room=room,raw_return=probe,estimated_floor=floor,outside=outside,fire=fire,
                               external_gain=settings.get('environment',{}).get('solar',{}).get('observed_gain')),
@@ -841,7 +941,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             snapshot=self.remember_plan_inputs(now,room,floor,outside,fire,usable_weather,settings,forecast,previous_reference)
         self.decision_event('full_recompute',force=True,snapshot=snapshot)
         if forecast:
-            self.validate_reserve_predictions(now,room,power,quality and source=='Вітальня',forecast)
+            self.validate_reserve_predictions(now,room,power,quality and source=='Вітальня',forecast,
+                                             measurements=dict(floor=floor,outside=outside,fire=measured_fire))
         self.apply_action(action,once)
         self.fan_tick(grid,fire_active)
         self.journal(reason)
@@ -857,17 +958,54 @@ class HeatingClimate(HeatingRecovery,Hass):
         after=self.val('energy')
         return round(after-before,4) if before is not None and after is not None and after>=before else None
     def summary(self):
-        rows=[r for r in self.samples if r["ts"]>time.time()-86400]
+        end=time.time();start=end-86400
+        rows=[r for r in self.samples if start<r['ts']<=end]
         good=[r for r in rows if r.get("quality")]
         temperatures=[r["room"] for r in good]
         energy=[r for r in rows if number(r.get("energy")) is not None]
+        covered=estimated=known_power=comfort_seconds=below=above=0.
+        for a,b in zip(self.samples,self.samples[1:]):
+            seconds=b['ts']-a['ts']
+            overlap=max(0.,min(end,b['ts'])-max(start,a['ts']))
+            if not 0<seconds<=420 or not overlap:
+                continue
+            if a.get('quality') and b.get('quality'):
+                covered+=overlap
+                policy=a.get('comfort_policy')
+                if policy and policy==b.get('comfort_policy') and number(a.get('room')) is not None and number(b.get('room')) is not None:
+                    left=max(start,a['ts']);right=min(end,b['ts'])
+                    t=left
+                    while t<right:
+                        stop=min(right,t+30);mid=(t+stop)/2
+                        temperature=a['room']+(b['room']-a['room'])*(mid-a['ts'])/seconds
+                        _,lo,hi,_=comfort_at(datetime.fromtimestamp(mid,self.climate_tz),policy)
+                        duration=stop-t
+                        below+=max(0.,lo-temperature)*duration/3600
+                        above+=max(0.,temperature-hi)*duration/3600;comfort_seconds+=duration
+                        t=stop
+            if number(a.get('power')) is not None and number(b.get('power')) is not None:
+                known_power+=overlap
+                if any(r.get('power_estimated') and not (r.get('power_source')=='fallback_grid_off' and
+                       r.get('grid')=='off' and r.get('power')==0) for r in (a,b)):
+                    estimated+=overlap
+        stamps=[start,*[r['ts'] for r in rows],end]
         return {"samples":len(rows),"valid_samples":len(good),
-                "coverage":round(len(good)/max(1,len(rows)),3),
+                "coverage":round(min(1.,covered/86400),3),
+                "row_quality_fraction":round(len(good)/max(1,len(rows)),3),
+                "expected_samples":288,"covered_minutes":round(covered/60,1),
+                "max_gap_seconds":round(max(b-a for a,b in zip(stamps,stamps[1:])),1),
+                "age_seconds":round(end-rows[-1]['ts'],1) if rows else None,
+                "room_measurement_age_seconds":round(max(0.,end-good[-1]['room_reported_at']),1)
+                    if good and number(good[-1].get('room_reported_at')) is not None else None,
+                "estimated_power_fraction":round(estimated/known_power,3) if known_power else None,
+                "comfort_covered_minutes":round(comfort_seconds/60,1),
+                "below_degree_hours":round(below,3) if comfort_seconds else None,
+                "above_degree_hours":round(above,3) if comfort_seconds else None,
                 "temperature_min":min(temperatures) if temperatures else None,
                 "temperature_max":max(temperatures) if temperatures else None,
                 "measured_kwh":round(energy[-1]["energy"]-energy[0]["energy"],4) if len(energy)>1 else None,
                 "hours_collected":round((rows[-1]["ts"]-rows[0]["ts"])/3600,2) if len(rows)>1 else 0.,
-                "hour_forecast_mae":self.hour_mae()}
+                "hour_forecast_mae":self.hour_mae(),"forecast_validation":self.validation_summary()}
     def energy_tick(self):
         total=self.val("energy")
         previous=self.memory.get("energy_last")
@@ -881,7 +1019,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 bins.append({"start":previous["ts"],"end":stamp,"kwh":round(delta,6),
                              "night":night,"cost":round(delta*rate,5) if rate is not None else None,
                              "quality":self.val("power") is not None,"historical":False,
-                             "estimated":getattr(self,"power_source","").startswith("fallback")})
+                             "estimated":estimated_power(getattr(self,"power_source",""))})
         if total is not None:
             self.memory["energy_last"]={"ts":stamp,"total":total}
         bins[:]=[b for b in bins if b["end"]>stamp-32*86400]

@@ -8,6 +8,8 @@ import math
 import statistics
 from datetime import datetime
 
+ENVIRONMENT_POLICY_VERSION=5
+
 
 def finite(value):
     try:
@@ -61,11 +63,27 @@ def weather_factor(condition):
 
 
 def observe_gain(previous, stamp, room, floor, outside, fire, heating,
-                 model, timezone, condition=None):
+                 model, timezone, condition=None,secondary=None,reported_at=None):
     state=dict(previous or {})
     observations=list(state.get('observations',[]))
     last=state.get('last')
-    current=dict(at=stamp,room=room,floor=floor,outside=outside,fire=fire,heating=heating)
+    fresh=reported_at if reported_at is not None else stamp if not last or room!=last['room'] else last.get('reported_at',last['at'])
+    current=dict(at=stamp,reported_at=fresh,room=room,floor=floor,outside=outside,
+                 fire=fire,heating=heating,secondary=secondary)
+    pending=state.get('pending_gain')
+    reverse=last and room<last['room']-.1
+    if reverse or heating or fire>=2:
+        state.update(observed_gain=0.,observed_at=stamp)
+        state.pop('pending_gain',None)
+        if reverse and stamp-last['at']<1080:
+            observations=[x for x in observations if x['at']<last['at']]
+    elif pending and stamp-pending['at']>=1080 and fresh>pending.get('reported_at',pending['at']):
+        other=pending.get('secondary')
+        consistent=(secondary is None or other is None or secondary>=other)
+        if room>=pending['room']-.1 and consistent:
+            observations.append({k:v for k,v in pending.items() if k in ('at','day','gain','factor')})
+            observations[-1].update(stable=True,secondary_checked=secondary is not None and other is not None)
+        state.pop('pending_gain',None)
     if not last:
         state['last']=current
     elif room!=last['room']:
@@ -77,18 +95,19 @@ def observe_gain(previous, stamp, room, floor, outside, fire, heating,
             residual=(room-last['room'])/hours-predicted
             # Room devices report quantised changes; never fit 15-second jumps.
             residual=max(0.,min(.8,residual))
-            observations.append(dict(at=stamp,day=now.date().isoformat(),gain=residual,
-                                     factor=daylight(now)*weather_factor(condition)))
+            state['pending_gain']=dict(at=stamp,reported_at=fresh,day=now.date().isoformat(),gain=residual,
+                factor=daylight(now)*weather_factor(condition),room=room,secondary=secondary)
             state['observed_gain']=residual
             state['observed_at']=stamp
         state['last']=current
     observations=[x for x in observations if stamp-x['at']<14*86400][-240:]
     state['observations']=observations
-    eligible=[x for x in observations if x['factor']>=.15]
+    eligible=[x for x in observations if x['factor']>=.15 and x.get('stable')]
     days=len({x['day'] for x in eligible})
     state['days']=days
-    train=eligible[:max(1,int(len(eligible)*.75))]
-    holdout=eligible[len(train):]
+    last_day=max((x['day'] for x in eligible),default=None)
+    train=[x for x in eligible if x['day']!=last_day]
+    holdout=[x for x in eligible if x['day']==last_day]
     candidate=min(.6,statistics.median(x['gain']/x['factor'] for x in train)) if train else 0.
     baseline=statistics.mean(x['gain'] for x in holdout) if holdout else None
     error=statistics.mean(abs(x['gain']-candidate*x['factor']) for x in holdout) if holdout else None
@@ -125,11 +144,11 @@ def gain_at(when, weather, settings, upper=False):
     elapsed=max(0.,(when.timestamp()-solar.get('observed_at',0))/3600)
     observed=(solar.get('observed_gain',0.)*math.exp(-elapsed/2)
               if elapsed<4 and daylight(when)>0 else 0.)
-    return min(.8,max(learned,observed))
+    return min(.8,max(learned,observed)) if upper else min(.8,learned)
 
 
-def forecast_step(room,floor,outside,power,fire,model,hours,when,weather,settings):
-    gain=gain_at(when,weather,settings)
+def forecast_step(room,floor,outside,power,fire,model,hours,when,weather,settings,upper=False):
+    gain=gain_at(when,weather,settings,upper=upper)
     dr=model['floor_air']*(floor-room)-model['room_loss']*(room-outside)+model['fire_gain']*max(0.,fire)+gain
     df=model['heat_gain']*power-model['floor_decay']*(floor-room)
     return room+dr*hours,floor+df*hours

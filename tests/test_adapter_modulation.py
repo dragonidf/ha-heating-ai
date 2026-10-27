@@ -11,6 +11,7 @@ for name in ('appdaemon','appdaemon.plugins','appdaemon.plugins.hass','appdaemon
 sys.modules['appdaemon.plugins.hass.hassapi'].Hass=object
 from heating_climate import HeatingClimate
 from heating_outages import schedule, signature
+from heating_model import DEFAULT_MODEL
 
 class AdapterModulationTests(unittest.TestCase):
     def fast_tick(self,at,segments,once=False):
@@ -19,8 +20,8 @@ class AdapterModulationTests(unittest.TestCase):
         app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly')
         app.memory=dict(demand=True,planned_heat_segments=segments,
                         modulation_profile=dict(bands=[],intervals=0,minutes=0))
-        app.model=dict(validated=True)
-        app.samples=[]
+        app.model=dict(DEFAULT_MODEL,validated=True)
+        app.samples=[];app.weather=[]
         app.power_source='balance'
         app.next_compute=at.timestamp()+300
         app.outage_signature=signature(schedule(None,at))

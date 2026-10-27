@@ -8,8 +8,9 @@ import gzip
 import hashlib
 import json
 import os
-from heating_model import number,in_window,heating_cycle
+from heating_model import number,in_window,heating_cycle,step,held_action
 from heating_outages import schedule,blocked
+from heating_fallback import estimated_power
 
 class HeatingRecovery:
     async def verify_decision_history(self,kwargs=None,**extra):
@@ -88,12 +89,13 @@ class HeatingRecovery:
                 mode=mode,armed=armed,permitted=bool(self.cfg.get('allow_actuation')) and armed,
                 grid=self.grid_state(),grid_evidence='existing inverter connection, input voltage and heartbeat guards',
                 power_w=actual,energy_counter_kwh=self.val('energy'),power_source=getattr(self,'power_source','unknown'),
-                power_estimated=getattr(self,'power_source','').startswith('fallback'),
+                power_estimated=estimated_power(getattr(self,'power_source','')),
                 physical_heating=actual is not None and actual>=1500,
                 execution='automatic' if mode=='Автоматичне керування' and armed and self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if actual is not None and actual>=1500 else 'idle',
                 measurements=context.get('measurements',{}),sources=sources,
                 policy={k:settings.get(k) for k in ('target','lower','upper','night_target','night_lower','night_upper','sleep_start','sleep_end','start','end','strategy','morning_min_minutes')},
-                reserve=reserve,coast_peak=context.get('coast_peak'),learning_attempt=self.memory.get('learning_attempt'),
+                reserve=reserve,coast_peak=context.get('coast_peak'),cycle_energy=forecast.get('cycle_energy'),
+                learning_attempt=self.memory.get('learning_attempt'),
                 model_version=self.model.get('version'),command=command,
                 inputs=self.memory.get('decision_input_refs',{}),
                 weather_received_at=self.memory.get('weather_at'),
@@ -153,31 +155,96 @@ class HeatingRecovery:
             journal.error=str(exc)
             return dict(snapshot_failure=str(exc))
 
-    def validate_reserve_predictions(self,now,room,power,quality,forecast=None):
-        """Prospective matched-horizon validation, separate from one-hour MAE."""
+    def validate_reserve_predictions(self,now,room,power,quality,forecast=None,measurements=None):
+        """Keep frozen-plan error separate from replay with measured inputs."""
         stamp=now.timestamp();pending=self.memory.setdefault('reserve_predictions',[])
         errors=self.memory.setdefault('reserve_errors',[])
+        results=self.memory.setdefault('forecast_validation',[])
+        rejected=self.memory.setdefault('forecast_validation_rejections',{})
+        grid=self.grid_state();energy=number(self.val('energy'))
+        inputs=measurements or {}
+        source_ok=(quality and power is not None and grid in ('on','off') and
+                   not str(getattr(self,'power_source','balance') or 'unknown').startswith(('unknown','unavailable')) and
+                   not estimated_power(getattr(self,'power_source','balance')) and
+                   not (grid=='off' and power>0) and
+                   (measurements is None or all(number(inputs.get(k)) is not None for k in ('outside','fire'))))
         for prediction in pending:
-            planned=any(s['start']<=stamp<s['end'] for s in prediction['segments'])
+            reasons=prediction.setdefault('reasons',[])
+            planned=any(s['start']<=stamp-.001<s['end'] for s in prediction['segments'])
             actual=power is not None and power>=1500
-            if (not quality or self.grid_state()!='on' or
-                    self.raw('mode')!='Автоматичне керування' or self.raw('armed')!='on' or
-                    prediction['model']!=self.model or planned!=actual):
+            requested=(self.memory['last_command']=='heat') if 'last_command' in self.memory else None
+            interval_reason=('unknown_measurement' if not source_ok else
+                'measurement_gap' if stamp-prediction.get('checked_at',stamp)>45 else None)
+            reason=(interval_reason or
+                ('control_mode_changed' if self.raw('mode')!='Автоматичне керування' or self.raw('armed')!='on' or self.memory.get('temporary_fallback') else
+                 'model_changed' if prediction['model']!=self.model else
+                 'execution_changed' if planned!=(requested if requested is not None else actual) else None))
+            if reason:
                 prediction['valid']=False
-            if prediction['ts']<=stamp and prediction['valid'] and stamp-prediction['ts']<=45 and room is not None:
-                energy=number(self.val('energy'))
+                if reason not in reasons:reasons.append(reason)
+            prediction['checked_at']=stamp
+            if interval_reason:prediction['timeline_valid']=False
+            observed=prediction.get('observed')
+            if observed and stamp>observed['at']:
+                seconds=stamp-observed['at']
+                if interval_reason or number(inputs.get('outside')) is None or number(inputs.get('fire')) is None:
+                    observed['valid']=False
+                if observed['valid']:
+                    before=number(observed.get('energy'))
+                    if energy is not None and before is not None and energy<before:
+                        observed['valid']=False
+                        if 'counter_reset' not in reasons:reasons.append('counter_reset')
+                    else:
+                        kw=((energy-before)*3600/seconds if energy is not None and before is not None else
+                            (observed['power_kw']+power/1000)/2)
+                        if not 0<=kw<=10.5:
+                            observed['valid']=False;prediction['valid']=False;prediction['timeline_valid']=False
+                            if 'counter_jump' not in reasons:reasons.append('counter_jump')
+                        else:
+                            observed['room'],observed['floor']=step(observed['room'],observed['floor'],
+                                (observed['outside']+inputs['outside'])/2,kw,
+                                (observed['fire']+inputs['fire'])/2,prediction['model'],seconds/3600)
+                            observed['request_seconds']+=seconds if requested else 0.
+                observed.update(at=stamp,energy=energy,power_kw=power/1000 if power is not None else None,
+                                outside=inputs.get('outside'),fire=inputs.get('fire'))
+            if prediction['ts']<=stamp and stamp-prediction['ts']<=45 and room is not None:
                 start_energy=number(prediction.get('start_energy'))
                 expected=prediction.get('expected_energy',0.)
-                matched=(energy is not None and start_energy is not None and
-                         abs(energy-start_energy-expected)<=max(.05,expected*.05))
-                if matched:
+                actual_energy=energy-start_energy if energy is not None and start_energy is not None and energy>=start_energy else None
+                matched=actual_energy is not None and abs(actual_energy-expected)<=max(.05,expected*.05)
+                if prediction['valid'] and matched:
                     errors.append(dict(hours=prediction['hours'],error=prediction['temperature']-room,
                         validated=True,at=stamp,model_version=self.model.get('version')))
-        pending[:]=[p for p in pending if p['ts']>stamp and p['valid']]
-        errors[:]=[r for r in errors[-240:] if r.get('at',stamp)>stamp-30*86400 and r.get('model_version')==self.model.get('version')]
+                elif not matched and 'energy_mismatch' not in reasons:reasons.append('energy_mismatch')
+                common=dict(hours=prediction['hours'],at=stamp,model_version=prediction['model'].get('version'),
+                    horizon=prediction.get('horizon',str(prediction['hours'])),reasons=list(reasons),
+                    window_start=prediction.get('start_at'),window_end=prediction['ts'])
+                planned_hours=sum(max(0.,min(s['end'],prediction['ts'])-max(s['start'],prediction.get('start_at',s['start'])))
+                                  for s in prediction['segments'])/3600
+                actual_hours=observed['request_seconds']/3600 if observed and observed['valid'] else None
+                power_error=(actual_energy/actual_hours-expected/planned_hours if actual_energy is not None and
+                    actual_hours and planned_hours and 'control_mode_changed' not in reasons else None)
+                results.append(dict(common,kind='frozen_plan',error=prediction['temperature']-room,
+                    valid=source_ok and prediction.get('timeline_valid',True),reserve_eligible=prediction['valid'] and matched,
+                    planned_kwh=expected,actual_kwh=actual_energy,
+                    energy_error_kwh=actual_energy-expected if actual_energy is not None else None,
+                    planned_request_minutes=planned_hours*60,actual_request_minutes=actual_hours*60 if actual_hours is not None else None,
+                    power_error_kw=power_error,
+                    energy_error_percent=(actual_energy/expected-1)*100 if actual_energy is not None and expected>0 else None))
+                if observed and observed['valid']:
+                    results.append(dict(common,kind='measured_inputs',error=observed['room']-room,valid=True,
+                        actual_request_minutes=observed['request_seconds']/60,
+                        note='Actual energy/weather/fire; unmeasured solar and ventilation remain disturbances'))
+                for why in reasons:rejected[why]=rejected.get(why,0)+1
+            elif not prediction['valid'] and not (observed and observed['valid']):
+                for why in reasons:rejected[why]=rejected.get(why,0)+1
+        pending[:]=[p for p in pending if p['ts']>stamp and (p['valid'] or p.get('observed',{}).get('valid'))]
+        errors[:]=[r for r in errors[-240:] if r.get('at',stamp)>stamp-30*86400 and
+                   r.get('model_version',self.model.get('version'))==self.model.get('version')]
+        results[:]=[r for r in results[-720:] if r['at']>stamp-30*86400]
         if forecast and stamp-self.memory.get('reserve_validation_at',0)>=3600:
             self.memory['reserve_validation_at']=stamp
-            rows=forecast.get('_calculation_curve',forecast['curve'])
+            rows=forecast.get('_calculation_curve',forecast.get('curve',[]))
             segments=[s for r in rows for s in r['heat_segments']]
             # Validation needs on/off intervals, not a duplicate of every 5-min
             # modulation sample in every pending horizon saved to state.json.
@@ -187,14 +254,133 @@ class HeatingRecovery:
                     intervals[-1]['end']=max(intervals[-1]['end'],segment['end'])
                 else:
                     intervals.append(dict(start=segment['start'],end=segment['end']))
-            for hours in (6,12,24,36):
-                point=next((r for r in rows if r['ts']>=stamp+hours*3600),None)
-                if point:
+            targets=[(str(h),stamp+h*3600) for h in (6,12,24,36,48)]
+            required=number((forecast.get('morning_reserve') or {}).get('assessment_until'))
+            if required and required>stamp:targets.append(('required',required))
+            queued=set()
+            for horizon,target in targets:
+                point=next((r for r in rows if r['ts']>=target),None)
+                if point and point['ts'] not in queued:
+                    queued.add(point['ts'])
+                    observed=(dict(at=stamp,room=room,floor=inputs['floor'],outside=inputs['outside'],
+                        fire=inputs['fire'],power_kw=power/1000,energy=energy,request_seconds=0.,valid=source_ok)
+                        if source_ok and all(number(inputs.get(k)) is not None for k in ('floor','outside','fire')) else None)
                     pending.append(dict(ts=point['ts'],hours=(point['ts']-stamp)/3600,
+                        horizon=horizon,start_at=stamp,checked_at=stamp,timeline_valid=source_ok,observed=observed,
                         temperature=point['temperature'],model=dict(self.model),valid=True,segments=intervals,
                         start_energy=self.val('energy'),expected_energy=sum(s.get('kwh',0.)*
                             max(0.,min(s['end'],point['ts'])-s['start'])/(s['end']-s['start'])
                             for s in segments if s['start']<point['ts'])))
+
+    def validation_summary(self):
+        groups={};stamp=self.now().timestamp()
+        for r in self.memory.get('forecast_validation',[]):
+            if not r.get('valid') or r.get('model_version')!=self.model.get('version'):continue
+            key=r['kind']+':'+r['horizon'];group=groups.setdefault(key,dict(kind=r['kind'],horizon=r['horizon'],
+                count=0,mae=0.,minimum_hours=r['hours'],maximum_hours=r['hours'],last_at=r['at'],_days=set()))
+            group['_days'].add(datetime.fromtimestamp(r['at'],self.now().tzinfo).date().isoformat())
+            group['count']+=1;group['mae']+=abs(r['error']);group['last_at']=max(group['last_at'],r['at'])
+            group['minimum_hours']=min(group['minimum_hours'],r['hours']);group['maximum_hours']=max(group['maximum_hours'],r['hours'])
+            for field,label in (('energy_error_kwh','energy'),('power_error_kw','power')):
+                value=number(r.get(field))
+                if value is not None:
+                    group[label+'_count']=group.get(label+'_count',0)+1
+                    group[label+'_mae']=group.get(label+'_mae',0)+abs(value)
+        for g in groups.values():
+            g['days']=len(g.pop('_days'))
+            g['mae']=round(g['mae']/g['count'],3);g['age_hours']=round((stamp-g['last_at'])/3600,1)
+            for label in ('energy','power'):
+                if g.get(label+'_count'):g[label+'_mae']=round(g[label+'_mae']/g[label+'_count'],3)
+        return dict(groups=list(groups.values()),pending=len(self.memory.get('reserve_predictions',[])),
+                    rejected=dict(self.memory.get('forecast_validation_rejections',{})))
+
+    def observe_stop_peak(self,now,room,power,quality):
+        stamp=now.timestamp();requested=self.memory.get('last_command')
+        previous=self.memory.get('peak_observation')
+        watch=self.memory.get('peak_watch')
+        if watch:
+            reason=('unknown_measurement' if not quality or power is None else
+                'measurement_gap' if stamp-watch['last_at']>45 else
+                'model_changed' if self.model.get('version')!=watch['model_version'] else
+                'reheated_before_peak_window' if requested=='heat' or power>=1500 else None)
+            if quality:watch['maximum']=max(watch['maximum'],room)
+            watch['last_at']=stamp
+            if reason or stamp>=watch['end']:
+                self.memory.setdefault('forecast_validation',[]).append(dict(kind='post_stop_peak',horizon='3',hours=3.,
+                    at=stamp,model_version=watch['model_version'],window_start=watch['start'],window_end=stamp,
+                    valid=reason is None,error=watch['predicted']-watch['maximum'] if reason is None else None,
+                    reasons=[reason] if reason else []))
+                if reason:
+                    rejected=self.memory.setdefault('forecast_validation_rejections',{})
+                    rejected[reason]=rejected.get(reason,0)+1
+                self.memory.pop('peak_watch',None)
+        if previous and previous['request']=='heat' and requested=='off' and quality and power==0:
+            peak=number(getattr(self,'decision_context',{}).get('coast_peak'))
+            if peak is not None:
+                self.memory['peak_watch']=dict(start=stamp,end=stamp+3*3600,last_at=stamp,maximum=room,
+                    predicted=peak,model_version=self.model.get('version'))
+        self.memory['peak_observation']=dict(at=stamp,request=requested)
+
+    def observe_cycle_energy(self,now,settings,power,energy,grid,automatic):
+        cycle=heating_cycle(now,settings)
+        if not cycle:return
+        stamp=now.timestamp();ledger=self.memory.setdefault('cycle_energy',{})
+        previous=self.memory.get('cycle_energy_observation')
+        current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,
+            known=power is not None and grid in ('on','off') and
+                  not getattr(self,'power_source','unknown').startswith(('unknown','unavailable')) and
+                  not estimated_power(getattr(self,'power_source','unknown')))
+        for c in {(x['cycle_id'],x['cycle_start']):x for x in [cycle,*([previous['cycle']] if previous else [])]}.values():
+            key=c['cycle_id']+'@'+str(c['cycle_start'])
+            entry=ledger.setdefault(key,dict(start=c['cycle_start'],end=c['cycle_end'],observed_kwh=0.,
+                automatic_kwh=0.,other_kwh=0.,transition_kwh=0.,unknown_seconds=0.,complete=stamp<=c['cycle_start']))
+            if not previous:
+                gap=max(0.,min(stamp,c['cycle_end'])-max(entry.get('observed_until',c['cycle_start']),c['cycle_start']))
+                if gap:entry['unknown_seconds']+=gap;entry['complete']=False
+                continue
+            seconds=stamp-previous['at'];a=max(previous['at'],c['cycle_start']);b=min(stamp,c['cycle_end'])
+            if b<=a:continue
+            before=number(previous.get('energy'));after=number(energy)
+            if (0<seconds<=45 and previous['known'] and current['known'] and
+                    before is not None and after is not None and after>=before):
+                kwh=(after-before)*(b-a)/seconds;entry['observed_kwh']+=kwh
+                kind=('automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
+                entry[kind+'_kwh']+=kwh
+            else:
+                entry['unknown_seconds']+=b-a;entry['complete']=False
+            entry['observed_until']=b
+        self.memory['cycle_energy_observation']=current
+        self.memory['cycle_energy']={k:v for k,v in ledger.items() if v['end']>stamp-16*86400}
+
+    def cycle_budget(self,now,forecast,context):
+        reserve=forecast.get('morning_reserve') or {};key=reserve.get('cycle_id')
+        entry=next((v for v in self.memory.get('cycle_energy',{}).values()
+                    if v['start']==reserve.get('cycle_start') and v['end']==reserve.get('cycle_end')),None)
+        if entry is None:return {}
+        stamp=now.timestamp();remaining=number(reserve.get('end_cycle_planned_kwh'))
+        if remaining is None:return {}
+        if stamp<entry['start']:
+            entry['last_prestart']=dict(at=stamp,kwh=remaining)
+            if entry['start']-stamp<=3*3600:entry.setdefault('baseline',dict(at=stamp,kwh=remaining))
+        hashes={k:hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+                for k,v in context.items()}
+        previous=entry.get('projection_inputs')
+        changes=[k for k in hashes if previous and previous.get(k)!=hashes[k]]
+        entry['projection_inputs']=hashes
+        spent=entry['observed_kwh'];total=spent+remaining if entry['complete'] else None
+        baseline=entry.get('baseline')
+        return dict(cycle_id=key,observed_kwh=round(spent,4),remaining_kwh=round(remaining,4),
+            projected_total_kwh=round(total,4) if total is not None else None,
+            observation_complete=entry['complete'],unknown_minutes=round(entry['unknown_seconds']/60,2),
+            baseline=baseline,last_prestart=entry.get('last_prestart'),
+            delta_from_baseline_kwh=round(total-baseline['kwh'],4) if baseline and total is not None else None,
+            baseline_consumed=spent>=baseline['kwh'] if baseline else None,
+            change_sources=changes or ['execution' if previous else 'initial_projection'],
+            remaining_need=(reserve.get('no_morning_counterfactual') or {}).get('deficit_degree_hours'),
+            need_certainty='conditional' if reserve.get('conditional') else 'validated_scenario',
+            coast_peak=context.get('thermal_state',{}).get('coast_peak'),
+            automatic_kwh=round(entry['automatic_kwh'],4),other_kwh=round(entry['other_kwh'],4),
+            transition_kwh=round(entry['transition_kwh'],4))
 
     def read_outage_schedule(self,now=None):
         source=self.cfg.get('outage_source') or self.cfg.get('outage_calendar')
@@ -259,7 +445,6 @@ class HeatingRecovery:
             action='fallback'
         if action=='fallback' and self.grid_state()!='on':
             action='off'
-        elapsed=time.time()-self.memory.get("command_at",0)
         room=self.source_temperature()[0]
         outage=self.read_outage_schedule()
         scheduled_off=bool(outage.get("valid") and blocked(time.time(),time.time()+15,outage["outages"]))
@@ -268,10 +453,10 @@ class HeatingRecovery:
             action="off"
         urgent=release or action=="fallback" or (action=="off" and (
             scheduled_off or self.grid_state()!="on" or (room is not None and room>=self.active_upper()) or
+            getattr(self,'decision_context',{}).get('coast_overheat',False) or
             (not once and self.raw('strategy')=='Тільки в дозволені години' and
              not in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))))
-        if action!=last and not urgent and ((last=="heat" and elapsed<600) or (last=="off" and action=="heat" and elapsed<900)):
-            action=last
+        action=held_action(last,self.memory.get('command_at',0),time.time(),action,urgent)
         current=self.val("thermostat",attribute="current_temperature")
         if action!="fallback" and (current is None or not 5<=current<=40 or
                                      self.raw('thermostat') in ('unknown','unavailable',None)):

@@ -229,9 +229,9 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==25, fields.count()  # 20 config values and five thermal coefficients.
+    assert fields.count()==28, fields.count()  # 23 config values and five thermal coefficients.
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==57
+    assert panel.locator('.system-help').count()==60
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()

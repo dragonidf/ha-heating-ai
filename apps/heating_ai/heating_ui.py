@@ -19,6 +19,9 @@ ENTITY_KEYS = (
 
 # Public allowlist; no paths, credentials, entity remapping or actuation permissions.
 _SYSTEM_ROWS = (
+    ('risk_cold_delta','Графік і прогноз','Холодний стрес-сценарій',2,0,10,.5,'°C','На скільки холодніша погода в окремій перевірці плану. Сценарій не підміняє погоду й не додає команди нагріву.'),
+    ('risk_blackout_short_minutes','Графік і прогноз','Коротке аварійне відключення',60,5,240,5,'хв','Гіпотетична втрата останніх хвилин нічного живлення за невідомого/аварійного графіка. Це перевірка без перепланування, не прогноз аварії.'),
+    ('risk_blackout_long_minutes','Графік і прогноз','Довге аварійне відключення',120,5,480,5,'хв','Другий стрес-сценарій. Не гарантує комфорт за довшого blackout і не дозволяє денний нагрів поза обраною політикою.'),
     ('outage_max_age','Графік і прогноз','Свіжість даних Svitlo',10800,300,21600,60,'с','Максимальний вік updated. 10800 с = 3 години. Старіші дані дають unknown; фізичний стан мережі перевіряється окремо.'),
     ('outage_advance_limit','Графік і прогноз','Ліміт завчасного нагріву',180,0,360,5,'хв','Максимальне перенесення нагріву перед відключенням поза дозволеним вікном. Застосовується лише за чинними перевірками комфорту й відомої мережі.'),
     ('morning_min_minutes','Графік і прогноз','Мінімальний ранковий сеанс',30,5,30,5,'хв','Мінімальна тривалість ранкового сеансу за наявності потреби в теплі; не змушує котел гріти без потреби.'),
@@ -99,6 +102,8 @@ def validate_system_settings(values,cfg,model):
             raise ValueError(field['label']+': значення поза дозволеними межами')
         clean[key]=value
     p={**system_values(cfg),**{k:v for k,v in clean.items() if schema[k]['target']=='config'}}
+    if p['risk_blackout_short_minutes']>p['risk_blackout_long_minutes']:
+        raise ValueError('Короткий blackout не може бути довшим за довгий')
     if not (p['fire_ignite_delta']<p['fire_start_delta']<=p['fire_intense_delta'] and
             p['fire_stop_delta']<p['fire_fast_stop_delta']<p['fire_start_delta'] and
             p['fire_fast_stop_slope']<p['fire_fade_slope']<=0<=p['fire_ignite_slope'] and

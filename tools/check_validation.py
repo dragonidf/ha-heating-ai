@@ -10,6 +10,7 @@ sys.path[:0]=[str(ROOT/'apps/heating_ai'),str(ROOT/'tests')]
 import test_sufficiency_search as fixture
 import test_adapter_modulation as adapter
 from heating_recovery import DecisionJournal
+from heating_stability import stress_scenarios
 
 def measured(function):
     start=time.perf_counter();value=function()
@@ -21,6 +22,10 @@ def main():
     args=parser.parse_args()
     case=fixture.SufficiencySearchTests();case.setUp()
     (plan,reference),full=measured(case.stable)
+    x=case.x
+    scenarios,stress=measured(lambda:stress_scenarios(case.now,x['room'],x['floor'],x['outside'],
+        x['fire'],x['model'],[],case.settings,plan))
+    plan['stress_scenarios']=scenarios
     # A known-deficient small remaining morning exercises all three bounded passes.
     case.now=case.now.replace(day=22,hour=6,minute=40,second=0)
     case.settings['outage_schedule']=dict(mode='normal',valid=True,outages=[])
@@ -40,6 +45,7 @@ def main():
         size=sum(p.stat().st_size for p in journal.directory.iterdir() if p.is_file())
     report=dict(scope='synthetic offline; fake HA I/O; single run, not a production latency guarantee',
         planning_ms=full,expanded_planning_ms=wide,cached_replay_ms=cached,fast_tick_with_fixture_ms=fast,
+        shadow_stress_ms=stress,
         expanded_passes=len(expanded['search_passes']),cached_plan_retained=held['plan_stable'],
         journal_average_write_ms=writes,journal_one_hour_bytes=size,
         journal_14day_extrapolated_mib=round(size*24*14/1024/1024,2),
