@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from unittest.mock import patch
 from threading import RLock
 from test_adapter_modulation import HeatingClimate
+from heating_model import DEFAULT_MODEL
 
 
 class PlannedExecutionTests(unittest.TestCase):
@@ -14,7 +15,7 @@ class PlannedExecutionTests(unittest.TestCase):
         app.now=lambda:at
         app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly',night_target='night')
         app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
-        app.model=dict(validated=True,version=4)
+        app.model=dict(DEFAULT_MODEL,validated=True,version=4)
         app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
         if weather_age is not None:
             app.weather=[dict(ts=at.timestamp()+i*3600,temperature=11.) for i in range(24)]

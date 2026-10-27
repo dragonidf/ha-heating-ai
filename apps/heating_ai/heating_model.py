@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import math
 import hashlib
 import json
-from heating_environment import forecast_step,safe_upper
+from heating_environment import forecast_step,safe_upper,ENVIRONMENT_POLICY_VERSION
 import statistics
 from heating_outages import blocked, covered, availability, schedule_covered
 
@@ -56,11 +56,19 @@ def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours
     for i in range(int(hours*12)):
         when=now+timedelta(minutes=5*(i+1))
         room,floor=forecast_step(room,floor,outside,0.,fire_delta*math.exp(-i/24),model,1/12,
-                                 when,settings.get('environment_weather',[]),settings)
+                                 when,settings.get('environment_weather',[]),settings,upper=True)
         profile=comfort_at(when,settings)
         if room>=safe_upper(profile[2],profile[3],settings):
             return True
     return False
+
+def held_action(last,changed_at,stamp,wanted,urgent=False):
+    elapsed=stamp-(number(changed_at) or 0.)
+    if wanted!=last and not urgent and ((last=='heat' and elapsed<600) or
+                                        (last=='off' and wanted=='heat' and elapsed<900)):
+        return last
+    return wanted
+
 
 def nominal_mode(power, previous):
     if power is None:
@@ -431,10 +439,12 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
           'budget_multiplier','reserve_errors')
     outage=settings.get('outage_schedule') or {}
     solar=(settings.get('environment') or {}).get('solar',{})
-    data=dict(version=SEARCH_POLICY_VERSION,cycle=cycle,room=round(room,2),floor=round(floor,1),
+    data=dict(version=SEARCH_POLICY_VERSION,environment_policy_version=ENVIRONMENT_POLICY_VERSION,
+        cycle=cycle,room=round(room,2),floor=round(floor,1),
         outside=round(outside,1),fire=round(fire,1),model=model,weather=weather,
         settings={k:settings.get(k) for k in keys},outage={k:outage.get(k) for k in ('mode','valid','outages','slots','known_until')},
         profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
+        actuator=settings.get('actuator'),
         environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain')})
     return hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
@@ -480,7 +490,8 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     width=beam_width or (48 if split else 12)
     evaluated=0;rejections=dict(upper_temperature=0,energy_limit=0)
     # score, room, floor, decisions, curve, energy, min_temperature, max_temperature
-    beams = [(0., room, floor, [], [], 0., room, room, 0.)]
+    actuator=settings.get('actuator') or {};actuator_enabled=bool(actuator)
+    beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.))]
     night_target=max(settings["lower"], settings["target"]-.5)
     profile=settings.get('modulation_profile')
     anchor=settings.get('modulation_anchor')
@@ -528,70 +539,83 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                 cuts.update(t for t in reserved_exact if tm<t<end)
             ordered=sorted(cuts)
             substeps.extend(zip(ordered,ordered[1:]))
-        masks = []
+        masks = [];hard_masks=[]
         for tm,end in substeps:
             normal = in_window(tm, settings["start"], settings["end"]) and in_window(end-timedelta(microseconds=1), settings["start"], settings["end"])
             extension = any(tm.timestamp() >= a and end.timestamp() <= b for a,b in extensions)
+            hard_masks.append(not blocked(tm.timestamp(),end.timestamp(),outages) and
+                (normal or extension or settings['strategy']!='Тільки в дозволені години'))
             masks.append(not (forbid_morning and in_window(tm,"05:00","07:00")) and
                          not blocked(tm.timestamp(), end.timestamp(), outages) and
                          (normal or extension or settings["strategy"] != "Тільки в дозволені години"))
         choices = [False, True] if any(masks) else [False]
         candidates = []
-        for score, r, f, decisions, curve, energy, low, high, deficit in beams:
+        for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at in beams:
             for heat in choices:
                 evaluated+=1
                 nr, nf, penalty = r, f, 0.
+                command,command_at=last,changed_at
                 shortage=deficit; fine=[]
                 used, outside_minutes, unsafe = 0., 0., False
                 heat_segments = []
-                for j,(tm,end) in enumerate(substeps):
-                    dt=(end.timestamp()-tm.timestamp())/3600
-                    elapsed_minutes=(tm.timestamp()-now.timestamp())/60
-                    out = outdoor_at(forecast, tm, outside)
-                    reserved_here=(reserved_exact[0]<=tm and end<=reserved_exact[1]) if reserved_exact else int(elapsed_minutes//5) in reserved
-                    active = (heat or reserved_here) and masks[j]
-                    wanted,limit_low,limit_high,zone=comfort_at(tm,settings)
-                    limit_low+=min(settings.get('_reserve_margin',0.),max(0.,wanted-limit_low)/2)
-                    limit_high=safe_upper(limit_high,zone,settings)
-                    if active and nr >= limit_high:
-                        unsafe = True
-                    effective_kw=modulation_power(nf,profile,3.,anchor,elapsed_minutes) if profile is not None else power_kw
-                    nr, nf = forecast_step(nr, nf, out, effective_kw if active else 0.,
-                                  fire_delta*math.exp(-elapsed_minutes/120), model, dt,tm,forecast,settings)
-                    # A session remains unsafe if its stored heat overshoots
-                    # later, after the boiler has stopped (including daytime).
-                    if nr>max(room,limit_high)+.01 and (active or any(decisions)):
-                        unsafe=True
-                    shortage+=max(0.,limit_low-nr)*dt
-                    fine.append(dict(ts=end.timestamp(),temperature=nr,**{'return':nf}))
-                    penalty += (max(0., limit_low-nr)**2 +
-                                max(0., nr-limit_high)**2)*500*dt*12
-                    desired = night_target if split and in_window(tm,"01:00","05:00") else settings["target"]
-                    if 'night_target' in settings:
-                        # Sleep near the lower band; store daytime heat near waking.
-                        desired=(limit_low+.05 if zone=='Сон' else
-                                 min(limit_high-.1, wanted+.5*(limit_high-wanted)))
-                    if split or allowed or settings["strategy"]=="Комфорт протягом доби":
-                        penalty += max(0.,desired-nr)**2*20*dt*12
-                    if split and in_window(tm,"01:00","05:00"):
-                        penalty += max(0.,nr-settings["target"])**2*30*dt*12
-                    if split and in_window(tm,"05:00","07:00"):
-                        # Prefer heat close to the morning, without inventing a floor-surface reading.
-                        penalty += max(0.,settings["target"]-nr)**2*20*dt*12
-                    if active:
-                        used += effective_kw*dt
-                        heat_segments.append({"start": tm.timestamp(), "end": end.timestamp(),
-                                              'power_kw':round(effective_kw,3),'kwh':effective_kw*dt})
-                        if not in_window(tm, settings["start"], settings["end"]):
-                            outside_minutes += dt*60
-                        if nr > limit_high or nf > 50:
+                for j,(begin,finish) in enumerate(substeps):
+                    deadline=datetime.fromtimestamp((number(command_at) or 0)+(600 if command=='heat' else 900),now.tzinfo)
+                    cuts=[begin,deadline,finish] if actuator_enabled and begin<deadline<finish else [begin,finish]
+                    for tm,end in zip(cuts,cuts[1:]):
+                        dt=(end.timestamp()-tm.timestamp())/3600
+                        elapsed_minutes=(tm.timestamp()-now.timestamp())/60
+                        out = outdoor_at(forecast, tm, outside)
+                        reserved_here=(reserved_exact[0]<=tm and end<=reserved_exact[1]) if reserved_exact else int(elapsed_minutes//5) in reserved
+                        active = (heat or reserved_here) and masks[j]
+                        wanted,limit_low,limit_high,zone=comfort_at(tm,settings)
+                        limit_low+=min(settings.get('_reserve_margin',0.),max(0.,wanted-limit_low)/2)
+                        limit_high=safe_upper(limit_high,zone,settings)
+                        if actuator_enabled:
+                            stop=(not hard_masks[j] or nr>=limit_high or
+                                  actuator.get('safety_stop') and tm.timestamp()<now.timestamp()+300)
+                            requested='heat' if active and not stop else 'off'
+                            applied=held_action(command,command_at,tm.timestamp(),requested,urgent=stop)
+                            if applied!=command:command,command_at=applied,tm.timestamp()
+                            active=applied=='heat' and hard_masks[j]
+                        if active and nr >= limit_high:
                             unsafe = True
-                        if 'night_target' in settings and split:
-                            # Store daytime heat as late as feasible in the cheap window.
-                            # Earlier heat remains possible for the full day/response reserve.
-                            minutes=tm.hour*60+tm.minute
-                            until_morning=(420-minutes)%1440
-                            penalty += effective_kw*dt * min(1.,until_morning/480) * 20
+                        effective_kw=modulation_power(nf,profile,3.,anchor,elapsed_minutes) if profile is not None else power_kw
+                        nr, nf = forecast_step(nr, nf, out, effective_kw if active else 0.,
+                                      fire_delta*math.exp(-elapsed_minutes/120), model, dt,tm,forecast,settings)
+                        # A session remains unsafe if its stored heat overshoots
+                        # later, after the boiler has stopped (including daytime).
+                        if nr>max(room,limit_high)+.01 and (active or any(decisions)):
+                            unsafe=True
+                        shortage+=max(0.,limit_low-nr)*dt
+                        fine.append(dict(ts=end.timestamp(),temperature=nr,**{'return':nf}))
+                        penalty += (max(0., limit_low-nr)**2 +
+                                    max(0., nr-limit_high)**2)*500*dt*12
+                        desired = night_target if split and in_window(tm,"01:00","05:00") else settings["target"]
+                        if 'night_target' in settings:
+                            # Sleep near the lower band; store daytime heat near waking.
+                            desired=(limit_low+.05 if zone=='Сон' else
+                                     min(limit_high-.1, wanted+.5*(limit_high-wanted)))
+                        if split or allowed or settings["strategy"]=="Комфорт протягом доби":
+                            penalty += max(0.,desired-nr)**2*20*dt*12
+                        if split and in_window(tm,"01:00","05:00"):
+                            penalty += max(0.,nr-settings["target"])**2*30*dt*12
+                        if split and in_window(tm,"05:00","07:00"):
+                            # Prefer heat close to the morning, without inventing a floor-surface reading.
+                            penalty += max(0.,settings["target"]-nr)**2*20*dt*12
+                        if active:
+                            used += effective_kw*dt
+                            heat_segments.append({"start": tm.timestamp(), "end": end.timestamp(),
+                                                  'power_kw':round(effective_kw,3),'kwh':effective_kw*dt})
+                            if not in_window(tm, settings["start"], settings["end"]):
+                                outside_minutes += dt*60
+                            if nr > limit_high or nf > 50:
+                                unsafe = True
+                            if 'night_target' in settings and split:
+                                # Store daytime heat as late as feasible in the cheap window.
+                                # Earlier heat remains possible for the full day/response reserve.
+                                minutes=tm.hour*60+tm.minute
+                                until_morning=(420-minutes)%1440
+                                penalty += effective_kw*dt * min(1.,until_morning/480) * 20
                 if unsafe:
                     rejections['upper_temperature']+=1
                     continue
@@ -617,7 +641,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                                    "temperature":round(nr,2),"return":round(nf,2),"heat":bool(heat_segments),
                                    "kwh":round(used,4),"heat_segments":heat_segments,
                                    "outside_minutes":outside_minutes,"_fine":fine}],
-                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage))
+                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage,command,command_at))
         if not candidates:
             return None
         candidates.sort(key=lambda v:(round(v[8],5),v[0]) if cycle_policy else (v[0],))
@@ -625,6 +649,8 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
         seen, beams = set(), []
         for candidate in candidates:
             key=(round(candidate[1]*10), round(candidate[2]*2), candidate[3][-1])
+            if actuator_enabled:
+                key+=(candidate[9],round(max(0.,candidate[10]+(600 if candidate[9]=='heat' else 900)-when.timestamp()-1800)/60))
             if split:
                 mix=session_energy(candidate[4])
                 key+=(mix["evening"]>0,mix["morning"]>0,round(candidate[5]*2))

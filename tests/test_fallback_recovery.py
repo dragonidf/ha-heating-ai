@@ -144,6 +144,12 @@ class FallbackSafetyRegressionTests(unittest.TestCase):
 class FinalDispatchGuardTests(unittest.TestCase):
     app=FallbackRecoveryTests.app
     run_action=FallbackRecoveryTests.run_action
+    def test_predicted_inertial_overheat_vetoes_minimum_on_hold(self):
+        app=self.app(23)
+        app.memory.update(last_command='heat',command_at=app.at.timestamp()-30)
+        app.decision_context=dict(coast_overheat=True)
+        self.run_action(app,'off')
+        self.assertLessEqual(app.attrs['temperature'],21.)
     def test_grid_or_upper_change_before_dispatch_vetoes_planned_heat(self):
         for grid,room in [('off',21.8),('unknown',21.8),('on',23.)]:
             with self.subTest(grid=grid,room=room):
