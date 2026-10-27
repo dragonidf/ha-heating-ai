@@ -3,7 +3,16 @@ import assert from 'node:assert/strict';
 globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
-const {numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths}=await import('../frontend/heating-panel.js');
+const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths}=await import('../frontend/heating-panel.js');
+test('model diagnostics render with legacy attributes and new rollout results',()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);
+  panel.config={};
+  panel.attrs=key=>key==='model'?{forecast_validation:{groups:[{kind:'measured_inputs',horizon:'required',minimum_hours:39,maximum_hours:39,count:10,mae:.2}],rejected:{measurement_gap:2}}}:{};
+  panel.entity=()=>undefined;panel.state=()=>'';panel.field=()=>'';
+  assert.match(panel.model(),/Потрібний/);
+  assert.match(panel.model(),/Прогалина/);
+  panel.attrs=()=>({});assert.match(panel.model(),/Ще немає завершених перевірок/);
+});
 test('history decoder accepts compact HA states and keeps unknown gaps',()=>{
   const rows=normalizeHistory([{s:'22',lu:10},{s:'unavailable',lu:20},{state:'23',last_updated:'1970-01-01T00:00:30Z'}]);
   assert.deepEqual(rows,[{ts:10,state:'22'},{ts:20,state:'unavailable'},{ts:30,state:'23'}]);

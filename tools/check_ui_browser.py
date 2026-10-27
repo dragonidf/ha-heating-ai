@@ -218,8 +218,28 @@ def check_compact_tabs(page):
     page.locator('.model-advanced summary').click()
     assert page.locator('.parameter-grid').is_visible()
     assert page.locator('.controller-facts').is_visible()
+    page.evaluate("""setHeatingScenario({'sensor.heating_model':{attributes:{forecast_validation:{
+        groups:[{kind:'measured_inputs',horizon:'required',minimum_hours:39,maximum_hours:39,
+            count:10,days:8,mae:0.2,age_hours:2}],rejected:{measurement_gap:3}}}}})""")
+    assert 'Потрібний' in page.locator('.validation-table').inner_text()
+    assert '10 / 8' in page.locator('.validation-table').inner_text()
+    assert 'Прогалина — 3' in page.locator('.model-advanced').inner_text()
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.locator('.model-advanced summary').click()
     page.locator('nav [data-tab="overview"]').click()
+    page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{cycle_energy:{
+        observed_kwh:12.3,remaining_kwh:4.2,projected_total_kwh:16.5,observation_complete:true,
+        baseline:{kwh:17,at:Date.now()/1000},change_sources:['weather']},stress_scenarios:[
+        {name:'cold_low_solar',deficit_degree_hours:0.4,hypothetical:true}]}}})""")
+    assert '16,50' in page.locator('[data-cycle-budget]').inner_text()
+    page.locator('.plan-details summary').click()
+    assert 'погода' in page.locator('.plan-details').inner_text()
+    assert 'Гіпотетичні' in page.locator('.plan-details').inner_text()
+    page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{cycle_energy:{
+        observed_kwh:12.3,remaining_kwh:4.2,projected_total_kwh:null,observation_complete:false}}}})""")
+    assert 'часткові дані' in page.locator('[data-cycle-budget]').inner_text()
+    assert '= —' in page.locator('[data-cycle-budget]').inner_text()
+    page.evaluate('panel.hass=mockHass')
 
 
 def check_system_settings(page):
