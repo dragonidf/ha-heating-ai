@@ -22,7 +22,9 @@ class UpdateGuardTests(unittest.TestCase):
             app.tick()
             app.apply_action('heat',False)  # No thermostat I/O, even for a delayed callback.
     def test_finished_update_resumes_cycles(self):
-        app=self.app(False);calls=[]
+        app=self.app(False);calls=[];app.memory={}
+        app.now=lambda:__import__('datetime').datetime(2026,10,29)
+        app.publish=lambda *a,**kw:None
         app.tick_inner=lambda:calls.append(True)
         app.tick();self.assertEqual(calls,[True])
     def test_actual_boiler_marker_uses_kw_and_preserves_missing_measurements(self):

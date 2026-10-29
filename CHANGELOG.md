@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.15
+
+- Validate persisted forecast records, including explicit null observations; quarantine malformed diagnostic records without certifying them or blocking heating control.
+- Isolate optional validation/reporting failures, preserve the primary traceback with bounded repeat logging, and keep recovery retry deadlines stable.
+- Separate calculated plans, dispatched commands and confirmed thermostat application; retain causal incident fields when Recorder attributes are offloaded.
+- Report controller, validation and storage health independently.
+
+
 ## 0.2.14 — 2026-10-27
 
 - Зовнішнє тепло: підтвердження стійкості й нового повідомлення датчика, перевірка другого виміру, швидке зняття кредиту після зворотного стрибка; неперевірений прогрів не замінює гарантований нагрів. Верхній сценарій збережено для захисту від перегріву.
