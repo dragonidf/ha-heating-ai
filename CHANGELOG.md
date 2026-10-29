@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.15 — 2026-10-29
+
+- Validate persisted forecast records, including explicit null observations; quarantine malformed diagnostic records without certifying them or blocking heating control.
+- Isolate optional validation/reporting failures, preserve the primary traceback with bounded repeat logging, and keep recovery retry deadlines stable.
+- Separate calculated plans, dispatched commands and confirmed thermostat application; retain causal incident fields when Recorder attributes are offloaded.
+- Report controller, validation and storage health independently.
+- Check every configured residual-balance power source and all fallback phase powers for freshness; voltage or a different phase cannot refresh a stale power measurement. Preserve and label power without an automatic request.
+- Show primary fallback errors, applied-plan age, and stale versus unavailable or true-zero power in the existing panel.
+- Provide a tested watchdog alignment that rechecks permissions and heartbeat before each command and preserves strict windows, upper limits and scheduled outages.
+
+
 ## 0.2.14 — 2026-10-27
 
 - Зовнішнє тепло: підтвердження стійкості й нового повідомлення датчика, перевірка другого виміру, швидке зняття кредиту після зворотного стрибка; неперевірений прогрів не замінює гарантований нагрів. Верхній сценарій збережено для захисту від перегріву.

@@ -8,11 +8,116 @@ import gzip
 import hashlib
 import json
 import os
+import math
+import traceback
 from heating_model import number,in_window,heating_cycle,step,held_action
 from heating_outages import schedule,blocked
 from heating_fallback import estimated_power
 
+def prediction_contract(value):
+    """Validate persisted diagnostic inputs without granting missing validity."""
+    numeric=lambda v:isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+    if not isinstance(value,dict):return None,'invalid_prediction_type'
+    p=dict(value)
+    if (not all(numeric(p.get(k)) for k in ('ts','hours','temperature')) or p['hours']<=0 or
+            not isinstance(p.get('valid'),bool) or not isinstance(p.get('model'),dict) or
+            not isinstance(p.get('segments'),list)):
+        return None,'invalid_prediction_fields'
+    for key in ('checked_at','start_at','expected_energy'):
+        if key in p and not numeric(p[key]):return None,'invalid_prediction_'+key
+    if p.get('start_energy') is not None and not numeric(p['start_energy']):return None,'invalid_prediction_energy'
+    for s in p['segments']:
+        if (not isinstance(s,dict) or not numeric(s.get('start')) or not numeric(s.get('end')) or s['end']<=s['start']):
+            return None,'invalid_prediction_segments'
+    if p.get('reasons') is None:p['reasons']=[]
+    if not isinstance(p.get('reasons',[]),list):return None,'invalid_prediction_reasons'
+    observed=p.get('observed')
+    if observed is None or isinstance(observed,dict) and not observed:
+        p['observed']=None
+    elif (not isinstance(observed,dict) or not isinstance(observed.get('valid'),bool) or
+          not all(numeric(observed.get(k)) for k in ('at','room','floor','outside','fire','power_kw','request_seconds')) or
+          observed['request_seconds']<0 or
+          observed.get('energy') is not None and not numeric(observed['energy']) or
+          not all(numeric(p['model'].get(k)) for k in ('floor_air','room_loss','floor_decay','heat_gain','fire_gain'))):
+        return None,'invalid_observed_fields'
+    else:p['observed']=dict(observed)
+    return p,None
+
 class HeatingRecovery:
+    def reject_validation(self,reason,value,stamp):
+        if not isinstance(self.memory.get('forecast_validation_rejections'),dict):self.memory['forecast_validation_rejections']={}
+        rejected=self.memory['forecast_validation_rejections']
+        rejected[reason]=rejected.get(reason,0)+1
+        evidence=dict(at=stamp,reason=reason,record_type=type(value).__name__,
+            keys=list(value)[:20] if isinstance(value,dict) else None,
+            digest=hashlib.sha256(repr(value).encode()).hexdigest())
+        journal=getattr(self,'decision_journal',None)
+        if journal:
+            try:evidence['snapshot_id']=journal.snapshot(value,stamp)
+            except Exception:pass  # The original state backup remains evidence.
+        if not isinstance(self.memory.get('validation_quarantine'),list):self.memory['validation_quarantine']=[]
+        quarantine=self.memory['validation_quarantine']
+        quarantine.append(evidence);del quarantine[:-32]
+
+    def record_failure(self,stage,exc,critical=False):
+        stamp=self.now().timestamp();key='control_incident' if critical else 'diagnostic_errors'
+        if not critical and not isinstance(self.memory.get(key),dict):self.memory[key]={}
+        records=self.memory if critical else self.memory[key]
+        name=key if critical else stage;previous=records.get(name) or {}
+        if not isinstance(previous,dict):previous={}
+        signature=type(exc).__name__+': '+str(exc)
+        new=not previous.get('active') or previous.get('signature')!=signature
+        incident=(dict(incident_id=uuid4().hex,signature=signature,first_at=stamp,count=0,stage=stage) if new else previous)
+        incident.update(active=True,last_at=stamp,count=incident['count']+1)
+        if new:
+            trace=traceback.extract_tb(exc.__traceback__)
+            if trace:incident.update(module=Path(trace[-1].filename).name,function=trace[-1].name,line=trace[-1].lineno)
+            self.log('%s incident %s at %s: %s\n%s', 'Control' if critical else 'Diagnostic',
+                incident['incident_id'],stage,signature,traceback.format_exc(),level='ERROR' if critical else 'WARNING')
+            incident['logged_at']=stamp
+        elif stamp-incident.get('logged_at',0)>=300:
+            self.log('Incident %s repeated %s times; last: %s',incident['incident_id'],incident['count'],signature,level='ERROR' if critical else 'WARNING')
+            incident['logged_at']=stamp
+        records[name]=incident
+        return incident
+
+    def run_diagnostic(self,stage,callback,*args,default=None,**kwargs):
+        completed={k:list(self.memory[k]) if isinstance(self.memory.get(k),list) else [] for k in ('reserve_errors','forecast_validation')}
+        try:
+            result=callback(*args,**kwargs)
+        except Exception as exc:
+            self.record_failure(stage,exc)
+            if stage in ('forecast_validation','peak_validation'):
+                self.memory.update(completed)
+            if stage=='forecast_validation':
+                self.reject_validation('diagnostic_exception',self.memory.get('reserve_predictions'),self.now().timestamp())
+                self.memory['reserve_predictions']=[]
+            result=default
+        else:
+            error=(self.memory.get('diagnostic_errors') or {}).get(stage)
+            if error:error.update(active=False,recovered_at=self.now().timestamp())
+        return result
+
+    def publish_diagnostic_health(self,**extra):
+        errors=self.memory.get('diagnostic_errors') or {}
+        active={k:{f:v.get(f) for f in ('incident_id','signature','first_at','last_at','count')} for k,v in errors.items() if v.get('active')}
+        incident=self.memory.get('control_incident') or {};fallback=self.memory.get('temporary_fallback')
+        quarantine=self.memory.get('validation_quarantine') or []
+        recent=bool(quarantine and self.now().timestamp()-quarantine[-1]['at']<300)
+        storage=self.memory.get('state_load_error') or getattr(getattr(self,'decision_journal',None),'error',None)
+        control='fallback' if fallback else 'error' if incident.get('active') else 'healthy' if self.memory.get('last_successful_tick') else 'starting'
+        state=('Помилка контролера' if control=='error' else 'Тимчасовий auto' if fallback else
+               'Помилка збереження' if storage else 'Діагностика обмежена' if active or recent else 'Журнал доступний')
+        self.publish('sensor.heating_diagnostics',state,storage_health='degraded' if storage else 'healthy',
+            storage_degraded=bool(storage),validation_health='degraded' if active or recent else 'healthy',control_health=control,
+            diagnostic_errors=active,validation_rejections=self.memory.get('forecast_validation_rejections',{}),
+            last_successful_tick=self.memory.get('last_successful_tick'),incident_id=incident.get('incident_id'),
+            control_error=incident.get('signature') if incident.get('active') else None,
+            recorder_status=self.memory.get('decision_recorder_status','pending'),
+            plan_execution=self.memory.get('plan_execution'),applied_plan=self.memory.get('applied_plan'),
+            last_full_recompute=self.memory.get('last_full_recompute'),
+            last_validation_rejection=(self.memory.get('validation_quarantine') or [None])[-1],**extra)
+
     async def verify_decision_history(self,kwargs=None,**extra):
         """Read Recorder itself; successful set_state is not persistence proof.
 
@@ -43,11 +148,7 @@ class HeatingRecovery:
         except Exception as exc:
             status='unverified: '+str(exc)
         self.memory['decision_recorder_status']=status
-        state_error=self.memory.get('state_load_error')
-        self.publish('sensor.heating_diagnostics',
-            'Помилка читання стану' if state_error else 'Журнал доступний' if status=='verified_same_state_attributes' else 'Перевірте історію Recorder',
-            recorder_status=status,state_load_error=state_error,
-            storage_degraded=bool(state_error or getattr(self,'decision_journal',None) and self.decision_journal.error),
+        self.publish_diagnostic_health(state_load_error=self.memory.get('state_load_error'),
             note='Перевіряється повна історія атрибутів; фільтри й термін зберігання не змінюються')
 
     def decision_event(self,event,action=None,reason=None,force=False,snapshot=None):
@@ -56,10 +157,10 @@ class HeatingRecovery:
             return
         try:
             now=self.now();stamp=now.timestamp()
-            context=getattr(self,'decision_context',{})
-            settings=context.get('settings',{})
+            context=getattr(self,'decision_context',None) or {}
+            settings=context.get('settings') or {}
             forecast=context.get('forecast') or {}
-            reserve=forecast.get('morning_reserve',{})
+            reserve=forecast.get('morning_reserve') or {}
             mode=self.raw('mode');armed=self.raw('armed')=='on'
             sources={}
             for key in ('room','return','outside','fireplace','power_balance','thermostat','energy'):
@@ -78,7 +179,7 @@ class HeatingRecovery:
                     quality='fresh' if available and age is not None and age<=max_age else 'stale_or_unknown',
                     timestamp_kind='last_reported' if state.get('last_reported') else 'last_updated' if reported else 'unknown')
             actual=self.val('power')
-            command=self.memory.get('command_diagnostic',{})
+            command=self.memory.get('command_diagnostic') or {}
             reference=self.memory.get('plan_reference') or {}
             record=dict(event=event,timezone=str(self.climate_tz),app_version=getattr(self,'release_version',None),
                 plan_id=forecast.get('plan_id') or reference.get('plan_id'),
@@ -90,6 +191,12 @@ class HeatingRecovery:
                 grid=self.grid_state(),grid_evidence='existing inverter connection, input voltage and heartbeat guards',
                 power_w=actual,energy_counter_kwh=self.val('energy'),power_source=getattr(self,'power_source','unknown'),
                 power_estimated=estimated_power(getattr(self,'power_source','')),
+                incident_id=(self.memory.get('control_incident') or {}).get('incident_id'),
+                control_state='fallback' if self.memory.get('temporary_fallback') else 'running',
+                execution_state=(self.memory.get('plan_execution') or {}).get('status','unconfirmed'),
+                reason_code=(self.memory.get('control_incident') or {}).get('stage') or event,
+                power_quality=getattr(self,'power_quality','unknown'),
+                source_timestamp=sources.get('power_balance',{}).get('reported_at'),
                 physical_heating=actual is not None and actual>=1500,
                 execution='automatic' if mode=='Автоматичне керування' and armed and self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if actual is not None and actual>=1500 else 'idle',
                 measurements=context.get('measurements',{}),sources=sources,
@@ -121,16 +228,14 @@ class HeatingRecovery:
             compact=journal.append(record,snapshot,stamp)
             self.memory['last_decision_id']=compact['decision_id']
             self.publish('sensor.heating_decision',record['action'] or 'unknown',**compact)
-            state_error=self.memory.get('state_load_error')
-            self.publish('sensor.heating_diagnostics','Помилка читання стану' if state_error else 'Помилка збереження' if journal.error else 'Журнал доступний',
-                         storage_degraded=bool(state_error or journal.error),error=state_error or journal.error,retention_days=journal.retention/86400,
+            self.publish_diagnostic_health(error=self.memory.get('state_load_error') or journal.error,retention_days=journal.retention/86400,
                          attribute_budget_bytes=8192,last_decision_id=compact['decision_id'],
-                         recorder_status=self.memory.get('decision_recorder_status','pending'))
+                         )
         except Exception as exc:
             # Diagnostics must not trigger native-auto fallback or stop control.
-            self.log('Decision diagnostics failed: %s',exc,level='WARNING')
+            self.record_failure('decision_journal',exc)
             try:
-                self.publish('sensor.heating_diagnostics','Помилка збереження',storage_degraded=True,error=str(exc))
+                self.publish_diagnostic_health(error=str(exc))
             except Exception:
                 pass
 
@@ -157,10 +262,21 @@ class HeatingRecovery:
 
     def validate_reserve_predictions(self,now,room,power,quality,forecast=None,measurements=None):
         """Keep frozen-plan error separate from replay with measured inputs."""
-        stamp=now.timestamp();pending=self.memory.setdefault('reserve_predictions',[])
-        errors=self.memory.setdefault('reserve_errors',[])
-        results=self.memory.setdefault('forecast_validation',[])
-        rejected=self.memory.setdefault('forecast_validation_rejections',{})
+        stamp=now.timestamp();pending=self.memory.get('reserve_predictions')
+        if pending is None:pending=[]
+        if not isinstance(pending,list):
+            self.reject_validation('invalid_prediction_queue',pending,stamp);pending=[]
+        clean=[]
+        for value in pending:
+            p,reason=prediction_contract(value)
+            if reason:self.reject_validation(reason,value,stamp)
+            else:clean.append(p)
+        pending=self.memory['reserve_predictions']=clean
+        for key,kind in (('reserve_errors',list),('forecast_validation',list),('forecast_validation_rejections',dict)):
+            if self.memory.get(key) is None:self.memory[key]=kind()
+            elif not isinstance(self.memory[key],kind):
+                self.reject_validation('invalid_'+key,self.memory[key],stamp);self.memory[key]=kind()
+        errors=self.memory['reserve_errors'];results=self.memory['forecast_validation'];rejected=self.memory['forecast_validation_rejections']
         grid=self.grid_state();energy=number(self.val('energy'))
         inputs=measurements or {}
         source_ok=(quality and power is not None and grid in ('on','off') and
@@ -238,13 +354,18 @@ class HeatingRecovery:
                 for why in reasons:rejected[why]=rejected.get(why,0)+1
             elif not prediction['valid'] and not (observed and observed['valid']):
                 for why in reasons:rejected[why]=rejected.get(why,0)+1
-        pending[:]=[p for p in pending if p['ts']>stamp and (p['valid'] or p.get('observed',{}).get('valid'))]
+        pending[:]=[p for p in pending if p['ts']>stamp and (p['valid'] or (p.get('observed') or {}).get('valid'))]
         errors[:]=[r for r in errors[-240:] if r.get('at',stamp)>stamp-30*86400 and
                    r.get('model_version',self.model.get('version'))==self.model.get('version')]
         results[:]=[r for r in results[-720:] if r['at']>stamp-30*86400]
-        if forecast and stamp-self.memory.get('reserve_validation_at',0)>=3600:
+        if forecast is not None and not isinstance(forecast,dict):
+            self.reject_validation('invalid_validation_forecast',forecast,stamp);return
+        if forecast and stamp-(self.memory.get('reserve_validation_at') or 0)>=3600:
             self.memory['reserve_validation_at']=stamp
-            rows=forecast.get('_calculation_curve',forecast.get('curve',[]))
+            rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
+            if (not isinstance(rows,list) or any(not isinstance(r,dict) or number(r.get('ts')) is None or
+                    number(r.get('temperature')) is None or not isinstance(r.get('heat_segments'),list) for r in rows)):
+                self.reject_validation('invalid_validation_curve',rows,stamp);return
             segments=[s for r in rows for s in r['heat_segments']]
             # Validation needs on/off intervals, not a duplicate of every 5-min
             # modulation sample in every pending horizon saved to state.json.
@@ -378,7 +499,7 @@ class HeatingRecovery:
             change_sources=changes or ['execution' if previous else 'initial_projection'],
             remaining_need=(reserve.get('no_morning_counterfactual') or {}).get('deficit_degree_hours'),
             need_certainty='conditional' if reserve.get('conditional') else 'validated_scenario',
-            coast_peak=context.get('thermal_state',{}).get('coast_peak'),
+            coast_peak=(context.get('thermal_state') or {}).get('coast_peak'),
             automatic_kwh=round(entry['automatic_kwh'],4),other_kwh=round(entry['other_kwh'],4),
             transition_kwh=round(entry['transition_kwh'],4))
 
@@ -419,6 +540,10 @@ class HeatingRecovery:
                 retry_at=self.next_compute if self.next_compute>stamp else stamp+300)
             self.memory['recovering_from_fallback']=False
             self.journal('Тимчасовий auto: '+reason,'recovery')
+        fallback=self.memory['temporary_fallback']
+        if fallback['retry_at']<=stamp:
+            fallback.update(last_retry_at=stamp,retry_at=stamp+300)
+        self.next_compute=fallback['retry_at']
         self.apply_action('fallback',False)
 
     def apply_action(self,action,once):
@@ -468,7 +593,7 @@ class HeatingRecovery:
                 return
             action="fallback"
         attrs=self.raw("thermostat","all") or {}
-        attrs=attrs.get("attributes",{})
+        attrs=attrs.get("attributes") or {}
         if action=="fallback":
             mode="auto"
             target=self.fallback_target(current,attrs)
@@ -493,15 +618,22 @@ class HeatingRecovery:
             fallback=self.memory['temporary_fallback']
             self.publish('sensor.heating_controller','Тимчасовий auto',friendly_name='Клімат — контролер',
                 reason=fallback['reason'],mode=self.raw('mode'),control_method='temporary_native_auto',
+                control_state='fallback',incident_id=(self.memory.get('control_incident') or {}).get('incident_id'),
+                error=(self.memory.get('control_incident') or {}).get('signature'),
+                entered_at=fallback.get('entered_at'),last_attempt_at=fallback.get('last_attempt_at'),
+                execution_state=(self.memory.get('command_diagnostic') or {}).get('status','unconfirmed'),
                 proposed_action='Штатний auto · повторна спроба керування на наступному перерахунку',
                 proposed_setpoint=target,recovery_at=datetime.fromtimestamp(fallback['retry_at'],self.climate_tz).isoformat(),
                 auto_confirmed=self.raw('thermostat')=='auto')
             if time.time()-fallback.get('last_attempt_at',0)<30:
                 return
-        command=self.memory.get('command_diagnostic',{})
-        if (command.get('action'),command.get('requested_mode'),command.get('requested_setpoint'))!=(action,mode,target):
+        command=self.memory.get('command_diagnostic') or {}
+        plan=self.memory.get('plan_execution') or {}
+        new_plan=(command.get('plan_id'),command.get('plan_calculated_at'))!=(plan.get('plan_id'),plan.get('calculated_at'))
+        if new_plan or (command.get('action'),command.get('requested_mode'),command.get('requested_setpoint'))!=(action,mode,target):
             command=dict(requested_at=time.time(),requested_action=requested_action,action=action,
-                requested_mode=mode,requested_setpoint=target,status='requested')
+                requested_mode=mode,requested_setpoint=target,status='requested',
+                plan_id=plan.get('plan_id'),plan_calculated_at=plan.get('calculated_at'))
             self.memory['command_diagnostic']=command
         self.memory["expected_mode"]=mode
         self.memory["expected_setpoint"]=target
@@ -525,10 +657,12 @@ class HeatingRecovery:
                 self.run_in(self.verify_command,12,expected=mode,target=target,generation=generation)
         except Exception:
             command.update(status='service_error',service_error_at=time.time())
+            if plan:plan.update(status='command_failed')
             self.decision_event('command_failed',action=action,reason='Помилка виклику сервісу термостата',force=True)
             raise
         if changed:
             command.update(status='service_returned',service_returned_at=time.time())
+            if plan:plan.update(status='sent',sent_at=time.time())
             self.decision_event('command_sent',action=action,force=True)
         if transition:
             self.memory["command_at"]=time.time()
@@ -541,6 +675,9 @@ class HeatingRecovery:
             if action=="heat":
                 self.run_in(self.verify_boiler_response,180)
         self.memory.update(owned=not release,last_command=action)
+        if not changed and not release and command.get('status')=='requested':
+            self.memory['command_generation']=self.memory.get('command_generation',0)+1
+            self.verify_command(dict(expected=mode,target=target,generation=self.memory['command_generation']))
         self.save()
 
     def verify_command(self,kwargs=None,**extra):
@@ -549,10 +686,18 @@ class HeatingRecovery:
             return
         expected=args.get("expected")
         confirmed=self.val("thermostat",attribute="temperature")
-        command=self.memory.setdefault('command_diagnostic',{})
+        command=self.memory.get('command_diagnostic') or {}
+        self.memory['command_diagnostic']=command
         accepted=(self.raw('thermostat')==expected and confirmed is not None and abs(confirmed-args['target'])<=.1)
         command.update(status='confirmed' if accepted else 'not_confirmed',confirmed_at=time.time(),
                        accepted_mode=self.raw('thermostat'),accepted_setpoint=confirmed)
+        plan=self.memory.get('plan_execution') or {}
+        if (plan and (command.get('plan_id'),command.get('plan_calculated_at'))==
+                (plan.get('plan_id'),plan.get('calculated_at'))):
+            plan.update(status='applied' if accepted and expected=='heat' else 'confirmed_fallback' if accepted else 'unconfirmed',
+                confirmed_at=time.time())
+            if accepted and expected=='heat':
+                self.memory['applied_plan']=dict(plan,applied_at=time.time(),action=command.get('action'))
         self.decision_event('command_confirmation',force=True)
         self.save()
         if self.raw("thermostat")!=expected or confirmed is None or abs(confirmed-args["target"])>.1:
@@ -589,7 +734,7 @@ class HeatingRecovery:
             return
         expected=self.memory.get("expected_mode")
         state=new.get("state") if isinstance(new,dict) else new
-        temperature=number(new.get("attributes",{}).get("temperature")) if isinstance(new,dict) else None
+        temperature=number((new.get("attributes") or {}).get("temperature")) if isinstance(new,dict) else None
         manual=state not in (expected,"unknown","unavailable",None) or (temperature is not None and temperature!=self.memory.get("expected_setpoint"))
         if manual:
             self.memory["owned"]=False
@@ -674,9 +819,10 @@ class DecisionJournal:
                 raw=json.dumps(result,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode('utf-8')
                 if len(raw)>8192:
                     digest=self.snapshot(result,stamp)
-                    result={k:result.get(k) for k in ('schema_version','decision_id','recorded_at','plan_id','parent_plan_id','cycle_id','action','snapshot_id')}
+                    result={k:result.get(k) for k in ('schema_version','decision_id','recorded_at','plan_id','parent_plan_id','cycle_id','action','snapshot_id',
+                        'incident_id','control_state','execution_state','reason_code','power_quality','source_timestamp')}
                     result.update(external_attributes=True,attributes_snapshot_id=digest,
-                                  reason='Повний запис перевищив 8 КіБ; див. локальний знімок')
+                                  reason=str(record.get('reason') or '')[:256] or 'Повний запис у локальному знімку')
                     raw=json.dumps(result,ensure_ascii=False,separators=(',',':')).encode('utf-8')
                 day=datetime.fromtimestamp(stamp,timezone.utc).strftime('%Y-%m-%d')
                 if self.used_bytes+len(raw)+1>self.max_bytes:

@@ -59,3 +59,13 @@ test('sessions merge without hiding conditional heat and never mutate the foreca
   assert.deepEqual(mergeSegments(rows),[{start:0,end:20},{start:20,end:40,conditional:'true'}]);
   assert.equal(JSON.stringify(rows),original);
 });
+test('controller health prioritizes fallback error over generic measurement warning',()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);
+  const attrs={controller:{control_method:'temporary_native_auto',reason:"Помилка циклу: null record"},diagnostics:{control_health:'fallback'},forecast:{created_at:new Date().toISOString()}};
+  panel.attrs=k=>attrs[k]||{};panel.state=k=>k==='heartbeat'?new Date().toISOString():k==='process'?'on':'';panel.time=()=> '12:00';
+  let status=panel.controllerHealth();assert.match(status.message,/null record/);assert.match(status.details,/немає підтвердження/);
+  attrs.controller={quality:true};attrs.diagnostics={control_health:'healthy',applied_plan:{applied_at:Date.now()/1000}};attrs.grid_status={raw:'on'};
+  attrs.forecast.created_at=new Date(Date.now()-600000).toISOString();status=panel.controllerHealth();
+  assert.match(status.message,/застарів/);assert.match(status.details,/0 хв/);
+  attrs.forecast.created_at=new Date().toISOString();assert.equal(panel.controllerHealth().message,'');
+});

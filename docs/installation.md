@@ -81,3 +81,12 @@ python tools/migrate_hacs.py --rollback /path/to/migration.json --appdaemon-stop
 Утиліта перевіряє незмінність посилання й резервних копій, прибирає посилання на файли та відновлює старі модулі. Запустити AppDaemon, перевірити цикл і відновити записані режим/armed. Резервні копії залишаються. **Дані навчання, телеметрію й енергію разом із кодом не відкочувати.**
 
 AppDaemon не обходить символічне посилання на цілий каталог. Використовуйте окремі файлові посилання всередині звичайного каталогу. Для AppDaemon App на HA OS їх можна створити одноразовою перевіреною командою в офіційному параметрі init_commands: перед запуском перевірити ціль і кожен шлях, після запуску повернути попередній список init_commands. File editor command endpoint для цього не використовується.
+
+
+`power_balance_sources` optionally lists **every power entity** used by the site's
+residual balance (input total, subtracted local loads and inverter grid power).
+With this list configured, each measurement must have a timestamp within 300 s.
+Voltage updates cannot refresh power. A stale component invalidates the primary
+balance; fallback remains explicitly estimated and excluded from thermal learning.
+Existing configs without this optional list retain their helper availability check.
+No wiring topology or sign convention is inferred by the controller.
