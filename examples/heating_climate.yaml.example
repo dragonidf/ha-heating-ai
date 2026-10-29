@@ -51,6 +51,7 @@
     "ai_report": "input_text.heating_ai_report",
     "rollback": "input_button.heating_model_rollback",
     "power_balance": "sensor.your_power_balance",
+    "power_balance_sources": [],
     "outage_calendar": "calendar.your_outage_calendar",
     "outage_source": "sensor.your_svitlo_status",
     "outage_emergency": "binary_sensor.your_outage_emergency",

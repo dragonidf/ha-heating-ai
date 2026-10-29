@@ -123,7 +123,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             if self.cfg.get(key):
                 self.listen_state(self.settings_changed,self.cfg[key])
         self.listen_state(self.balance_changed,self.cfg["power_balance"])
-        for entity in self.cfg.get("fallback_phase_power",[]):
+        for entity in set(self.cfg.get("fallback_phase_power",[])+self.cfg.get("power_balance_sources",[])):
             self.listen_state(self.balance_changed,entity)
         if self.cfg.get("power_fault"):
             self.listen_state(self.balance_changed,self.cfg["power_fault"])
@@ -232,7 +232,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         stamp=state.get("last_reported") or state.get("last_updated")
         try:
             return time.time()-datetime.fromisoformat(stamp.replace("Z","+00:00")).timestamp() <= seconds
-        except (ValueError,TypeError):
+        except (AttributeError,ValueError,TypeError):
             return False
     def heartbeat_fresh(self,entities,seconds):
         return any(self.fresh(entity,seconds) for entity in entities)
@@ -401,6 +401,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         row['daylight_weight']=daylight(self.now())
         row['external_gain']=(self.memory.get('solar_observer') or {}).get('observed_gain',0.)
         row["power_source"]=getattr(self,"power_source","balance")
+        row['power_quality']=getattr(self,'power_quality','unknown')
+        if row['power_quality'] in ('unknown','contradictory'):row['quality']=False
+        row['execution']='automatic' if self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if power is not None and power>=1.5 else 'idle'
         row["power_estimated"]=getattr(self,"fallback_interval",False)
         row['heating_requested']=self.memory.get('last_command')=='heat'
         row['heat_command_at']=self.memory.get('command_at') if row['heating_requested'] else None
@@ -556,9 +559,13 @@ class HeatingClimate(HeatingRecovery,Hass):
     def update_heating_power(self):
         stamp=time.time()
         primary=self.val("power_balance")
-        failed=primary is None or (self.cfg.get("power_fault") and self.get_state(self.cfg["power_fault"])=="on")
+        dependencies=self.cfg.get('power_balance_sources',[])
+        stale=[entity for entity in dependencies if not self.fresh(entity,300)]
+        fault=self.get_state(self.cfg['power_fault']) if self.cfg.get('power_fault') else 'off'
+        failed=primary is None or bool(stale) or fault!='off'
         phases=[number(self.get_state(e)) for e in self.cfg.get("fallback_phase_power",[])]
-        fresh=self.heartbeat_fresh(self.cfg.get("fallback_phase_power",[])+self.cfg.get("input_heartbeat",[]),300)
+        phase_entities=self.cfg.get('fallback_phase_power',[])
+        fresh=len(phase_entities)==3 and all(self.fresh(entity,300) for entity in phase_entities)
         alive=self.raw("connection")=="on" and self.heartbeat_fresh(self.cfg["inverter_heartbeat"],90)
         grid_off=alive and self.raw("grid")=="off" and self.val("grid_voltage",999)<50
         raw,source,active=fallback_power(primary,failed,self.raw("thermostat"),
@@ -575,6 +582,11 @@ class HeatingClimate(HeatingRecovery,Hass):
             stage=nominal_mode(power,self.stage)
             if stage in ("3 кВт","6 кВт","9 кВт"):
                 self.memory["last_measured_stage_kw"]=int(stage.split()[0])
+        requested=(self.raw('mode')=='Автоматичне керування' and self.raw('armed')=='on' and
+                   self.memory.get('owned',False) and self.memory.get('last_command')=='heat' and
+                   not self.memory.get('temporary_fallback'))
+        self.power_quality=('unknown' if power is None else 'estimated' if estimated_power(source) else
+                            'contradictory' if grid_off and power>=1500 else 'measured')
         self.publish("sensor.heating_power_confirmed",power,
                      friendly_name="Котел — підтверджена потужність ТЕНів",
                      unit_of_measurement="W",device_class="power",state_class="measurement",
@@ -582,7 +594,11 @@ class HeatingClimate(HeatingRecovery,Hass):
                      averaging_seconds=20,raw_balance_w=primary,
                      averaged_balance_w=self.power_estimator.average,
                      power_source=source,estimated=estimated_power(source),primary_failed=bool(failed),
-                     requested_heating=active,fallback_raw_w=raw if source.startswith("fallback") else None,
+                     requested_heating=bool(requested),inferred_demand=active,
+                     power_quality=self.power_quality,stale_sources=stale,power_fault=fault,
+                     power_without_request=power is not None and power>=1500 and not requested,
+                     uncertainty='Несвіжі складові балансу' if stale else 'Помилка або невідомий стан вимірювачів' if fault!='off' else None,
+                     fallback_raw_w=raw if source.startswith("fallback") else None,
                      timestamp=self.now().isoformat())
         return power
     def stage_update(self,power):
@@ -599,7 +615,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.tick_inner()
             self.memory['last_successful_tick']=self.now().isoformat()
             incident=self.memory.get('control_incident')
-            if incident:incident.update(active=False,recovered_at=self.now().timestamp())
+            if incident and not self.memory.get('temporary_fallback') and not self.memory.get('recovering_from_fallback'):
+                incident.update(active=False,recovered_at=self.now().timestamp())
             self.run_diagnostic('health_publish',self.publish_diagnostic_health)
         except Exception as exc:
             incident=self.record_failure('control_tick',exc,critical=True)
@@ -618,10 +635,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.ventilation_tick(now.timestamp())
         if now.hour==10 and self.memory.get("learn_morning_date")!=now.date().isoformat():
             self.memory["learn_morning_date"]=now.date().isoformat()
-            self.daily_learn()
+            self.run_diagnostic('learning',self.daily_learn)
         if now.hour==20 and now.minute>=45 and self.memory.get("learn_date")!=now.date().isoformat():
             self.memory["learn_date"]=now.date().isoformat()
-            self.daily_learn()
+            self.run_diagnostic('learning',self.daily_learn)
         room,source,primary,thermostat=self.source_temperature()
         probe=self.val("return")
         probe_ok=probe is not None and 0<probe<65 and self.heartbeat_fresh(self.cfg["return_heartbeat"],self.cfg.get('return_max_age',1200))

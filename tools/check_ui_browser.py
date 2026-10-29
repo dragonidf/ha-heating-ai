@@ -300,6 +300,24 @@ def check_system_settings(page):
     page.locator('nav [data-tab="overview"]').click()
 
 
+def check_controller_incident(page):
+    page.set_viewport_size({'width':360,'height':800})
+    page.evaluate("""setHeatingScenario({
+        'sensor.heating_controller':{state:'Тимчасовий auto',attributes:{control_method:'temporary_native_auto',reason:'Помилка циклу: null record'}},
+        'sensor.heating_diagnostics':{attributes:{control_health:'fallback'}}})""")
+    assert 'null record' in page.locator('[data-controller-health]').inner_text()
+    assert 'бракує актуальних' not in page.locator('[data-controller-health]').inner_text()
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+    page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'0',attributes:{timestamp:new Date(Date.now()-600000).toISOString()}}})""")
+    assert page.locator('.boiler-status').inner_text()=='Немає даних'
+    assert page.locator('.boiler-metrics strong').first.inner_text()=='—'
+    page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'0',attributes:{timestamp:new Date().toISOString()}}})""")
+    assert page.locator('.boiler-status').inner_text()=='Очікування'
+    assert '0,0' in page.locator('.boiler-metrics strong').first.inner_text()
+    page.evaluate('panel.hass={...mockHass}')
+    page.set_viewport_size({'width':1440,'height':1100})
+
+
 def main(engine='chromium'):
     ARTIFACTS.mkdir(exist_ok=True)
     server=ThreadingHTTPServer(('127.0.0.1',0),partial(QuietHandler,directory=str(ROOT)))
@@ -318,6 +336,7 @@ def main(engine='chromium'):
                 panel.hass={...mockHass};
             }''',system_fields({},DEFAULT_MODEL))
             check_compact_overview(page)
+            check_controller_incident(page)
             page.wait_for_function('nativeConfigs.length === 2')
             check_compact_tabs(page)
             check_system_settings(page)

@@ -65,3 +65,48 @@ def build(app_slug='a0d7b954_appdaemon', update='update.heating_ai_appdaemon_upd
 
 if __name__=='__main__':
     print(json.dumps(build(),ensure_ascii=False,indent=2))
+
+
+def protect_watchdog(config,cfg):
+    """Keep an existing watchdog's triggers and guards; align fallback targets.
+
+    Used through the automation API, not installed as another AppDaemon app.
+    """
+    from copy import deepcopy
+    result=deepcopy(config)
+    actions=result['actions']
+    if [a.get('action') for a in actions[:2]]!=['climate.set_temperature','climate.set_hvac_mode']:
+        raise ValueError('Unexpected watchdog actions; review before updating')
+    keys=('thermostat','room','upper','night_upper','sleep_start','sleep_end','start','end','strategy','native_setpoint')
+    bindings={k:cfg[k] for k in keys if cfg.get(k)}
+    bindings['room_max_age']=cfg.get('room_max_age',14400)
+    # Static entity bindings only. Power topology, settings and limits remain in HA.
+    result.setdefault('variables',{})['heating_bindings']=bindings
+    target="""{% set c=heating_bindings %}
+{% set t=now().strftime('%H:%M:%S') %}
+{% set a=states(c.start) %}{% set b=states(c.end) %}
+{% set allowed=(a<=t<b) if a<b else (t>=a or t<b) if a>b else false %}
+{% set s=states(c.sleep_start) if c.sleep_start is defined else '' %}
+{% set e=states(c.sleep_end) if c.sleep_end is defined else '' %}
+{% set sleep=(s<=t<e) if s<e else (t>=s or t<e) if s>e else false %}
+{% set upper=states(c.night_upper if sleep and c.night_upper is defined else c.upper)|float(none) %}
+{% set room=states(c.room)|float(none) %}
+{% set fresh=room is not none and as_timestamp(states[c.room].last_reported,0)>=as_timestamp(now())-c.room_max_age %}
+{% set current=state_attr(c.thermostat,'current_temperature')|float(none) %}
+{% set minimum=state_attr(c.thermostat,'min_temp')|float(5) %}
+{% set maximum=state_attr(c.thermostat,'max_temp')|float(35) %}
+{% set step=state_attr(c.thermostat,'target_temp_step')|float(0.5) %}
+{% set ns=namespace(off=false) %}
+{% for interval in state_attr('sensor.heating_outage_schedule','outages')|default([],true) %}
+{% if interval.start<=as_timestamp(now())<interval.end %}{% set ns.off=true %}{% endif %}
+{% endfor %}
+{% set inhibit=(is_state(c.strategy,'Тільки в дозволені години') and not allowed) or room is none or not fresh or upper is none or room>=upper or ns.off %}
+{% set target=(current-2 if current is not none else minimum) if inhibit else states(c.native_setpoint)|float(26) %}
+{{ [minimum,[maximum,((target/step)|round(0))*step]|min]|max }}"""
+    actions[0]['data']['temperature']=target
+    # Recheck permissions and heartbeat before each physical command; recovery or
+    # a manual pause during the first service must stop the second writer.
+    guards=deepcopy(result['conditions'])+[dict(condition='template',value_template=
+        "{{ as_timestamp(states('sensor.heating_heartbeat'),0)<as_timestamp(now())-180 }}")]
+    result['actions']=[*deepcopy(guards),actions[0],*deepcopy(guards),*actions[1:]]
+    return result

@@ -102,12 +102,14 @@ class HeatingRecovery:
         errors=self.memory.get('diagnostic_errors') or {}
         active={k:{f:v.get(f) for f in ('incident_id','signature','first_at','last_at','count')} for k,v in errors.items() if v.get('active')}
         incident=self.memory.get('control_incident') or {};fallback=self.memory.get('temporary_fallback')
+        quarantine=self.memory.get('validation_quarantine') or []
+        recent=bool(quarantine and self.now().timestamp()-quarantine[-1]['at']<300)
         storage=self.memory.get('state_load_error') or getattr(getattr(self,'decision_journal',None),'error',None)
         control='fallback' if fallback else 'error' if incident.get('active') else 'healthy' if self.memory.get('last_successful_tick') else 'starting'
         state=('Помилка контролера' if control=='error' else 'Тимчасовий auto' if fallback else
-               'Помилка збереження' if storage else 'Діагностика обмежена' if active else 'Журнал доступний')
+               'Помилка збереження' if storage else 'Діагностика обмежена' if active or recent else 'Журнал доступний')
         self.publish('sensor.heating_diagnostics',state,storage_health='degraded' if storage else 'healthy',
-            storage_degraded=bool(storage),validation_health='degraded' if active else 'healthy',control_health=control,
+            storage_degraded=bool(storage),validation_health='degraded' if active or recent else 'healthy',control_health=control,
             diagnostic_errors=active,validation_rejections=self.memory.get('forecast_validation_rejections',{}),
             last_successful_tick=self.memory.get('last_successful_tick'),incident_id=incident.get('incident_id'),
             control_error=incident.get('signature') if incident.get('active') else None,
@@ -616,6 +618,10 @@ class HeatingRecovery:
             fallback=self.memory['temporary_fallback']
             self.publish('sensor.heating_controller','Тимчасовий auto',friendly_name='Клімат — контролер',
                 reason=fallback['reason'],mode=self.raw('mode'),control_method='temporary_native_auto',
+                control_state='fallback',incident_id=(self.memory.get('control_incident') or {}).get('incident_id'),
+                error=(self.memory.get('control_incident') or {}).get('signature'),
+                entered_at=fallback.get('entered_at'),last_attempt_at=fallback.get('last_attempt_at'),
+                execution_state=(self.memory.get('command_diagnostic') or {}).get('status','unconfirmed'),
                 proposed_action='Штатний auto · повторна спроба керування на наступному перерахунку',
                 proposed_setpoint=target,recovery_at=datetime.fromtimestamp(fallback['retry_at'],self.climate_tz).isoformat(),
                 auto_confirmed=self.raw('thermostat')=='auto')
@@ -670,7 +676,8 @@ class HeatingRecovery:
                 self.run_in(self.verify_boiler_response,180)
         self.memory.update(owned=not release,last_command=action)
         if not changed and not release and command.get('status')=='requested':
-            self.verify_command(dict(expected=mode,target=target,generation=self.memory.get('command_generation')))
+            self.memory['command_generation']=self.memory.get('command_generation',0)+1
+            self.verify_command(dict(expected=mode,target=target,generation=self.memory['command_generation']))
         self.save()
 
     def verify_command(self,kwargs=None,**extra):

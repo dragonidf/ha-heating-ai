@@ -96,6 +96,12 @@ class DiagnosticBoundaryTests(unittest.TestCase):
         self.assertEqual(app.values['armed'],'on')
         app.tick_inner=lambda:None
         with patch('heating_climate.time.time',return_value=app.at.timestamp()+15):app.tick()
+        self.assertTrue(app.memory['control_incident']['active'])
+        def recovered():
+            app.resume_temporary_fallback();app.apply_action('off',False)
+            app.verify_command(dict(expected='heat',target=21,generation=app.memory['command_generation']))
+        app.tick_inner=recovered
+        with patch('heating_climate.time.time',return_value=app.at.timestamp()+300):app.tick()
         self.assertFalse(app.memory['control_incident']['active'])
 
     def test_recorder_success_cannot_hide_fallback_health(self):
