@@ -291,7 +291,7 @@ export class HeatingAIPanel extends HTMLElement {
     if(field.kind==='json'&&value&&typeof value==='object')value={...value,verified:isTrue(value.verified)};
     const common=`data-system-key="${h(field.key)}" aria-label="${h(field.label)}" ${this.systemPending?'disabled':''}`;
     if(field.kind==='json')return `<textarea ${common} data-json rows="5" spellcheck="false">${h(JSON.stringify(value,null,2))}</textarea>`;
-    if(field.kind==='select')return `<select ${common}>${Object.entries(field.options||{}).map(([key,label])=>`<option value="${h(key)}" ${key===value?'selected':''}>${h(label)}</option>`).join('')}</select>`;
+    if(field.kind==='select')return `<span class="equipment-select"><select ${common}>${Object.entries(field.options||{}).map(([key,label])=>`<option value="${h(key)}" ${key===value?'selected':''}>${h(label)}</option>`).join('')}</select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>`;
     return `<input type="text" ${common} value="${h(value)}" placeholder="switch.…" autocapitalize="none" spellcheck="false">`;
   }
   equipmentSettings() {
@@ -982,8 +982,10 @@ footer span{font-size:11px}
 .system-help{flex-shrink:0;border:0;color:var(--green);min-width:44px;min-height:44px;padding:8px;font-size:15px}
 .system-field input,.system-field select{width:100%;max-width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
 .system-label>span,.system-label>label{min-width:0;overflow-wrap:anywhere}
-.system-field select{contain:inline-size;overflow:hidden;text-overflow:ellipsis}
-.system-field input{contain:inline-size;overflow:hidden}
+.equipment-select{position:relative;display:block;width:100%;max-width:100%;min-width:0;overflow:hidden}
+.field .equipment-select select,.system-field .equipment-select select{display:block;appearance:none;-webkit-appearance:none;padding-right:34px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.equipment-select svg{position:absolute;right:10px;top:50%;transform:translateY(-50%);width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;pointer-events:none}
+.equipment-select:focus-within{outline:2px solid var(--green);outline-offset:2px;border-radius:12px}
 .system-settings summary{min-width:0;overflow-wrap:anywhere}
 .system-field .number{width:100%;min-width:0}
 .system-field .number input{flex:1;width:0}

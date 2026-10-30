@@ -318,6 +318,8 @@ def check_equipment(page):
     assert page.locator('.boiler-metrics strong').first.inner_text()=='—'
     page.evaluate('panel.hass=mockHass')
     page.locator('nav [data-tab="settings"]').click()
+    page.locator('[data-system-key="boiler_power_mode"]').select_option('auto')
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), 'Long AUTO selection must fit a narrow settings column'
     page.locator('[data-system-key="boiler_power_mode"]').select_option('fixed_6')
     assert not page.evaluate('systemRequests.length')
     page.locator('[data-system-key="recuperator_entity"]').fill('switch.recuperator')
