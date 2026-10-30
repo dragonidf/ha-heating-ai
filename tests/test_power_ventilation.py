@@ -87,6 +87,16 @@ class SettingsAndLatency(unittest.TestCase):
             self.assertEqual(r['watts'],0.)
 
 class CalibrationContracts(unittest.TestCase):
+    def test_validated_ventilation_can_advance_within_daily_bounds(self):
+        from test_system_settings import SystemSettingsTests
+        from unittest.mock import patch
+        app=SystemSettingsTests().app();app.samples=[];app.climate_tz=app.now().tzinfo
+        app.memory['ventilation_model']=dict(validated=True,model_version=app.model['version'],fit_day='2026-10-20',base_room_loss=.02,recuperator=.002,bath=.004)
+        candidate=dict(validated=True,model_version=app.model['version'],base_room_loss=.021,recuperator=.0021,bath=.0041)
+        with patch('heating_climate.fit_ventilation',return_value=candidate):app.refresh_equipment_models()
+        self.assertEqual(app.memory['ventilation_model']['fit_day'],'2026-10-21')
+        self.assertAlmostEqual(app.memory['ventilation_model']['base_room_loss'],.021)
+
     def test_separate_mode_sessions_and_average_are_not_an_instant_six_kw_stage(self):
         from heating_model import DEFAULT_MODEL,step
         rows=[];model=dict(DEFAULT_MODEL,version=6)

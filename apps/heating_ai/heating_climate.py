@@ -387,12 +387,15 @@ class HeatingClimate(HeatingRecovery,Hass):
         today=self.now().date().isoformat()
         if previous.get('validated') and previous.get('model_version')==self.model.get('version'):
             if not fit['validated'] or previous.get('fit_day')==today:return
+            clipped=False
             for key in ('base_room_loss','recuperator','bath'):
                 limit=abs(previous[key])*.2
-                fit[key]=max(previous[key]-limit,min(previous[key]+limit,fit[key]))
+                value=max(previous[key]-limit,min(previous[key]+limit,fit[key]))
+                clipped=clipped or value!=fit[key];fit[key]=value
             # Clipping changes a fit: keep the candidate shadow until revalidated.
-            fit.update(validated=False,reason='daily_bound_requires_revalidation')
-            self.memory['ventilation_candidate']=fit;return
+            if clipped:
+                fit.update(validated=False,reason='daily_bound_requires_revalidation')
+                self.memory['ventilation_candidate']=fit;return
         self.memory['ventilation_model']=dict(fit,fit_day=today)
 
     def assess_power_sources(self,stamp,primary,grid_off):

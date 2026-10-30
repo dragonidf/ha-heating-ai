@@ -283,7 +283,9 @@ def check_system_settings(page):
     assert field.input_value()=='7200'
     for width in (430,390,360,320):
         page.set_viewport_size({'width':width,'height':850})
-        assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+        # WebKit commits container queries after the viewport call returns.
+        page.evaluate('()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
+        assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,page.locator('heating-ai-panel').evaluate("el=>[...el.shadowRoot.querySelectorAll('*')].filter(x=>x.getBoundingClientRect().right>innerWidth+1).slice(0,12).map(x=>[x.tagName,x.className,x.getBoundingClientRect().width])"))
         for control in page.locator('[data-system-key],.system-help').all():
             assert control.bounding_box()['height']>=40
         page.locator('[data-system-help="floor_air"]').click()

@@ -979,7 +979,8 @@ footer span{font-size:11px}
 .system-field{min-width:0;display:flex;flex-direction:column;gap:5px}
 .system-label{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;line-height:1.4}
 .system-help{flex-shrink:0;border:0;color:var(--green);min-width:44px;min-height:44px;padding:8px;font-size:15px}
-.system-field input,.system-field select{width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
+.system-field input,.system-field select{width:100%;max-width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
+.system-label>span{min-width:0;overflow-wrap:anywhere}
 .system-field .number{width:100%;min-width:0}
 .system-field .number input{flex:1;width:0}
 .system-field .number span{white-space:nowrap}
