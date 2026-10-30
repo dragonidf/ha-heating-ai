@@ -8,6 +8,15 @@ from datetime import datetime, timedelta, time
 EMERGENCY_WARNING = "Аварійні відключення: графік не гарантує світло"
 
 
+def planning_schedule(data,policy='unknown',published=False):
+    """Optional owner-selected forecast assumption; never a physical grid signal."""
+    if (policy=='assume_available' and not published and data.get('mode')=='unknown' and
+            not data.get('emergency') and not data.get('slots') and not data.get('outages')):
+        return dict(data,source_mode='unknown',mode='normal',valid=True,assumed=True,
+                    reason='Мережа без графіка: доступна у прогнозі',warning=None)
+    return data
+
+
 def availability(data, start, finish):
     """Internal rolling coverage only; never writes a synthetic HA schedule."""
     if data.get('valid') and data.get('mode') == 'normal':

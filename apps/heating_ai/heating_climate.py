@@ -11,6 +11,7 @@ import statistics
 import time
 import calendar
 import shutil
+import hashlib
 from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation)
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
@@ -269,7 +270,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         equipment=self.memory.get('equipment_settings') or {}
         if isinstance(equipment,dict):
             for key,value in equipment.items():
-                if key not in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity'):continue
+                if key not in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity','outage_missing_policy'):continue
                 try:
                     clean,_=validate_system_settings({key:value},self.cfg,self.model);self.cfg.update(clean)
                 except (ValueError,TypeError):self.log('Invalid saved equipment field: %s',key,level='WARNING')
@@ -304,7 +305,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 if any(self.get_state(entity,attribute='all') is None for entity in entities):raise ValueError('Сутність не існує в Home Assistant')
             if model and not self.consider({**self.model,**model},'Налаштування користувача',apply=True):
                 raise ValueError(self.memory.get('last_result','Модель не пройшла перевірку'))
-            equipment={k:v for k,v in config.items() if k in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity')}
+            equipment={k:v for k,v in config.items() if k in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity','outage_missing_policy')}
             for k in equipment:config.pop(k,None)
             changed={k:v for k,v in equipment.items() if self.cfg.get(k)!=v}
             if changed:
@@ -463,9 +464,13 @@ class HeatingClimate(HeatingRecovery,Hass):
             return
         old=self.memory.get('power_recommendation') or {}
         stamp=now.timestamp()
-        # Three like-for-like searches at most every fifteen minutes; schedule
-        # changes and an explicitly selected mode invalidate the cached advice.
-        key=[str(signature),settings.get('equipment_version'),round(room*2),round(outside),round(fire/5)]
+        # Cache unchanged advice for fifteen minutes; relevant forecast inputs
+        # invalidate it, but a refresh timestamp alone does not.
+        schedule_key=signature[:2]+signature[3:] if isinstance(signature,(tuple,list)) and len(signature)==5 else signature
+        comfort={k:settings.get(k) for k in ('target','lower','upper','night_target','night_lower','night_upper','start','end','sleep_start','sleep_end','strategy','morning_min_minutes','budget_multiplier')}
+        weather_key=(getattr(self,'weather',None) or weather) if weather else []
+        context=(schedule_key,comfort,weather_key,self.model.get('version'))
+        key=[hashlib.sha256(repr(context).encode()).hexdigest(),settings.get('equipment_version'),round(room*2),round(floor),round(outside),round(fire/5)]
         if stamp-old.get('computed_at',0)<900 and old.get('input_key')==key:return
         result=recommend_power(now,room,floor,outside,fire,self.model,weather,settings,self.memory.get('power_calibrations'))
         if old.get('mode') and result.get('mode') and result['mode']<old['mode'] and stamp-old.get('changed_at',0)<900:return
@@ -473,20 +478,27 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory['power_recommendation']=result
 
     def publish_equipment(self,ventilation_support=None):
+        # AppDaemon's nested attribute transport drops numeric zero/false.
+        # Keep canonical counters numeric; stringify only these wire values.
+        def wire(value):
+            if isinstance(value,dict):return {k:wire(v) for k,v in value.items()}
+            if isinstance(value,list):return [wire(v) for v in value]
+            if value is False:return 'false'
+            return '0' if isinstance(value,(int,float)) and value==0 else value
         profile=power_profile(self.cfg.get('boiler_power_mode','unconfirmed'),self.memory.get('power_calibrations'),self.memory.get('modulation_profile'),self.memory.get('equipment_version',0))
         self.publish('sensor.heating_power_model',self.cfg.get('boiler_power_mode','unconfirmed'),
-            friendly_name='Котел — фізичний режим і прогноз',equipment_version=self.memory.get('equipment_version',0),
+            **wire(dict(friendly_name='Котел — фізичний режим і прогноз',equipment_version=self.memory.get('equipment_version',0),
             history=[dict(at=h['at'],changed=list(h['values'])) for h in (self.memory.get('equipment_history') or [])[-3:]],
             profile={k:v for k,v in profile.items() if k not in ('bands','stage_minutes')},
             bands=[{k:b.get(k) for k in ('return_min','return_max','power_kw','minutes')} for b in profile.get('bands',[])[:16]],
             mode_contradiction=self.memory.get('mode_contradiction',False),
             recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
             energy=self.memory.get('power_observation_ledger'),
-            accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')
+            accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')))
         self.publish('sensor.heating_ventilation','Враховано' if (self.memory.get('ventilation_model') or {}).get('validated') else 'Навчання; чинна базова модель',
-            friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
+            **wire(dict(friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
             model=self.memory.get('ventilation_model') or {},candidate=self.memory.get('ventilation_candidate'),
-            note='Реле не доводить витрату повітря; майбутній duty — сценарій, не точний розклад')
+            note='Реле не доводить витрату повітря; майбутній duty — сценарій, не точний розклад')))
 
     def ai_report_changed(self,entity,attribute,old,new,kwargs=None,**extra):
         if old!=new:
@@ -902,6 +914,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      friendly_name="Клімат — графік відключень 3.1",valid=bool(outage_data.get("valid")),
                      updated=outage_data.get("updated"),emergency=emergency,mode=outage_data['mode'],
                      source_available=outage_data['source_available'],source_fresh=outage_data['source_fresh'],
+                     assumed_available=bool(outage_data.get('assumed')),source_mode=outage_data.get('source_mode',outage_data['mode']),
                      reason=outage_data['reason'],
                      scheduled_outage_now=outage_now,next_outage=upcoming[0] if upcoming else None,
                      outages=upcoming,known_until=outage_data.get("known_until"),

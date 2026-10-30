@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 — 2026-10-30
+
+- Show boiler advice on the comfort hero and boiler card, including a labelled best alternative when none can fully meet comfort. Keep conditional advice separate from a sufficient plan.
+- Replace typed ventilation bindings with existing HA relay/fan choices and friendly names. Group settings by control, comfort, boiler, heating hours, circulation and ventilation, with critical controls first.
+- Add an explicit persisted forecast policy for missing schedules: assume available grid without altering actual grid guards or emergency signals; published outage intervals remain authoritative. Remove generic missing/partial schedule notices from the overview.
+- Keep capacity-advice caching through unchanged schedule refreshes; real interval/status changes still invalidate it. Publish a compact signature rather than the full slot tuple.
+- Preserve explicit zero and false values in the new equipment/ventilation sensor attributes across AppDaemon transport. Zero measured/estimated energy and zero balance watts must remain distinguishable from unavailable data in the panel and Recorder.
+- Encode only the published attributes; canonical energy counters, control, forecasts and saved history remain unchanged. Add a regression reproducing transport filtering and checking that counters are not mutated.
+
 ## 0.3.0 — 2026-10-30
 
 - Describe the physical 3/6/9 kW or AUTO boiler mode in revisioned persistent settings, separately from HVAC and measured watts. Selecting a mode never sends a boiler command; old installations remain explicitly unconfirmed until selected.

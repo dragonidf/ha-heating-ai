@@ -516,7 +516,11 @@ class HeatingRecovery:
         record=self.get_state(source,attribute='all') if source else None
         advisory=self.cfg.get('outage_emergency')
         emergency=self.get_state(advisory) if advisory else None
-        return schedule(record,now or self.now(),self.cfg.get('outage_max_age',10800),emergency=emergency)
+        from heating_outages import planning_schedule
+        attrs=record.get('attributes') if isinstance(record,dict) else None
+        published=bool(isinstance(attrs,dict) and (attrs.get('today_48half') or attrs.get('tomorrow_48half')))
+        return planning_schedule(schedule(record,now or self.now(),self.cfg.get('outage_max_age',10800),emergency=emergency),
+                                 self.cfg.get('outage_missing_policy','unknown'),published=published)
     def active_upper(self):
         if (self.cfg.get('night_upper') and
                 in_window(self.now(),self.raw('sleep_start') or '23:00',self.raw('sleep_end') or '07:00')):

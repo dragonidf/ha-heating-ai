@@ -4,6 +4,23 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths}=await import('../frontend/heating-panel.js');
+test('device bindings use existing HA relay choices with friendly names',()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={};panel._hass={states:{
+    'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},
+    'fan.bath':{state:'unavailable',attributes:{friendly_name:'Витяжка ванної'}},
+    'sensor.unrelated':{state:'12',attributes:{friendly_name:'Не пристрій'}}}};
+  const html=panel.equipmentControl({kind:'entity',key:'recuperator_entity',label:'Рекуператор',value:'switch.recuperator'});
+  assert.match(html,/<select/);assert.doesNotMatch(html,/<input/);
+  assert.match(html,/Рекуператор вітальні/);assert.match(html,/Витяжка ванної/);assert.doesNotMatch(html,/sensor.unrelated/);
+});
+test('boiler advice remains visible when no mode can fully meet comfort',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.state=k=>({power_model:'auto',power_confirmed:'0',boiler_active:'off'})[k];
+  p.attrs=k=>k==='power_model'?{recommendation:{status:'model_bound_insufficient',alternatives:[
+    {nominal_kw:3,mode:'fixed_3',found:true,deficit_degree_hours:4},
+    {nominal_kw:6,mode:'fixed_6',found:true,deficit_degree_hours:3},
+    {nominal_kw:9,mode:'fixed_9',found:true,deficit_degree_hours:2}]}}:{};
+  const html=p.boilerOverview();assert.match(html,/Для зменшення дефіциту/);assert.match(html,/9 кВт/);
+});
 test('a corrected equipment JSON draft clears its earlier validation error',async()=>{
   const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={};panel.render=()=>{};
   let error='';const field={value:'{',type:'textarea',dataset:{systemKey:'power_phase_topology'},

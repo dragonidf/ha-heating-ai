@@ -88,6 +88,8 @@ def check_theme_and_motion(page):
 
 
 def check_compact_overview(page):
+    # Interaction checks may have expanded advice; density is the collapsed view.
+    if page.locator('.power-advice[open]').count():page.locator('.power-advice>summary').click()
     assert page.locator('.boiler-card').count()==1, 'Boiler metrics must share one card'
     assert page.locator('.heat-sources>.card').count()==2
     assert page.locator('.hero .hero-outside').count()==1
@@ -144,7 +146,7 @@ def check_compact_overview(page):
             schedule_complete:true,weather_complete:true,weather_missing_minutes:missing}}})''',missing)
         assert page.locator('.forecast-warning').count()==0, (missing,'Tolerated weather tail must not warn')
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}}})")
-    assert 'Графік мережі неповний' in page.locator('.forecast-warning').inner_text()
+    assert page.locator('.forecast-warning').count()==0, 'Partial schedule is used without a generic incompleteness notice'
     for missing in (61,95,None):
         page.evaluate('''missing=>setHeatingScenario({'sensor.heating_forecast':{attributes:{
             schedule_complete:true,weather_complete:false,weather_missing_minutes:missing}}})''',missing)
@@ -153,7 +155,7 @@ def check_compact_overview(page):
         'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true,weather_missing_minutes:42}},
         'sensor.heating_outage_schedule':{attributes:{warning:'Аварійне відключення'}}})""")
     warnings=page.locator('.forecast-warning').all_text_contents()
-    assert any('Графік мережі неповний' in warning for warning in warnings)
+    assert all('Графік мережі неповний' not in warning for warning in warnings)
     assert any('Аварійне відключення' in warning for warning in warnings)
     assert all('Погодинна погода неповна' not in warning for warning in warnings)
     page.evaluate("""setHeatingScenario({
@@ -161,11 +163,14 @@ def check_compact_overview(page):
         'sensor.heating_outage_schedule':{attributes:{mode:'normal',warning:null,emergency:false,outages:[]}}})""")
     assert page.locator('.forecast-warning').count()==0, 'Normal mode must not warn about absent schedule'
     assert page.locator('[data-forecast-metric="schedule"] strong').inner_text()=='Не очікуються'
+    page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true}},
+        'sensor.heating_outage_schedule':{attributes:{mode:'normal',assumed_available:true,warning:null,emergency:false}}})""")
+    assert page.locator('.forecast-warning').count()==0
+    assert page.locator('[data-forecast-metric="schedule"] strong').inner_text()=='Доступна'
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true,outage_mode:'normal'}},
         'sensor.heating_outage_schedule':{attributes:{mode:'unknown',warning:'Графік недоступний'}}})""")
-    assert 'Графік недоступний' in page.locator('.forecast-warning').all_text_contents()
-    assert any('Графік мережі неповний' in text for text in page.locator('.forecast-warning').all_text_contents())
+    assert page.locator('.forecast-warning').count()==0, 'Missing schedule does not create a generic warning'
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}},
         'sensor.heating_outage_schedule':{attributes:{mode:'scheduled',emergency:true,warning:'Аварійні відключення: графік не гарантує світло'}}})""")
@@ -249,9 +254,9 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==33, fields.count()  # Existing controls plus physical mode, quality policy, phase map and two relays.
+    assert fields.count()==34, fields.count()
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==62
+    assert panel.locator('.system-help').count()==63
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()
@@ -317,13 +322,26 @@ def check_equipment(page):
     page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'unknown',attributes:{confirmation_pending:true,timestamp:new Date().toISOString()}}})""")
     assert page.locator('.boiler-metrics strong').first.inner_text()=='—'
     page.evaluate('panel.hass=mockHass')
+    page.evaluate("""setHeatingScenario({'sensor.heating_power_model':{state:'auto',attributes:{recommendation:{
+        status:'model_bound_insufficient',reason:'Жоден режим не забезпечує весь комфорт',alternatives:[
+        {mode:'fixed_3',nominal_kw:3,found:'true',feasible:'false',deficit_degree_hours:4},
+        {mode:'fixed_9',nominal_kw:9,found:'true',feasible:'false',deficit_degree_hours:2}]}}}})""")
+    assert '9 кВт' in page.locator('.hero-power').inner_text()
+    assert 'Для зменшення дефіциту' in page.locator('.power-advice>summary').inner_text()
+    assert page.locator('.hero').bounding_box()['height']<225, page.locator('.hero').bounding_box()
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+    page.screenshot(path=str(ARTIFACTS/'heating-recommendation-360.png'),full_page=True)
+    page.evaluate('panel.hass=mockHass')
     page.locator('nav [data-tab="settings"]').click()
+    headings=page.locator('.settings-grid>.card h2').all_text_contents()
+    assert headings==['Керування опаленням','Комфорт','Котел','Години нагріву','Циркуляція','Вентиляція'],headings
+    page.evaluate("mockHass.states={...mockHass.states,'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},'fan.bath':{state:'unavailable',attributes:{friendly_name:'Витяжка ванної'}}};panel.hass={...mockHass}")
+    assert page.locator('[data-system-key="recuperator_entity"]').evaluate('el=>el.tagName')=='SELECT'
     page.locator('[data-system-key="boiler_power_mode"]').select_option('auto')
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), 'Long AUTO selection must fit a narrow settings column'
     page.locator('[data-system-key="boiler_power_mode"]').select_option('fixed_6')
     assert not page.evaluate('systemRequests.length')
-    page.locator('[data-system-key="recuperator_entity"]').fill('switch.recuperator')
-    page.locator('[data-system-key="recuperator_entity"]').press('Tab')
+    page.locator('[data-system-key="recuperator_entity"]').select_option('switch.recuperator')
     page.locator('[data-system-save]').first.click()
     page.wait_for_function('systemRequests.length===1')
     assert page.evaluate('systemRequests[0].data.values')=={'boiler_power_mode':'fixed_6','recuperator_entity':'switch.recuperator'}
@@ -331,6 +349,7 @@ def check_equipment(page):
     page.wait_for_function("!document.querySelector('heating-ai-panel').shadowRoot.querySelector('[data-system-key=boiler_power_mode]').disabled")
     page.evaluate('systemRequests=[];panel.hass=mockHass')
     page.locator('nav [data-tab="overview"]').click()
+    if page.locator('.power-advice[open]').count():page.locator('.power-advice>summary').click()
     page.set_viewport_size({'width':1440,'height':1100})
 
 
@@ -491,7 +510,7 @@ def main(engine='chromium'):
                             # v0.2.4 was 4493–4550 px on these same synthetic fixtures.
                             assert page.locator('main').bounding_box()['height']<3650, (width,'overview did not become compact')
                             assert page.locator('.hero').bounding_box()['height']<225
-                            assert page.locator('.boiler-card').bounding_box()['height']<175
+                            assert page.locator('.boiler-card').bounding_box()['height']<175, (width,page.locator('.boiler-card').bounding_box(),page.locator('.power-advice').get_attribute('open'))
                             assert page.locator('.fireplace-card').bounding_box()['height']<225
                             assert page.locator('.plan-card').bounding_box()['height']<420
                         if width<=600:
