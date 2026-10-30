@@ -6,6 +6,7 @@
 - Read a bounded, batched HA power snapshot with real report timestamps instead of relying on AppDaemon's state-changed cache for unchanged meter readings. Preserve freshness, unit, skew, fault and actual-grid checks; failed reads remain unknown, not zero.
 - Suppress duplicate diagnostic decisions caused solely by measurement timestamps and running energy-ledger updates. Losslessly compress closed-day diagnostic logs under disk pressure, verify their checksums and preserve protected evidence and retention times. Expose the diagnostic budget and persistent storage error.
 - Add regressions for saving 6 kW with learned coefficients, delayed acknowledgement, fresh unchanged reports, stale reports and API failure, duplicate decisions, journal pressure and interrupted compression. Keep physical boiler modes, model coefficients, energy counters and telemetry unchanged by the hotfix.
+- Pin the browser-test runner to the supported Ubuntu image and declare timezone data explicitly for reproducible schedule checks.
 
 ## 0.3.1 — 2026-10-30
 
