@@ -4,6 +4,14 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths}=await import('../frontend/heating-panel.js');
+test('a corrected equipment JSON draft clears its earlier validation error',async()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={};panel.render=()=>{};
+  let error='';const field={value:'{',type:'textarea',dataset:{systemKey:'power_phase_topology'},
+    hasAttribute:key=>['data-system-key','data-json'].includes(key),reportValidity:()=>!error,setCustomValidity:value=>{error=value;}};
+  await panel.changed({target:field});assert.ok(error);assert.deepEqual(panel.systemDraft,{});
+  field.value='{"verified":false,"phases":[]}';await panel.changed({target:field});
+  assert.equal(error,'');assert.deepEqual(panel.systemDraft,{power_phase_topology:{verified:false,phases:[]}});
+});
 test('model diagnostics render with legacy attributes and new rollout results',()=>{
   const panel=Object.create(HeatingAIPanel.prototype);
   panel.config={};

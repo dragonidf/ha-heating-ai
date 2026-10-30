@@ -70,3 +70,70 @@ def repair_samples(rows, recovery):
                 row['quality'] = False
     return changed
 
+
+
+def aligned_power(readings,entities,stamp,max_age=300,max_skew=30):
+    """Validate the actual power timestamps, units and measurement kind."""
+    values={};times=[]
+    for entity in entities:
+        r=readings.get(entity) or {};value=number(r.get('value'));at=number(r.get('at'))
+        if value is None or at is None:return dict(valid=False,reason='missing_measurement',entity=entity)
+        if not 0<=stamp-at<=max_age:return dict(valid=False,reason='stale_power',entity=entity)
+        if r.get('unit') not in ('W','kW') or r.get('kind','active')!='active':return dict(valid=False,reason='power_units',entity=entity)
+        values[entity]=value*(1000 if r['unit']=='kW' else 1);times.append(at)
+    if not times:return dict(valid=False,reason='no_sources')
+    skew=max(times)-min(times)
+    if skew>max_skew:return dict(valid=False,reason='asynchronous_power',skew_seconds=skew)
+    return dict(valid=True,values=values,skew_seconds=skew,oldest_at=min(times))
+
+
+def phase_residual(topology,readings,stamp):
+    """B is an audited residual estimate, never proof of one TEN per phase."""
+    result=dict(valid=False,watts=None,quality='unknown',independent=False)
+    if not isinstance(topology,dict) or topology.get('verified') is not True:return dict(result,reason='topology_unconfirmed')
+    phases=topology.get('phases') or []
+    if not isinstance(phases,list) or len(phases)!=3 or not all(isinstance(p,dict) for p in phases):return dict(result,reason='phase_mapping_missing')
+    inputs=[];loads=[];physical=set();seen=set()
+    for phase in phases:
+        entity=phase.get('input')
+        if not isinstance(entity,str) or entity in seen:return dict(result,reason='duplicate_phase')
+        seen.add(entity);inputs.append(entity)
+        if any(isinstance(phase.get(k),bool) or number(phase.get(k)) is None or phase[k]<0 for k in ('background_w','uncertainty_w')):
+            return dict(result,reason='background_unconfirmed')
+        if not isinstance(phase.get('loads'),list) or not all(isinstance(x,dict) for x in phase['loads']):return dict(result,reason='invalid_loads')
+        for load in phase.get('loads',[]):
+            identity=load.get('physical_id');entity=load.get('entity')
+            if not identity or not entity or identity in physical or entity in seen:return dict(result,reason='duplicate_load')
+            physical.add(identity);seen.add(entity);loads.append(entity)
+    aligned=aligned_power(readings,inputs+loads,stamp)
+    if not aligned['valid']:return dict(result,**{k:v for k,v in aligned.items() if k!='valid'})
+    v=aligned['values'];residuals=[v[p['input']]-sum(v[x['entity']] for x in p.get('loads',[]))-p['background_w'] for p in phases]
+    uncertainty=sum(p['uncertainty_w'] for p in phases)
+    if min(residuals)<-max(100.,uncertainty):return dict(result,reason='negative_residual')
+    watts=max(0.,sum(residuals))
+    return dict(result,valid=True,watts=watts,quality='estimated',reason='audited_residual',
+        phase_watts=residuals,lower_w=max(0.,watts-uncertainty),upper_w=watts+uncertainty,
+        skew_seconds=aligned['skew_seconds'],shared_failures='Input meter, phase mapping and unmetered loads')
+
+
+def combine_power(a,b):
+    if a.get('valid'):
+        if b.get('valid') and abs(a['watts']-b['watts'])>max(500.,abs(a['watts'])*.2):
+            return dict(watts=None,quality='unknown',reason='methods_conflict',independent=False)
+        return dict(watts=a['watts'],quality='measured',reason='primary_balance',independent=False)
+    if b.get('valid'):return dict(watts=b['watts'],quality='estimated',reason='phase_residual',independent=False)
+    return dict(watts=None,quality='unknown',reason=a.get('reason') or b.get('reason') or 'no_measurement',independent=False)
+
+
+def integrate_observation(state,stamp,watts,quality,max_hold=45.,restart=False):
+    """Causal left integration, bounded hold; persistent totals, no gap backfill."""
+    previous=state.get('last')
+    if previous and stamp<=previous['at']:return state
+    for key in ('measured_kwh','estimated_kwh','unknown_seconds'):state.setdefault(key,0.)
+    if previous:
+        dt=stamp-previous['at'];known=(not restart and previous['quality'] in ('measured','estimated') and previous['watts'] is not None)
+        seconds=min(dt,max_hold) if known else 0.
+        if seconds:state[previous['quality']+'_kwh']+=max(0.,previous['watts'])*seconds/3600000
+        state['unknown_seconds']+=dt-seconds
+    state['last']=dict(at=stamp,watts=number(watts),quality=quality if number(watts) is not None else 'unknown')
+    return state

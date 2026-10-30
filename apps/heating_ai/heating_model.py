@@ -159,6 +159,11 @@ def modulation_power(return_c, profile, fallback=3., anchor=None, ahead_minutes=
     The live anchor decays over 15 minutes and 2°C; it cannot impose today's
     stage on a distant evening or a different return temperature.
     """
+    mode=(profile or {}).get('physical_mode')
+    if mode in ('fixed_3','fixed_6','fixed_9'):
+        fallback=float(mode[-1])
+        if not profile.get('validated'):return fallback
+        anchor=None  # A live reading from a different mode cannot change its calibration.
     rows=(profile or {}).get('bands',[])
     kw=fallback
     near=[r for r in rows if abs(r['return_c']-return_c)<=3]
@@ -443,7 +448,9 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
         cycle=cycle,room=round(room,2),floor=round(floor,1),
         outside=round(outside,1),fire=round(fire,1),model=model,weather=weather,
         settings={k:settings.get(k) for k in keys},outage={k:outage.get(k) for k in ('mode','valid','outages','slots','known_until')},
-        profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
+        physical_mode=(settings.get('modulation_profile') or {}).get('physical_mode'),
+        equipment_version=settings.get('equipment_version'),ventilation_model=settings.get('ventilation_model'),
+        ventilation_expected=settings.get('ventilation_expected'),profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
         actuator=settings.get('actuator'),
         environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain')})
     return hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -1023,8 +1030,8 @@ class HeatingPowerEstimator:
     No nominal power substitution and no energy backfill. A short disturbance
     cannot establish a heating session; missing data immediately clears it.
     """
-    def __init__(self, window=20., confirm=30.):
-        self.window, self.confirm = window, confirm
+    def __init__(self, window=20., confirm=30., threshold=2000.):
+        self.window, self.confirm, self.threshold = window, confirm, threshold
         self.points = []
         self.since = None
         self.average = None
@@ -1046,7 +1053,7 @@ class HeatingPowerEstimator:
             end = self.points[i+1][0]
             area += max(0., end-max(start,at))*power
         self.average = area/covered if covered>0 else value
-        if self.average<2000 or value<2000:
+        if self.average<self.threshold or value<self.threshold:
             self.since = None
             return 0.
         if self.since is None:
@@ -1054,7 +1061,7 @@ class HeatingPowerEstimator:
         if covered<self.window or stamp-self.since<self.confirm:
             return 0.
         # Raw sub-threshold means heating has ended: never retain residual heat power.
-        if value<2000:
+        if value<self.threshold:
             self.since = None
             return 0.
         return self.average
@@ -1062,3 +1069,67 @@ class HeatingPowerEstimator:
 
 
 
+
+
+def learn_power_modes(samples,model=None):
+    """Extend the existing return-band learner; split by whole command sessions.
+
+    Legacy unlabelled intervals remain an assumption, never confirmed auto data.
+    No stage is inferred from a five-minute energy average.
+    """
+    profiles={};candidates={}
+    ended={a.get('heat_command_at') for a,b in zip(samples,samples[1:]) if a.get('heating_requested') and
+           (not b.get('heating_requested') or a.get('heat_command_at')!=b.get('heat_command_at'))}
+    for mode in ('fixed_3','fixed_6','fixed_9','auto'):
+        rows=[r for r in samples if r.get('boiler_power_mode')==mode and r.get('boiler_mode_confirmed') and
+              r.get('power_quality')=='measured' and r.get('quality') and not r.get('power_estimated') and
+              r.get('heat_command_at') in ended]
+        versions={r.get('equipment_version') for r in rows}
+        latest=max((v for v in versions if isinstance(v,int)),default=None)
+        rows=[r for r in rows if r.get('equipment_version')==latest]
+        sessions=sorted({r.get('heat_command_at') for r in rows if number(r.get('heat_command_at')) is not None})
+        if len(sessions)<3:continue
+        split=sessions[-1];train=[r for r in rows if r.get('heat_command_at')!=split];test=[r for r in rows if r.get('heat_command_at')==split]
+        evaluation_model=(test[0].get('thermal_model') or model) if test else model
+        candidate=learn_modulation(train);baseline=3. if mode=='auto' else float(mode[-1])
+        errors=[];base=[];thermal=[];base_thermal=[]
+        simulated=None;reference=None
+        for a,b in zip(test,test[1:]):
+            dt=(b['ts']-a['ts'])/3600
+            if not 3/60<=dt<=7/60 or not a.get('heating_requested') or a.get('heat_command_at')!=b.get('heat_command_at'):continue
+            ea,eb=number(a.get('energy')),number(b.get('energy'))
+            if ea is None or eb is None or eb<ea:continue
+            actual=(eb-ea)/dt
+            if not 0<=actual<=10.5:continue
+            predicted=modulation_power(a['return'],candidate)
+            errors.append(abs(predicted-actual));base.append(abs(baseline-actual))
+            # Replay the held-out complete session from one measured thermal state;
+            # long-horizon validation is still reported separately.
+            if evaluation_model and all(number(r.get(k)) is not None for r in (a,b) for k in ('room','return','outside')):
+                if simulated is None:simulated=(a['room'],a.get('floor_estimate',a['return']));reference=simulated
+                simulated=step(*simulated,a['outside'],predicted,a.get('fire',0.),evaluation_model,dt)
+                reference=step(*reference,a['outside'],baseline,a.get('fire',0.),evaluation_model,dt)
+                thermal.append(abs(simulated[0]-b['room']));base_thermal.append(abs(reference[0]-b['room']))
+        days=len({datetime.fromtimestamp(r['ts']).date() for r in rows})
+        accepted=(days>=2 and len(errors)>=6 and candidate['minutes']>=60 and statistics.mean(errors)<statistics.mean(base)*.95 and
+                  bool(thermal) and statistics.mean(thermal)<=statistics.mean(base_thermal))
+        stage_seconds={k:sum((r.get('instantaneous_stage_seconds') or {}).get(k,0.) for r in train if r.get('heating_requested')) for k in ('off','3','6','9','unknown')}
+        known=sum(stage_seconds[k] for k in ('off','3','6','9'))
+        probabilities={k:stage_seconds[k]/known for k in ('off','3','6','9')} if known else None
+        candidate.update(physical_mode=mode,validated=accepted,equipment_version=latest,sessions=len(sessions),days=days,
+            holdout_samples=len(errors),holdout_mae_kw=statistics.mean(errors) if errors else None,
+            baseline_mae_kw=statistics.mean(base) if base else None,
+            holdout_temperature_mae=statistics.mean(thermal) if thermal else None,
+            baseline_temperature_mae=statistics.mean(base_thermal) if base_thermal else None,
+            stage_probabilities=probabilities,stage_seconds=stage_seconds,stage_note='Probabilities from time-aligned instantaneous power bands only; not proof of physical TEN contacts',
+            last_sample_at=rows[-1]['ts'] if rows else None)
+        candidates[mode]=candidate
+        if accepted:profiles[mode]=candidate
+    return dict(version=2,profiles=profiles,candidates=candidates,status='validated' if profiles else 'insufficient_independent_sessions')
+
+
+def power_profile(mode,calibrations,legacy,equipment_version=None):
+    accepted=((calibrations or {}).get('profiles') or {}).get(mode)
+    if accepted and (equipment_version is None or accepted.get('equipment_version')==equipment_version):return dict(accepted,physical_mode=mode,assumed=False)
+    return dict(legacy or {},physical_mode=mode,assumed=True,validated=False,
+                assumption='legacy_mixed_modes' if mode in ('auto','unconfirmed') else 'nominal_fixed_with_unknown_duty')

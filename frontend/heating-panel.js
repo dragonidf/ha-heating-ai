@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.2.15';
+const VERSION = '0.3.0';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -83,7 +83,7 @@ const patchDOM = (current,next) => {
   } else if(current instanceof HTMLSelectElement&&!editing)current.value=next.value;
 };
 const defaults = {
-  diagnostics:'sensor.heating_diagnostics',process:'binary_sensor.appdaemon_running',controller:'sensor.heating_controller', alive:'binary_sensor.heating_controller_alive', permitted:'binary_sensor.heating_actuation_permitted',
+  power_model:'sensor.heating_power_model',ventilation:'sensor.heating_ventilation',diagnostics:'sensor.heating_diagnostics',process:'binary_sensor.appdaemon_running',controller:'sensor.heating_controller', alive:'binary_sensor.heating_controller_alive', permitted:'binary_sensor.heating_actuation_permitted',
   heartbeat:'sensor.heating_heartbeat', temperature:'sensor.heating_temperature', power_confirmed:'sensor.heating_power_confirmed', boiler_active:'binary_sensor.heating_boiler_active',boiler_stage:'sensor.heating_boiler_stage',
   grid_status:'sensor.heating_grid', fireplace_status:'sensor.heating_fireplace', fireplace_active:'binary_sensor.heating_fireplace_active',
   energy_24h:'sensor.heating_energy_24h', energy_monthly:'sensor.heating_energy_monthly', forecast:'sensor.heating_forecast',
@@ -286,13 +286,34 @@ export class HeatingAIPanel extends HTMLElement {
     const tag=entity?'button':'div';
     return `<${tag} class="compact-metric" ${entity?`data-info="${h(this.id(entity))}"`:''} ${key?`data-forecast-metric="${h(key)}"`:''}><span class="muted">${h(label)}</span><strong>${h(value)}${value!=='—'&&unit?` <small>${h(unit)}</small>`:''}</strong></${tag}>`;
   }
+  equipmentControl(field) {
+    let value=this.systemDraft[field.key]??field.value??field.default;
+    if(field.kind==='json'&&value&&typeof value==='object')value={...value,verified:isTrue(value.verified)};
+    const common=`data-system-key="${h(field.key)}" aria-label="${h(field.label)}" ${this.systemPending?'disabled':''}`;
+    if(field.kind==='json')return `<textarea ${common} data-json rows="5" spellcheck="false">${h(JSON.stringify(value,null,2))}</textarea>`;
+    if(field.kind==='select')return `<span class="equipment-select"><select ${common}>${Object.entries(field.options||{}).map(([key,label])=>`<option value="${h(key)}" ${key===value?'selected':''}>${h(label)}</option>`).join('')}</select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>`;
+    return `<input type="text" ${common} value="${h(value)}" placeholder="switch.…" autocapitalize="none" spellcheck="false">`;
+  }
+  equipmentSettings() {
+    const fields=(this.attrs('system_settings').fields||[]).filter(f=>['boiler_power_mode','recuperator_entity','bath_entity'].includes(f.key));
+    if(!fields.length)return '';
+    return this.section('Котел і вентиляція',`<div class="control-grid">${fields.map(f=>`<label class="field"><span>${h(f.label)} <button type="button" class="system-help" data-system-help="${h(f.key)}" aria-label="Підказка: ${h(f.label)}">?</button></span>${this.equipmentControl(f)}</label>`).join('')}</div><p class="muted note">Вкажіть режим, який ви виставили на самому котлі. Цей вибір не перемикає котел. Реле вентиляції лише спостерігаються.</p><div class="system-actions"><span role="status">${h(this.systemMessage||'')}</span><button data-system-save ${!Object.keys(this.systemDraft).length||this.systemPending?'disabled':''}>Зберегти зміни</button></div>`);
+  }
+  powerDetails() {
+    const p=this.attrs('power_model'),v=this.attrs('ventilation'),o=p.power_observation||{},energy=p.energy||{};
+    return this.section('Потужність і вентиляція',`${this.row('Фізичний режим',({fixed_3:'3 кВт',fixed_6:'6 кВт',fixed_9:'9 кВт',auto:'Авто',unconfirmed:'Не підтверджено'})[this.state('power_model')]||'—')}${this.row('Точність потужності',p.accuracy||'—')}${this.row('Метод A',fmt(o.a?.watts,0)+' Вт')}${this.row('Метод B',fmt(o.b?.watts,0)+' Вт · '+(o.b?.reason==='topology_unconfirmed'?'схема фаз не підтверджена':o.b?.reason||'—'))}${this.row('Якість',({measured:'Виміряна',estimated:'Оцінена',unknown:'Невідома'})[o.quality]||'—')}<div class="plan-breakdown">${this.compactMetric('Виміряно',fmt(energy.measured_kwh,3),'кВт·год')}${this.compactMetric('Оцінено',fmt(energy.estimated_kwh,3),'кВт·год')}${this.compactMetric('Невідомий час',fmt(numeric(energy.unknown_seconds)===null?null:energy.unknown_seconds/60,1),'хв')}</div><p class="muted note">Новий облік якості від ${this.time(energy.started_at,true)}. A/B можуть мати спільні джерела; це перевірка узгодженості.</p>${this.row('Вентиляція',this.state('ventilation'))}${this.row('Незалежних днів',fmt(v.model?.days,0))}${this.row('Причина статусу',({insufficient_independent_days:'Бракує незалежних днів',correlated_or_constant_relays:'Стани пристроїв не дозволяють розділити вплив',heldout_improvement:'Покращення на відкладеному дні',no_heldout_improvement:'Кандидат не покращив прогноз'})[v.model?.reason]||v.model?.reason||'—')}<p class="muted note">Реле показує живлення, а не виміряну витрату повітря. Старий прогноз діє, доки кандидат не пройде перевірку.</p>`);
+  }
   boilerOverview() {
     const meta=this.attrs('power_confirmed'),reported=Date.parse(meta.timestamp);
     const stale=meta.timestamp!==undefined&&(!Number.isFinite(reported)||Date.now()-reported>90000);
-    const binary=stale?'unavailable':this.state('boiler_active'),power=stale?null:numeric(this.state('power_confirmed'));
+    const binary=stale||isTrue(meta.confirmation_pending)?'unavailable':this.state('boiler_active'),power=stale?null:numeric(this.state('power_confirmed'));
     const heating=binary==='on'?true:binary==='off'?false:power===null?null:power>=1500;
-    const summary=this.attrs('summary').last_24h||{};
-    return `<section class="card boiler-card" data-heating="${heating??'unknown'}"><div class="card-heading"><h2>Котел</h2><span class="pill boiler-status">${heating===true?'Гріє':heating===false?'Очікування':'Немає даних'}</span></div><div class="boiler-metrics">${this.compactMetric('Потужність',fmt(power===null?null:power/1000),'кВт','power_confirmed')}${this.compactMetric('Обратка',fmt(this.state('return')),'°C','return')}${this.compactMetric('За 24 год',fmt(this.state('energy_24h'),2),'кВт·год','energy_24h')}</div><p class="boiler-note muted">${stale?'Потужність застаріла — потрібні свіжі вимірювання.':isTrue(meta.power_without_request)?'Є потужність без автоматичного запиту — перевірте котел і вимірювання.':isTrue(meta.estimated)?'Потужність оцінена резервним джерелом.':`У кімнаті за добу ${fmt(summary.temperature_min)}–${fmt(summary.temperature_max)} °C`}</p></section>`;
+    const summary=this.attrs('summary').last_24h||{},equipment=this.attrs('power_model'),recommend=equipment.recommendation||{};
+    const mode=({fixed_3:'3 кВт',fixed_6:'6 кВт',fixed_9:'9 кВт',auto:'Авто',unconfirmed:'Не підтверджено'})[this.state('power_model')]||'Не підтверджено';
+    const recommended=({fixed_3:'3 кВт',fixed_6:'6 кВт',fixed_9:'9 кВт'})[recommend.mode];
+    const modeSummary=`На котлі: ${mode}${recommended?` · рекомендовано ${recommended}${recommend.confidence!=='validated_scenario'?' (умовно)':''}`:''}`;
+    const advice=equipment.recommendation?`<details class="power-advice"><summary>${h(modeSummary)}</summary><p class="muted note">${h(recommend.reason||'Бракує даних')}</p>${recommend.change_before?this.row('Потрібна ручна зміна до',this.time(recommend.change_before,true)):''}${(recommend.alternatives||[]).map(a=>this.row(`${a.nominal_kw} кВт`,a.feasible?'План знайдено':`Дефіцит ${fmt(a.deficit_degree_hours,2)} °C·год`)).join('')}<p class="muted note">${h(recommend.model_bound?.assumptions||'Номінальна потужність не гарантує фактичних кВт·год. Нова рекомендація не є командою котлу.')}</p></details>`:'';
+    return `<section class="card boiler-card" data-heating="${heating??'unknown'}"><div class="card-heading"><h2>Котел</h2><span class="pill boiler-status">${heating===true?'Гріє':heating===false?'Очікування':'Немає даних'}</span></div><div class="boiler-metrics">${this.compactMetric('Потужність',fmt(power===null?null:power/1000),'кВт','power_confirmed')}${this.compactMetric('Обратка',fmt(this.state('return')),'°C','return')}${this.compactMetric('За 24 год',fmt(this.state('energy_24h'),2),'кВт·год','energy_24h')}</div>${advice||`<p class="boiler-note muted">${h(modeSummary)}</p>`}<p class="boiler-note muted">${stale?'Потужність застаріла — потрібні свіжі вимірювання.':isTrue(meta.power_without_request)?'Є потужність без автоматичного запиту — перевірте котел і вимірювання.':isTrue(meta.estimated)?'Потужність оцінена резервним джерелом.':`У кімнаті за добу ${fmt(summary.temperature_min)}–${fmt(summary.temperature_max)} °C`}</p>${isTrue(equipment.mode_contradiction)?'<p class="warn note">Вимірювання тривало суперечить режиму — перевірте налаштування на котлі.</p>':''}</section>`;
   }
   fireplaceOverview() {
     const phase=this.state('fireplace_status'),fire=this.attrs('fireplace_status'),fan=this.attrs('fan_status');
@@ -336,31 +357,32 @@ export class HeatingAIPanel extends HTMLElement {
     return `<div class="overview"><div class="hero card"><div><h1 class="eyebrow">Комфорт у вашому домі</h1><div class="temperature">${fmt(this.state('temperature'))}<span>°C</span></div><p class="hero-target"><span>${h(c.comfort_zone||'Поточний комфорт')}</span><span>Ціль <strong>${fmt(c.target_temperature)} °C</strong></span></p><button class="hero-outside" data-info="${h(this.id('outside'))}"><span>Надворі</span> <strong>${fmt(this.state('outside'))} °C</strong></button></div><div class="hero-side"><span class="eyebrow">Рішення контролера</span><h2>${h(c.reason||'Очікуємо даних')}</h2><p class="muted">${h(c.proposed_action||'')}</p><div class="comfort">Межі комфорту <strong>${fmt(c.lower_temperature)}–${fmt(c.upper_temperature)} °C</strong></div></div></div><div class="heat-sources">${this.boilerOverview()}${this.fireplaceOverview()}</div>${this.forecastOverview()}${this.heatingPlan()}<div class="columns"><div>${this.section('Температура й нагрів',this.historyChart(),'history-card')}${this.section('Енергія котла по годинах','<div class="native" data-native="energy"></div>')}</div><div>${this.section('Енергія за місяць',`<div class="large">${fmt(used,1)} <small>кВт·год</small></div><progress max="${budget!==null&&budget>0?budget:1}" value="${used??0}" aria-label="Місячна енергія"></progress><p class="muted">Орієнтир ${fmt(budget,0)} кВт·год${budget&&used!==null?' · '+fmt(used/budget*100,0)+' %':''}</p>`)}${this.section('Погода на наступну добу','<div class="native" data-native="weather"></div>'+this.field('weather_refresh','Оновити погодинну погоду'))}</div></div></div>`;
   }
   settings() {
+    this.syncSystemSettings();
     const fields=items=>items.map(([key,label])=>this.field(key,label)).join('');
     const tuning=(key,fallback)=>(this.attrs('system_settings').fields||[]).find(f=>f.key===key)?.value??fallback;
     return `<div class="settings-page compact-page"><div class="page-title"><h1>Налаштування</h1></div><div class="settings-grid">
     ${this.section('Комфорт',`<div class="comfort-groups"><fieldset><legend>День</legend><div class="control-grid thirds">${fields([['target','Ціль'],['lower','Мінімум'],['upper','Максимум']])}</div></fieldset><fieldset><legend>Під час сну</legend><div class="control-grid thirds">${fields([['night_target','Ціль'],['night_lower','Мінімум'],['night_upper','Максимум']])}</div><div class="control-grid">${fields([['sleep_start','Початок сну'],['sleep_end','Кінець сну']])}</div></fieldset></div>`, 'comfort-settings')}
     ${this.section('Розклад і витрати',`${this.field('strategy','Планування нагріву')}<div class="control-grid">${fields([['start','Дозволено з'],['end','Дозволено до'],['monthly_budget','Місячний орієнтир'],['session_limit','Ліміт сеансу, хв']])}</div>`)}
-    ${this.section('Керування опаленням',`${this.field('mode','Режим системи')}<div class="control-grid">${fields([['armed','Дозволити команди'],['restore_once','Нагрів після появи мережі']])}</div>${this.field('native_setpoint','Уставка штатного резерву')}<div class="settings-status">${this.row('Одноразовий запит',this.state('restore_status'))}${this.row('Контролер',this.state('controller'))}${this.row('Команди',this.state('permitted')==='on'?'Дозволені':'Не дозволені')}</div>`)}
+    ${this.equipmentSettings()}${this.section('Керування опаленням',`${this.field('mode','Режим системи')}<div class="control-grid">${fields([['armed','Дозволити команди'],['restore_once','Нагрів після появи мережі']])}</div>${this.field('native_setpoint','Уставка штатного резерву')}<div class="settings-status">${this.row('Одноразовий запит',this.state('restore_status'))}${this.row('Контролер',this.state('controller'))}${this.row('Команди',this.state('permitted')==='on'?'Дозволені':'Не дозволені')}</div>`)}
     ${this.section('Циркуляція',`<div class="circulation-config"><div class="control-grid circulation-mode">${fields([['fan_control','Автоматичні команди'],['fan_mode','Режим циркуляції']])}</div><div class="control-grid thirds circulation-levels">${fields([['fan_night_limit','1 · Ніч'],['fan_speed','2 · День стандарт'],['fan_intense_speed','3 · День інтенсив']])}</div></div><details class="inline-help"><summary>Коли змінюється рівень</summary><p>${h(tuning('fan_night_start','23:00'))}–${h(tuning('fan_night_end','07:00'))} — рівень 1. Удень при інтенсивному горінні — 3, за інших умов — 2. Нічна швидкість не перевищує стандартну, інтенсивна — не нижча за неї.</p><p>Запуск при різниці від ${fmt(tuning('fire_start_delta',5))} °C; нижче ${fmt(tuning('fire_stop_delta',3))} °C протягом ${fmt(tuning('fire_cooldown_seconds',300)/60)} хв — зупинка. При різниці нижче ${fmt(tuning('fire_fast_stop_delta',4))} °C і тренді ${fmt(tuning('fire_fast_stop_slope',-2))} °C/год або нижче — зупинка без затримки.</p></details>`, 'circulation-settings','fireplace-settings')}
     </div>${this.systemSettings()}</div>`;
   }
   systemSettings() {
-    const a=this.attrs('system_settings'),fields=Array.isArray(a.fields)?a.fields:[];
+    const a=this.attrs('system_settings'),fields=(Array.isArray(a.fields)?a.fields:[]).filter(f=>!['boiler_power_mode','recuperator_entity','bath_entity'].includes(f.key));
     this.syncSystemSettings();
     const groups=[...new Set(fields.map(f=>f.group))];
     const helpButton=(key,label)=>`<button type="button" class="system-help" data-system-help="${h(key)}" aria-label="Підказка: ${h(label)}">?</button>`;
     const rows=fields.map(f=>{
       const value=Object.hasOwn(this.systemDraft,f.key)?this.systemDraft[f.key]:f.value;
       const common=`data-system-key="${h(f.key)}" aria-label="${h(f.label)}" ${this.systemPending?'disabled':''}`;
-      const control=f.kind==='readonly'?`<span class="system-fixed">${h(value)} ${h(f.unit||'')}</span>`:
+      const control=['select','entity','json'].includes(f.kind)?this.equipmentControl(f):f.kind==='readonly'?`<span class="system-fixed">${h(value)} ${h(f.unit||'')}</span>`:
         `<div class="number"><input type="${f.kind==='time'?'time':'number'}" ${common} value="${h(value)}" ${f.kind==='time'?'':`min="${h(f.min)}" max="${h(f.max)}" step="${h(f.step)}"`}><span>${h(f.unit||'')}</span></div>`;
       return {group:f.group,html:`<div class="system-field"><div class="system-label"><label>${h(f.label)}</label>${helpButton(f.key,f.label)}</div>${control}</div>`};
     });
     const existing=[['target','Ціль удень'],['lower','Мінімум удень'],['upper','Максимум удень'],['night_target','Ціль уві сні'],['night_lower','Мінімум уві сні'],['night_upper','Максимум уві сні'],['sleep_start','Початок сну'],['sleep_end','Кінець сну'],['start','Дозволений початок нагріву'],['end','Дозволений кінець нагріву'],['monthly_budget','Місячний орієнтир енергії'],['session_limit','Ліміт одноразового нагріву'],['native_setpoint','Уставка штатного auto'],['fan_night_limit','Швидкість 1 · ніч'],['fan_speed','Швидкість 2 · стандарт'],['fan_intense_speed','Швидкість 3 · інтенсив'],['fan_mode','Режим циркуляції'],['mode','Режим опалення'],['strategy','Стратегія нагріву'],['armed','Дозвіл команд котлу'],['restore_once','Одноразовий нагрів після мережі'],['fan_control','Дозвіл команд циркуляції'],['fan_backup','Підтвердження резерву циркуляції'],['ai_auto_apply','Застосування перевірених пропозицій ШІ']];
     this.systemExisting=existing;
     const helpers=existing.map(([key,label])=>`<div class="system-field"><div class="system-label"><span>${h(label)}</span>${helpButton('entity:'+key,label)}</div><button class="system-entity" data-info="${h(this.id(key))}" ${this.entity(key)?'':'disabled'}>${h(this.state(key))} <small>${h(this.attrs(key).unit_of_measurement||'')} ↗</small></button></div>`).join('');
-    return `<details class="card system-settings"><summary>Системні налаштування <span aria-hidden="true">＋</span></summary><div class="system-body"><details class="system-group"><summary>Температури, режими й ліміти</summary><div class="system-grid">${helpers}</div></details>${groups.map(group=>`<details class="system-group"><summary>${h(group)}</summary><div class="system-grid">${rows.filter(r=>r.group===group).map(r=>r.html).join('')}</div></details>`).join('')}${fields.length?'':'<p class="muted">Розширені параметри будуть доступні після оновлення контролера. Чинні helpers можна редагувати вище.</p>'}<div class="system-actions"><span class="system-message" role="status">${h(this.systemMessage||'')}</span><button data-system-reset ${!Object.keys(this.systemDraft).length||this.systemPending?'disabled':''}>Скасувати зміни</button><button data-system-save ${!Object.keys(this.systemDraft).length||this.systemPending?'disabled':''}>${this.systemPending?'Очікуємо контролер…':'Зберегти зміни'}</button></div></div></details>${this.systemHelp?this.systemHelpDialog(fields):''}`;
+    return `<details class="card system-settings"><summary>Системні налаштування <span aria-hidden="true">＋</span></summary><div class="system-body"><details class="system-group"><summary>Температури, режими й ліміти</summary><div class="system-grid">${helpers}</div></details>${groups.map(group=>`<details class="system-group"><summary>${h(group)}</summary><div class="system-grid">${rows.filter(r=>r.group===group).map(r=>r.html).join('')}</div></details>`).join('')}${fields.length?'':'<p class="muted">Розширені параметри будуть доступні після оновлення контролера. Чинні helpers можна редагувати вище.</p>'}<div class="system-actions"><span class="system-message" role="status">${h(this.systemMessage||'')}</span><button data-system-reset ${!Object.keys(this.systemDraft).length||this.systemPending?'disabled':''}>Скасувати зміни</button><button data-system-save ${!Object.keys(this.systemDraft).length||this.systemPending?'disabled':''}>${this.systemPending?'Очікуємо контролер…':'Зберегти зміни'}</button></div></div></details>${this.systemHelp?this.systemHelpDialog(this.attrs('system_settings').fields||[]):''}`;
   }
   systemHelpDialog(fields) {
     const f=fields.find(f=>f.key===this.systemHelp),entityKey=this.systemHelp.startsWith('entity:')?this.systemHelp.slice(7):null;
@@ -376,7 +398,7 @@ export class HeatingAIPanel extends HTMLElement {
       mode:'Обирає автоматичне керування, спостереження, штатний auto або вимкнення.',strategy:'Визначає, як дозволене вікно і тариф впливають на планування нагріву.',armed:'Дозволяє команди обладнанню за умови чинних перевірок контролера.',restore_once:'Запитує один нагрів після підтвердженого відновлення мережі.',fan_control:'Дозволяє контролеру надсилати команди вентилятору.',ai_auto_apply:'Дозволяє застосовувати пропозиції ШІ лише після чинної перевірки моделі.'
     };
     const instruction=entityKey?'Натисніть значення зі стрілкою: відкриється стандартний редактор Home Assistant. Зміна helper застосовується його чинним механізмом.':f?.kind==='readonly'?'Це системна константа, наведена для діагностики. Ця панель не змінює захисну логіку.':'Змініть поле й натисніть «Зберегти зміни». Поки не збережено, контролер використовує попереднє значення. Перевірені зміни зберігаються поза каталогом HACS і відновлюються після reload/update.';
-    return `<dialog class="system-dialog" aria-labelledby="system-help-title"><div class="system-dialog-heading"><h2 id="system-help-title">${h(label)}</h2><button data-system-close aria-label="Закрити підказку">×</button></div><p>${h(f?.help||existingHelp[entityKey]||'Чинний параметр Home Assistant.')}</p>${f&&f.kind!=='readonly'?`<p class="muted">За замовчуванням: ${h(f.default)} ${h(f.unit||'')}${f.kind==='number'?` · Межі: ${h(f.min)}–${h(f.max)}`:''}</p>`:''}<p>${h(instruction)}</p></dialog>`;
+    return `<dialog class="system-dialog" aria-labelledby="system-help-title"><div class="system-dialog-heading"><h2 id="system-help-title">${h(label)}</h2><button data-system-close aria-label="Закрити підказку">×</button></div><p>${h(f?.help||existingHelp[entityKey]||'Чинний параметр Home Assistant.')}</p>${f&&f.kind!=='readonly'?`<p class="muted">За замовчуванням: ${h(typeof f.default==='object'?JSON.stringify(f.default):f.default)} ${h(f.unit||'')}${f.kind==='number'?` · Межі: ${h(f.min)}–${h(f.max)}`:''}</p>`:''}<p>${h(instruction)}</p></dialog>`;
   }
   closeSystemHelp() {
     const key=this.systemHelp;this.systemHelp=null;this.render();
@@ -417,7 +439,7 @@ export class HeatingAIPanel extends HTMLElement {
     ${this.section('Дії',`${this.field('ai_auto_apply','Застосовувати перевірені пропозиції')}<div class="action-buttons">${this.field('rollback','Попередня модель')}${this.field('weather_refresh','Оновити погоду')}</div><div class="report-meta muted">Погодинні дані до ${h(this.time(f.weather_known_until,true))}</div>`, 'model-actions')}
     ${this.section('Модуляція котла',`<p class="model-meta muted">${h(a.power_learning_status||'')} · ${fmt(p.intervals,0)} інтервалів · ${fmt(p.minutes,0)} хв</p><div class="table-scroll"><table><thead><tr><th>Обратка</th><th>Потужність</th><th>Досвід</th></tr></thead><tbody>${(p.bands||[]).map(b=>`<tr><td>${fmt(b.return_min,0)}–${fmt(b.return_max,0)} °C</td><td>${fmt(b.measured_kw)} кВт</td><td>${fmt(b.minutes,0)} хв</td></tr>`).join('')||'<tr><td colspan="3">Очікуємо підтверджених сеансів.</td></tr>'}</tbody></table></div>`)}
     ${this.section('Підлога й погода',`<div class="fact-grid">${facts([['Виміряна обратка',fmt(env.raw_return),'°C'],['Зовнішній прогрів',fmt(env.external_gain_c_per_hour,3),'°C/год'],['Сонячна складова',isTrue(env.solar_validated)?'Перевірена':'Навчається'],['Днів спостережень',fmt(env.solar_learning_days,0)],['Поточна похибка',fmt(a.reliability?.recent_mae,2),'°C'],['Корекція погоди',fmt(f.local_weather_bias),'°C']])}</div>${isTrue(a.reliability?.degraded)?`<p class="warn pill">Точність знижена · запас ${fmt(env.upper_margin)} °C</p>`:''}`)}
-    ${this.section('Журнал рішень',`<div class="journal">${[...(a.journal||[])].reverse().map(r=>`<div class="entry"><time>${h(this.time(r.time,true))}</time><p>${h(r.reason)}</p></div>`).join('')||'<p class="empty">Журнал ще порожній.</p>'}</div>`, 'model-journal')}
+    ${this.powerDetails()}${this.section('Журнал рішень',`<div class="journal">${[...(a.journal||[])].reverse().map(r=>`<div class="entry"><time>${h(this.time(r.time,true))}</time><p>${h(r.reason)}</p></div>`).join('')||'<p class="empty">Журнал ще порожній.</p>'}</div>`, 'model-journal')}
     <section class="card model-advanced"><details><summary>Параметри й діагностика</summary>${validation}<div class="parameter-grid">${Object.entries(a.parameters||{}).map(([key,value])=>this.row(key,typeof value==='number'?fmt(value,4):value)).join('')}</div><div class="fact-grid controller-facts">${facts([['Процес AppDaemon',this.state('process')==='on'?'Працює':'Не підтверджено'],['Контур керування',this.attrs('diagnostics').control_health||'Немає даних'],['Команди',this.state('permitted')==='on'?'Дозволені':'Не дозволені'],['Останній цикл',this.time(this.state('heartbeat'),true)]])}</div><p class="muted note">${h(this.controllerHealth().details)}</p><p class="muted note">Внутрішній режим Tenko не читається через зовнішній термостат. Запас тепла — еквівалент, а не температура поверхні підлоги. Зовнішній прогрів сам по собі не доводить сонячний внесок.</p><p class="muted note">Прогноз враховує енергію та модуляцію; початкова оцінка для невивчених температур ${fmt(f.power_prior_kw)} кВт. Годинна похибка не підтверджує довгий горизонт; метод, кількість і вік оцінок наведено окремо.</p></details></section>
     </div></div>`;
   }
@@ -433,6 +455,8 @@ export class HeatingAIPanel extends HTMLElement {
       !fresh?'Немає свіжого успішного циклу контролера.':
       !isTrue(c.quality)?'Контролеру бракує актуальних вимірювань.':
       this.attrs('grid_status').raw!=='on'?'Нагрів очікує підтвердження електромережі.':
+      d.storage_health==='degraded'?'Не вдалося зберегти частину діагностики — перевірте журнал.':
+      d.validation_health==='degraded'?'Перевірка прогнозу обмежена; контур керування продовжує працювати.':
       stale?'Прогноз застарів: це попередній сценарій.':'';
     const applied=numeric(d.applied_plan?.applied_at);
     const appliedText=applied===null?'немає підтвердження':`${Math.max(0,Math.floor((Date.now()/1000-applied)/60))} хв тому`;
@@ -489,8 +513,12 @@ export class HeatingAIPanel extends HTMLElement {
   async changed(e) {
     if(e.target.hasAttribute('data-system-key')) {
       const el=e.target;
+      if(el.hasAttribute('data-json'))el.setCustomValidity('');
       if(!el.reportValidity()||el.type==='number'&&numeric(el.value)===null)return;
-      this.systemDraft[el.dataset.systemKey]=el.type==='number'?Number(el.value):el.value;
+      if(el.hasAttribute('data-json')){
+        try{this.systemDraft[el.dataset.systemKey]=JSON.parse(el.value);el.setCustomValidity('');}
+        catch{el.setCustomValidity('Потрібен коректний JSON');el.reportValidity();return;}
+      }else this.systemDraft[el.dataset.systemKey]=el.type==='number'?Number(el.value):el.value;
       this.systemMessage='Є незбережені зміни';this.render();return;
     }
     const el=e.target, key=el.dataset.control;if(!key)return;
@@ -644,6 +672,8 @@ td:not(:first-child),th:not(:first-child){text-align:right}
 .native{width:100%;max-width:100%;min-width:0;min-height:110px;--ha-card-border-width:0;--ha-card-box-shadow:none}
 .native>*{display:block;width:100%;max-width:100%;min-width:0}
 .empty{color:var(--muted);padding:20px 0;font-size:13px}
+.field .system-help{min-height:44px;min-width:44px;margin:0}
+.system-field textarea{box-sizing:border-box;width:100%;max-width:100%;min-width:0;font:16px/1.5 monospace;background:var(--surface);color:var(--ink);border:1px solid var(--stroke);border-radius:10px;padding:8px}.system-field:has(textarea){grid-column:1/-1}
 .health-details{display:block;margin-top:5px;font-size:11px;line-height:1.5;overflow-wrap:anywhere;color:var(--muted)}
 .notice{border-radius:14px;background:var(--warm-fill);border:1px solid var(--stroke);color:var(--source-yellow);padding:12px 16px;margin-bottom:12px;font-size:13px}
 .hidden{display:none}
@@ -947,10 +977,16 @@ footer span{font-size:11px}
 .system-group{border-bottom:1px solid var(--stroke)}
 .system-group>summary{font-size:13px;font-weight:500}
 .system-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 18px;padding:6px 0 16px}
-.system-field{min-width:0;display:flex;flex-direction:column;gap:5px}
-.system-label{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;line-height:1.4}
+.system-field{min-width:0;max-width:100%;overflow-wrap:anywhere;display:flex;flex-direction:column;gap:5px}
+.system-label{min-width:0;max-width:100%;overflow-wrap:anywhere;display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;line-height:1.4}
 .system-help{flex-shrink:0;border:0;color:var(--green);min-width:44px;min-height:44px;padding:8px;font-size:15px}
-.system-field input{width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
+.system-field input,.system-field select{width:100%;max-width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
+.system-label>span,.system-label>label{min-width:0;overflow-wrap:anywhere}
+.equipment-select{position:relative;display:block;width:100%;max-width:100%;min-width:0;overflow:hidden}
+.field .equipment-select select,.system-field .equipment-select select{display:block;appearance:none;-webkit-appearance:none;padding-right:34px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.equipment-select svg{position:absolute;right:10px;top:50%;transform:translateY(-50%);width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;pointer-events:none}
+.equipment-select:focus-within{outline:2px solid var(--green);outline-offset:2px;border-radius:12px}
+.system-settings summary{min-width:0;overflow-wrap:anywhere}
 .system-field .number{width:100%;min-width:0}
 .system-field .number input{flex:1;width:0}
 .system-field .number span{white-space:nowrap}
@@ -968,7 +1004,7 @@ footer span{font-size:11px}
 .system-dialog-heading button{flex-shrink:0}
 @container(max-width:900px){.system-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}
 }
-@container(max-width:430px){.system-grid{grid-template-columns:1fr}
+@container(max-width:430px){.system-grid{grid-template-columns:minmax(0,1fr)}
 .system-settings>summary{font-size:14px}
 .system-label{font-size:12px}
 .system-actions button{flex:1 1 120px}
@@ -997,7 +1033,7 @@ footer span{font-size:11px}
 
 .boiler-metrics .compact-metric+.compact-metric{border-left:1px solid var(--stroke);padding-left:12px;border-radius:0}
 
-.boiler-note{font-size:12px}
+.boiler-note{font-size:12px}.power-advice{margin:2px 0}.power-advice>summary{min-height:44px;display:flex;align-items:center;font-size:12px;color:var(--muted);cursor:pointer}.power-advice>summary::after{content:"＋";margin-left:auto;padding-left:6px}
 
 .overview .forecast-stats{border-top:1px solid var(--stroke);padding-top:4px}
 
@@ -1087,7 +1123,7 @@ progress::-moz-progress-bar{background:var(--green)}
   .system-help{min-width:44px;min-height:44px;margin:0}
 
   .system-field{gap:4px}
-  .compact-page .field input:not([type="checkbox"]),.compact-page .field select,.system-field input{font-size:16px}
+  .compact-page .field input:not([type="checkbox"]),.compact-page .field select,.system-field input,.system-field select{font-size:16px}
 
 }
 

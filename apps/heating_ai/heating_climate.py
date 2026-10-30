@@ -11,14 +11,14 @@ import statistics
 import time
 import calendar
 import shutil
-from heating_fallback import fallback_power, repair_samples,estimated_power
+from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation)
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
-                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile)
+                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,learn_power_modes,power_profile)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning
-from heating_stability import stable_plan,replay,stress_scenarios
-from heating_environment import observe_floor,observe_gain,reliability,daylight,anchor_weather
+from heating_stability import stable_plan,replay,stress_scenarios,recommend_power
+from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings)
 
@@ -35,6 +35,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.statefile=self.directory/"state.json"
         self.telemetry=self.directory/"telemetry.jsonl"
         self.memory=self.load_state()
+        self.migrate_equipment_state()
         self.model=self.memory.get("model",dict(DEFAULT_MODEL))
         self.decision_journal=DecisionJournal(self.directory)
         self.run_every(self.verify_decision_history,self.datetime()+timedelta(seconds=420),600)
@@ -64,8 +65,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                         self.samples.append(row)
                 except (KeyError,ValueError):
                     continue
-        self.power_estimator=HeatingPowerEstimator(confirm=10.)
+        self.power_estimator=HeatingPowerEstimator(window=10. if self.cfg.get('power_measurement_policy')=='audited' else 20.,confirm=10.,threshold=500. if self.cfg.get('power_measurement_policy')=='audited' else 2000.)
         self.memory['modulation_profile']=learn_modulation(self.samples)
+        self.run_diagnostic('power_calibration',self.refresh_equipment_models)
         if self.memory.get('modulation_controller_version')!=1:
             self.memory['predictions']=[]
             self.memory['modulation_controller_version']=1
@@ -264,6 +266,14 @@ class HeatingClimate(HeatingRecovery,Hass):
         if old!=new:
             self.decision_event('settings_change',reason='Змінено параметр '+entity,force=True)
     def restore_system_settings(self):
+        equipment=self.memory.get('equipment_settings') or {}
+        if isinstance(equipment,dict):
+            for key,value in equipment.items():
+                if key not in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity'):continue
+                try:
+                    clean,_=validate_system_settings({key:value},self.cfg,self.model);self.cfg.update(clean)
+                except (ValueError,TypeError):self.log('Invalid saved equipment field: %s',key,level='WARNING')
+        self.configure_ventilation()
         overrides=self.memory.get('system_settings',{})
         if overrides:
             try:
@@ -287,8 +297,34 @@ class HeatingClimate(HeatingRecovery,Hass):
             if data.get('revision')!=self.memory.get('system_settings_revision',0):
                 raise ValueError('Налаштування вже змінилися; оновіть панель')
             config,model=validate_system_settings(data.get('values'),self.cfg,self.model)
+            if getattr(self,'runtime_ready',False):
+                entities=[config.get(k) for k in ('recuperator_entity','bath_entity') if config.get(k)]
+                for phase in (config.get('power_phase_topology') or {}).get('phases',[]):
+                    entities.append(phase['input']);entities.extend(load['entity'] for load in phase['loads'])
+                if any(self.get_state(entity,attribute='all') is None for entity in entities):raise ValueError('Сутність не існує в Home Assistant')
             if model and not self.consider({**self.model,**model},'Налаштування користувача',apply=True):
                 raise ValueError(self.memory.get('last_result','Модель не пройшла перевірку'))
+            equipment={k:v for k,v in config.items() if k in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity')}
+            for k in equipment:config.pop(k,None)
+            changed={k:v for k,v in equipment.items() if self.cfg.get(k)!=v}
+            if changed:
+                self.decision_event('equipment_change',reason='Змінено опис фізичного обладнання',force=True,
+                    snapshot=dict(previous={k:self.cfg.get(k) for k in changed},values=changed,pending_hourly=self.memory.get('predictions',[])))
+                self.memory['predictions']=[]
+                self.ventilation_totals={};self.ventilation_at=time.time();self.stage_totals={}
+                history=self.memory.setdefault('equipment_history',[])
+                history.append(dict(at=self.now().isoformat(),previous={k:self.cfg.get(k,'unconfirmed') for k in changed},values=changed))
+                del history[:-32]
+                self.memory['equipment_version']=self.memory.get('equipment_version',0)+1
+                self.memory['equipment_settings']={**(self.memory.get('equipment_settings') or {}),**equipment}
+                for k in equipment:config.pop(k,None)
+                self.cfg.update(equipment);self.configure_ventilation()
+                if hasattr(self,'power_estimator'):
+                    self.power_estimator.window=10. if self.cfg.get('power_measurement_policy')=='audited' else 20.
+                    self.power_estimator.threshold=500. if self.cfg.get('power_measurement_policy')=='audited' else 2000.
+                    self.power_estimator.update(time.time(),None)
+                self.memory.pop('plan_reference',None)
+                self.run_diagnostic('equipment_calibration',self.refresh_equipment_models)
             self.cfg.update(config)
             self.memory['system_settings']={**self.memory.get('system_settings',{}),**config}
             self.memory['system_settings_revision']=self.memory.get('system_settings_revision',0)+1
@@ -298,6 +334,160 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.system_settings_result=dict(last_request_id=request if isinstance(request,str) else None,
                                          last_success=success,last_error=error,model_pending=bool(self.memory.get('pending_model')))
         self.publish_system_settings()
+    def migrate_equipment_state(self):
+        if self.memory.get('equipment_schema') or self.memory.get('state_load_error'):return
+        import hashlib
+        backup=self.directory/'deployment_backups'/'equipment-v1'
+        backup.mkdir(parents=True,exist_ok=True)
+        manifest=backup/'manifest.json'
+        if manifest.exists():
+            try:prior=json.loads(manifest.read_text())
+            except (ValueError,OSError) as exc:raise OSError('Equipment backup manifest unreadable') from exc
+            for name,digest in prior.items():
+                if name not in ('state.json','telemetry.jsonl','configuration.json') or hashlib.sha256((backup/name).read_bytes()).hexdigest()!=digest:
+                    raise OSError('Equipment migration backup mismatch')
+        hashes={}
+        for source in (self.statefile,self.telemetry):
+            if source.exists():
+                target=backup/source.name
+                if not target.exists():
+                    shutil.copy2(source,target)
+                    if hashlib.sha256(source.read_bytes()).digest()!=hashlib.sha256(target.read_bytes()).digest():raise OSError('Equipment migration backup mismatch')
+                hashes[source.name]=hashlib.sha256(target.read_bytes()).hexdigest()
+        configuration=backup/'configuration.json'
+        if not configuration.exists():
+            configuration.write_text(json.dumps(dict(settings=system_values(self.cfg),
+                sources={k:self.cfg.get(k) for k in ('power_balance','power_balance_sources','power_fault','power_phase_topology','ventilation')}),sort_keys=True))
+        hashes[configuration.name]=hashlib.sha256(configuration.read_bytes()).hexdigest()
+        manifest.write_text(json.dumps(hashes,sort_keys=True))
+        self.memory['equipment_schema']=1
+
+    def configure_ventilation(self):
+        raw=self.cfg.get('ventilation') or {}
+        bindings=dict(raw) if isinstance(raw,dict) else {}
+        for key,name in (('recuperator_entity','recuperator'),('bath_entity','bath')):
+            if key in self.cfg:
+                entity=self.cfg[key]
+                if entity:bindings[name]=dict(entity=entity)
+                else:bindings.pop(name,None)
+        self.cfg['ventilation']=bindings
+        if getattr(self,'runtime_ready',False):
+            tracked=getattr(self,'equipment_listeners',{})
+            wanted={b.get('entity') for b in bindings.values() if isinstance(b,dict)}-{None}
+            for entity in list(tracked):
+                if entity not in wanted:self.cancel_listen_state(tracked.pop(entity))
+            for entity in wanted:
+                if entity not in tracked:tracked[entity]=self.listen_state(self.ventilation_changed,entity)
+            self.equipment_listeners=tracked
+
+    def refresh_equipment_models(self):
+        self.memory['power_calibrations']=learn_power_modes(self.samples,self.model)
+        fit=fit_ventilation(self.samples,self.model,self.climate_tz)
+        previous=self.memory.get('ventilation_model') or {}
+        today=self.now().date().isoformat()
+        if previous.get('validated') and previous.get('model_version')==self.model.get('version'):
+            if not fit['validated'] or previous.get('fit_day')==today:return
+            clipped=False
+            for key in ('base_room_loss','recuperator','bath'):
+                limit=abs(previous[key])*.2
+                value=max(previous[key]-limit,min(previous[key]+limit,fit[key]))
+                clipped=clipped or value!=fit[key];fit[key]=value
+            # Clipping changes a fit: keep the candidate shadow until revalidated.
+            if clipped:
+                fit.update(validated=False,reason='daily_bound_requires_revalidation')
+                self.memory['ventilation_candidate']=fit;return
+        self.memory['ventilation_model']=dict(fit,fit_day=today)
+
+    def assess_power_sources(self,stamp,primary,grid_off):
+        entities=list(self.cfg.get('power_balance_sources') or [])
+        topology=self.cfg.get('power_phase_topology') or {}
+        phases=topology.get('phases') if isinstance(topology,dict) else None
+        for phase in phases if isinstance(phases,list) else []:
+            if not isinstance(phase,dict):continue
+            entities.append(phase.get('input'))
+            loads=phase.get('loads')
+            if isinstance(loads,list):entities.extend(x.get('entity') for x in loads if isinstance(x,dict))
+        readings={}
+        for entity in set(entities)-{None}:
+            record=self.get_state(entity,attribute='all')
+            record=record if isinstance(record,dict) else {}
+            attrs=record.get('attributes') or {}
+            when=record.get('last_reported') or record.get('last_updated')
+            try:at=datetime.fromisoformat(when.replace('Z','+00:00')).timestamp()
+            except (AttributeError,ValueError,TypeError):at=None
+            readings[entity]=dict(value=record.get('state'),at=at,unit=attrs.get('unit_of_measurement'),kind='active')
+        aligned=aligned_power(readings,self.cfg.get('power_balance_sources') or [],stamp)
+        a=dict(aligned,watts=primary if aligned['valid'] else None,quality='measured' if aligned['valid'] else 'unknown')
+        if primary is None or primary < -500 or primary>10500:a.update(valid=False,watts=None,reason='invalid_balance_range')
+        if self.cfg.get('power_fault') and self.get_state(self.cfg['power_fault'])!='off':a.update(valid=False,watts=None,reason='meter_fault')
+        if grid_off:a=dict(valid=True,watts=0.,quality='measured',reason='confirmed_grid_only_supply_off')
+        b=phase_residual(topology,readings,stamp);final=combine_power(a,b)
+        return dict(a={k:v for k,v in a.items() if k!='values'},b=b,**final,at=stamp)
+
+    def observe_power_quality(self,stamp,primary,power,grid_off):
+        assessment=self.assess_power_sources(stamp,primary,grid_off)
+        final=assessment
+        ledger=self.memory.setdefault('power_observation_ledger',dict(started_at=stamp))
+        integrate_observation(ledger,stamp,final['watts'],final['quality'],restart=not getattr(self,'power_observation_started',False))
+        self.power_observation_started=True
+        old=getattr(self,'stage_observation',None)
+        raw=final['watts'];band='unknown'
+        if final['quality']=='measured' and raw is not None:
+            if abs(raw)<500:band='off'
+            else:
+                nearest=min((3,6,9),key=lambda k:abs(raw-k*1000))
+                if abs(raw-nearest*1000)<=max(500,nearest*200):band=str(nearest)
+        since=old['since'] if old and old['band']==band else stamp
+        if old and 0<stamp-old['at']<=45:
+            key=old['band'] if old['at']-old['since']>=10 else 'unknown'
+            totals=getattr(self,'stage_totals',{});totals[key]=totals.get(key,0.)+stamp-old['at'];self.stage_totals=totals
+        self.stage_observation=dict(at=stamp,band=band,since=since)
+        mode=self.cfg.get('boiler_power_mode','unconfirmed')
+        contradiction=(mode.startswith('fixed_') and final['quality']=='measured' and raw is not None and raw>float(mode[-1])*1250)
+        if contradiction:self.memory.setdefault('mode_contradiction_since',stamp)
+        else:self.memory.pop('mode_contradiction_since',None)
+        self.memory['mode_contradiction']=contradiction and stamp-self.memory.get('mode_contradiction_since',stamp)>=600
+        journal=getattr(self,'decision_journal',None)
+        if journal and stamp-getattr(self,'power_minute_at',stamp-60)>=60:
+            journal.append(dict(event='power_minute',action=self.memory.get('last_command'),reason='power_quality_observation',
+                physical_mode=mode,equipment_version=self.memory.get('equipment_version',0),
+                power=assessment,energy=dict(ledger),instantaneous_stage_seconds=getattr(self,'stage_totals',{}),
+                ventilation=getattr(self,'ventilation_states',{})),stamp=stamp)
+            self.power_minute_at=stamp
+        self.power_observation=dict(assessment,controller_power_w=power,controller_source=getattr(self,'power_source','unknown'),
+            policy=self.cfg.get('power_measurement_policy','legacy'))
+
+    def update_power_recommendation(self,now,room,floor,outside,fire,weather,settings,signature):
+        if self.cfg.get('boiler_power_mode','unconfirmed')=='unconfirmed':
+            self.memory['power_recommendation']=dict(status='insufficient_data',reason='Підтвердьте фізичний режим котла',mode=None)
+            return
+        old=self.memory.get('power_recommendation') or {}
+        stamp=now.timestamp()
+        # Three like-for-like searches at most every fifteen minutes; schedule
+        # changes and an explicitly selected mode invalidate the cached advice.
+        key=[str(signature),settings.get('equipment_version'),round(room*2),round(outside),round(fire/5)]
+        if stamp-old.get('computed_at',0)<900 and old.get('input_key')==key:return
+        result=recommend_power(now,room,floor,outside,fire,self.model,weather,settings,self.memory.get('power_calibrations'))
+        if old.get('mode') and result.get('mode') and result['mode']<old['mode'] and stamp-old.get('changed_at',0)<900:return
+        result.update(computed_at=stamp,input_key=key,changed_at=stamp if result.get('mode')!=old.get('mode') else old.get('changed_at',stamp))
+        self.memory['power_recommendation']=result
+
+    def publish_equipment(self,ventilation_support=None):
+        profile=power_profile(self.cfg.get('boiler_power_mode','unconfirmed'),self.memory.get('power_calibrations'),self.memory.get('modulation_profile'),self.memory.get('equipment_version',0))
+        self.publish('sensor.heating_power_model',self.cfg.get('boiler_power_mode','unconfirmed'),
+            friendly_name='Котел — фізичний режим і прогноз',equipment_version=self.memory.get('equipment_version',0),
+            history=[dict(at=h['at'],changed=list(h['values'])) for h in (self.memory.get('equipment_history') or [])[-3:]],
+            profile={k:v for k,v in profile.items() if k not in ('bands','stage_minutes')},
+            bands=[{k:b.get(k) for k in ('return_min','return_max','power_kw','minutes')} for b in profile.get('bands',[])[:16]],
+            mode_contradiction=self.memory.get('mode_contradiction',False),
+            recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
+            energy=self.memory.get('power_observation_ledger'),
+            accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')
+        self.publish('sensor.heating_ventilation','Враховано' if (self.memory.get('ventilation_model') or {}).get('validated') else 'Навчання; чинна базова модель',
+            friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
+            model=self.memory.get('ventilation_model') or {},candidate=self.memory.get('ventilation_candidate'),
+            note='Реле не доводить витрату повітря; майбутній duty — сценарій, не точний розклад')
+
     def ai_report_changed(self,entity,attribute,old,new,kwargs=None,**extra):
         if old!=new:
             self.publish_ai_summary()
@@ -397,12 +587,25 @@ class HeatingClimate(HeatingRecovery,Hass):
              "energy":self.val("energy"),"thermostat":thermostat}
         row["measurement_version"]=3
         row['environment_version']=1
+        row['boiler_power_mode']=self.cfg.get('boiler_power_mode','unconfirmed')
+        row['boiler_mode_confirmed']=row['boiler_power_mode']!='unconfirmed'
+        row['equipment_version']=self.memory.get('equipment_version',0)
+        row['thermal_model_version']=self.model.get('version')
+        row['thermal_model']=dict(self.model)
+        row['power_observation']=getattr(self,'power_observation',{})
+        row['instantaneous_stage_seconds']=getattr(self,'stage_totals',{})
+        row['previous_power_band']=(getattr(self,'stage_observation',None) or {}).get('band')
+        row['seconds_since_command']=max(0.,stamp-self.memory.get('command_at',stamp))
+        row['voltages_v']={entity:number(self.get_state(entity)) if self.fresh(entity,300) else None for entity in self.cfg.get('input_voltages',[])}
+        prior=self.samples[-1] if self.samples else None
+        row['return_slope_c_per_hour']=((probe-prior['return'])*3600/(stamp-prior['ts']) if prior and probe is not None and number(prior.get('return')) is not None and stamp>prior['ts'] else None)
+        self.stage_totals={}
         row['floor_estimate']=(self.memory.get('floor_observer') or {}).get('estimate')
         row['daylight_weight']=daylight(self.now())
         row['external_gain']=(self.memory.get('solar_observer') or {}).get('observed_gain',0.)
         row["power_source"]=getattr(self,"power_source","balance")
         row['power_quality']=getattr(self,'power_quality','unknown')
-        if row['power_quality'] in ('unknown','contradictory'):row['quality']=False
+        if row['power_quality'] in ('unknown','contradictory') or getattr(self,'power_confirmation_pending',False):row['quality']=False
         row['execution']='automatic' if self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if power is not None and power>=1.5 else 'idle'
         row["power_estimated"]=getattr(self,"fallback_interval",False)
         row['heating_requested']=self.memory.get('last_command')=='heat'
@@ -431,6 +634,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.samples.append(row)
         self.samples=self.samples[-4032:]
         self.memory['modulation_profile']=learn_modulation(self.samples)
+        self.run_diagnostic('power_calibration',self.refresh_equipment_models)
         with self.telemetry.open("a") as file:
             file.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+"\n")
         pairs=[r for r in self.samples[-288:] if r.get("source")=="Вітальня" and
@@ -571,6 +775,11 @@ class HeatingClimate(HeatingRecovery,Hass):
         raw,source,active=fallback_power(primary,failed,self.raw("thermostat"),
             self.val("thermostat",attribute="temperature"),self.val("thermostat",attribute="current_temperature"),
             phases,fresh,self.memory.get("last_measured_stage_kw"),grid_off)
+        if self.cfg.get('power_measurement_policy')=='audited':
+            assessment=self.assess_power_sources(stamp,primary,grid_off)
+            raw=assessment['watts']
+            source='balance' if assessment['quality']=='measured' else 'fallback_audited_residual' if assessment['quality']=='estimated' else 'unavailable'
+            active=None
         if source!=getattr(self,"power_source",None):
             self.power_estimator.update(stamp,None)
         self.power_source=source
@@ -578,6 +787,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         if raw is None:
             self.measurement_valid_since=stamp
         power=self.power_estimator.update(stamp,raw)
+        pending=raw is not None and raw>=self.power_estimator.threshold and power==0.
+        if getattr(self,'power_confirmation_pending',False) and not pending:self.next_compute=0
+        self.power_confirmation_pending=pending
+        self.current_power_w=None if pending else power
         if source=="balance" and power is not None and power>=2000:
             stage=nominal_mode(power,self.stage)
             if stage in ("3 кВт","6 кВт","9 кВт"):
@@ -585,13 +798,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         requested=(self.raw('mode')=='Автоматичне керування' and self.raw('armed')=='on' and
                    self.memory.get('owned',False) and self.memory.get('last_command')=='heat' and
                    not self.memory.get('temporary_fallback'))
-        self.power_quality=('unknown' if power is None else 'estimated' if estimated_power(source) else
+        self.power_quality=('unknown' if self.current_power_w is None else 'estimated' if estimated_power(source) else
                             'contradictory' if grid_off and power>=1500 else 'measured')
-        self.publish("sensor.heating_power_confirmed",power,
+        self.publish("sensor.heating_power_confirmed",self.current_power_w,confirmation_pending=pending,
                      friendly_name="Котел — підтверджена потужність ТЕНів",
                      unit_of_measurement="W",device_class="power",state_class="measurement",
-                     measurement_version=3,threshold_w=2000,confirmation_seconds=10,
-                     averaging_seconds=20,raw_balance_w=primary,
+                     measurement_version=3,threshold_w=self.power_estimator.threshold,confirmation_seconds=10,
+                     averaging_seconds=self.power_estimator.window,raw_balance_w=primary,
                      averaged_balance_w=self.power_estimator.average,
                      power_source=source,estimated=estimated_power(source),primary_failed=bool(failed),
                      requested_heating=bool(requested),inferred_demand=active,
@@ -600,13 +813,14 @@ class HeatingClimate(HeatingRecovery,Hass):
                      uncertainty='Несвіжі складові балансу' if stale else 'Помилка або невідомий стан вимірювачів' if fault!='off' else None,
                      fallback_raw_w=raw if source.startswith("fallback") else None,
                      timestamp=self.now().isoformat())
+        self.run_diagnostic('power_observation',self.observe_power_quality,stamp,primary,power,grid_off)
         return power
     def stage_update(self,power):
         self.stage=nominal_mode(None if power is None else power*1000,self.stage)
         self.candidate=None
-        self.publish("sensor.heating_boiler_stage",self.stage,friendly_name="Котел — підтверджений ступінь",
+        self.publish("sensor.heating_boiler_stage",self.stage,friendly_name="Котел — діапазон потужності",physical_stage_confirmed=False,
                      icon="mdi:water-boiler",measurement_version=3,timestamp=self.now().isoformat())
-        self.publish('binary_sensor.heating_boiler_active',None if power is None else 'on' if power>=1.5 else 'off',
+        self.publish('binary_sensor.heating_boiler_active',None if power is None or getattr(self,'power_confirmation_pending',False) else 'on' if power>=(.5 if self.cfg.get('power_measurement_policy')=='audited' else 1.5) else 'off',
                      friendly_name='Котел — фактичний нагрів',icon='mdi:water-boiler')
     def tick(self,kwargs=None,**extra):
         if self.update_in_progress():
@@ -717,8 +931,13 @@ class HeatingClimate(HeatingRecovery,Hass):
             measurements=dict(floor=(self.memory.get('floor_observer') or {}).get('estimate',probe),outside=outside,fire=measured_fire))
         self.run_diagnostic('peak_validation',self.observe_stop_peak,now,room,power,source=='Вітальня' and room is not None)
         settings['reserve_errors']=self.memory.get('reserve_errors',[])
-        profile=self.memory.get('modulation_profile',dict(bands=[]))
+        profile=power_profile(self.cfg.get('boiler_power_mode','unconfirmed'),self.memory.get('power_calibrations'),
+            self.memory.get('modulation_profile',dict(bands=[],intervals=0,minutes=0)),self.memory.get('equipment_version',0))
         settings['modulation_profile']=profile
+        settings['equipment_version']=self.memory.get('equipment_version',0)
+        settings['thermal_model_version']=self.model.get('version')
+        settings['ventilation_model']=self.memory.get('ventilation_model') or {}
+        settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
         floor=probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
         if quality:
@@ -817,11 +1036,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         if quality and valid:
             forecast,plan_reference=stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
                           power_kw=3.0,previous=self.memory.get('plan_reference'))
+            self.run_diagnostic('power_recommendation',self.update_power_recommendation,now,room,floor,outside,fire,usable_weather,settings,signature)
             forecast['cycle_energy']=self.run_diagnostic('cycle_projection',self.cycle_budget,now,forecast,dict(weather=usable_weather,
                 grid={k:outage_data.get(k) for k in ('mode','valid','outages')},
                 thermal_state=dict(room=room,floor=floor,fire=fire,coast_peak=peak,
                     gain={k:((settings.get('environment') or {}).get('solar') or {}).get(k) for k in ('coefficient','validated','observed_gain')}),
-                power=dict(bands=[{k:b.get(k) for k in ('return_min','return_max','measured_kw')} for b in profile.get('bands',[])],anchor=anchor),
+                ventilation=dict(model=settings.get('ventilation_model'),expected=settings.get('ventilation_expected')),
+                power=dict(physical_mode=profile.get('physical_mode'),equipment_version=settings.get('equipment_version'),bands=[{k:b.get(k) for k in ('return_min','return_max','measured_kw')} for b in profile.get('bands',[])],anchor=anchor),
                 manual=dict(mode=self.raw('mode'),armed=self.raw('armed')),
                 fallback=bool(self.memory.get('temporary_fallback')),model=self.model),default={})
             forecast['stress_scenarios']=self.run_diagnostic('stress_scenarios',stress_scenarios,
@@ -836,7 +1057,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                          cycle_energy=forecast['cycle_energy'],
                          stress_scenarios=forecast['stress_scenarios'],
                          planned_kwh=forecast["energy"],horizon_hours=forecast["horizon_hours"],
-                         validated=self.model.get("validated",False) and not environment_quality['degraded'],
+                         validated=self.model.get("validated",False) and not environment_quality['degraded'] and not profile.get('assumed',True),
+                         power_assumption=profile.get('assumption'),ventilation_validated=bool((settings.get('ventilation_model') or {}).get('validated')),
+                         equipment_version=settings.get('equipment_version'),
                          structural_model_validated=self.model.get('validated',False),
                          reliability=environment_quality,estimated_floor=floor,
                          local_weather_bias=round(weather_bias,2),
@@ -884,7 +1107,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                                                             candidate_temperature=point['temperature'])
         else:
             self.publish("sensor.heating_forecast","unavailable",friendly_name="Клімат — мінімум прогнозу",curve=[],
-                         reason="Недостатньо актуальних даних або некоректні межі")
+                         reason="Недостатньо актуальних даних або некоректні межі",planning_policy_version=4,created_at=now.isoformat())
         demand=bool(forecast and forecast["heat"])
         # The optimiser already balances comfort, stored heat and tariff.
         # Reaching the soft air target must not cancel its scheduled session.
@@ -927,7 +1150,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         if forecast:self.memory['plan_execution'].update(status='intended',intended_action=action)
         self.publish("sensor.heating_controller","Спостереження" if action=="observe" else reason,
                      comfort_zone=comfort_zone,target_temperature=target,lower_temperature=lower,upper_temperature=upper,
-                     friendly_name="Клімат — контролер",reason=reason,proposed_action="Нагрів · термостат +2 °C" if demand else "Очікування · термостат −2 °C",
+                     friendly_name="Клімат — контролер",reason=reason,proposed_action="Нагрів · зсув уставки +2 °C" if demand else "Очікування · зсув уставки −2 °C",
                      control_method="heat_offset_v2",thermostat_temperature=thermostat,
                      proposed_setpoint=thermostat+(2 if demand else -2) if thermostat is not None else None,
                      source=source,quality=quality,mode=self.raw("mode"),grid=grid,return_valid=probe_ok,
@@ -948,6 +1171,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      power_learning=profile,
                      effective_power_kw=round(effective,3) if effective is not None else None,
                      power_learning_status='Навчання модуляції' if profile['intervals'] else 'Очікуємо підтверджений нагрів')
+        self.run_diagnostic('equipment_publish',self.publish_equipment,ventilation_support)
         self.run_diagnostic('ai_summary',self.publish_ai_summary,refresh=True)
         self.memory["planned_heat_segments"]=forecast["heat_segments"] if forecast else []
         self.memory["demand"]=demand

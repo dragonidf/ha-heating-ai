@@ -63,8 +63,8 @@ class PlannedExecutionTests(unittest.TestCase):
                     today_48half=[] if phase=='normal' else ['on']*48)) if phase else None
                 app.tick_inner()
             self.planner_calls=planner.call_count
-            self.planner_settings=planner.call_args.args[7]
-            self.planner_weather=planner.call_args.args[6]
+            self.planner_settings=planner.call_args.args[7] if planner.call_args else None
+            self.planner_weather=planner.call_args.args[6] if planner.call_args else None
         self.forecast_status=app.published['sensor.heating_forecast']
         self.outage_status=app.published['sensor.heating_outage_schedule']
         return actions,app.published['sensor.heating_controller']

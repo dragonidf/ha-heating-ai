@@ -9,7 +9,7 @@ from uuid import uuid4
 from heating_model import (held_action,number,plan as optimise, step, outdoor_at, in_window,
                            modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
                            reserve_context,attach_reserve,coast_reserve_needed,local_boundary,
-                           SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics)
+                           SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics,power_profile)
 from heating_outages import blocked, availability, schedule_covered
 from heating_environment import forecast_step,gain_at,safe_upper,ENVIRONMENT_POLICY_VERSION
 
@@ -17,7 +17,7 @@ from heating_environment import forecast_step,gain_at,safe_upper,ENVIRONMENT_POL
 def policy(settings):
     keys=('target','lower','upper','start','end','strategy','split_comfort',
           'morning_min_minutes','day_price','night_price','budget_multiplier',
-          'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin')
+          'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin','equipment_version','ventilation_model','ventilation_expected')
     return {**{k:settings.get(k) for k in keys},'environment_policy_version':ENVIRONMENT_POLICY_VERSION,
             'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
             'search_policy_version':SEARCH_POLICY_VERSION}
@@ -263,3 +263,49 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
                   parent_plan_id=previous.get('plan_id') if previous else None)
     return result,reference(now,room,floor,outside,fire,model,weather,settings,result)
 
+
+
+def recommend_power(now,room,floor,outside,fire,model,weather,settings,calibrations=None):
+    """Three bounded searches on identical inputs, never three command writers."""
+    alternatives=[]
+    for kw in (3,6,9):
+        mode='fixed_'+str(kw)
+        calibration=power_profile(mode,calibrations,{},settings.get('equipment_version'))
+        scenario=dict(settings,modulation_profile=calibration,modulation_anchor=None)
+        result=optimise(now,room,floor,outside,fire,model,weather,scenario,kw)
+        reserve=(result or {}).get('morning_reserve') or {}
+        feasible=bool(result and (reserve.get('predicted_sufficient') if reserve else not result.get('comfort_shortfall')))
+        alternatives.append(dict(mode=mode,nominal_kw=kw,found=bool(result),feasible=feasible,
+            calibrated=bool(calibration.get('validated')),minimum=(result or {}).get('minimum'),
+            deficit_degree_hours=reserve.get('deficit_degree_hours'),energy_kwh=(result or {}).get('energy'),
+            change_before=min((s['start'] for s in (result or {}).get('heat_segments',[]) if s['start']>now.timestamp()),default=None)))
+    chosen=next((a for a in alternatives if a['feasible']),None)
+    bound=None
+    if not chosen:
+        r,f=room,floor;allowed_seconds=0.;first_shortfall=None
+        context=reserve_context(now,settings,model)
+        finish=(context or {}).get('assessment_until',now.timestamp()+86400)
+        data=availability(settings.get('outage_schedule') or {},now.timestamp(),finish)
+        outages=data.get('outages',[]) if data.get('valid') else []
+        stamp=now.timestamp()
+        while stamp<finish:
+            end=min(stamp+300,finish);when=datetime.fromtimestamp(stamp,now.tzinfo)
+            allowed=(settings.get('strategy')!='Тільки в дозволені години' or in_window(when,settings['start'],settings['end'])) and not blocked(stamp,end,outages)
+            allowed_seconds+=end-stamp if allowed else 0.
+            r,f=forecast_step(r,f,outdoor_at(weather,when,outside),9. if allowed else 0.,
+                fire*math.exp(-(stamp-now.timestamp())/7200),model,(end-stamp)/3600,when,weather,settings)
+            _,lower,_,_=comfort_at(datetime.fromtimestamp(end,now.tzinfo),settings)
+            if r<lower-.001 and first_shortfall is None:first_shortfall=end
+            stamp=end
+        bound=dict(allowed_minutes=allowed_seconds/60,first_shortfall=first_shortfall,
+            optimistic_maximum_kw=9.,upper_and_storage_limits_relaxed=True,
+            assumptions='Чинна теплова модель, задана погода й вентиляція; 9 кВт у кожний доступний інтервал; невідома мережа умовно доступна')
+
+    return dict(created_at=now.isoformat(),mode=chosen['mode'] if chosen else None,
+        status='feasible_found' if chosen else 'no_available_interval' if bound and not bound['allowed_minutes'] else 'model_bound_insufficient' if bound and bound['first_shortfall'] else 'search_not_found',
+        confidence='validated_scenario' if chosen and chosen['calibrated'] else 'conditional_nominal_assumption',
+        reason='Знайдено план за зазначеної потужності; змініть фізичний режим вручну за потреби' if chosen else
+            'Пошук не знайшов допустимого плану; вищий режим може не допомогти через межі або відключення',
+        change_before=chosen['change_before'] if chosen else None,alternatives=alternatives,
+        physical_impossibility_proven=False,model_bound=bound,
+        model_insufficiency_proven=bool(bound and bound['first_shortfall']))

@@ -149,7 +149,7 @@ def gain_at(when, weather, settings, upper=False):
 
 def forecast_step(room,floor,outside,power,fire,model,hours,when,weather,settings,upper=False):
     gain=gain_at(when,weather,settings,upper=upper)
-    dr=model['floor_air']*(floor-room)-model['room_loss']*(room-outside)+model['fire_gain']*max(0.,fire)+gain
+    dr=model['floor_air']*(floor-room)-model['room_loss']*(room-outside)+model['fire_gain']*max(0.,fire)+gain-ventilation_loss(room,outside,model['room_loss'],settings,upper=upper)
     df=model['heat_gain']*power-model['floor_decay']*(floor-room)
     return room+dr*hours,floor+df*hours
 
@@ -183,3 +183,84 @@ def anchor_weather(weather, stamp, outside):
                for r in weather]
     return corrected,bias
 
+
+
+def ventilation_loss(room,outside,base_loss,settings,upper=False):
+    """Replace the previously averaged loss, rather than adding it twice."""
+    fit=settings.get('ventilation_model') or {}
+    if not fit.get('validated') or fit.get('model_version')!=settings.get('thermal_model_version'):return 0.
+    expected=settings.get('ventilation_expected') or {}
+    if upper:
+        expected={k:0. if room>=outside else 1. for k in ('recuperator','bath')}
+    elif any(finite(expected.get(k)) is None for k in ('recuperator','bath')):return 0.
+    # Wider scenarios use maximal/minimal duty; relay ON is not measured airflow.
+    duty={k:max(0.,min(1.,expected[k])) for k in ('recuperator','bath')}
+    effective=fit['base_room_loss']+sum(fit[k]*duty[k] for k in duty)
+    return (effective-base_loss)*(room-outside)
+
+
+def fit_ventilation(samples,model,timezone=None):
+    """Joint base/recuperator/bath effective loss, independent held-out days.
+
+    Unknown duty, correlated relays and daylight/fire disturbances cannot
+    identify independent coefficients. The old model remains the fallback.
+    """
+    days_present=sorted({datetime.fromtimestamp(r['ts'],timezone).date().isoformat() for r in samples if isinstance(r.get('ts'),(int,float))})
+    first=next((r for r in samples if days_present and datetime.fromtimestamp(r['ts'],timezone).date().isoformat()==days_present[-1]),{})
+    frozen=first.get('thermal_model')
+    if frozen and frozen!=model:return dict(validated=False,model_version=model.get('version'),days=0,samples=0,reason='thermal_model_changed')
+    model=frozen or model
+    records=[]
+    for index in range(6,len(samples),6):
+        chunk=samples[index-6:index+1];a,b=chunk[0],chunk[-1]
+        dt=(b['ts']-a['ts'])/3600
+        if not .4<=dt<=.6:continue
+        if any(not r.get('quality') or r.get('power_estimated') or r.get('power_quality')!='measured' or
+               r.get('grid')!='on' or r.get('fire',0)>2 or r.get('daylight_weight',1)>.1 for r in chunk):continue
+        room=finite(a.get('room'));outside=finite(a.get('outside'));floor=finite(a.get('floor_estimate'))
+        if None in (room,outside,floor) or abs(room-outside)<5:continue
+        u={};valid=True
+        for key in ('recuperator','bath'):
+            vals=[(r.get('ventilation') or {}).get(key) or {} for r in chunk[1:]]
+            if any(finite(v.get('on_fraction')) is None or v.get('unknown_fraction',1)>.05 for v in vals):valid=False;break
+            u[key]=statistics.mean(v['on_fraction'] for v in vals)
+        if not valid:continue
+        delta=room-outside;rate=(b['room']-room)/dt
+        drive=model['floor_air']*(floor-room)+model['fire_gain']*a.get('fire',0)
+        records.append(dict(x=[1.,u['recuperator'],u['bath']],y=(drive-rate)/delta,
+            day=datetime.fromtimestamp(a['ts'],timezone).date().isoformat(),dt=dt,delta=delta,drive=drive,rate=rate))
+    days=sorted(day for day in {r['day'] for r in records} if sum(r['day']==day for r in records)>=6)
+    records=[r for r in records if r['day'] in days]
+    result=dict(validated=False,model_version=model.get('version'),days=len(days),samples=len(records),reason='insufficient_independent_days')
+    if len(days)<3:return result
+    train=[r for r in records if r['day']!=days[-1]];hold=[r for r in records if r['day']==days[-1]]
+    if len(train)<12 or len(hold)<6:return result
+    matrix=[[sum(r['x'][i]*r['x'][j] for r in train) for j in range(3)]+[sum(r['x'][i]*r['y'] for r in train)] for i in range(3)]
+    for i in range(3):
+        pivot=max(range(i,3),key=lambda k:abs(matrix[k][i]));matrix[i],matrix[pivot]=matrix[pivot],matrix[i]
+        if abs(matrix[i][i])<1e-7:return dict(result,reason='correlated_or_constant_relays')
+        scale=matrix[i][i];matrix[i]=[v/scale for v in matrix[i]]
+        for j in range(3):
+            if j==i:continue
+            factor=matrix[j][i];matrix[j]=[a-factor*b for a,b in zip(matrix[j],matrix[i])]
+    coefficients=[matrix[i][3] for i in range(3)]
+    if not (max(.001,model['room_loss']*.8)<=coefficients[0]<=min(.15,model['room_loss']*1.2) and all(0<=v<=.05 for v in coefficients[1:])):
+        return dict(result,reason='coefficient_bounds')
+    error=[abs((sum(v*x for v,x in zip(coefficients,r['x']))-r['y'])*r['delta']*r['dt']) for r in hold]
+    baseline=[abs((model['room_loss']-r['y'])*r['delta']*r['dt']) for r in hold]
+    accepted=statistics.mean(baseline)>.01 and statistics.mean(error)<statistics.mean(baseline)*.95 and max(error)<=max(baseline)+.02
+    return dict(result,validated=accepted,reason='heldout_improvement' if accepted else 'no_heldout_improvement',
+        base_room_loss=coefficients[0],recuperator=coefficients[1],bath=coefficients[2],
+        holdout_mae=statistics.mean(error),baseline_mae=statistics.mean(baseline),holdout_day=days[-1])
+
+
+def ventilation_expectation(samples,current):
+    """Empirical duty scenarios, not invented future switching timestamps."""
+    result={};support={}
+    for key in ('recuperator','bath'):
+        rows=[(r.get('ventilation') or {}).get(key) or {} for r in samples[-288:]]
+        known=[v['on_fraction'] for v in rows if finite(v.get('on_fraction')) is not None and v.get('unknown_fraction',1)<=.05]
+        result[key]=statistics.mean(known) if len(known)>=12 else None
+        support[key]=dict(intervals=len(known),unknown_fraction=1-len(known)/len(rows) if rows else 1,
+            current=(current.get(key) or {}).get('relay','unknown'),future='empirical_duty' if len(known)>=12 else 'unknown')
+    return result,support
