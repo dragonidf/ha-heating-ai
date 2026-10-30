@@ -13,6 +13,38 @@ from heating_model import DEFAULT_MODEL
 
 
 class DecisionHistoryTests(unittest.TestCase):
+    def test_existing_archive_recovers_interrupted_compaction_and_counts_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stamp=time.time();journal=DecisionJournal(directory,max_bytes=10000);journal.directory.mkdir()
+            day=datetime.fromtimestamp(stamp-86400,ZoneInfo('UTC')).strftime('%Y-%m-%d')
+            path=journal.directory/(day+'.jsonl');raw=b'{"protected":true}\n'*1000;path.write_bytes(raw)
+            archive=path.with_suffix('.jsonl.gz');archive.write_bytes(gzip.compress(raw))
+            result=journal.append(dict(action='off'),stamp=stamp)
+            self.assertFalse(result.get('storage_degraded'));self.assertFalse(path.exists())
+            self.assertEqual(gzip.decompress(archive.read_bytes()),raw)
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.iterdir()))
+
+    def test_different_existing_archive_never_replaces_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stamp=time.time();journal=DecisionJournal(directory,max_bytes=10000);journal.directory.mkdir()
+            day=datetime.fromtimestamp(stamp-86400,ZoneInfo('UTC')).strftime('%Y-%m-%d')
+            path=journal.directory/(day+'.jsonl');raw=b'{"protected":true}\n'*1000;path.write_bytes(raw)
+            path.with_suffix('.jsonl.gz').write_bytes(gzip.compress(b'different evidence'))
+            result=journal.append(dict(action='off'),stamp=stamp)
+            self.assertTrue(result.get('storage_degraded'));self.assertEqual(path.read_bytes(),raw)
+
+    def test_closed_day_compression_recovers_budget_without_losing_protected_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stamp=time.time();journal=DecisionJournal(directory,max_bytes=10000)
+            journal.directory.mkdir();day=datetime.fromtimestamp(stamp-86400,ZoneInfo('UTC')).strftime('%Y-%m-%d')
+            old=journal.directory/(day+'.jsonl');raw=(json.dumps(dict(reason='protected history',value=1))+'\n')*1000
+            old.write_text(raw);os.utime(old,(stamp-86400,stamp-86400))
+            result=journal.append(dict(action='off',reason='new evidence'),stamp=stamp)
+            self.assertFalse(result.get('storage_degraded',False))
+            archive=old.with_suffix('.jsonl.gz');self.assertEqual(gzip.decompress(archive.read_bytes()).decode(),raw)
+            self.assertFalse(old.exists());self.assertLess(journal.used_bytes,journal.max_bytes)
+            self.assertEqual(archive.stat().st_mtime,stamp-86400)
+
     def test_same_state_different_decisions_restart_and_replayable_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)
@@ -200,8 +232,13 @@ class AdapterEvidenceTests(unittest.TestCase):
         app.publish=lambda entity,state,**attrs:published.append((entity,state,attrs))
         with tempfile.TemporaryDirectory() as directory:
             app.decision_journal=DecisionJournal(directory)
+            app.power_observation=dict(at=1.,watts=0.,quality='measured',reason='primary_balance')
+            app.memory['power_observation_ledger']=dict(last=dict(at=1.,watts=0.),measured_kwh=0.)
             app.decision_event('tick_change')
             app.decision_context['measurements']['room']=21.401
+            app.power_observation['at']=16.
+            app.memory['power_observation_ledger']['last']['at']=16.
+            app.get_state=lambda *args,**kw:dict(state='21.4',last_reported=(at-timedelta(minutes=11)).isoformat())
             app.decision_event('tick_change')
             decisions=[r for r in published if r[0]=='sensor.heating_decision']
             self.assertEqual(len(decisions),1)

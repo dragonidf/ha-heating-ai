@@ -399,6 +399,14 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.memory['ventilation_candidate']=fit;return
         self.memory['ventilation_model']=dict(fit,fit_day=today)
 
+    def read_power_snapshot(self,entities):
+        template="""{% set ns=namespace(rows={}) %}{% for id in entities %}{% set s=states[id] %}{% if s is not none %}{% set ns.rows=dict(ns.rows,**{id:dict(value=s.state,at=as_timestamp(s.last_reported if s.last_reported is defined else s.last_updated,none),unit=s.attributes.get('unit_of_measurement'),kind='active')}) %}{% endif %}{% endfor %}{{ ns.rows|tojson }}"""
+        result=self.render_template(template,variables=dict(entities=entities))
+        if isinstance(result,str):result=json.loads(result)
+        if not isinstance(result,dict) or any(not isinstance(row,dict) for row in result.values()):
+            raise ValueError('Invalid live power snapshot')
+        return result
+
     def assess_power_sources(self,stamp,primary,grid_off):
         entities=list(self.cfg.get('power_balance_sources') or [])
         topology=self.cfg.get('power_phase_topology') or {}
@@ -408,16 +416,33 @@ class HeatingClimate(HeatingRecovery,Hass):
             entities.append(phase.get('input'))
             loads=phase.get('loads')
             if isinstance(loads,list):entities.extend(x.get('entity') for x in loads if isinstance(x,dict))
-        readings={}
-        for entity in set(entities)-{None}:
-            record=self.get_state(entity,attribute='all')
-            record=record if isinstance(record,dict) else {}
-            attrs=record.get('attributes') or {}
-            when=record.get('last_reported') or record.get('last_updated')
-            try:at=datetime.fromisoformat(when.replace('Z','+00:00')).timestamp()
-            except (AttributeError,ValueError,TypeError):at=None
-            readings[entity]=dict(value=record.get('state'),at=at,unit=attrs.get('unit_of_measurement'),kind='active')
-        aligned=aligned_power(readings,self.cfg.get('power_balance_sources') or [],stamp)
+        live_snapshot=getattr(self,'runtime_ready',False) and callable(getattr(self,'render_template',None))
+        if live_snapshot:
+            # AppDaemon's state_changed cache misses reports with unchanged values.
+            # Read real HA report timestamps together; never refresh stale data locally.
+            wanted=sorted(set(entities+[self.cfg.get('power_balance')])-{None})
+            if stamp-getattr(self,'power_snapshot_at',0)>=10 or wanted!=getattr(self,'power_snapshot_entities',None):
+                self.power_snapshot=self.run_diagnostic('power_snapshot',self.read_power_snapshot,wanted,default={})
+                self.power_snapshot_at=time.time();self.power_snapshot_entities=wanted
+            readings=self.power_snapshot
+            stamp=max(stamp,self.power_snapshot_at)
+            balance=readings.get(self.cfg.get('power_balance')) or {}
+            primary=number(balance.get('value'))
+            if balance.get('unit')=='kW' and primary is not None:primary*=1000
+            if balance.get('unit') not in ('W','kW'):primary=None
+        else:
+            readings={}
+            for entity in set(entities)-{None}:
+                record=self.get_state(entity,attribute='all')
+                record=record if isinstance(record,dict) else {}
+                attrs=record.get('attributes') or {}
+                when=record.get('last_reported') or record.get('last_updated')
+                try:at=datetime.fromisoformat(when.replace('Z','+00:00')).timestamp()
+                except (AttributeError,ValueError,TypeError):at=None
+                readings[entity]=dict(value=record.get('state'),at=at,unit=attrs.get('unit_of_measurement'),kind='active')
+        dependencies=list(self.cfg.get('power_balance_sources') or [])
+        if live_snapshot:dependencies.append(self.cfg.get('power_balance'))
+        aligned=aligned_power(readings,dependencies,stamp)
         a=dict(aligned,watts=primary if aligned['valid'] else None,quality='measured' if aligned['valid'] else 'unknown')
         if primary is None or primary < -500 or primary>10500:a.update(valid=False,watts=None,reason='invalid_balance_range')
         if self.cfg.get('power_fault') and self.get_state(self.cfg['power_fault'])!='off':a.update(valid=False,watts=None,reason='meter_fault')

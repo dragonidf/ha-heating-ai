@@ -335,6 +335,7 @@ def check_equipment(page):
     page.locator('nav [data-tab="settings"]').click()
     headings=page.locator('.settings-grid>.card h2').all_text_contents()
     assert headings==['Керування опаленням','Комфорт','Котел','Години нагріву','Циркуляція','Вентиляція'],headings
+    assert page.locator('[data-system-key="floor_air"]').evaluate('el=>el.validity.stepMismatch')
     page.evaluate("mockHass.states={...mockHass.states,'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},'fan.bath':{state:'unavailable',attributes:{friendly_name:'Витяжка ванної'}}};panel.hass={...mockHass}")
     assert page.locator('[data-system-key="recuperator_entity"]').evaluate('el=>el.tagName')=='SELECT'
     page.locator('[data-system-key="boiler_power_mode"]').select_option('auto')
@@ -387,7 +388,7 @@ def main(engine='chromium'):
             page.evaluate('''fields=>{
                 mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,fields}}};
                 panel.hass={...mockHass};
-            }''',system_fields({},DEFAULT_MODEL))
+            }''',system_fields({},dict(DEFAULT_MODEL,floor_air=.02839661755318365)))
             check_compact_overview(page)
             check_controller_incident(page)
             page.wait_for_function('nativeConfigs.length === 2')
