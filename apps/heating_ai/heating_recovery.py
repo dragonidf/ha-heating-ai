@@ -10,6 +10,7 @@ import json
 import os
 import math
 import traceback
+import shutil
 from heating_model import number,in_window,heating_cycle,step,held_action
 from heating_outages import schedule,blocked
 from heating_fallback import estimated_power
@@ -109,6 +110,8 @@ class HeatingRecovery:
         state=('Помилка контролера' if control=='error' else 'Тимчасовий auto' if fallback else
                'Помилка збереження' if storage else 'Діагностика обмежена' if active or recent else 'Журнал доступний')
         self.publish('sensor.heating_diagnostics',state,storage_health='degraded' if storage else 'healthy',
+            storage_error=storage,journal_used_bytes=getattr(getattr(self,'decision_journal',None),'used_bytes',None),
+            journal_max_bytes=getattr(getattr(self,'decision_journal',None),'max_bytes',None),
             storage_degraded=bool(storage),validation_health='degraded' if active or recent else 'healthy',control_health=control,
             diagnostic_errors=active,validation_rejections=self.memory.get('forecast_validation_rejections',{}),
             last_successful_tick=self.memory.get('last_successful_tick'),incident_id=incident.get('incident_id'),
@@ -226,6 +229,9 @@ class HeatingRecovery:
             signature.pop('power_w')
             signature.pop('energy_counter_kwh')
             signature.pop('measurements')
+            signature.pop('source_timestamp')
+            signature.pop('energy_quality')
+            signature['power_observation']={k:observation.get(k) for k in ('quality','reason','policy','controller_source')}
             signature['source_quality']={k:(v['quality'],v['available']) for k,v in sources.items()}
             fingerprint=hashlib.sha256(json.dumps(signature,sort_keys=True,default=str).encode()).hexdigest()
             if not force and fingerprint==getattr(self,'decision_fingerprint',None):
@@ -771,6 +777,7 @@ class DecisionJournal:
         self.max_bytes=max_bytes
         self.error=None
         self.last_rotation=0
+        self.last_compaction=0
         self.used_bytes=None
         self.lock=RLock()
 
@@ -782,6 +789,29 @@ class DecisionJournal:
                     p.unlink()
             self.last_rotation=stamp
             self.used_bytes=sum(p.stat().st_size for p in self.directory.iterdir() if p.is_file())
+        if self.used_bytes>=self.max_bytes*.9 and stamp-self.last_compaction>60:
+            self.last_compaction=stamp
+            day=datetime.fromtimestamp(stamp,timezone.utc).strftime('%Y-%m-%d')
+            for path in sorted(self.directory.glob('????-??-??.jsonl')):
+                if path.stem>=day:continue
+                info=path.stat();archive=path.with_suffix('.jsonl.gz');temporary=archive.with_suffix('.tmp');existing=archive.exists()
+                try:
+                    if not existing:
+                        with path.open('rb') as source,gzip.open(temporary,'wb') as target:
+                            shutil.copyfileobj(source,target)
+                        if temporary.stat().st_size>=info.st_size:continue
+                        with path.open('rb') as source,gzip.open(temporary,'rb') as restored:
+                            if hashlib.file_digest(source,'sha256').digest()!=hashlib.file_digest(restored,'sha256').digest():
+                                raise OSError('Diagnostic compression checksum mismatch')
+                        os.utime(temporary,(info.st_atime,info.st_mtime));temporary.replace(archive)
+                    else:
+                        with path.open('rb') as source,gzip.open(archive,'rb') as restored:
+                            if hashlib.file_digest(source,'sha256').digest()!=hashlib.file_digest(restored,'sha256').digest():
+                                raise OSError('Existing diagnostic archive differs; original retained')
+                    path.unlink();self.used_bytes-=info.st_size
+                    if not existing:self.used_bytes+=archive.stat().st_size
+                finally:
+                    temporary.unlink(missing_ok=True)
         if self.used_bytes>=self.max_bytes:
             raise OSError('Diagnostic disk budget exhausted; protected history retained')
 

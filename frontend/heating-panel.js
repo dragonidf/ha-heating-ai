@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -436,12 +436,14 @@ export class HeatingAIPanel extends HTMLElement {
   }
   async saveSystemSettings() {
     if(this.systemPending||!Object.keys(this.systemDraft).length)return;
-    if([...this.shadowRoot.querySelectorAll('[data-system-key]')].some(el=>!el.reportValidity()))return;
+    if([...this.shadowRoot.querySelectorAll('[data-system-key]')].some(el=>Object.hasOwn(this.systemDraft,el.dataset.systemKey)&&!el.reportValidity())) {
+      this.systemMessage='Перевірте значення змінених полів';this.render();return;
+    }
     const request=globalThis.crypto?.randomUUID?.()||String(Date.now());
     this.systemPending=request;this.systemMessage='';this.render();
     try {
       await this.hass.callApi('POST','events/heating_system_settings',{request_id:request,revision:numeric(this.attrs('system_settings').revision)??0,values:{...this.systemDraft}});
-      this.systemTimeout=setTimeout(()=>{if(this.systemPending===request){this.systemPending=null;this.systemMessage='Немає підтвердження контролера. Оновіть дані перед повтором.';this.render();}},15000);
+      this.systemTimeout=setTimeout(()=>{if(this.systemPending===request){this.systemMessage='Очікуємо підтвердження контролера: перерахунок може тривати довше. За потреби оновіть панель.';this.render();}},15000);
     } catch(error){this.systemPending=null;this.systemMessage=`Не вдалося зберегти: ${error.message||'помилка Home Assistant'}`;}
     this.render();
   }

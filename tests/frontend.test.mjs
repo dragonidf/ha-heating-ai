@@ -4,6 +4,27 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths}=await import('../frontend/heating-panel.js');
+test('saving a boiler mode ignores untouched advanced coefficient step validity',async()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={boiler_power_mode:'fixed_6'};panel.render=()=>{};
+  panel.shadowRoot={querySelectorAll:()=>[
+    {dataset:{systemKey:'boiler_power_mode'},reportValidity:()=>true},
+    {dataset:{systemKey:'floor_air'},reportValidity:()=>false}]};
+  let requests=0,ack={revision:2};panel.attrs=()=>ack;
+  panel._hass={callApi:async(method,path,data)=>{requests++;assert.equal(data.values.boiler_power_mode,'fixed_6');
+    ack={revision:3,last_request_id:data.request_id,last_success:'true'};panel.syncSystemSettings();}};
+  await panel.saveSystemSettings();clearTimeout(panel.systemTimeout);
+  assert.equal(requests,1);assert.deepEqual(panel.systemDraft,{});assert.equal(panel.systemMessage,'Зміни збережено');
+});
+test('a delayed controller acknowledgement still clears the saved draft',async()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={boiler_power_mode:'fixed_6'};panel.render=()=>{};
+  panel.shadowRoot={querySelectorAll:()=>[]};let ack={revision:2},timeout;
+  panel.attrs=()=>ack;panel._hass={callApi:async()=>{}};
+  const previous=globalThis.setTimeout;globalThis.setTimeout=callback=>{timeout=callback;return 0;};
+  try{await panel.saveSystemSettings();}finally{globalThis.setTimeout=previous;}
+  const request=panel.systemPending;timeout();
+  ack={revision:3,last_request_id:request,last_success:'true'};panel.syncSystemSettings();
+  assert.deepEqual(panel.systemDraft,{});assert.equal(panel.systemMessage,'Зміни збережено');
+});
 test('device bindings use existing HA relay choices with friendly names',()=>{
   const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={};panel._hass={states:{
     'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},

@@ -141,6 +141,22 @@ class CalibrationContracts(unittest.TestCase):
         self.assertFalse(bad['validated']);self.assertEqual(bad['reason'],'correlated_or_constant_relays')
 
 class AuditedAdapter(unittest.TestCase):
+    def test_real_report_timestamps_override_unchanged_appdaemon_cache_without_relaxing_skew(self):
+        from unittest.mock import Mock,patch
+        app=self.app();app.runtime_ready=True;app.cfg.update(power_balance_sources=['total','load'],power_balance='balance')
+        at=app.at.timestamp()
+        rows={k:dict(value=v,at=at,unit='W',kind='active') for k,v in [('total','3000'),('load','3000'),('balance','0')]}
+        app.render_template=Mock(return_value=rows)
+        with patch('heating_climate.time.time',return_value=at):a=app.assess_power_sources(at,None,False)
+        self.assertEqual(a['quality'],'measured');self.assertEqual(a['watts'],0.)
+        app.assess_power_sources(at+5,None,False);self.assertEqual(app.render_template.call_count,1)
+        rows['load']['at']=at-65
+        with patch('heating_climate.time.time',return_value=at+11):a=app.assess_power_sources(at+11,None,False)
+        self.assertEqual(a['quality'],'unknown');self.assertIsNone(a['watts'])
+        app.render_template.side_effect=OSError('HA unavailable');app.record_failure=Mock()
+        with patch('heating_climate.time.time',return_value=at+22):a=app.assess_power_sources(at+22,None,False)
+        self.assertEqual(a['quality'],'unknown');self.assertIsNone(a['watts'])
+
     def app(self):
         from test_power_provenance import PowerProvenanceTests
         from heating_model import HeatingPowerEstimator
