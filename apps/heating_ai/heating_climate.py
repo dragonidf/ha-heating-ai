@@ -1150,7 +1150,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         if forecast:self.memory['plan_execution'].update(status='intended',intended_action=action)
         self.publish("sensor.heating_controller","Спостереження" if action=="observe" else reason,
                      comfort_zone=comfort_zone,target_temperature=target,lower_temperature=lower,upper_temperature=upper,
-                     friendly_name="Клімат — контролер",reason=reason,proposed_action="Нагрів · термостат +2 °C" if demand else "Очікування · термостат −2 °C",
+                     friendly_name="Клімат — контролер",reason=reason,proposed_action="Нагрів · зсув уставки +2 °C" if demand else "Очікування · зсув уставки −2 °C",
                      control_method="heat_offset_v2",thermostat_temperature=thermostat,
                      proposed_setpoint=thermostat+(2 if demand else -2) if thermostat is not None else None,
                      source=source,quality=quality,mode=self.raw("mode"),grid=grid,return_valid=probe_ok,

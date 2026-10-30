@@ -513,6 +513,7 @@ export class HeatingAIPanel extends HTMLElement {
   async changed(e) {
     if(e.target.hasAttribute('data-system-key')) {
       const el=e.target;
+      if(el.hasAttribute('data-json'))el.setCustomValidity('');
       if(!el.reportValidity()||el.type==='number'&&numeric(el.value)===null)return;
       if(el.hasAttribute('data-json')){
         try{this.systemDraft[el.dataset.systemKey]=JSON.parse(el.value);el.setCustomValidity('');}
@@ -981,6 +982,7 @@ footer span{font-size:11px}
 .system-help{flex-shrink:0;border:0;color:var(--green);min-width:44px;min-height:44px;padding:8px;font-size:15px}
 .system-field input,.system-field select{width:100%;max-width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
 .system-label>span{min-width:0;overflow-wrap:anywhere}
+.system-field select{contain:inline-size;overflow:hidden;text-overflow:ellipsis}
 .system-field .number{width:100%;min-width:0}
 .system-field .number input{flex:1;width:0}
 .system-field .number span{white-space:nowrap}

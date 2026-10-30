@@ -285,7 +285,7 @@ def check_system_settings(page):
         page.set_viewport_size({'width':width,'height':850})
         # WebKit commits container queries after the viewport call returns.
         page.evaluate('()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
-        assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,page.locator('heating-ai-panel').evaluate("el=>[...el.shadowRoot.querySelectorAll('*')].filter(x=>x.getBoundingClientRect().right>innerWidth+1).slice(0,12).map(x=>[x.tagName,x.className,x.getBoundingClientRect().width])"))
+        assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,page.evaluate('({document:document.documentElement.scrollWidth,viewport:innerWidth,body:document.body.getBoundingClientRect().width})'),page.locator('heating-ai-panel').evaluate("el=>[...el.shadowRoot.querySelectorAll('*')].filter(x=>x.getBoundingClientRect().right>innerWidth||x.scrollWidth>x.clientWidth+1).slice(0,16).map(x=>[x.tagName,x.className,x.getBoundingClientRect().width,x.scrollWidth,x.clientWidth])"))
         for control in page.locator('[data-system-key],.system-help').all():
             assert control.bounding_box()['height']>=40
         page.locator('[data-system-help="floor_air"]').click()
