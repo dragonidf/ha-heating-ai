@@ -977,12 +977,14 @@ footer span{font-size:11px}
 .system-group{border-bottom:1px solid var(--stroke)}
 .system-group>summary{font-size:13px;font-weight:500}
 .system-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 18px;padding:6px 0 16px}
-.system-field{min-width:0;display:flex;flex-direction:column;gap:5px}
-.system-label{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;line-height:1.4}
+.system-field{min-width:0;max-width:100%;overflow-wrap:anywhere;display:flex;flex-direction:column;gap:5px}
+.system-label{min-width:0;max-width:100%;overflow-wrap:anywhere;display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;line-height:1.4}
 .system-help{flex-shrink:0;border:0;color:var(--green);min-width:44px;min-height:44px;padding:8px;font-size:15px}
 .system-field input,.system-field select{width:100%;max-width:100%;min-width:0;min-height:44px;border:1px solid var(--control-stroke);border-radius:12px;background:var(--raised);color:inherit;padding:8px 10px;font:inherit}
-.system-label>span{min-width:0;overflow-wrap:anywhere}
+.system-label>span,.system-label>label{min-width:0;overflow-wrap:anywhere}
 .system-field select{contain:inline-size;overflow:hidden;text-overflow:ellipsis}
+.system-field input{contain:inline-size;overflow:hidden}
+.system-settings summary{min-width:0;overflow-wrap:anywhere}
 .system-field .number{width:100%;min-width:0}
 .system-field .number input{flex:1;width:0}
 .system-field .number span{white-space:nowrap}
@@ -1000,7 +1002,7 @@ footer span{font-size:11px}
 .system-dialog-heading button{flex-shrink:0}
 @container(max-width:900px){.system-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}
 }
-@container(max-width:430px){.system-grid{grid-template-columns:1fr}
+@container(max-width:430px){.system-grid{grid-template-columns:minmax(0,1fr)}
 .system-settings>summary{font-size:14px}
 .system-label{font-size:12px}
 .system-actions button{flex:1 1 120px}
