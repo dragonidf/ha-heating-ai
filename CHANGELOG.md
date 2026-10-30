@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 — 2026-10-30
+
+- Describe the physical 3/6/9 kW or AUTO boiler mode in revisioned persistent settings, separately from HVAC and measured watts. Selecting a mode never sends a boiler command; old installations remain explicitly unconfirmed until selected.
+- Extend return-band power learning with mode/configuration separation, completed-session holdouts, instantaneous power-band distributions and thermal non-regression gates. Compare three like-for-like capacity plans; distinguish conditional nominal advice, search failure and an optimistic model insufficiency bound.
+- Add audited A/B residual measurement with per-input freshness, time alignment, units, duplicate checks and explicit phase-map verification. In audited mode unknown stays unknown; no phase-count or thermostat-only fallback. Preserve low-voltage heating and unrequested consumption.
+- Keep a restart-safe measured/estimated/unknown W×seconds quality ledger without rewriting existing energy totals or telemetry. Back up state, telemetry and allowlisted effective configuration before the idempotent equipment migration.
+- Observe recuperator/bathroom relays without controlling them. Fit joint base/ventilation losses only with identifiable independent days and held-out improvement; retain the existing thermal model while evidence is insufficient.
+- Keep the compact three-tab panel; add physical-mode advice, quality/energy diagnostics and validated equipment settings. Preserve strict hours, grid guards, manual ownership, watchdog and HACS workflow, including unavailable-forecast release verification.
+- Add mode, metering, migration and browser regressions plus a separate nonlinear-house closed-loop checker. Physical energy accuracy and new AUTO/ventilation coefficients remain unverified until sufficient newly tagged site sessions exist; see [validation and operating notes](docs/power-ventilation.md).
+
 ## 0.2.15 — 2026-10-29
 
 - Validate persisted forecast records, including explicit null observations; quarantine malformed diagnostic records without certifying them or blocking heating control.

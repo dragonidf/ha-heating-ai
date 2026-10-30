@@ -178,10 +178,16 @@ class HeatingRecovery:
                     reported_at=reported,age_seconds=round(age,1) if age is not None else None,
                     quality='fresh' if available and age is not None and age<=max_age else 'stale_or_unknown',
                     timestamp_kind='last_reported' if state.get('last_reported') else 'last_updated' if reported else 'unknown')
-            actual=self.val('power')
+            actual=getattr(self,'current_power_w',None) if hasattr(self,'current_power_w') else self.val('power')
             command=self.memory.get('command_diagnostic') or {}
             reference=self.memory.get('plan_reference') or {}
-            record=dict(event=event,timezone=str(self.climate_tz),app_version=getattr(self,'release_version',None),
+            observation=getattr(self,'power_observation',{})
+            record=dict(physical_mode=self.cfg.get('boiler_power_mode','unconfirmed'),
+                equipment_version=self.memory.get('equipment_version',0),
+                power_observation=observation,energy_quality=self.memory.get('power_observation_ledger'),
+                ventilation=getattr(self,'ventilation_states',{}),
+                execution_evidence=('physically_confirmed_by_balance' if command.get('action')=='heat' and command.get('status')=='confirmed' else 'unrequested_consumption') if actual is not None and actual>=500 and getattr(self,'power_quality','unknown')=='measured' else 'acknowledged' if command.get('status')=='confirmed' else command.get('status','calculated'),
+                event=event,timezone=str(self.climate_tz),app_version=getattr(self,'release_version',None),
                 plan_id=forecast.get('plan_id') or reference.get('plan_id'),
                 parent_plan_id=forecast.get('parent_plan_id'),cycle_id=reserve.get('cycle_id'),
                 reason=reason or context.get('reason') or event,
@@ -294,6 +300,7 @@ class HeatingRecovery:
             reason=(interval_reason or
                 ('control_mode_changed' if self.raw('mode')!='Автоматичне керування' or self.raw('armed')!='on' or self.memory.get('temporary_fallback') else
                  'model_changed' if prediction['model']!=self.model else
+                 'equipment_changed' if prediction.get('equipment_version',0)!=self.memory.get('equipment_version',0) else
                  'execution_changed' if planned!=(requested if requested is not None else actual) else None))
             if reason:
                 prediction['valid']=False
@@ -332,7 +339,7 @@ class HeatingRecovery:
                     errors.append(dict(hours=prediction['hours'],error=prediction['temperature']-room,
                         validated=True,at=stamp,model_version=self.model.get('version')))
                 elif not matched and 'energy_mismatch' not in reasons:reasons.append('energy_mismatch')
-                common=dict(hours=prediction['hours'],at=stamp,model_version=prediction['model'].get('version'),
+                common=dict(physical_mode=prediction.get('physical_mode','unconfirmed'),equipment_version=prediction.get('equipment_version',0),hours=prediction['hours'],at=stamp,model_version=prediction['model'].get('version'),
                     horizon=prediction.get('horizon',str(prediction['hours'])),reasons=list(reasons),
                     window_start=prediction.get('start_at'),window_end=prediction['ts'])
                 planned_hours=sum(max(0.,min(s['end'],prediction['ts'])-max(s['start'],prediction.get('start_at',s['start'])))
@@ -386,7 +393,7 @@ class HeatingRecovery:
                     observed=(dict(at=stamp,room=room,floor=inputs['floor'],outside=inputs['outside'],
                         fire=inputs['fire'],power_kw=power/1000,energy=energy,request_seconds=0.,valid=source_ok)
                         if source_ok and all(number(inputs.get(k)) is not None for k in ('floor','outside','fire')) else None)
-                    pending.append(dict(ts=point['ts'],hours=(point['ts']-stamp)/3600,
+                    pending.append(dict(physical_mode=self.cfg.get('boiler_power_mode','unconfirmed') if hasattr(self,'cfg') else 'unconfirmed',equipment_version=self.memory.get('equipment_version',0),ts=point['ts'],hours=(point['ts']-stamp)/3600,
                         horizon=horizon,start_at=stamp,checked_at=stamp,timeline_valid=source_ok,observed=observed,
                         temperature=point['temperature'],model=dict(self.model),valid=True,segments=intervals,
                         start_energy=self.val('energy'),expected_energy=sum(s.get('kwh',0.)*
@@ -397,7 +404,8 @@ class HeatingRecovery:
         groups={};stamp=self.now().timestamp()
         for r in self.memory.get('forecast_validation',[]):
             if not r.get('valid') or r.get('model_version')!=self.model.get('version'):continue
-            key=r['kind']+':'+r['horizon'];group=groups.setdefault(key,dict(kind=r['kind'],horizon=r['horizon'],
+            mode=r.get('physical_mode','unconfirmed')
+            key=mode+':'+r['kind']+':'+r['horizon'];group=groups.setdefault(key,dict(physical_mode=mode,kind=r['kind'],horizon=r['horizon'],
                 count=0,mae=0.,minimum_hours=r['hours'],maximum_hours=r['hours'],last_at=r['at'],_days=set()))
             group['_days'].add(datetime.fromtimestamp(r['at'],self.now().tzinfo).date().isoformat())
             group['count']+=1;group['mae']+=abs(r['error']);group['last_at']=max(group['last_at'],r['at'])
@@ -718,10 +726,10 @@ class HeatingRecovery:
         if self.grid_state()!="on":
             return
         power=self.val("power")
-        self.memory.setdefault('command_diagnostic',{}).update(boiler_confirmed=power is not None and power>=1500,
+        self.memory.setdefault('command_diagnostic',{}).update(boiler_confirmed=power is not None and power>=(500 if self.cfg.get('power_measurement_policy')=='audited' else 1500),
             power_checked_at=time.time(),confirmed_power_w=power)
         self.decision_event('boiler_response',force=True)
-        if power is None or power<1500:
+        if power is None or power<(500 if self.cfg.get('power_measurement_policy')=='audited' else 1500):
             self.notify_once("Команду heat прийнято, але нагрів котла за потужністю не підтвердився")
             self.enter_temporary_fallback('Запит нагріву прийнято, але потужність не підтверджена')
         elif self.memory.get("once") and self.memory["once"].get("active_at") is None:
@@ -820,7 +828,8 @@ class DecisionJournal:
                 if len(raw)>8192:
                     digest=self.snapshot(result,stamp)
                     result={k:result.get(k) for k in ('schema_version','decision_id','recorded_at','plan_id','parent_plan_id','cycle_id','action','snapshot_id',
-                        'incident_id','control_state','execution_state','reason_code','power_quality','source_timestamp')}
+                        'incident_id','control_state','execution_state','reason_code','power_quality','source_timestamp',
+                        'physical_mode','equipment_version','execution_evidence')}
                     result.update(external_attributes=True,attributes_snapshot_id=digest,
                                   reason=str(record.get('reason') or '')[:256] or 'Повний запис у локальному знімку')
                     raw=json.dumps(result,ensure_ascii=False,separators=(',',':')).encode('utf-8')

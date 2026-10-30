@@ -249,9 +249,9 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==28, fields.count()  # 23 config values and five thermal coefficients.
+    assert fields.count()==33, fields.count()  # Existing controls plus physical mode, quality policy, phase map and two relays.
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==60
+    assert panel.locator('.system-help').count()==62
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()
@@ -270,13 +270,13 @@ def check_system_settings(page):
     field.fill('7200');field.press('Tab')
     assert page.evaluate('systemRequests.length')==0, 'Editing a draft must not apply it'
     assert page.evaluate("panel.hass.states['sensor.heating_system_settings'].attributes.fields.find(f=>f.key==='outage_max_age').value")==before
-    page.locator('[data-system-save]').click()
+    page.locator('[data-system-save]').last.click()
     page.wait_for_function('systemRequests.length===1')
     assert page.evaluate('systemRequests[0].path')=='events/heating_system_settings'
     assert page.evaluate('systemRequests[0].data.values')=={'outage_max_age':7200}
     page.wait_for_function("document.querySelector('heating-ai-panel').shadowRoot.querySelector('.system-message').textContent.includes('Зміни збережено')")
     page.evaluate('failSystem=true')
-    field.fill('3600');field.press('Tab');page.locator('[data-system-save]').click()
+    field.fill('3600');field.press('Tab');page.locator('[data-system-save]').last.click()
     assert 'Не вдалося' in page.locator('.system-message').inner_text()
     page.evaluate('failSystem=false')
     page.locator('[data-system-reset]').click()
@@ -298,6 +298,36 @@ def check_system_settings(page):
     page.set_viewport_size({'width':1440,'height':1100})
     page.evaluate('systemRequests=[];calls=[]')
     page.locator('nav [data-tab="overview"]').click()
+
+
+def check_equipment(page):
+    page.set_viewport_size({'width':360,'height':800})
+    for mode in ('fixed_3','fixed_6','fixed_9','auto','unconfirmed'):
+        page.evaluate("""mode=>setHeatingScenario({
+            'sensor.heating_power_model':{state:mode,attributes:{mode_contradiction:false,
+                recommendation:{mode:'fixed_6',reason:'Перевірте фізичний режим перед ранковим сеансом',change_before:Date.now()/1000+3600,
+                    alternatives:[{nominal_kw:3,feasible:false,deficit_degree_hours:.5},{nominal_kw:6,feasible:true}]}}},
+            'sensor.heating_power_confirmed':{state:'1800',attributes:{timestamp:new Date().toISOString(),power_quality:'measured'}}})""",mode)
+        assert '1,8' in page.locator('.boiler-metrics').inner_text()
+        if page.locator('.power-advice').get_attribute('open') is None:page.locator('.power-advice>summary').click()
+        assert 'ручна зміна' in page.locator('.power-advice').inner_text()
+        assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+    page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'unknown',attributes:{confirmation_pending:true,timestamp:new Date().toISOString()}}})""")
+    assert page.locator('.boiler-metrics strong').first.inner_text()=='—'
+    page.evaluate('panel.hass=mockHass')
+    page.locator('nav [data-tab="settings"]').click()
+    page.locator('[data-system-key="boiler_power_mode"]').select_option('fixed_6')
+    assert not page.evaluate('systemRequests.length')
+    page.locator('[data-system-key="recuperator_entity"]').fill('switch.recuperator')
+    page.locator('[data-system-key="recuperator_entity"]').press('Tab')
+    page.locator('[data-system-save]').first.click()
+    page.wait_for_function('systemRequests.length===1')
+    assert page.evaluate('systemRequests[0].data.values')=={'boiler_power_mode':'fixed_6','recuperator_entity':'switch.recuperator'}
+    assert not page.evaluate('calls.length'), 'Describing equipment must not command a device'
+    page.wait_for_function("!document.querySelector('heating-ai-panel').shadowRoot.querySelector('[data-system-key=boiler_power_mode]').disabled")
+    page.evaluate('systemRequests=[];panel.hass=mockHass')
+    page.locator('nav [data-tab="overview"]').click()
+    page.set_viewport_size({'width':1440,'height':1100})
 
 
 def check_controller_incident(page):
@@ -339,6 +369,7 @@ def main(engine='chromium'):
             check_controller_incident(page)
             page.wait_for_function('nativeConfigs.length === 2')
             check_compact_tabs(page)
+            check_equipment(page)
             check_system_settings(page)
             page.wait_for_selector('.history-plot svg')
             check_theme_and_motion(page)
@@ -537,7 +568,7 @@ def main(engine='chromium'):
             assert page.locator('.boiler-status').inner_text()=='Немає даних'
             assert not errors, errors
             browser.close()
-        print(f'{engine}: browser checks passed: compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts, instant summary display and all 25 controls.')
+            print(f'{engine}: browser checks passed: physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')
     finally:
         server.shutdown()
 

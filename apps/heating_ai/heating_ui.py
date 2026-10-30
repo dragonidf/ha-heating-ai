@@ -59,6 +59,15 @@ SYSTEM_FIELDS += [dict(key=k,group='Теплова модель',label=_MODEL_HE
                       help=_MODEL_HELP[k][1]+' Зміна проходить чинну перевірку моделі на історії; без достатніх даних може бути відхилена. Попередню модель можна відновити.',
                       default=DEFAULT_MODEL[k],min=lo,max=hi,step=.0001,unit='',target='model',kind='number')
                   for k,(lo,hi) in BOUNDS.items()]
+SYSTEM_FIELDS += [dict(key='boiler_power_mode',group='Котел і вимірювання',label='Режим на фізичному котлі',
+    default='unconfirmed',target='config',kind='select',options={'unconfirmed':'Не підтверджено','fixed_3':'3 кВт','fixed_6':'6 кВт','fixed_9':'9 кВт','auto':'Авто — котел обирає потужність'},
+    help='Вкажіть режим, який ви виставили на самому котлі. Цей вибір не перемикає котел. Фіксована номінальна потужність допускає внутрішні відсічення; авто навчається окремо.'),
+    *[dict(key=k,group='Вентиляція',label=label,default='',target='config',kind='entity',
+           help='Сутність реле switch або fan. Це лише врахування стану, без команд вентиляції. Порожнє значення означає, що пристрій не підключений до моделі.')
+      for k,label in [('recuperator_entity','Реле рекуператора'),('bath_entity','Реле витяжки ванної')]]]
+
+SYSTEM_FIELDS += [dict(key='power_measurement_policy',group='Котел і вимірювання',label='Перевірка вимірювань',default='legacy',target='config',kind='select',options={'legacy':'Попередній алгоритм + shadow A/B','audited':'Узгоджені A/B; непевні дані — unknown'},help='Узгоджені A/B перевіряють кожний timestamp і не оцінюють котел за порогом фази чи запитом термостата. За відсутності даних контролер використовує чинний безпечний резерв. Новий окремий облік якості не переписує старі кВт·год.')]
+SYSTEM_FIELDS += [dict(key='power_phase_topology',group='Котел і вимірювання',label='Підтверджена схема фаз · JSON',default={'verified':False,'phases':[]},target='config',kind='json',help='Для кожної з 3 фаз: input, loads [{entity, physical_id}], background_w і uncertainty_w. GRID інвертора включіть як одне підписане навантаження на підтвердженій фазі. physical_id має бути єдиним для двох інтеграцій того самого приладу. verified=true лише після перевірки реального розміщення лічильників. Непідтверджена схема не застосовується.')]
 SYSTEM_DEFAULTS={f['key']:f['default'] for f in SYSTEM_FIELDS if f['target']=='config'}
 SYSTEM_FIXED = (
     ('forecast_hours','Горизонт прогнозу',24,'год','Фіксований горизонт чинного планувальника. Ця панель не змінює алгоритм прогнозування.'),
@@ -94,7 +103,13 @@ def validate_system_settings(values,cfg,model):
         if key not in schema:
             raise ValueError('Параметр не доступний для редагування')
         field=schema[key]
-        if field['kind']=='time':
+        if field['kind']=='json':
+            value=validate_phase_topology(value)
+        elif field['kind']=='select':
+            if not isinstance(value,str) or value not in field['options']:raise ValueError('Невідомий режим котла')
+        elif field['kind']=='entity':
+            if not isinstance(value,str) or value and not re.fullmatch(r'(switch|fan)\.[a-z0-9_]+',value):raise ValueError('Потрібна сутність switch або fan')
+        elif field['kind']=='time':
             if not isinstance(value,str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',value):
                 raise ValueError('Час має бути у форматі ГГ:ХХ')
         elif (isinstance(value,bool) or not isinstance(value,(int,float)) or
@@ -170,3 +185,26 @@ def install_panel(cfg):
             'source_directory': str(Path(__file__).resolve().parent),
             'module_hashes': modules, 'release_verified': True,
             'entities': entities}
+
+
+def validate_phase_topology(value):
+    """Only public sensor bindings and explicit wiring assertions, never secrets."""
+    import re
+    from heating_fallback import phase_residual
+    if not isinstance(value,dict) or set(value)-{'verified','phases'} or not isinstance(value.get('verified'),bool):
+        raise ValueError('Потрібні verified та phases; інших ключів немає')
+    phases=value.get('phases')
+    if not isinstance(phases,list) or len(phases) not in (0,3):raise ValueError('Схема містить рівно три фази або порожня')
+    for phase in phases:
+        if not isinstance(phase,dict) or set(phase)-{'input','loads','background_w','uncertainty_w'}:raise ValueError('Невідома структура фази')
+        loads=phase.get('loads')
+        if not isinstance(loads,list):raise ValueError('loads має бути списком')
+        ids=[phase.get('input')]
+        for load in loads:
+            if not isinstance(load,dict) or set(load)!={'entity','physical_id'} or not isinstance(load['physical_id'],str) or not 1<=len(load['physical_id'])<=80:raise ValueError('Потрібні entity та physical_id навантаження')
+            ids.append(load['entity'])
+        if any(not isinstance(x,str) or not re.fullmatch(r'sensor\.[a-z0-9_]+',x) for x in ids):raise ValueError('Потрібні існуючі sensor entity IDs')
+    if value['verified']:
+        result=phase_residual(value,{},0.)
+        if result.get('reason')!='missing_measurement':raise ValueError('Схема суперечлива: '+str(result.get('reason')))
+    return value
