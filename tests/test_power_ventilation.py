@@ -55,11 +55,12 @@ class SettingsAndLatency(unittest.TestCase):
         from test_system_settings import SystemSettingsTests
         from unittest.mock import Mock
         fixture=SystemSettingsTests();app=fixture.app();app.samples=[];app.climate_tz=app.now().tzinfo;app.call_service=Mock()
-        status=fixture.submit(app,dict(boiler_power_mode='fixed_6',recuperator_entity='switch.recuperator'))
+        status=fixture.submit(app,dict(boiler_power_mode='fixed_6',recuperator_entity='switch.recuperator',outage_missing_policy='assume_available'))
         self.assertTrue(status['last_success']);self.assertEqual(app.memory['equipment_version'],1)
         self.assertNotIn('boiler_power_mode',app.memory['system_settings']);app.call_service.assert_not_called()
         previous=copy.deepcopy(app.memory);fresh=fixture.app();fresh.memory=previous;fresh.restore_system_settings()
         self.assertEqual(fresh.cfg['boiler_power_mode'],'fixed_6');self.assertEqual(fresh.model,app.model)
+        self.assertEqual(fresh.cfg['outage_missing_policy'],'assume_available');self.assertNotIn('outage_missing_policy',app.memory['system_settings'])
         fixture.submit(app,dict(boiler_power_mode='fixed_6'),revision=1)
         self.assertNotIn('boiler_power_mode',app.memory['system_settings'])
         self.assertEqual(app.memory['equipment_version'],1)
@@ -175,6 +176,71 @@ class AuditedAdapter(unittest.TestCase):
         self.assertEqual(settings,dict(target=21,lower=20,upper=22))
 
 class UpgradeEvidence(unittest.TestCase):
+    def test_advice_cache_ignores_refresh_timestamp_but_not_changed_outages(self):
+        from test_system_settings import SystemSettingsTests
+        from unittest.mock import patch
+        from datetime import timedelta
+        app=SystemSettingsTests().app();app.cfg['boiler_power_mode']='auto'
+        at=app.now();settings={'equipment_version':1};slots=((100.,200.,False),)
+        with patch('heating_climate.recommend_power',side_effect=lambda *a,**kw:{'mode':'fixed_6'}) as search:
+            app.update_power_recommendation(at,21,25,8,0,[],settings,('scheduled',True,'first',False,slots))
+            app.update_power_recommendation(at+timedelta(seconds=60),21,25,8,0,[],settings,('scheduled',True,'refreshed',False,slots))
+            self.assertEqual(search.call_count,1)
+            app.update_power_recommendation(at+timedelta(seconds=75),21,25,8,0,[],settings,('scheduled',True,'refreshed',False,((100.,200.,True),)))
+            self.assertEqual(search.call_count,2)
+            weather=[{'ts':at.timestamp()+3600,'temperature':-5}]
+            changed=('scheduled',True,'refreshed',False,((100.,200.,True),))
+            app.update_power_recommendation(at+timedelta(seconds=90),21,25,8,0,weather,settings,changed)
+            self.assertEqual(search.call_count,3)
+            app.weather=weather
+            app.update_power_recommendation(at+timedelta(seconds=95),21,25,8,0,[dict(weather[0],temperature=-4.98)],settings,changed)
+            self.assertEqual(search.call_count,3)
+            app.update_power_recommendation(at+timedelta(seconds=105),21,25,8,0,weather,dict(settings,target=23),changed)
+            self.assertEqual(search.call_count,4)
+
+    def test_explicit_missing_schedule_assumption_preserves_real_schedule_and_emergency(self):
+        from heating_outages import planning_schedule,availability,schedule_covered,blocked
+        raw={'mode':'unknown','valid':False,'emergency':False,'slots':[],'outages':[],'warning':'missing','source_fresh':False}
+        self.assertIs(planning_schedule(raw,'unknown'),raw)
+        self.assertIs(planning_schedule(raw,'assume_available',published=True),raw)
+        normal=availability(planning_schedule(raw,'assume_available'),100.,90000.)
+        self.assertTrue(normal['assumed']);self.assertEqual(normal['mode'],'normal');self.assertFalse(normal['source_fresh'])
+        self.assertTrue(schedule_covered(normal,100.,90000.));self.assertFalse(blocked(100.,90000.,normal['outages']))
+        self.assertIsNone(normal['warning']);self.assertFalse(raw['valid'])
+        emergency=dict(raw,emergency=True)
+        self.assertIs(planning_schedule(emergency,'assume_available'),emergency)
+        scheduled=dict(raw,mode='scheduled',valid=True,slots=[dict(start=100.,end=200.,off=True)],outages=[dict(start=100.,end=200.)])
+        self.assertIs(planning_schedule(scheduled,'assume_available'),scheduled)
+
+    def test_missing_schedule_assumption_never_overrides_actual_grid(self):
+        from test_planned_execution import PlannedExecutionTests
+        fixture=PlannedExecutionTests()
+        self.assertEqual(fixture.cycle(missing_policy='assume_available',grid='off')[0],['off'])
+        self.assertEqual(fixture.planner_settings['outage_schedule']['mode'],'normal')
+        self.assertTrue(fixture.outage_status['assumed_available'])
+        self.assertEqual(fixture.cycle(missing_policy='assume_available',grid='on')[0],['heat'])
+
+    def test_zero_equipment_metrics_survive_transport_without_mutating_counters(self):
+        from test_system_settings import SystemSettingsTests
+        app=SystemSettingsTests().app()
+        app.cfg['boiler_power_mode']='auto'
+        app.memory['power_observation_ledger']={'started_at':100.,'last':{'at':100.,'watts':0.,'quality':'measured'},'measured_kwh':0.,'estimated_kwh':0.,'unknown_seconds':0.}
+        app.power_observation={'a':{'valid':True,'watts':0.},'watts':0.,'quality':'measured'}
+        before=copy.deepcopy(app.memory)
+        def transport(value):
+            if isinstance(value,dict):return {k:transport(v) for k,v in value.items() if v}
+            if isinstance(value,list):return [transport(v) for v in value]
+            return value
+        app.publish_equipment()
+        payload=transport(app.published['sensor.heating_power_model'])
+        self.assertEqual(float(payload['energy']['measured_kwh']),0.)
+        self.assertEqual(float(payload['energy']['unknown_seconds']),0.)
+        self.assertEqual(float(payload['power_observation']['a']['watts']),0.)
+        self.assertEqual(app.memory,before)
+        app.power_observation={'quality':'unknown','watts':None,'a':{'valid':False,'watts':None}}
+        app.publish_equipment();unknown=transport(app.published['sensor.heating_power_model'])
+        self.assertNotIn('watts',unknown['power_observation']);self.assertEqual(unknown['power_observation']['quality'],'unknown')
+
     def test_hand_edited_invalid_topology_is_unknown_not_a_callback_crash(self):
         app=AuditedAdapter().app()
         for value in ('invalid',{'verified':True,'phases':[None]}, {'verified':True,'phases':[]}):

@@ -8,12 +8,13 @@ from heating_model import DEFAULT_MODEL
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None):
         app=HeatingClimate()
         at=datetime(2026,10,14,0,5,tzinfo=ZoneInfo('Europe/Kiev'))
         app.climate_tz=at.tzinfo
         app.now=lambda:at
         app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly',night_target='night')
+        if missing_policy:app.cfg['outage_missing_policy']=missing_policy
         app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
         app.model=dict(DEFAULT_MODEL,validated=True,version=4)
         app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
