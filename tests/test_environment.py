@@ -27,11 +27,12 @@ class EnvironmentTests(unittest.TestCase):
         b,_=observe_floor(dict(a),self.at.timestamp()+7200,22,22,0,'off',self.model)
         c,_=observe_floor(old,self.at.timestamp()+7200,22,22,0,'off',self.model)
         self.assertAlmostEqual(b['estimate'],c['estimate'])
-    def test_actual_heating_reanchors_after_flush(self):
+    def test_heating_probe_cannot_erase_a_warmer_energy_inventory(self):
         old=dict(at=self.at.timestamp(),estimate=29,power_kw=0)
         a,_=observe_floor(old,self.at.timestamp()+60,22,23,8,'on',self.model)
         b,_=observe_floor(a,self.at.timestamp()+300,22,26,8,'on',self.model)
-        self.assertEqual(b['estimate'],26)
+        self.assertGreater(b['estimate'],26)
+        self.assertTrue(b['energy_retained'])
     def test_grid_alone_is_not_circulation(self):
         old=dict(at=self.at.timestamp(),estimate=29,power_kw=0,last_heated_at=self.at.timestamp())
         _,value=observe_floor(old,self.at.timestamp()+300,22,21,0,'on',self.model)

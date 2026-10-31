@@ -12,6 +12,14 @@ add('sensor.heating_outage_schedule','Відомий',{known_until:now+20*3600,o
 add('sensor.heating_model','Перевірена',{parameters:{version:4,floor_air:.044,room_loss:.0128,heat_gain:.72,validated:true},hour_mae:.059,usable_pairs:1881,samples:2508,last_analysis:new Date().toISOString(),last_result:'Локальне навчання: попередні коефіцієнти збережено',reliability:{recent_mae:.11},power_learning_status:'Навчання модуляції',power_learning:{intervals:130,minutes:650,bands:[{return_min:22,return_max:24,measured_kw:8.4,minutes:60},{return_min:24,return_max:26,measured_kw:7.4,minutes:150},{return_min:26,return_max:28,measured_kw:5.9,minutes:330}]},journal:[{time:new Date().toISOString(),reason:'Накопиченого тепла достатньо / очікування вікна'},{time:new Date(Date.now()-3600000).toISOString(),reason:'Заплановано ранковий нагрів'}]});
 add('sensor.heating_environment',24.3,{raw_return:24.1,external_gain_c_per_hour:.02,solar_learning_days:2});
 add('sensor.heating_ai_summary','За добу 17,50 кВт·год. Модель зберігає комфорт; параметри без змін.',{last_24h:{temperature_min:21.3,temperature_max:22.1,hours_collected:23.9,samples:293,valid_samples:287,coverage:.98}});
+const comparisonFirst={cycle_id:'night-first',started_at:now-10*3600,start_known:true,
+ forecast:{at:now-22*3600,plan_id:'frozen-twelve-hours',curve:Array.from({length:49},(_,i)=>({ts:now-10*3600+i*1800,temperature:21+.2*Math.sin(i/6)}))},
+ actual:Array.from({length:41},(_,i)=>({ts:now-10*3600+i*900,temperature:i===20?null:21.1+.2*Math.sin(i/8)}))};
+const comparisonSecond={cycle_id:'night-missing',started_at:now-34*3600,start_known:true,forecast:null,
+ actual:Array.from({length:20},(_,i)=>({ts:now-34*3600+i*900,temperature:21.2}))};
+window.comparisonFixtures={'night-first':comparisonFirst,'night-missing':comparisonSecond};window.comparisonRequests=[];
+add('sensor.heating_plan_history','Історія прогнозів',{periods:[{cycle_id:'night-first',started_at:comparisonFirst.started_at},{cycle_id:'night-missing',started_at:comparisonSecond.started_at}],selected:comparisonFirst,
+ energy_cycles:[{cycle_id:'finished',start:now-10*3600,end:now-2*3600,initial_plan:{at:now-22*3600,kwh:24.17},latest_plan:{kwh:31.2},observed_kwh:35.4,meter_kwh:35.5,complete:true,unknown_seconds:600,other_kwh:.17}]});
 for(const [name,value] of Object.entries({target:22,lower:21.5,upper:22.5,night_target:21.5,night_lower:21,night_upper:22,monthly_budget:700,session_limit:90,native_setpoint:22,fan_speed:38,fan_night_limit:30,fan_intense_speed:60}))add('input_number.heating_'+name,value,{min:0,max:name.startsWith('fan_')?100:1000,step:.5,unit_of_measurement:name.startsWith('fan_')?'%':undefined});
 for(const key of ['sleep_start','sleep_end','start','end'])add('input_datetime.heating_'+key,key.includes('start')?'23:00:00':'07:00:00',{has_date:false,has_time:true});
 for(const key of ['armed','restore_once','fan_control','ai_auto_apply'])add('input_boolean.heating_'+key,key==='armed'?'on':'off');
@@ -20,6 +28,11 @@ window.calls=[];window.failService=false;
 window.systemRequests=[];window.failSystem=false;
 window.mockHass={states,config:{time_zone:'Europe/Kyiv'},callService:async(domain,service,data)=>{window.calls.push({domain,service,data});if(window.failService)throw new Error('Немає доступу');}};
 mockHass.callApi=async(method,path,data)=>{
+  if(path==='events/heating_plan_history'){
+    comparisonRequests.push(data);const old=mockHass.states['sensor.heating_plan_history'];
+    mockHass.states={...mockHass.states,'sensor.heating_plan_history':{...old,attributes:{...old.attributes,selected:comparisonFixtures[data.cycle_id],request_id:data.request_id}}};
+    panel.hass={...mockHass};return;
+  }
   systemRequests.push({method,path,data});if(window.failSystem)throw new Error('Немає доступу');
   // Fake acknowledgement only. Real event handling/validation has Python tests.
   const old=mockHass.states['sensor.heating_system_settings'];

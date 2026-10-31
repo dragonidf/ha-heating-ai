@@ -19,6 +19,7 @@ def policy(settings):
           'morning_min_minutes','day_price','night_price','budget_multiplier',
           'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin','equipment_version','ventilation_model','ventilation_expected')
     return {**{k:settings.get(k) for k in keys},'environment_policy_version':ENVIRONMENT_POLICY_VERSION,
+            'energy_budget_policy_version':1,
             'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
             'search_policy_version':SEARCH_POLICY_VERSION}
 
@@ -234,6 +235,11 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
             checked=previous.get('search_check_key')==key
             result=replay(now,room,floor,outside,fire,model,weather,settings,
                           previous['segments'],previous['split'],power_kw,reserve_checked=checked)
+            budget=settings.get('cycle_energy_budget') or {}
+            if result and budget:
+                remaining=sum(s.get('kwh',0.)*max(0.,min(s['end'],budget['end'])-max(s['start'],budget['start']))/
+                    max(1.,s['end']-s['start']) for row in result.get('_calculation_curve',result['curve']) for s in row['heat_segments'])
+                if remaining>budget['remaining_kwh']+.05:result=None
             if result and result['maximum']<=max(settings['upper'],room)+.01:
                 reserve=result.get('morning_reserve',{})
                 improved=None

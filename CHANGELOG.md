@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.3 — 2026-10-31
+
+- Preserve the energy-derived floor inventory during heating; a cooler return pipe no longer erases delivered heat. Bound counter deltas and do not invent heating across unobserved gaps. Model coefficients and canonical energy history remain intact.
+- Execute future plan segments between full calculations and recheck their expiry at dispatch. Coalesce power callbacks and ignore unchanged outage metadata to reduce queued work. Actual grid, temperature limits, manual ownership and minimum on/off protections remain authoritative.
+- Persist initial, current and observed cycle energy separately; subtract spent energy from the planning reference and prefer staying within it among equally safe candidates. Preserve legacy baselines, expose unknown intervals, counter resets and concrete deviation evidence.
+- Record prospective temperature forecasts and freeze the one issued 12 hours before a confirmed heating start. Preserve a month of cycle comparisons through restart, expose period selection, break missing observations and explicitly mark absent advance data without reconstructing it.
+- Simplify the overview, remove duplicate power advice and technical search text, consolidate warnings and show a compact plan/fact comparison. Put detailed execution and metering on the AI tab. Deficit messages use the same curve/limits and state their time, depth and relation to the visible horizon.
+- Keep save acknowledgements through restart, reconcile persisted matching settings after a missed acknowledgement, allow bounded retries and retain visible success feedback. Disk failures do not report success. Add regression, incident replay and responsive browser checks. Physical consumption accuracy remains pending the next completed site cycle.
+
 ## 0.3.2 — 2026-10-30
 
 - Save equipment changes without validating untouched, hidden model coefficients against HTML step increments. Keep the request pending through long controller computations so a delayed acknowledgement clears the saved draft.

@@ -67,6 +67,22 @@ class SystemSettingsTests(unittest.TestCase):
         self.assertFalse(status['last_success']);self.assertEqual((app.cfg,app.model),before)
         self.assertNotIn('system_settings',app.memory)
 
+    def test_acknowledgement_is_persisted_and_republished_after_restart(self):
+        app=self.app();status=self.submit(app,{'outage_max_age':7200})
+        saved=deepcopy(app.memory)
+        self.assertEqual(saved['system_settings_receipt']['last_request_id'],'request-1')
+        restarted=self.app();restarted.memory=saved;restarted.restore_system_settings();restarted.publish_system_settings()
+        result=restarted.published['sensor.heating_system_settings']
+        self.assertTrue(result['last_success']);self.assertEqual(result['last_request_id'],'request-1')
+        self.assertEqual(result['persisted_revision'],status['revision'])
+
+    def test_disk_error_is_an_explicit_failed_ack_not_success(self):
+        app=self.app();app.save.side_effect=OSError('disk unavailable')
+        status=self.submit(app,{'outage_max_age':7200})
+        self.assertFalse(status['last_success']);self.assertIn('disk unavailable',status['last_error'])
+        self.assertEqual(status['persisted_revision'],0)
+        self.assertNotIn('system_settings_receipt',app.memory)
+
     def test_saved_overrides_restore_without_replacing_local_config(self):
         app=self.app();app.memory['system_settings']={'outage_max_age':7200,'fire_cooldown_seconds':420}
         app.restore_system_settings()

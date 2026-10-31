@@ -295,7 +295,7 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
     rows=[point for row in rows for point in row.get('_fine',[row])]
     previous=now.timestamp(); first=None; deficit=0.; minutes=0.; minimum=room
     maximum=room
-    day_deficit=0.;day_minutes=0.;day_depth=0.
+    day_deficit=0.;day_minutes=0.;day_depth=0.;first_value=first_lower=first_shortfall=None
     for row in rows:
         stop=min(row['ts'],until)
         if stop<=previous:
@@ -306,7 +306,8 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
         threshold=lo+min(margin,max(0.,comfort_at(datetime.fromtimestamp(previous,now.tzinfo),settings)[0]-lo)/2)
         short=max(0.,threshold-value)
         if short>.001:
-            first=first if first is not None else previous
+            if first is None:
+                first=previous;first_value=value;first_lower=threshold;first_shortfall=short
             deficit+=short*(stop-previous)/3600
             minutes+=(stop-previous)/60
             day_short=max(0.,lo-value)
@@ -318,6 +319,10 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
         if stop>=until:
             break
     return dict(minimum_before_next_heat=round(minimum,3),
+                first_violation_temperature=round(first_value,3) if first_value is not None else None,
+                first_violation_lower=round(first_lower,3) if first_lower is not None else None,
+                first_violation_shortfall=round(first_shortfall,3) if first_shortfall is not None else None,
+                covered_until=previous,coverage_complete=previous>=until-.001,
                 first_comfort_violation_at=first,deficit_degree_hours=round(deficit,5),
                 deficit_minutes=round(minutes,2),day_deficit_degree_hours=round(day_deficit,5),
                 day_deficit_minutes=round(day_minutes,2),day_max_shortfall=round(day_depth,3),predicted_maximum=round(maximum,3))
@@ -401,6 +406,7 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
     hours=(context['assessment_until']-now.timestamp())/3600
     margin=uncertainty_reserve(settings,hours)
     metrics=trajectory_metrics(now,room,rows,settings,context['assessment_until'],margin or 0.)
+    actual_limits=trajectory_metrics(now,room,rows,settings,context['assessment_until'])
     cycle_segments=[s for row in rows for s in row['heat_segments']
                     if context['morning_start'] is not None and
                     s['start']>=context['morning_start'] and s['end']<=context['morning_end']]
@@ -417,6 +423,9 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
     cancellation=(None if planned else 'Запас достатній без ранкового нагріву' if not required else
                   'Ранковий резерв недоступний або небезпечний за поточними обмеженнями')
     result['morning_reserve']=dict(context,**metrics,morning_required_minutes=required,
+        comfort_deficit=dict(actual_limits,visible_until=now.timestamp()+86400,
+            outside_visible_horizon=bool(actual_limits['first_comfort_violation_at'] and
+                actual_limits['first_comfort_violation_at']>=now.timestamp()+86400)),
         planned_minutes=round(planned,2),planned_kwh=round(sum(s.get('kwh',0.) for s in cycle_segments),4),
         confirmed_completed_minutes=round(completed,2),
         confirmed_kwh=number(settings.get('confirmed_morning_kwh')),
@@ -441,7 +450,7 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
     cycle=heating_cycle(now,settings)
     keys=('target','lower','upper','night_target','night_lower','night_upper','start','end','sleep_start',
           'sleep_end','strategy','split_comfort','morning_min_minutes','upper_margin','day_price','night_price',
-          'budget_multiplier','reserve_errors')
+          'budget_multiplier','reserve_errors','cycle_energy_budget')
     outage=settings.get('outage_schedule') or {}
     solar=(settings.get('environment') or {}).get('solar',{})
     data=dict(version=SEARCH_POLICY_VERSION,environment_policy_version=ENVIRONMENT_POLICY_VERSION,
@@ -498,7 +507,11 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     evaluated=0;rejections=dict(upper_temperature=0,energy_limit=0)
     # score, room, floor, decisions, curve, energy, min_temperature, max_temperature
     actuator=settings.get('actuator') or {};actuator_enabled=bool(actuator)
-    beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.))]
+    beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.),0.)]
+    budget=settings.get('cycle_energy_budget') or {}
+    def rank(value):
+        excess=max(0.,value[11]-budget['remaining_kwh']) if budget else 0.
+        return (round(value[8],5),round(excess,4),value[0]) if cycle_policy else (value[0],)
     night_target=max(settings["lower"], settings["target"]-.5)
     profile=settings.get('modulation_profile')
     anchor=settings.get('modulation_anchor')
@@ -557,13 +570,14 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                          (normal or extension or settings["strategy"] != "Тільки в дозволені години"))
         choices = [False, True] if any(masks) else [False]
         candidates = []
-        for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at in beams:
+        for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at, cycle_used in beams:
             for heat in choices:
                 evaluated+=1
                 nr, nf, penalty = r, f, 0.
                 command,command_at=last,changed_at
                 shortage=deficit; fine=[]
                 used, outside_minutes, unsafe = 0., 0., False
+                cycle_added=0.
                 heat_segments = []
                 for j,(begin,finish) in enumerate(substeps):
                     deadline=datetime.fromtimestamp((number(command_at) or 0)+(600 if command=='heat' else 900),now.tzinfo)
@@ -611,6 +625,9 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                             penalty += max(0.,settings["target"]-nr)**2*20*dt*12
                         if active:
                             used += effective_kw*dt
+                            if budget:
+                                cycle_added+=effective_kw*max(0.,min(end.timestamp(),budget['end'])-
+                                    max(tm.timestamp(),budget['start']))/3600
                             heat_segments.append({"start": tm.timestamp(), "end": end.timestamp(),
                                                   'power_kw':round(effective_kw,3),'kwh':effective_kw*dt})
                             if not in_window(tm, settings["start"], settings["end"]):
@@ -648,10 +665,10 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                                    "temperature":round(nr,2),"return":round(nf,2),"heat":bool(heat_segments),
                                    "kwh":round(used,4),"heat_segments":heat_segments,
                                    "outside_minutes":outside_minutes,"_fine":fine}],
-                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage,command,command_at))
+                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage,command,command_at,cycle_used+cycle_added))
         if not candidates:
             return None
-        candidates.sort(key=lambda v:(round(v[8],5),v[0]) if cycle_policy else (v[0],))
+        candidates.sort(key=rank)
         # Keep diverse room/floor states instead of 12 nearly identical paths.
         seen, beams = set(), []
         for candidate in candidates:
@@ -696,7 +713,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
         beams=[b for b in beams if round(b[6],2)>=minimum_required]
         if not beams:
             return None
-    best = min(beams, key=lambda v:(round(v[8],5),v[0]) if cycle_policy else (v[0],))
+    best = min(beams, key=rank)
     return {"heat":bool(best[4][0]["heat_segments"] and best[4][0]["heat_segments"][0]["start"] == now.timestamp()),"curve":best[4],"energy":round(best[5],2),
             "minimum":round(best[6],2),"maximum":round(best[7],2),
             "horizon_hours":round(count/2,1),"validated":bool(model.get("validated")),
