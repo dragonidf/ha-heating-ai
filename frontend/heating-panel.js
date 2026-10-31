@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.3.3';
+const VERSION = '0.3.4';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -16,6 +16,14 @@ const icon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">$
 }[name]||''}</svg>`;
 const h = escapeHTML;
 const fmt = (v,d=1) => numeric(v) === null ? '—' : Number(v).toLocaleString('uk-UA',{maximumFractionDigits:d,minimumFractionDigits:d});
+export const calendarMidnight = (day,timeZone) => {
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(day))return null;
+  const target=Date.parse(day+'T00:00:00Z');if(!Number.isFinite(target)||new Date(target).toISOString().slice(0,10)!==day)return null;
+  let stamp=target;
+  const format=new Intl.DateTimeFormat('sv-SE',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+  for(let i=0;i<3;i++)stamp-=Date.parse(format.format(new Date(stamp)).replace(' ','T')+'Z')-target;
+  return stamp/1000;
+};
 export const chartLayout = width => {
   const w=Math.max(1,Math.round(numeric(width)??880)), height=w<520?350:370;
   return {width:w,height,left:46,right:12,top:24,bottom:height-124,tickIntervals:w<520?2:4};
@@ -102,7 +110,7 @@ export class HeatingAIPanel extends HTMLElement {
   constructor() {
     super(); this.attachShadow({mode:'open'}); this.tab='overview'; this.config={}; this.nativeCards=new Map(); this.nativeConfigs=new Map(); this.pending=new Set();
     this.historyRange=24;this.historyVisible=new Set(['room','return']);this.historyEpoch=0;
-    this.comparisonRange=12;this.comparisonCache=new Map();this.systemDraft={};this.systemHelp=null;this.systemPending=null;
+    this.comparisonDays=7;this.comparisonCache=new Map();this.systemDraft={};this.systemHelp=null;this.systemPending=null;
     this.shadowRoot.addEventListener('click',e=>this.clicked(e));
     this.shadowRoot.addEventListener('change',e=>this.changed(e));
     this.shadowRoot.addEventListener('focusout',()=>setTimeout(()=>this.render(),0));
@@ -116,7 +124,9 @@ export class HeatingAIPanel extends HTMLElement {
     this.syncSystemSettings();
     const history=this.attrs('plan_history');
     if(history.selected?.cycle_id)this.comparisonCache.set(history.selected.cycle_id,history.selected);
-    if(this.comparisonPending&&history.request_id===this.comparisonPending){this.comparisonPending=null;clearTimeout(this.comparisonTimeout);}
+    if(this.comparisonPending&&history.comparison?.request_id===this.comparisonPending){
+      this.comparisonData=history.comparison;this.comparisonPending=null;clearTimeout(this.comparisonTimeout);
+    }
     this.toggleAttribute('data-light',value.themes?.darkMode===false);
     for(const card of this.nativeCards.values()) card.hass=value;
     const ids=new Set([...Object.values(defaults),...Object.values(this.config.entities||{}),...Object.values(value.states['sensor.heating_ui']?.attributes?.entities||{}),'sensor.heating_ui']);
@@ -240,6 +250,8 @@ export class HeatingAIPanel extends HTMLElement {
     return header+legend+svg+`<div class="history-totals"><span><i style="background:var(--source-red)"></i>Котел <strong>${total(boiler)}</strong></span><span><i style="background:var(--history-fire)"></i>Камін <strong>${total(fire)}</strong></span></div><p class="history-readout muted" aria-live="polite">${h(readout)}</p>${missing?'<p class="muted note">Штрихування — немає історичних даних.</p>':''}${!values.length?'<p class="muted note">Температурні вимірювання за цей період відсутні.</p>':''}${this.historyError?`<p class="warn note" role="status">${h(this.historyError)} Показано попередні дані.</p>`:''}`;
   }
   inspectHistory(event) {
+    const comparison=event.target.closest?.('.comparison-plot');
+    if(comparison){this.inspectComparison(event,comparison);return;}
     const plot=event.target.closest?.('.history-plot');if(!plot||!this.historyData)return;
     if(event.type==='pointerleave'&&event.target!==plot)return;
     const end=this.historyData.end,start=end-this.historyRange*3600;
@@ -390,37 +402,102 @@ export class HeatingAIPanel extends HTMLElement {
     const metrics=`<div class="plan-energy-grid">${this.compactMetric(row.initial_plan&&!isTrue(row.initial_plan.legacy)?(isTrue(row.initial_plan.before_start)?'Початковий план':'Перша збережена оцінка'):'Збережена база',fmt(initial?.kwh,2),'кВт·год')}${this.compactMetric(row.latest_plan?'Актуальний план':'План перед стартом',fmt(current,2),'кВт·год')}${this.compactMetric(complete?'Факт':'Факт · частково',fmt(fact,2),'кВт·год')}</div>`;
     return this.section(finished?'Останній цикл · план і факт':'Поточний цикл · план і факт',`<div class="muted note">${h(this.time(Number(row.start),true))} → ${h(this.time(Number(row.end),true))}</div>${metrics}${detailed?`${this.row('Відхилення від початкового',diff===null?'—':(diff>0?'+':'')+fmt(diff,2)+' кВт·год')}<details class="energy-notes"><summary>Якість обліку</summary>${this.row('Невизначені інтервали',fmt(Number(row.unknown_seconds||0)/60,1)+' хв')}${this.row('Без автоматичного запиту',fmt(row.other_kwh,2)+' кВт·год')}<p class="muted note">${complete?'Облік за лічильником розрахункової потужності.':'Показано лише підтверджену частину; прогалини не зараховані як нуль.'} Початкова база від ${h(this.time(initial?.at,true))} не змінюється під час перерахунків.</p></details>`:''}`,'plan-energy');
   }
-  async selectComparison(cycle) {
-    this.comparisonCycle=cycle;this.comparisonError='';
-    if(this.comparisonCache?.has(cycle)){this.render();return;}
-    const request=globalThis.crypto?.randomUUID?.()||String(Date.now());this.comparisonPending=request;this.render();
-    try{
-      await this.hass.callApi('POST','events/heating_plan_history',{request_id:request,cycle_id:cycle});
-      if(this.comparisonPending!==request)return;
-      this.comparisonTimeout=setTimeout(()=>{if(this.comparisonPending===request){this.comparisonPending=null;this.comparisonError='Не вдалося отримати період. Виберіть його повторно.';this.render();}},20000);
-    }catch{this.comparisonPending=null;this.comparisonError='Не вдалося отримати історію.';this.render();}
+  comparisonWindow() {
+    const end=this.comparisonEnd??Math.floor(Date.now()/300000)*300;
+    return {start:this.comparisonStart??end-(this.comparisonDays||7)*86400,end};
+  }
+  async loadComparison(force=false) {
+    if(this.tab!=='model'||!this.hass?.callApi||this.comparisonPending)return;
+    const span=this.comparisonWindow(),signature=`${span.start}:${span.end}`;
+    if(!force&&this.comparisonSignature===signature&&Date.now()-this.comparisonAttemptAt<300000)return;
+    this.comparisonSignature=signature;this.comparisonAttemptAt=Date.now();this.comparisonError='';
+    const request=globalThis.crypto?.randomUUID?.()||String(Date.now());this.comparisonPending=request;
+    this.comparisonTimeout=setTimeout(()=>{
+      if(this.comparisonPending===request){this.comparisonPending=null;this.comparisonError='Історія ще не надійшла. Натисніть оновлення.';this.render();}
+    },60000);
+    this.render();
+    try{await this.hass.callApi('POST','events/heating_plan_history',{request_id:request,...span});}
+    catch{if(this.comparisonPending===request){this.comparisonPending=null;clearTimeout(this.comparisonTimeout);this.comparisonError='Не вдалося завантажити історію. Повторіть.';this.render();}}
+  }
+  setComparisonDays(days) {
+    if(![1,7,30].includes(days))return;
+    this.comparisonDays=days;this.comparisonEnd=Math.floor(Date.now()/300000)*300;
+    this.comparisonStart=this.comparisonEnd-days*86400;this.comparisonDateDraft={};
+    this.comparisonPending=null;clearTimeout(this.comparisonTimeout);this.comparisonCursor=null;
+    this.comparisonSignature='';this.render();
+  }
+  applyComparisonDates() {
+    const zone=this.hass.config?.time_zone||'Europe/Kyiv';
+    const day=stamp=>new Intl.DateTimeFormat('sv-SE',{timeZone:zone}).format(new Date(stamp*1000));
+    const span=this.comparisonWindow(),draft=this.comparisonDateDraft||{};
+    const from=draft.from||day(span.start),to=draft.to||day(span.end);
+    const next=new Date(to+'T00:00:00Z');next.setUTCDate(next.getUTCDate()+1);
+    if(!Number.isFinite(next.getTime()))return;
+    const start=calendarMidnight(from,zone),end=Math.min(Date.now()/1000,calendarMidnight(next.toISOString().slice(0,10),zone));
+    if(start===null||!Number.isFinite(end)||end<=start||end-start>31*86400){
+      this.comparisonError='Оберіть минулий період тривалістю до 31 діб.';this.render();return;
+    }
+    this.comparisonDays=null;this.comparisonStart=start;this.comparisonEnd=end;
+    this.comparisonPending=null;clearTimeout(this.comparisonTimeout);this.comparisonSignature='';this.comparisonCursor=null;this.render();
+  }
+  inspectComparison(event,plot) {
+    const {start,end}=this.comparisonWindow();
+    if(event.type==='pointerleave')return;
+    if(event.type==='keydown') {
+      if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+      event.preventDefault();const step=(end-start)>86400?3600:900;
+      this.comparisonCursor=event.key==='Home'?start:event.key==='End'?end:Math.max(start,Math.min(end,(this.comparisonCursor??start)+(event.key==='ArrowLeft'?-step:step)));
+    }else{
+      const rect=plot.getBoundingClientRect(),fraction=(event.clientX-rect.left-42)/(rect.width-54);
+      this.comparisonCursor=start+Math.max(0,Math.min(1,fraction))*(end-start);
+    }
+    this.render();
   }
   temperatureComparison() {
-    const a=this.attrs('plan_history'),periods=Array.isArray(a.periods)?a.periods:[];
-    const id=this.comparisonCycle||periods[0]?.cycle_id;
-    const row=this.comparisonCache?.get(id)||(a.selected?.cycle_id===id?a.selected:null);
-    const controls=`<div class="comparison-tools"><label>Період<select data-comparison-period aria-label="Цикл нагріву">${periods.map(p=>`<option value="${h(p.cycle_id)}" ${p.cycle_id===id?'selected':''}>${h(this.time(Number(p.started_at),true))}</option>`).join('')||'<option>Ще немає циклів</option>'}</select></label><div class="history-ranges" role="group" aria-label="Горизонт порівняння">${[6,12,24].map(hours=>`<button data-comparison-range="${hours}" aria-pressed="${(this.comparisonRange||12)===hours}">${hours} год</button>`).join('')}</div></div>`;
-    if(!row)return this.section('Прогноз і фактична температура',controls+`<p class="empty">${h(this.comparisonError||(this.comparisonPending?'Завантажуємо…':'Ще немає зафіксованих циклів. Історія зберігатиметься після перезапуску.'))}</p>`,'comparison-card');
-    const start=Number(row.started_at),end=start+(this.comparisonRange||12)*3600;
-    const predicted=row.forecast?.curve||[],actual=row.actual||[],values=[...predicted,...actual].filter(p=>Number(p.ts)>=start&&Number(p.ts)<=end).map(p=>numeric(p.temperature)).filter(v=>v!==null);
+    const {start,end}=this.comparisonWindow(),incoming=this.attrs('plan_history').comparison;
+    const matched=data=>data&&Number(data.start)===start&&Math.abs(Number(data.end)-end)<1;
+    const data=matched(this.comparisonData)?this.comparisonData:matched(incoming)?incoming:null;
+    const zone=this.hass?.config?.time_zone||'Europe/Kyiv';
+    const day=stamp=>new Intl.DateTimeFormat('sv-SE',{timeZone:zone}).format(new Date(stamp*1000));
+    const draft=this.comparisonDateDraft||{};
+    const controls=`<div class="comparison-tools"><div class="history-ranges" role="group" aria-label="Період порівняння">${[[1,'24 год'],[7,'7 днів'],[30,'30 днів']].map(([days,label])=>`<button data-comparison-days="${days}" aria-pressed="${this.comparisonDays===days}">${label}</button>`).join('')}</div><button class="history-refresh" data-comparison-refresh aria-label="Оновити порівняння" ${this.comparisonPending?'disabled':''}>↻</button></div><details class="comparison-dates"><summary>Обрати дати</summary><div><label>Від<input type="date" data-comparison-date="from" aria-label="Початкова дата" value="${h(draft.from||day(start))}" max="${day(Date.now()/1000)}"></label><label>До<input type="date" data-comparison-date="to" aria-label="Кінцева дата" value="${h(draft.to||day(end))}" max="${day(Date.now()/1000)}"></label><button data-comparison-apply>Показати</button></div></details><p class="comparison-period muted">${h(this.time(start,true))} — ${h(this.time(end,true))}</p>`;
+    const cycles=Array.isArray(data?.cycles)?data.cycles:[],actual=Array.isArray(data?.actual)?data.actual:[];
+    const forecasts=cycles.map((c,i)=>({cycle:c,finish:Math.min(end,cycles[i+1]?.started_at??end),points:c.forecast?.curve||[]}));
+    const visible=p=>numeric(p.ts)!==null&&Number(p.ts)>=start&&Number(p.ts)<=end;
+    const values=[...actual,...forecasts.flatMap(f=>f.points.filter(p=>Number(p.ts)>=Number(f.cycle.started_at)&&Number(p.ts)<=f.finish))].filter(visible).map(p=>numeric(p.temperature)).filter(v=>v!==null);
     const width=Math.max(220,Math.round(this.shadowRoot?.querySelector('.comparison-plot')?.clientWidth||Math.min(this.clientWidth-64||600,900)));
-    const height=240,left=42,right=12,top=15,bottom=205;
+    const height=260,left=42,right=12,top=15,bottom=220;
     const low=values.length?Math.floor(Math.min(...values)-.5):20,high=values.length?Math.ceil(Math.max(...values)+.5):24;
-    const x=ts=>left+(ts-start)/(end-start)*(width-left-right),y=v=>bottom-(v-low)/(high-low)*(bottom-top);
-    const paths=(points,gap)=>{const rows=[];let last=null;for(const p of points){if(last&&Number(p.ts)-Number(last.ts)>gap)rows.push({ts:Number(last.ts)+1,state:'unavailable'});rows.push({ts:Number(p.ts),state:p.temperature??'unavailable'});last=p;}return historyPaths(rows,start,end,x,y);};
-    const horizontal=Array.from({length:5},(_,i)=>{const value=low+(high-low)*i/4;return `<line x1="${left}" x2="${width-right}" y1="${y(value)}" y2="${y(value)}" class="comparison-grid"/><text x="${left-8}" y="${y(value)+4}" text-anchor="end">${fmt(value,1)}</text>`;}).join('');
-    const ticks=[0,.5,1].map(t=>`<text x="${x(start+(end-start)*t)}" y="230" text-anchor="${t===0?'start':t===1?'end':'middle'}">${h(this.time(start+(end-start)*t))}</text>`).join('');
-    // Do not extend the last recorded observation into an unobserved future.
-    const actualEnd=Math.min(end,Number(actual.at(-1)?.ts||start));
-    const actualRows=actual.filter(p=>Number(p.ts)<=actualEnd);
-    const actualPaths=paths(actualRows.concat(actualEnd<end?[{ts:actualEnd+.001,temperature:null}]:[]),1200);
-    const svg=`<div class="comparison-plot"><svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Завчасний прогноз і виміряна температура">${horizontal}${ticks}${paths(predicted.concat(predicted.length&&Number(predicted.at(-1).ts)<end?[{ts:Number(predicted.at(-1).ts)+.001,temperature:null}]:[]),3600).map(d=>`<path data-comparison-line="forecast" d="${d}" fill="none" stroke="var(--history-return)" stroke-width="2" stroke-dasharray="5 4"/>`).join('')}${actualPaths.map(d=>`<path data-comparison-line="actual" d="${d}" fill="none" stroke="var(--history-room)" stroke-width="2.5"/>`).join('')}</svg></div>`;
-    return this.section('Прогноз і фактична температура',controls+svg+`<div class="comparison-legend"><span>┄ Очікувана · за 12 год до нагріву</span><span>━ Фактична температура</span></div><p class="muted note">${row.forecast?`Зафіксовано ${h(this.time(row.forecast.at,true))} · за ${fmt((start-Number(row.forecast.at))/3600,2)} год до початку. Прогноз незмінний.`:'Завчасного прогнозу немає. Його не відновлено заднім числом.'}${!isTrue(row.start_known)?' Початок фізичного нагріву до першого спостереження невідомий.':''}</p>`,'comparison-card');
+    const x=ts=>left+(Number(ts)-start)/(end-start)*(width-left-right),y=v=>bottom-(Number(v)-low)/(high-low)*(bottom-top);
+    // Stop at real endpoints; keep gaps and separate independently frozen issues.
+    const paths=(points,gap)=>{
+      const out=[];let path='',last=null;
+      for(const p of points){const ts=numeric(p.ts),v=numeric(p.temperature);
+        if(ts===null||v===null||last!==null&&ts-last>gap){if(path)out.push(path);path='';}
+        if(ts!==null&&v!==null)path+=`${path?'L':'M'}${x(ts).toFixed(2)},${y(v).toFixed(2)} `;
+        last=ts;
+      }
+      if(path)out.push(path);return out;
+    };
+    const grid=Array.from({length:5},(_,i)=>{const value=low+(high-low)*i/4;return `<line x1="${left}" x2="${width-right}" y1="${y(value)}" y2="${y(value)}" class="comparison-grid"/><text x="${left-8}" y="${y(value)+4}" text-anchor="end">${fmt(value,1)}</text>`;}).join('');
+    const count=width<520?3:6;
+    const ticks=Array.from({length:count+1},(_,i)=>{const ts=start+(end-start)*i/count;
+      const label=new Intl.DateTimeFormat('uk-UA',{timeZone:zone,...(end-start>86400?{day:'2-digit',month:'2-digit'}:{hour:'2-digit',minute:'2-digit'})}).format(new Date(ts*1000));
+      return `<text x="${x(ts)}" y="248" text-anchor="${i===0?'start':i===count?'end':'middle'}">${h(label)}</text>`;}).join('');
+    const forecastPaths=forecasts.flatMap(f=>paths(f.points.filter(p=>Number(p.ts)>=Number(f.cycle.started_at)&&Number(p.ts)<=f.finish),3600)).map(d=>`<path data-comparison-line="forecast" d="${d}" fill="none" stroke="var(--history-return)" stroke-width="2" stroke-dasharray="5 4"/>`).join('');
+    const actualPaths=paths(actual,1200).map(d=>`<path data-comparison-line="actual" d="${d}" fill="none" stroke="var(--history-room)" stroke-width="2.5"/>`).join('');
+    const cursor=numeric(this.comparisonCursor),cross=cursor!==null?`<line x1="${x(cursor)}" x2="${x(cursor)}" y1="${top}" y2="${bottom}" stroke="currentColor" stroke-dasharray="3 4"/>`:'';
+    const svg=`<div class="comparison-plot" tabindex="0" role="img" aria-label="Очікувана і фактична температура за вибрані дати. Стрілки змінюють час."><svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}"><defs><clipPath id="comparison-clip"><rect x="${left}" y="${top}" width="${width-left-right}" height="${bottom-top}"/></clipPath></defs>${grid}${ticks}<g clip-path="url(#comparison-clip)">${forecastPaths}${actualPaths}${cross}</g></svg></div>`;
+    const nearest=points=>points.filter(p=>numeric(p.temperature)!==null).reduce((a,p)=>!a||Math.abs(Number(p.ts)-cursor)<Math.abs(Number(a.ts)-cursor)?p:a,null);
+    const measured=cursor===null?null:nearest(actual),expected=cursor===null?null:nearest(forecasts.flatMap(f=>cursor>=Number(f.cycle.started_at)&&cursor<=f.finish?f.points:[]));
+    const readout=cursor===null?'Торкніться графіка, щоб порівняти значення.':`${this.time(cursor,true)} · Очікувана ${fmt(expected&&Math.abs(Number(expected.ts)-cursor)<=1800?expected.temperature:null)} °C · Фактична ${fmt(measured&&Math.abs(Number(measured.ts)-cursor)<=600?measured.temperature:null)} °C`;
+    const missing=cycles.filter(c=>!c.forecast).length;
+    const coverage=forecasts.reduce((sum,f)=>sum+f.points.slice(1).reduce((n,p,i)=>{
+      const previous=f.points[i];return n+(Number(p.ts)-Number(previous.ts)<=3600?Math.max(0,Math.min(Number(p.ts),f.finish)-Math.max(Number(previous.ts),start,Number(f.cycle.started_at))):0);
+    },0),0);
+    const status=this.comparisonError||data?.error||(this.comparisonPending?'Завантажуємо збережені прогнози й виміри…':!actual.length?'Фактичних вимірів за цей період немає.':!forecastPaths?'Завчасних прогнозів за цей період не збережено. Показано фактичну температуру.':'');
+    const sources=`<details class="comparison-sources"><summary>Джерела прогнозу · ${cycles.filter(c=>c.forecast).length} з ${cycles.length} циклів</summary><p class="muted note">Пунктир — оригінальний прогноз, виданий щонайменше за 12 годин до початку нагріву. Нові перерахунки його не замінюють. Пропуски не відновлено заднім числом.</p>${cycles.map(c=>`<p class="comparison-source"><strong>${h(this.time(Number(c.started_at),true))}</strong><span>${c.forecast?`Прогноз від ${h(this.time(Number(c.forecast.at),true))} · за ${fmt((Number(c.started_at)-Number(c.forecast.at))/3600,2)} год${c.forecast.source==='archive'?' · оригінал з архіву':''}`:isTrue(c.start_known)?'Завчасного прогнозу немає':'Точний початок нагріву не підтверджено'}</span></p>`).join('')}${data?.warnings?.length?'<p class="warn note">Частина архіву недоступна. Відсутні ділянки залишено порожніми.</p>':''}</details>`;
+    return this.section('Прогноз і фактична температура',controls+svg+`<div class="comparison-legend"><span>┄ Очікувана · прогноз за 12 год до нагріву</span><span>━ Фактична температура</span></div><p class="comparison-readout muted" aria-live="polite">${h(readout)}</p>${status?`<p class="comparison-status muted" role="status">${h(status)}</p>`:''}${data&&coverage<(end-start)-300?`<p class="comparison-coverage muted">Збережений прогноз: ${fmt(coverage/3600,1)} з ${fmt((end-start)/3600,0)} год. Решта — без завчасних даних.</p>`:''}${missing?`<p class="muted note">Без завчасного прогнозу: ${missing} циклів.</p>`:''}`+sources,'comparison-card');
   }
   overview() {
     const c=this.attrs('controller'),budget=numeric(this.state('monthly_budget')),used=numeric(this.state('energy_monthly'));
@@ -568,6 +645,7 @@ export class HeatingAIPanel extends HTMLElement {
     this.observePlot();
     this.mountNative();
     this.loadHistory();
+    this.loadComparison();
   }
   async mountNative() {
     const slots=[...this.shadowRoot.querySelectorAll('[data-native]')];
@@ -590,12 +668,14 @@ export class HeatingAIPanel extends HTMLElement {
     } catch { this.helpersPromise=null;for(const slot of slots)if(slot.isConnected)slot.textContent='Не вдалося завантажити графік Home Assistant. Оновіть сторінку.'; }
   }
   async clicked(e) {
-    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-system-help],[data-system-close],[data-system-save],[data-system-reset]'); if(!el)return;
+    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-comparison-days],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset]'); if(!el)return;
     if(el.hasAttribute('data-system-help')){this.systemHelp=el.dataset.systemHelp;this.render();return;}
     if(el.hasAttribute('data-system-close')){this.closeSystemHelp();return;}
     if(el.hasAttribute('data-system-save')){await this.saveSystemSettings();return;}
     if(el.hasAttribute('data-system-reset')){this.systemDraft={};this.systemMessage='';this.render();return;}
-    if(el.dataset.comparisonRange){this.comparisonRange=Number(el.dataset.comparisonRange);this.render();return;}
+    if(el.dataset.comparisonDays){this.setComparisonDays(Number(el.dataset.comparisonDays));return;}
+    if(el.hasAttribute('data-comparison-refresh')){await this.loadComparison(true);return;}
+    if(el.hasAttribute('data-comparison-apply')){this.applyComparisonDates();return;}
     if(el.dataset.historyRange){this.historyRange=Number(el.dataset.historyRange);this.historyCursor=null;this.render();return;}
     if(el.dataset.historySeries){const key=el.dataset.historySeries;if(this.historyVisible.has(key)){if(this.historyVisible.size>1)this.historyVisible.delete(key);}else this.historyVisible.add(key);this.render();return;}
     if(el.hasAttribute('data-history-refresh')){this.loadHistory(true);return;}
@@ -605,7 +685,7 @@ export class HeatingAIPanel extends HTMLElement {
     if(el.dataset.press){if(el.dataset.press==='rollback'&&!confirm('Повернути попередню модель? Поточна модель збережеться для наступного відкату.'))return;await this.call(el.dataset.press,'press',{});}
   }
   async changed(e) {
-    if(e.target.hasAttribute('data-comparison-period')){await this.selectComparison(e.target.value);return;}
+    if(e.target.hasAttribute('data-comparison-date')){this.comparisonDateDraft={...this.comparisonDateDraft,[e.target.dataset.comparisonDate]:e.target.value};return;}
     if(e.target.hasAttribute('data-system-key')) {
       const el=e.target;
       if(el.hasAttribute('data-json'))el.setCustomValidity('');
@@ -1236,6 +1316,16 @@ progress::-moz-progress-bar{background:var(--green)}
 .comparison-plot text{fill:var(--muted);font-size:11px}.comparison-grid{stroke:var(--stroke);stroke-width:1}
 .comparison-legend{display:flex;flex-wrap:wrap;gap:8px 20px;font-size:12px;color:var(--muted)}
 .comparison-legend span:first-child{color:var(--history-return)}.comparison-legend span:last-child{color:var(--history-room)}
+.comparison-dates{margin-top:8px}.comparison-dates summary,.comparison-sources summary{min-height:44px;display:flex;align-items:center;cursor:pointer}
+.comparison-dates>div{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;padding:4px 0 10px}
+.comparison-dates label{min-width:0;display:grid;gap:5px;font-size:12px;color:var(--muted)}
+.comparison-dates input{box-sizing:border-box;min-width:0;width:100%;min-height:44px;background:var(--surface);color:var(--primary-text-color);border:1px solid var(--stroke);border-radius:8px;padding:8px;font:inherit}
+.comparison-dates button{grid-column:1/-1;min-height:44px}.comparison-period{font-size:12px;margin:4px 0}
+.comparison-plot{touch-action:pan-y}.comparison-plot:focus-visible{outline:2px solid var(--primary-color);border-radius:8px}
+.comparison-readout{font-size:12px;min-height:36px;margin:8px 0}.comparison-status{font-size:13px}
+.comparison-coverage{font-size:12px;margin:6px 0;color:var(--muted)}
+.comparison-sources{border-top:1px solid var(--stroke);margin-top:10px;font-size:12px}
+.comparison-source{display:grid;gap:3px;margin:0;padding:9px 0;color:var(--muted)}.comparison-source strong{color:var(--primary-text-color);font-weight:500}
 @container(max-width:600px){.plan-energy-grid{gap:8px}.plan-energy-grid .compact-metric>strong{font-size:19px}.plan-energy-grid .compact-metric>span{font-size:11px}}
 @container(max-width:350px){
   .temperature{font-size:38px}

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4 — 2026-10-31
+
+- Replace cycle-only temperature comparison with a calendar chart: actual and immutable advance forecasts on one timeline, default last seven days, 24-hour/30-day presets and custom dates in the HA timezone. Add touch/keyboard inspection and explicit forecast coverage/gaps.
+- Read original, checksum-verified issued forecasts from the private decision archive and actual temperatures from telemetry, including evidence collected before 0.3.3. Never rerun the model to fill history, substitute a later forecast, or infer a physical heating start across a measurement gap. Preserve existing frozen comparisons and restart persistence.
+- Load history through the AppDaemon executor without blocking heating ticks or changing plans, settings, model coefficients or energy counters. Retain the legacy cycle event contract.
+- Fix delegated comparison-button clicks. Verify real range changes, custom dates across DST, touch controls, missing forecasts and observation gaps in regression/browser tests.
+
 ## 0.3.3 — 2026-10-31
 
 - Preserve the energy-derived floor inventory during heating; a cooler return pipe no longer erases delivered heat. Bound counter deltas and do not invent heating across unobserved gaps. Model coefficients and canonical energy history remain intact.

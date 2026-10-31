@@ -3,7 +3,14 @@ import assert from 'node:assert/strict';
 globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
-const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths}=await import('../frontend/heating-panel.js');
+const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('comparison range controls are real delegated click targets',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.render=()=>{};
+  p.loadComparison=async()=>{};
+  const el={dataset:{comparisonDays:'7'},hasAttribute:()=>false};
+  await p.clicked({target:{closest:selector=>selector.includes('[data-comparison-days]')?el:null}});
+  assert.equal(p.comparisonDays,7);
+});
 test('saving a boiler mode ignores untouched advanced coefficient step validity',async()=>{
   const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={boiler_power_mode:'fixed_6'};panel.render=()=>{};
   panel.shadowRoot={querySelectorAll:()=>[
@@ -137,7 +144,24 @@ test('deficit warning uses concrete limits and labels the horizon without stale 
 test('temperature comparison explicitly shows absent advance forecasts and nullable observations',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.comparisonCache=new Map();p.time=()=> '23:00';
   const row={cycle_id:'night',started_at:100,start_known:true,forecast:null,actual:[{ts:100,temperature:21},{ts:400,temperature:null},{ts:700,temperature:21.2}]};
-  p.attrs=()=>({periods:[{cycle_id:'night',started_at:100}],selected:row});p.shadowRoot={querySelector:()=>null};p.clientWidth=390;
+  p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonData={start:100,end:1000,cycles:[row],actual:row.actual};
+  p.attrs=()=>({});p.shadowRoot={querySelector:()=>null};p.clientWidth=390;
   const text=p.temperatureComparison();assert.match(text,/не відновлено заднім числом/);
   assert.doesNotMatch(text,/data-comparison-line="forecast"/);assert.match(text,/data-comparison-line="actual"/);
+});
+test('comparison dates use HA timezone across the autumn DST transition',()=>{
+  const before=calendarMidnight('2026-10-25','Europe/Kyiv'),after=calendarMidnight('2026-10-26','Europe/Kyiv');
+  assert.equal(after-before,25*3600);
+  assert.equal(new Date(after*1000).toISOString(),'2026-10-25T22:00:00.000Z');
+  assert.equal(calendarMidnight('bad','Europe/Kyiv'),null);
+  assert.equal(calendarMidnight('2026-02-31','Europe/Kyiv'),null);
+});
+test('weekly comparison draws actuals without requiring a heating cycle',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.time=()=> '24.10';p.comparisonDays=7;
+  p.comparisonStart=100;p.comparisonEnd=100+7*86400;
+  p.comparisonData={start:100,end:p.comparisonEnd,cycles:[],actual:[{ts:100,temperature:22},{ts:400,temperature:22.2}]};
+  p.attrs=()=>({});p.shadowRoot={querySelector:()=>null};p.clientWidth=390;
+  const text=p.temperatureComparison();assert.match(text,/data-comparison-days="7" aria-pressed="true"/);
+  assert.match(text,/data-comparison-line="actual"/);assert.doesNotMatch(text,/data-comparison-line="forecast"/);
+  assert.match(text,/Показано фактичну температуру/);
 });
