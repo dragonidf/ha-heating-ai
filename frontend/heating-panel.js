@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.3.4';
+const VERSION = '0.3.5';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -462,7 +462,7 @@ export class HeatingAIPanel extends HTMLElement {
     const draft=this.comparisonDateDraft||{};
     const controls=`<div class="comparison-tools"><div class="history-ranges" role="group" aria-label="Період порівняння">${[[1,'24 год'],[7,'7 днів'],[30,'30 днів']].map(([days,label])=>`<button data-comparison-days="${days}" aria-pressed="${this.comparisonDays===days}">${label}</button>`).join('')}</div><button class="history-refresh" data-comparison-refresh aria-label="Оновити порівняння" ${this.comparisonPending?'disabled':''}>↻</button></div><details class="comparison-dates"><summary>Обрати дати</summary><div><label>Від<input type="date" data-comparison-date="from" aria-label="Початкова дата" value="${h(draft.from||day(start))}" max="${day(Date.now()/1000)}"></label><label>До<input type="date" data-comparison-date="to" aria-label="Кінцева дата" value="${h(draft.to||day(end))}" max="${day(Date.now()/1000)}"></label><button data-comparison-apply>Показати</button></div></details><p class="comparison-period muted">${h(this.time(start,true))} — ${h(this.time(end,true))}</p>`;
     const cycles=Array.isArray(data?.cycles)?data.cycles:[],actual=Array.isArray(data?.actual)?data.actual:[];
-    const forecasts=cycles.map((c,i)=>({cycle:c,finish:Math.min(end,cycles[i+1]?.started_at??end),points:c.forecast?.curve||[]}));
+    const forecasts=cycles.map((c,i)=>({cycle:c,finish:Math.min(end,cycles.slice(i+1).find(next=>isTrue(next.start_known))?.started_at??end),points:c.forecast?.curve||[]}));
     const visible=p=>numeric(p.ts)!==null&&Number(p.ts)>=start&&Number(p.ts)<=end;
     const values=[...actual,...forecasts.flatMap(f=>f.points.filter(p=>Number(p.ts)>=Number(f.cycle.started_at)&&Number(p.ts)<=f.finish))].filter(visible).map(p=>numeric(p.temperature)).filter(v=>v!==null);
     const width=Math.max(220,Math.round(this.shadowRoot?.querySelector('.comparison-plot')?.clientWidth||Math.min(this.clientWidth-64||600,900)));

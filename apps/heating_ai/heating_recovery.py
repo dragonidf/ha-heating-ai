@@ -576,7 +576,8 @@ class HeatingRecovery:
         last=self.memory.get('temperature_history_power') or {}
         if cycle and number(power) is not None and power>=1500:
             key=cycle['cycle_id'];entry=history.get(key)
-            if entry is None:
+            continuous=bool(last and 0<stamp-last['at']<=45 and number(last.get('power')) is not None and last['power']>=1500)
+            if entry is None and not continuous:
                 edge=bool(last and 0<stamp-last['at']<=45 and number(last.get('power')) is not None and last['power']<1500)
                 eligible=[x for x in candidates if 12*3600<=stamp-x['at']<=12*3600+600 and
                           x['curve'][0]['ts']<=stamp<=x['curve'][-1]['ts']]
@@ -1026,7 +1027,9 @@ class DecisionJournal:
                             power=number(record.get('power_w'))
                             measured=record.get('power_quality')=='measured' and record.get('power_estimated') not in (True,'true')
                             key=record.get('cycle_id')
-                            if key and power is not None and power>=1500 and measured and key not in cycles:
+                            continuous=bool(previous and 0<at-previous['at']<=45 and previous['measured'] and
+                                            previous['power'] is not None and previous['power']>=1500)
+                            if key and power is not None and power>=1500 and measured and key not in cycles and not continuous:
                                 edge=bool(previous and 0<at-previous['at']<=45 and previous['measured'] and
                                           previous['power'] is not None and previous['power']<1500)
                                 cycles[key]=dict(cycle_id=key,started_at=at,start_known=edge,forecast=None)

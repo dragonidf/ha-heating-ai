@@ -87,6 +87,13 @@ class TemperatureComparisonTests(unittest.TestCase):
         self.assertEqual(result['cycles'][0]['forecast']['plan_id'],'already-frozen')
         self.assertEqual(stored,previous)
 
+    def test_cycle_boundary_during_continuous_heat_is_not_a_new_physical_start(self):
+        at=self.start+86400;self.night(at,'night')
+        self.record(at+8*3600-15,power_w=6000.,power_quality='measured',power_source='balance',cycle_id='night')
+        self.record(at+8*3600,power_w=6000.,power_quality='measured',power_source='balance',cycle_id='next-window')
+        result=self.journal.temperature_comparison(self.start,self.end)
+        self.assertEqual(len(result['cycles']),1)
+
     def test_range_event_uses_background_reader_without_touching_planning(self):
         app=HeatingRecovery();app.memory={};app.decision_journal=self.journal
         app.now=lambda:datetime.fromtimestamp(self.end,timezone.utc);app.next_compute=123

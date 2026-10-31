@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.5 — 2026-10-31
+
+- Preserve the frozen temperature forecast through the post-heating coast when an accounting window changes while the boiler is still heating. A continuous measured ON state is not another physical start, an unconfirmed later start cannot truncate an existing original forecast, and the heating tail cannot occupy tomorrow's forecast slot. Add backend/frontend regressions for the live07:00 boundary case; control and energy accounting remain unchanged.
+
 ## 0.3.4 — 2026-10-31
 
 - Replace cycle-only temperature comparison with a calendar chart: actual and immutable advance forecasts on one timeline, default last seven days, 24-hour/30-day presets and custom dates in the HA timezone. Add touch/keyboard inspection and explicit forecast coverage/gaps.

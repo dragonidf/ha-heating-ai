@@ -165,3 +165,12 @@ test('weekly comparison draws actuals without requiring a heating cycle',()=>{
   assert.match(text,/data-comparison-line="actual"/);assert.doesNotMatch(text,/data-comparison-line="forecast"/);
   assert.match(text,/Показано фактичну температуру/);
 });
+test('an unconfirmed later start cannot truncate the frozen post-heat temperature curve',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.time=()=> '07:00';p.comparisonStart=100;p.comparisonEnd=2000;
+  p.comparisonData={start:100,end:2000,actual:[],cycles:[
+    {cycle_id:'night',started_at:100,start_known:true,forecast:{at:-43100,curve:[100,400,1000,1600].map(ts=>({ts,temperature:21.}))}},
+    {cycle_id:'next-window',started_at:800,start_known:false,forecast:null}]};
+  p.attrs=()=>({});p.shadowRoot={querySelector:()=>null};p.clientWidth=390;
+  const text=p.temperatureComparison();const path=text.match(/data-comparison-line="forecast" d="([^"]+)"/)[1];
+  assert.equal((path.match(/L/g)||[]).length,3);
+});

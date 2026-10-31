@@ -107,6 +107,21 @@ class FrozenTemperatureTests(unittest.TestCase):
         self.assertIsNone(row['forecast'])
         self.observe(self.at+timedelta(minutes=5),power=6000.,forecast=self.forecast)
         self.assertIsNone(row['forecast'])
+
+    def test_heat_tail_after_seven_does_not_occupy_tomorrows_forecast_cycle(self):
+        self.observe(self.at-timedelta(hours=12),forecast=self.forecast)
+        self.observe(self.at-timedelta(seconds=15));self.observe(self.at,power=6000.)
+        self.observe(self.at+timedelta(hours=8,seconds=-15),power=6000.)
+        self.observe(self.at+timedelta(hours=8),power=6000.)
+        self.assertEqual(len(self.app.memory['temperature_history']),1)
+        future=copy.deepcopy(self.forecast)
+        future['plan_id']='tomorrow-original'
+        for point in future['curve']:point['ts']+=86400
+        self.observe(self.at+timedelta(hours=12),forecast=future)
+        self.observe(self.at+timedelta(days=1,seconds=-15))
+        self.observe(self.at+timedelta(days=1),power=6000.)
+        entries=sorted(self.app.memory['temperature_history'].values(),key=lambda v:v['started_at'])
+        self.assertEqual(entries[-1]['forecast']['plan_id'],'tomorrow-original')
     def test_sensor_loss_is_a_gap_and_grid_loss_does_not_fabricate_temperatures(self):
         self.observe(self.at-timedelta(hours=12),forecast=self.forecast)
         self.observe(self.at-timedelta(seconds=15));self.observe(self.at,power=6000.)
