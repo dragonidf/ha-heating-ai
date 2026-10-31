@@ -243,6 +243,10 @@ def check_compact_tabs(page):
     page.evaluate('calls=[];panel.hass=mockHass')
     page.locator('nav [data-tab="model"]').click()
     assert page.locator('.model-page .model-stats .compact-metric').count()==4
+    assert page.locator('.modulation-details').get_attribute('open') is None
+    page.locator('.modulation-details>summary').click()
+    assert page.locator('.modulation-details tbody tr').count()==3
+    page.locator('.modulation-details>summary').click()
     page.evaluate("""setHeatingScenario({'sensor.heating_model':{attributes:{
         parameters:{validated:true,version:4},last_result:'legacy',
         learning_attempt:{time:'2026-10-21T20:45:00+03:00',status:'rejected',reason:'Немає поліпшення holdout'}}}})""")
@@ -520,7 +524,7 @@ def main(engine='chromium'):
                         for control in page.locator('.field input,.field select,.field button').all():
                             assert control.bounding_box()['height']>=40, (width,tab,'small touch target')
                         if width in (360,390,430,768):
-                            assert page.locator('main').bounding_box()['height']<(2200 if tab=='settings' else 2700), (width,tab,'page not compact')
+                            assert page.locator('main').bounding_box()['height']<(2200 if tab=='settings' else 2700), (width,tab,'page not compact',page.locator('main').bounding_box()['height'])
                     if tab=='overview':
                         if width in (360,430):check_compact_overview(page)
                         wait_for_chart_layout(page)
