@@ -11,6 +11,40 @@ test('comparison range controls are real delegated click targets',async()=>{
   await p.clicked({target:{closest:selector=>selector.includes('[data-comparison-days]')?el:null}});
   assert.equal(p.comparisonDays,7);
 });
+test('an in-flight default comparison keeps its bounds across a five-minute clock boundary',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonDays=7;
+  const original=Date.now;
+  try {
+    Date.now=()=>1793478899000;const first=p.comparisonWindow();
+    Date.now=()=>1793478901000;assert.deepEqual(p.comparisonWindow(),first);
+  }finally{Date.now=original;}
+});
+test('detaching a pending comparison allows the panel to load again after reconnect',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonPending='lost-request';p.historyEpoch=0;
+  const old=globalThis.cancelAnimationFrame;globalThis.cancelAnimationFrame=()=>{};
+  try{p.disconnectedCallback();assert.equal(p.comparisonPending,null);}
+  finally{globalThis.cancelAnimationFrame=old;}
+});
+test('the comparison can load by REST when no websocket acknowledgement reaches the panel',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.tab='model';p.isConnected=true;
+  p.render=()=>{};p.id=()=> 'sensor.heating_plan_history';p.attrs=()=>({});
+  p._hass={callApi:async(method,path,data)=>method==='POST'?{}:{attributes:{comparison:{...p.comparisonWindow(),request_id:p.comparisonPending,actual:[{ts:100,temperature:21}],cycles:[]}}}};
+  try{await p.loadComparison();await p.readComparison(p.comparisonPending);assert.equal(p.comparisonData.actual.length,1);assert.equal(p.comparisonPending,null);}
+  finally{clearTimeout(p.comparisonTimeout);clearTimeout(p.comparisonPoll);}
+});
+test('matching shared comparison data redraws even if HA reuses its hass object',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.comparisonStart=100;p.comparisonEnd=1000;
+  p.comparisonPending='this-client';p.comparisonCache=new Map();p.nativeCards=new Map();p.toggleAttribute=()=>{};
+  p.syncSystemSettings=()=>{};let renders=0;p.render=()=>renders++;
+  const hass={states:{'sensor.heating_plan_history':{attributes:{comparison:{start:100,end:1000,request_id:'another-client',actual:[{ts:100,temperature:21}],cycles:[]}}}}};
+  p._hass=hass;p.hass=hass;
+  assert.equal(renders,1);assert.equal(p.comparisonData.actual.length,1);assert.equal(p.comparisonPending,null);
+});
+test('a response for another date range cannot replace the requested comparison',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='active';
+  assert.equal(p.acceptComparison({start:200,end:1100,actual:[],cycles:[]}),false);
+  assert.equal(p.comparisonPending,'active');assert.equal(p.comparisonData,undefined);
+});
 test('saving a boiler mode ignores untouched advanced coefficient step validity',async()=>{
   const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={boiler_power_mode:'fixed_6'};panel.render=()=>{};
   panel.shadowRoot={querySelectorAll:()=>[

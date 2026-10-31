@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.3.5';
+const VERSION = '0.3.6';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -124,13 +124,11 @@ export class HeatingAIPanel extends HTMLElement {
     this.syncSystemSettings();
     const history=this.attrs('plan_history');
     if(history.selected?.cycle_id)this.comparisonCache.set(history.selected.cycle_id,history.selected);
-    if(this.comparisonPending&&history.comparison?.request_id===this.comparisonPending){
-      this.comparisonData=history.comparison;this.comparisonPending=null;clearTimeout(this.comparisonTimeout);
-    }
+    const comparisonChanged=this.acceptComparison(history.comparison);
     this.toggleAttribute('data-light',value.themes?.darkMode===false);
     for(const card of this.nativeCards.values()) card.hass=value;
     const ids=new Set([...Object.values(defaults),...Object.values(this.config.entities||{}),...Object.values(value.states['sensor.heating_ui']?.attributes?.entities||{}),'sensor.heating_ui']);
-    if(!previous||[...ids].some(id=>previous.states[id]!==value.states[id])||previous.themes!==value.themes)this.render();
+    if(!previous||comparisonChanged||[...ids].some(id=>previous.states[id]!==value.states[id])||previous.themes!==value.themes)this.render();
   }
   get hass() { return this._hass; }
   connectedCallback() {
@@ -146,11 +144,21 @@ export class HeatingAIPanel extends HTMLElement {
       if(changed&&!this.resizeFrame)this.resizeFrame=requestAnimationFrame(()=>{this.resizeFrame=0;if(this.isConnected)this.render();});
     });
     this.resizeObserver.observe(this);
+    this.comparisonResume??=()=>{
+      if(document.visibilityState!=='hidden'&&this.tab==='model'&&(this.comparisonPending||!this.comparisonData||Date.now()-this.comparisonAttemptAt>=300000)){
+        this.cancelComparison();this.loadComparison(true);
+      }
+    };
+    document.addEventListener('visibilitychange',this.comparisonResume);
+    window.addEventListener('online',this.comparisonResume);
     this.timer=setInterval(()=>this.render(),30000); this.render();
   }
   disconnectedCallback() {
     clearInterval(this.timer);this.resizeObserver?.disconnect();
-    clearTimeout(this.systemTimeout);clearTimeout(this.systemRetryTimeout);clearTimeout(this.comparisonTimeout);
+    clearTimeout(this.systemTimeout);clearTimeout(this.systemRetryTimeout);this.cancelComparison();
+    this.comparisonSignature='';this.comparisonAttemptAt=0;
+    globalThis.document?.removeEventListener('visibilitychange',this.comparisonResume);
+    window.removeEventListener?.('online',this.comparisonResume);
     cancelAnimationFrame(this.resizeFrame);this.resizeFrame=0;this.observedPlots=new Set();
     cancelAnimationFrame(this.historyFrame);this.historyFrame=0;this.historyEpoch++;
     if(this.historyPending)this.historyAttemptAt=0;
@@ -403,27 +411,54 @@ export class HeatingAIPanel extends HTMLElement {
     return this.section(finished?'Останній цикл · план і факт':'Поточний цикл · план і факт',`<div class="muted note">${h(this.time(Number(row.start),true))} → ${h(this.time(Number(row.end),true))}</div>${metrics}${detailed?`${this.row('Відхилення від початкового',diff===null?'—':(diff>0?'+':'')+fmt(diff,2)+' кВт·год')}<details class="energy-notes"><summary>Якість обліку</summary>${this.row('Невизначені інтервали',fmt(Number(row.unknown_seconds||0)/60,1)+' хв')}${this.row('Без автоматичного запиту',fmt(row.other_kwh,2)+' кВт·год')}<p class="muted note">${complete?'Облік за лічильником розрахункової потужності.':'Показано лише підтверджену частину; прогалини не зараховані як нуль.'} Початкова база від ${h(this.time(initial?.at,true))} не змінюється під час перерахунків.</p></details>`:''}`,'plan-energy');
   }
   comparisonWindow() {
-    const end=this.comparisonEnd??Math.floor(Date.now()/300000)*300;
-    return {start:this.comparisonStart??end-(this.comparisonDays||7)*86400,end};
+    this.comparisonEnd??=Math.floor(Date.now()/300000)*300;
+    this.comparisonStart??=this.comparisonEnd-(this.comparisonDays||7)*86400;
+    return {start:this.comparisonStart,end:this.comparisonEnd};
+  }
+  cancelComparison() {
+    clearTimeout(this.comparisonTimeout);clearTimeout(this.comparisonPoll);this.comparisonPending=null;
+  }
+  acceptComparison(data) {
+    if(!data||!Array.isArray(data.actual)||!Array.isArray(data.cycles))return false;
+    const span=this.comparisonWindow();
+    if(Number(data.start)!==span.start||Math.abs(Number(data.end)-span.end)>=1)return false;
+    // The HA entity is shared by clients: matching bounds, not one UUID, identify its data.
+    const changed=this.comparisonData!==data||Boolean(this.comparisonPending);
+    this.comparisonData=data;this.comparisonError='';this.cancelComparison();return changed;
+  }
+  async readComparison(request) {
+    if(this.comparisonPending!==request||!this.isConnected)return;
+    try {
+      const record=await this.hass.callApi('GET',`states/${this.id('plan_history')}`);
+      if(this.comparisonPending!==request)return;
+      if(this.acceptComparison(record?.attributes?.comparison)){this.render();return;}
+    }catch{/* A missed state push or temporary connection loss can recover before the deadline. */}
+    if(this.comparisonPending===request)this.comparisonPoll=setTimeout(()=>this.readComparison(request),5000);
   }
   async loadComparison(force=false) {
-    if(this.tab!=='model'||!this.hass?.callApi||this.comparisonPending)return;
+    if(!this.isConnected||this.tab!=='model'||!this.hass?.callApi||this.comparisonPending)return;
+    if(this.comparisonDays&&(force||!this.comparisonAttemptAt||Date.now()-this.comparisonAttemptAt>=300000)){
+      this.comparisonEnd=Math.floor(Date.now()/300000)*300;this.comparisonStart=this.comparisonEnd-this.comparisonDays*86400;
+    }
     const span=this.comparisonWindow(),signature=`${span.start}:${span.end}`;
     if(!force&&this.comparisonSignature===signature&&Date.now()-this.comparisonAttemptAt<300000)return;
     this.comparisonSignature=signature;this.comparisonAttemptAt=Date.now();this.comparisonError='';
     const request=globalThis.crypto?.randomUUID?.()||String(Date.now());this.comparisonPending=request;
     this.comparisonTimeout=setTimeout(()=>{
-      if(this.comparisonPending===request){this.comparisonPending=null;this.comparisonError='Історія ще не надійшла. Натисніть оновлення.';this.render();}
+      if(this.comparisonPending===request){this.cancelComparison();this.comparisonError='Історія ще не надійшла. Натисніть оновлення.';this.render();}
     },60000);
     this.render();
-    try{await this.hass.callApi('POST','events/heating_plan_history',{request_id:request,...span});}
-    catch{if(this.comparisonPending===request){this.comparisonPending=null;clearTimeout(this.comparisonTimeout);this.comparisonError='Не вдалося завантажити історію. Повторіть.';this.render();}}
+    try{
+      await this.hass.callApi('POST','events/heating_plan_history',{request_id:request,...span});
+      if(this.comparisonPending===request)this.comparisonPoll=setTimeout(()=>this.readComparison(request),1500);
+    }
+    catch{if(this.comparisonPending===request){this.cancelComparison();this.comparisonError='Не вдалося завантажити історію. Повторіть.';this.render();}}
   }
   setComparisonDays(days) {
     if(![1,7,30].includes(days))return;
     this.comparisonDays=days;this.comparisonEnd=Math.floor(Date.now()/300000)*300;
     this.comparisonStart=this.comparisonEnd-days*86400;this.comparisonDateDraft={};
-    this.comparisonPending=null;clearTimeout(this.comparisonTimeout);this.comparisonCursor=null;
+    this.cancelComparison();this.comparisonCursor=null;
     this.comparisonSignature='';this.render();
   }
   applyComparisonDates() {
@@ -438,7 +473,7 @@ export class HeatingAIPanel extends HTMLElement {
       this.comparisonError='Оберіть минулий період тривалістю до 31 діб.';this.render();return;
     }
     this.comparisonDays=null;this.comparisonStart=start;this.comparisonEnd=end;
-    this.comparisonPending=null;clearTimeout(this.comparisonTimeout);this.comparisonSignature='';this.comparisonCursor=null;this.render();
+    this.cancelComparison();this.comparisonSignature='';this.comparisonCursor=null;this.render();
   }
   inspectComparison(event,plot) {
     const {start,end}=this.comparisonWindow();

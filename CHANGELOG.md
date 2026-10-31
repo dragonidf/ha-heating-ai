@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6 — 2026-10-31
+
+- Recover the temperature comparison after a missed HA state push, panel detach/reconnect, WebView resume or network restoration. Read the completed result through a bounded REST fallback, accept matching shared-entity date ranges and redraw even when HA reuses its state object.
+- Pin comparison dates while a request is in flight so a five-minute clock boundary cannot discard the response. Refresh rolling dates only when starting another request. Cancel pending timers on detach and retain valid comparison data.
+- Add regression/browser checks with deliberately suppressed state pushes and an interrupted load; verify initial loading and recovery without manually injecting a hass acknowledgement. Heating control, model coefficients, counters and private history remain unchanged.
+
 ## 0.3.5 — 2026-10-31
 
 - Preserve the frozen temperature forecast through the post-heating coast when an accounting window changes while the boiler is still heating. A continuous measured ON state is not another physical start, an unconfirmed later start cannot truncate an existing original forecast, and the heating tail cannot occupy tomorrow's forecast slot. Add backend/frontend regressions for the live07:00 boundary case; control and energy accounting remain unchanged.

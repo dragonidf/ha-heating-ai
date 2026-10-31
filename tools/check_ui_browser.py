@@ -87,6 +87,34 @@ def check_theme_and_motion(page):
     assert page.evaluate('calls.length===0'), 'Theme and motion checks must not actuate anything'
 
 
+def check_comparison_delivery(page):
+    page.locator('nav [data-tab="model"]').click()
+    page.wait_for_selector('[data-comparison-line="actual"]')
+    page.evaluate('window.suppressComparisonPush=true')
+    page.locator('[data-comparison-days="1"]').click()
+    # A real HA browser can miss a state push while the App/WebView is hidden.
+    # The server has the result, but no hass setter is called in this scenario.
+    page.wait_for_function('panel.comparisonPending===null',timeout=7000)
+    assert page.locator('[data-comparison-line="actual"]').count()>0
+    page.evaluate('window.suppressComparisonPush=false;window.pauseComparisonReply=true')
+    page.locator('[data-comparison-days="30"]').click()
+    page.wait_for_function('Boolean(panel.comparisonPending)')
+    before=page.evaluate('comparisonRequests.length')
+    page.evaluate('panel.remove();window.pauseComparisonReply=false;document.body.append(panel)')
+    page.wait_for_function('n=>comparisonRequests.length>n',arg=before,timeout=7000)
+    page.wait_for_function('panel.comparisonPending===null')
+    assert page.locator('[data-comparison-line="actual"]').count()>0
+    page.evaluate('window.pauseComparisonReply=true')
+    page.locator('[data-comparison-days="1"]').click()
+    before=page.evaluate('comparisonRequests.length')
+    page.evaluate("window.pauseComparisonReply=false;window.dispatchEvent(new Event('online'))")
+    page.wait_for_function('n=>comparisonRequests.length>n',arg=before,timeout=7000)
+    page.wait_for_function('panel.comparisonPending===null')
+    assert page.locator('[data-comparison-line="actual"]').count()>0
+    page.locator('[data-comparison-days="7"]').click()
+    page.locator('nav [data-tab="overview"]').click()
+
+
 def check_plan_comparison(page):
     assert page.locator('.overview .plan-energy-grid .compact-metric').count()==3
     assert '24,17' in page.locator('.overview .plan-energy').inner_text()
@@ -453,6 +481,7 @@ def main(engine='chromium'):
                 mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,fields}}};
                 panel.hass={...mockHass};
             }''',system_fields({},dict(DEFAULT_MODEL,floor_air=.02839661755318365)))
+            check_comparison_delivery(page)
             check_plan_comparison(page)
             check_compact_overview(page)
             check_controller_incident(page)
