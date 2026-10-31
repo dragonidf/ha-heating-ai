@@ -11,6 +11,7 @@ import os
 import math
 import traceback
 import shutil
+import copy
 from heating_model import number,in_window,heating_cycle,step,held_action
 from heating_outages import schedule,blocked
 from heating_fallback import estimated_power
@@ -461,7 +462,7 @@ class HeatingRecovery:
         if not cycle:return
         stamp=now.timestamp();ledger=self.memory.setdefault('cycle_energy',{})
         previous=self.memory.get('cycle_energy_observation')
-        current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,
+        current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,grid=grid,power=power,
             known=power is not None and grid in ('on','off') and
                   not getattr(self,'power_source','unknown').startswith(('unknown','unavailable')) and
                   not estimated_power(getattr(self,'power_source','unknown')))
@@ -469,15 +470,31 @@ class HeatingRecovery:
             key=c['cycle_id']+'@'+str(c['cycle_start'])
             entry=ledger.setdefault(key,dict(start=c['cycle_start'],end=c['cycle_end'],observed_kwh=0.,
                 automatic_kwh=0.,other_kwh=0.,transition_kwh=0.,unknown_seconds=0.,complete=stamp<=c['cycle_start']))
+            if stamp==c['cycle_start'] and number(energy) is not None:
+                entry.setdefault('counter_start',energy)
             if not previous:
                 gap=max(0.,min(stamp,c['cycle_end'])-max(entry.get('observed_until',c['cycle_start']),c['cycle_start']))
                 if gap:entry['unknown_seconds']+=gap;entry['complete']=False
                 continue
             seconds=stamp-previous['at'];a=max(previous['at'],c['cycle_start']);b=min(stamp,c['cycle_end'])
             if b<=a:continue
+            if 0<seconds<=45 and previous.get('grid')==grid=='off':
+                entry['outage_seconds']=entry.get('outage_seconds',0.)+b-a
+            if 0<seconds<=45 and previous['automatic'] and automatic:
+                entry['requested_seconds']=entry.get('requested_seconds',0.)+b-a
             before=number(previous.get('energy'));after=number(energy)
-            if (0<seconds<=45 and previous['known'] and current['known'] and
-                    before is not None and after is not None and after>=before):
+            counter_ok=(0<seconds<=45 and before is not None and after is not None and
+                0<=after-before<=10.5*seconds/3600+.00002)
+            if counter_ok:
+                if previous['at']<=c['cycle_start']<=stamp:
+                    entry.setdefault('counter_start',before+(after-before)*(c['cycle_start']-previous['at'])/seconds)
+                if number(entry.get('counter_start')) is not None:
+                    end_value=before+(after-before)*(b-previous['at'])/seconds
+                    entry['meter_kwh']=max(0.,end_value-entry['counter_start'])
+            elif before is not None and after is not None and (after<before or
+                    0<seconds<=45 and after-before>10.5*seconds/3600+.00002):
+                entry.pop('counter_start',None);entry.pop('meter_kwh',None);entry['counter_reset']=True
+            if counter_ok and previous['known'] and current['known']:
                 kwh=(after-before)*(b-a)/seconds;entry['observed_kwh']+=kwh
                 kind=('automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
                 entry[kind+'_kwh']+=kwh
@@ -494,17 +511,42 @@ class HeatingRecovery:
         if entry is None:return {}
         stamp=now.timestamp();remaining=number(reserve.get('end_cycle_planned_kwh'))
         if remaining is None:return {}
+        legacy_base=entry.get('baseline')
         if stamp<entry['start']:
             entry['last_prestart']=dict(at=stamp,kwh=remaining)
             if entry['start']-stamp<=3*3600:entry.setdefault('baseline',dict(at=stamp,kwh=remaining))
+        if stamp<entry['end'] and entry['start']-stamp<=12*3600:
+            base=legacy_base
+            entry.setdefault('initial_plan',dict(base,before_start=base['at']<entry['start'],legacy=True) if base else
+                dict(at=stamp,kwh=remaining,plan_id=forecast.get('plan_id'),before_start=stamp<entry['start']))
         hashes={k:hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
                 for k,v in context.items()}
         previous=entry.get('projection_inputs')
         changes=[k for k in hashes if previous and previous.get(k)!=hashes[k]]
         entry['projection_inputs']=hashes
-        spent=entry['observed_kwh'];total=spent+remaining if entry['complete'] else None
+        spent=entry.get('meter_kwh',entry['observed_kwh'])
+        total=spent+remaining if entry['complete'] or number(entry.get('meter_kwh')) is not None else None
         baseline=entry.get('baseline')
+        initial=entry.get('initial_plan') or baseline
+        entry['latest_plan']=dict(at=stamp,kwh=round(total,4) if total is not None else None,
+            remaining_kwh=round(remaining,4),plan_id=forecast.get('plan_id'))
+        detail=reserve.get('comfort_deficit') or {}
+        requested=entry.get('requested_seconds',0.)
+        deviation=dict(extra_kwh=round(total-initial['kwh'],4) if initial and total is not None else None,
+            outage_minutes=round(entry.get('outage_seconds',0.)/60,2),
+            request_average_kw=round(entry['automatic_kwh']*3600/requested,3) if requested else None,
+            minimum_temperature=detail.get('minimum_before_next_heat'),
+            violation_at=detail.get('first_comfort_violation_at'),
+            violation_temperature=detail.get('first_violation_temperature'),
+            lower=detail.get('first_violation_lower'),
+            attribution='measured_execution_and_current_forecast; causal shares are not independently identified')
+        entry['latest_plan']['deviation']=deviation
         return dict(cycle_id=key,observed_kwh=round(spent,4),remaining_kwh=round(remaining,4),
+            initial_plan=initial,latest_plan=entry['latest_plan'],
+            deviation=deviation,
+            fact_complete=entry['complete'] or number(entry.get('meter_kwh')) is not None,
+            initial_plan_is_prestart=bool(initial and initial['at']<=entry['start']),
+            overrun_kwh=round(max(0.,spent-initial['kwh']),4) if initial else None,
             projected_total_kwh=round(total,4) if total is not None else None,
             observation_complete=entry['complete'],unknown_minutes=round(entry['unknown_seconds']/60,2),
             baseline=baseline,last_prestart=entry.get('last_prestart'),
@@ -516,6 +558,64 @@ class HeatingRecovery:
             coast_peak=(context.get('thermal_state') or {}).get('coast_peak'),
             automatic_kwh=round(entry['automatic_kwh'],4),other_kwh=round(entry['other_kwh'],4),
             transition_kwh=round(entry['transition_kwh'],4))
+
+    def observe_temperature_history(self,now,settings,room,power,quality,forecast=None):
+        """Capture issued forecasts prospectively; never reconstruct an earlier issue."""
+        stamp=now.timestamp();history=self.memory.setdefault('temperature_history',{})
+        candidates=self.memory.setdefault('temperature_forecasts',[])
+        if forecast and stamp-(candidates[-1]['at'] if candidates else 0)>=290:
+            rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
+            curve=[dict(ts=r['ts'],temperature=r['temperature']) for r in rows
+                   if number(r.get('ts')) is not None and number(r.get('temperature')) is not None]
+            if curve:
+                candidates.append(dict(at=stamp,plan_id=forecast.get('plan_id'),curve=curve,
+                    weather_complete=forecast.get('weather_complete'),model_version=self.model.get('version')))
+        candidates[:]=[x for x in candidates if x['at']>=stamp-13*3600]
+        cycle=heating_cycle(now,settings)
+        last=self.memory.get('temperature_history_power') or {}
+        if cycle and number(power) is not None and power>=1500:
+            key=cycle['cycle_id'];entry=history.get(key)
+            if entry is None:
+                edge=bool(last and 0<stamp-last['at']<=45 and number(last.get('power')) is not None and last['power']<1500)
+                eligible=[x for x in candidates if 12*3600<=stamp-x['at']<=12*3600+600 and
+                          x['curve'][0]['ts']<=stamp<=x['curve'][-1]['ts']]
+                frozen=copy.deepcopy(max(eligible,key=lambda x:x['at'])) if edge and eligible else None
+                history[key]=dict(cycle_id=key,cycle_start=cycle['cycle_start'],cycle_end=cycle['cycle_end'],
+                    started_at=stamp,start_known=edge,forecast=frozen,actual=[])
+        self.memory['temperature_history_power']=dict(at=stamp,power=power)
+        for entry in history.values():
+            finish=min(entry['started_at']+86400,(entry.get('forecast') or {}).get('curve',[dict(ts=entry['started_at']+86400)])[-1]['ts'])
+            actual=entry['actual']
+            if entry['started_at']<=stamp<=finish and (not actual or stamp-actual[-1]['ts']>=290 or
+                    quality!=(actual[-1]['temperature'] is not None)):
+                actual.append(dict(ts=stamp,temperature=room if quality else None))
+        self.memory['temperature_history']={k:v for k,v in history.items() if v['started_at']>stamp-30*86400}
+
+    def publish_plan_history(self,cycle_id=None,request_id=None):
+        history=self.memory.get('temperature_history') or {}
+        keys=sorted(history,key=lambda k:history[k]['started_at'],reverse=True)
+        selected=history.get(cycle_id or getattr(self,'history_selected',None))
+        if selected is None and keys:selected=history[keys[0]]
+        if selected:self.history_selected=selected['cycle_id']
+        # Send one requested curve, not a month of observations on every tick.
+        def wire(value):
+            if isinstance(value,dict):return {k:wire(v) for k,v in value.items()}
+            if isinstance(value,list):return [wire(v) for v in value]
+            if value is False:return 'false'
+            return '0' if isinstance(value,(int,float)) and value==0 else value
+        self.publish('sensor.heating_plan_history','Історія прогнозів',**wire(dict(
+            request_id=request_id,selected=selected,
+            periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
+            energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
+                'latest_plan','observed_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
+                'cycle_id':k} for k,v in sorted((self.memory.get('cycle_energy') or {}).items(),
+                key=lambda pair:pair[1]['start'],reverse=True)[:16]])))
+
+    def plan_history_requested(self,event,data,kwargs=None,**extra):
+        if not isinstance(data,dict) or not isinstance(data.get('request_id'),str):return
+        key=data.get('cycle_id')
+        if key not in (self.memory.get('temperature_history') or {}):return
+        self.publish_plan_history(key,data['request_id'])
 
     def read_outage_schedule(self,now=None):
         source=self.cfg.get('outage_source') or self.cfg.get('outage_calendar')
@@ -594,6 +694,9 @@ class HeatingRecovery:
         if action=='heat' and (scheduled_off or self.grid_state()!='on' or
                               room is not None and room>=self.active_upper()):
             action="off"
+        plan_forecast=(getattr(self,'decision_context',None) or {}).get('forecast')
+        if action=='heat' and not once and isinstance(plan_forecast,dict) and 'heat_segments' in plan_forecast:
+            if not any(s['start']<=time.time()<s['end'] for s in plan_forecast['heat_segments']):action='off'
         urgent=release or action=="fallback" or (action=="off" and (
             scheduled_off or self.grid_state()!="on" or (room is not None and room>=self.active_upper()) or
             getattr(self,'decision_context',{}).get('coast_overheat',False) or

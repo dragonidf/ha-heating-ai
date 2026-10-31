@@ -19,7 +19,7 @@ def finite(value):
         return None
 
 
-def observe_floor(previous, stamp, room, probe, power_kw, grid, model):
+def observe_floor(previous, stamp, room, probe, power_kw, grid, model, energy_kwh=None):
     if finite(room) is None or finite(probe) is None:
         return previous or {}, probe
     state=dict(previous or {})
@@ -29,16 +29,22 @@ def observe_floor(previous, stamp, room, probe, power_kw, grid, model):
     hours=max(0.,min(24.,(stamp-state.get('at',stamp))/3600))
     # Integrate the preceding measured power, not a command or a nominal 9 kW.
     old_power=finite(state.get('power_kw')) or 0.
+    before=finite(state.get('energy_kwh'))
+    if energy_kwh is not None and before is not None and hours>0:
+        measured=(energy_kwh-before)/hours
+        old_power=measured if 0<=measured<=10.5 and hours<=.1 else 0.
+    elif hours>45/3600 and old_power>0:
+        old_power=0.  # No invented heating across an unobserved restart/gap.
     if hours>0:
         decay=max(.001,model['floor_decay'])
         equilibrium=room+model['heat_gain']*old_power/decay
         estimate=equilibrium+(estimate-equilibrium)*math.exp(-decay*hours)
     heating=grid=='on' and finite(power_kw) is not None and power_kw>=1.5
     if heating:
-        # Heating proves circulation, after allowing the pipe to flush.
-        # Its return reading then anchors the equivalent thermal state.
+        # Return water is a proxy, not the slab's integrated heat inventory.
+        # A cool pipe must not erase energy delivered by the measured boiler.
         state.setdefault('heating_since',stamp)
-        estimate=probe if stamp-state['heating_since']>=180 else max(estimate,probe)
+        estimate=max(estimate,probe)
         state['last_heated_at']=stamp
     elif grid=='on' and stamp-state.get('last_heated_at',stamp)>6*3600:
         # Very slow correction; a cold stagnant pipe cannot erase a warm slab.
@@ -46,8 +52,9 @@ def observe_floor(previous, stamp, room, probe, power_kw, grid, model):
     if not heating:
         state.pop('heating_since',None)
     estimate=max(room-2.,min(50.,estimate))
-    state.update(at=stamp,estimate=estimate,power_kw=power_kw if heating else 0.,
-                 source='heating_probe' if heating else 'stored_heat_estimate',
+    state.update(at=stamp,estimate=estimate,power_kw=power_kw if heating else 0.,energy_kwh=energy_kwh,
+                 energy_retained=heating and estimate>probe+.1,
+                 source='measured_energy_inventory' if heating and estimate>probe+.1 else 'heating_probe' if heating else 'stored_heat_estimate',
                  probe=probe,grid=grid)
     return state,estimate
 

@@ -14,11 +14,11 @@ from heating_outages import schedule, signature
 from heating_model import DEFAULT_MODEL
 
 class AdapterModulationTests(unittest.TestCase):
-    def fast_tick(self,at,segments,once=False):
+    def fast_tick(self,at,segments,once=False,initial_demand=True):
         app=HeatingClimate()
         app.climate_tz=ZoneInfo('Europe/Kiev')
         app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly')
-        app.memory=dict(demand=True,planned_heat_segments=segments,
+        app.memory=dict(demand=initial_demand,planned_heat_segments=segments,
                         modulation_profile=dict(bands=[],intervals=0,minutes=0))
         app.model=dict(DEFAULT_MODEL,validated=True)
         app.samples=[];app.weather=[]
@@ -54,6 +54,9 @@ class AdapterModulationTests(unittest.TestCase):
         at=datetime(2026,10,13,6,30,tzinfo=ZoneInfo('Europe/Kiev'))
         self.assertEqual(self.fast_tick(at,[dict(start=at.timestamp(),end=at.timestamp()+1800)]),['heat'])
         self.assertEqual(self.fast_tick(at,[],once=True),['heat'])
+    def test_future_session_starts_on_time_between_full_computations(self):
+        at=datetime(2026,10,13,5,30,tzinfo=ZoneInfo('Europe/Kiev'))
+        self.assertEqual(self.fast_tick(at,[dict(start=at.timestamp()-15,end=at.timestamp()+1800)],initial_demand=False),['heat'])
     def test_actual_session_energy_is_counter_delta_not_nominal_power(self):
         app=HeatingClimate()
         app.memory=dict(last_command='heat',heat_session_start_energy=100)

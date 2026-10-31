@@ -115,3 +115,29 @@ test('controller health prioritizes fallback error over generic measurement warn
   assert.match(status.message,/застарів/);assert.match(status.details,/0 хв/);
   attrs.forecast.created_at=new Date().toISOString();assert.equal(panel.controllerHealth().message,'');
 });
+test('a superseded acknowledgement reconciles only actually persisted matching values',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={boiler_power_mode:'fixed_6'};p.render=()=>{};
+  p.shadowRoot={querySelectorAll:()=>[]};let a={revision:2,persisted_revision:2,fields:[]};p.attrs=()=>a;
+  p._hass={callApi:async()=>{}};await p.saveSystemSettings();
+  a={revision:3,persisted_revision:2,last_success:false,fields:[{key:'boiler_power_mode',value:'fixed_6'}]};p.syncSystemSettings();
+  assert.equal(p.systemDraft.boiler_power_mode,'fixed_6');assert.ok(p.systemPending);
+  a={...a,persisted_revision:3,last_request_id:'another-client',last_success:true};p.syncSystemSettings();
+  assert.deepEqual(p.systemDraft,{});assert.equal(p.systemPending,null);assert.match(p.equipmentSave(),/Збережено ✓/);
+});
+test('deficit warning uses concrete limits and labels the horizon without stale conclusions',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.time=()=> '01.11 20:00';
+  const data={controller:{quality:true},grid_status:{raw:'on'},forecast:{created_at:new Date().toISOString(),weather_complete:true,
+    morning_reserve:{comfort_deficit:{coverage_complete:true,first_comfort_violation_at:Date.now()/1000+25*3600,
+      first_violation_temperature:20.8,first_violation_lower:21.,first_violation_shortfall:.2,outside_visible_horizon:true}}}};
+  p.attrs=k=>data[k]||{};p.state=k=>k==='heartbeat'?new Date().toISOString():'';
+  assert.match(p.controllerHealth().message,/20,80 °C/);assert.match(p.controllerHealth().message,/поза видимими/);
+  data.forecast.created_at=new Date(Date.now()-600000).toISOString();
+  assert.match(p.controllerHealth().message,/застарів/);assert.doesNotMatch(p.controllerHealth().message,/20,80/);
+});
+test('temperature comparison explicitly shows absent advance forecasts and nullable observations',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.comparisonCache=new Map();p.time=()=> '23:00';
+  const row={cycle_id:'night',started_at:100,start_known:true,forecast:null,actual:[{ts:100,temperature:21},{ts:400,temperature:null},{ts:700,temperature:21.2}]};
+  p.attrs=()=>({periods:[{cycle_id:'night',started_at:100}],selected:row});p.shadowRoot={querySelector:()=>null};p.clientWidth=390;
+  const text=p.temperatureComparison();assert.match(text,/не відновлено заднім числом/);
+  assert.doesNotMatch(text,/data-comparison-line="forecast"/);assert.match(text,/data-comparison-line="actual"/);
+});

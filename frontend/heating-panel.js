@@ -1,5 +1,5 @@
 /* Heating AI — native Home Assistant panel/card. No tokens or external services. */
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 export const escapeHTML = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const numeric = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
 export const isTrue = value => value === true || value === 'true' || value === 'on';
@@ -89,7 +89,7 @@ const defaults = {
   energy_24h:'sensor.heating_energy_24h', energy_monthly:'sensor.heating_energy_monthly', forecast:'sensor.heating_forecast',
   outages:'sensor.heating_outage_schedule', model:'sensor.heating_model', environment:'sensor.heating_environment', summary:'sensor.heating_ai_summary',
   restore_status:'sensor.heating_restore_status', fan_status:'sensor.heating_fan',
-  system_settings:'sensor.heating_system_settings',
+  plan_history:'sensor.heating_plan_history',system_settings:'sensor.heating_system_settings',
   target:'input_number.heating_target',lower:'input_number.heating_lower',upper:'input_number.heating_upper',
   night_target:'input_number.heating_night_target',night_lower:'input_number.heating_night_lower',night_upper:'input_number.heating_night_upper',
   sleep_start:'input_datetime.heating_sleep_start',sleep_end:'input_datetime.heating_sleep_end',start:'input_datetime.heating_start',end:'input_datetime.heating_end',
@@ -102,7 +102,7 @@ export class HeatingAIPanel extends HTMLElement {
   constructor() {
     super(); this.attachShadow({mode:'open'}); this.tab='overview'; this.config={}; this.nativeCards=new Map(); this.nativeConfigs=new Map(); this.pending=new Set();
     this.historyRange=24;this.historyVisible=new Set(['room','return']);this.historyEpoch=0;
-    this.systemDraft={};this.systemHelp=null;this.systemPending=null;
+    this.comparisonRange=12;this.comparisonCache=new Map();this.systemDraft={};this.systemHelp=null;this.systemPending=null;
     this.shadowRoot.addEventListener('click',e=>this.clicked(e));
     this.shadowRoot.addEventListener('change',e=>this.changed(e));
     this.shadowRoot.addEventListener('focusout',()=>setTimeout(()=>this.render(),0));
@@ -114,6 +114,9 @@ export class HeatingAIPanel extends HTMLElement {
   set hass(value) {
     const previous=this._hass;this._hass=value;
     this.syncSystemSettings();
+    const history=this.attrs('plan_history');
+    if(history.selected?.cycle_id)this.comparisonCache.set(history.selected.cycle_id,history.selected);
+    if(this.comparisonPending&&history.request_id===this.comparisonPending){this.comparisonPending=null;clearTimeout(this.comparisonTimeout);}
     this.toggleAttribute('data-light',value.themes?.darkMode===false);
     for(const card of this.nativeCards.values()) card.hass=value;
     const ids=new Set([...Object.values(defaults),...Object.values(this.config.entities||{}),...Object.values(value.states['sensor.heating_ui']?.attributes?.entities||{}),'sensor.heating_ui']);
@@ -137,14 +140,14 @@ export class HeatingAIPanel extends HTMLElement {
   }
   disconnectedCallback() {
     clearInterval(this.timer);this.resizeObserver?.disconnect();
-    clearTimeout(this.systemTimeout);
+    clearTimeout(this.systemTimeout);clearTimeout(this.systemRetryTimeout);clearTimeout(this.comparisonTimeout);
     cancelAnimationFrame(this.resizeFrame);this.resizeFrame=0;this.observedPlots=new Set();
     cancelAnimationFrame(this.historyFrame);this.historyFrame=0;this.historyEpoch++;
     if(this.historyPending)this.historyAttemptAt=0;
     this.historyPending=null;
   }
   observePlot() {
-    const plots=new Set(this.shadowRoot.querySelectorAll('.forecast-plot,.history-plot'));
+    const plots=new Set(this.shadowRoot.querySelectorAll('.forecast-plot,.history-plot,.comparison-plot'));
     for(const plot of this.observedPlots||[])if(!plots.has(plot))this.resizeObserver?.unobserve(plot);
     for(const plot of plots)if(!this.observedPlots?.has(plot))this.resizeObserver?.observe(plot);
     this.observedPlots=plots;
@@ -308,8 +311,8 @@ export class HeatingAIPanel extends HTMLElement {
     return (this.attrs('system_settings').fields||[]).filter(f=>keys.includes(f.key)).map(f=>`<label class="field"><span>${h(f.label)} <button type="button" class="system-help" data-system-help="${h(f.key)}" aria-label="Підказка: ${h(f.label)}">?</button></span>${this.equipmentControl(f)}</label>`).join('');
   }
   equipmentSave() {
-    if(!Object.keys(this.systemDraft).length&&!this.systemPending)return '';
-    return `<div class="system-actions equipment-save"><span class="equipment-status" role="status">${h(this.systemMessage||'')}</span><button data-system-save ${this.systemPending?'disabled':''}>Зберегти</button></div>`;
+    if(!Object.keys(this.systemDraft).length&&!this.systemPending&&!this.systemMessage)return '';
+    return `<div class="system-actions equipment-save"><span class="equipment-status" role="status">${h(this.systemMessage||'')}</span><button data-system-save ${this.systemPending||!Object.keys(this.systemDraft).length?'disabled':''}>${this.systemPending?'Зберігаємо…':Object.keys(this.systemDraft).length?'Зберегти':'Збережено ✓'}</button></div>`;
   }
   powerDetails() {
     const p=this.attrs('power_model'),v=this.attrs('ventilation'),o=p.power_observation||{},energy=p.energy||{};
@@ -329,10 +332,9 @@ export class HeatingAIPanel extends HTMLElement {
     const stale=meta.timestamp!==undefined&&(!Number.isFinite(reported)||Date.now()-reported>90000);
     const binary=stale||isTrue(meta.confirmation_pending)?'unavailable':this.state('boiler_active'),power=stale?null:numeric(this.state('power_confirmed'));
     const heating=binary==='on'?true:binary==='off'?false:power===null?null:power>=1500;
-    const equipment=this.attrs('power_model');
     const {recommend,mode,recommended,partial,adviceValue,changeBefore}=this.powerAdvice();
-    const advice=`<details class="power-advice"><summary><span>На котлі<strong>${h(mode)}</strong></span><span class="${partial?'warn':''}">${partial?'Для зменшення дефіциту':'Рекомендовано'}<strong>${h(adviceValue)}${(recommended||partial)&&recommend.confidence!=='validated_scenario'?'<small> · умовно</small>':''}</strong></span></summary><p class="muted note">${partial?'Жоден режим не забезпечує весь комфорт за чинними умовами. Наведений варіант найкраще зменшує прогнозований дефіцит. ':''}${h(recommend.reason||'Рекомендація з’явиться після перерахунку температури, погоди й плану.')}</p>${changeBefore?this.row('Потрібна ручна зміна до',this.time(changeBefore,true)):''}${(recommend.alternatives||[]).map(a=>this.row(`${a.nominal_kw} кВт`,isTrue(a.feasible)?'План знайдено':`Дефіцит ${fmt(a.deficit_degree_hours,2)} °C·год`)).join('')}<p class="muted note">${h(recommend.model_bound?.assumptions||'Номінальна потужність не гарантує фактичних кВт·год. Рекомендація не перемикає котел.')}</p></details>`;
-    return `<section class="card boiler-card" data-heating="${heating??'unknown'}"><div class="card-heading"><h2>Котел</h2><span class="pill boiler-status">${heating===true?'Гріє':heating===false?'Очікування':'Немає даних'}</span></div><div class="boiler-metrics">${this.compactMetric('Потужність',fmt(power===null?null:power/1000),'кВт','power_confirmed')}${this.compactMetric('Обратка',fmt(this.state('return')),'°C','return')}${this.compactMetric('За 24 год',fmt(this.state('energy_24h'),2),'кВт·год','energy_24h')}</div>${advice}${stale||isTrue(meta.power_without_request)||isTrue(meta.estimated)?`<p class="boiler-note muted">${stale?'Потужність застаріла — потрібні свіжі вимірювання.':isTrue(meta.power_without_request)?'Є потужність без автоматичного запиту — перевірте котел і вимірювання.':'Потужність оцінена резервним джерелом.'}</p>`:''}${isTrue(equipment.mode_contradiction)?'<p class="warn note">Вимірювання тривало суперечить режиму — перевірте налаштування на котлі.</p>':''}</section>`;
+    const advice=`<details class="power-advice"><summary><span>На котлі<strong>${h(mode)}</strong></span><span class="${partial?'warn':''}">${partial?'Для зменшення дефіциту':recommend.mode===this.state('power_model')?'Режим відповідає плану':'Рекомендовано'}<strong>${h(recommend.mode===this.state('power_model')?'✓':adviceValue)}${(recommended||partial)&&recommend.confidence!=='validated_scenario'?'<small> · умовно</small>':''}</strong></span></summary><p class="muted note">${partial?'Жоден режим не забезпечує весь комфорт за чинними умовами. Наведений варіант найкраще зменшує прогнозований дефіцит. ':''}${h(recommend.reason||'Рекомендація з’явиться після перерахунку температури, погоди й плану.')}</p>${changeBefore?this.row('Потрібна ручна зміна до',this.time(changeBefore,true)):''}${(recommend.alternatives||[]).map(a=>this.row(`${a.nominal_kw} кВт`,isTrue(a.feasible)?'План знайдено':`Дефіцит ${fmt(a.deficit_degree_hours,2)} °C·год`)).join('')}<p class="muted note">${h(recommend.model_bound?.assumptions||'Номінальна потужність не гарантує фактичних кВт·год. Рекомендація не перемикає котел.')}</p></details>`;
+    return `<section class="card boiler-card" data-heating="${heating??'unknown'}"><div class="card-heading"><h2>Котел</h2><span class="pill boiler-status">${heating===true?'Гріє':heating===false?'Очікування':'Немає даних'}</span></div><div class="boiler-metrics">${this.compactMetric('Потужність',fmt(power===null?null:power/1000),'кВт','power_confirmed')}${this.compactMetric('Обратка',fmt(this.state('return')),'°C','return')}${this.compactMetric('За 24 год',fmt(this.state('energy_24h'),2),'кВт·год','energy_24h')}</div>${advice}</section>`;
   }
   fireplaceOverview() {
     const phase=this.state('fireplace_status'),fire=this.attrs('fireplace_status'),fan=this.attrs('fan_status');
@@ -347,34 +349,82 @@ export class HeatingAIPanel extends HTMLElement {
     const f=this.attrs('forecast'),o=this.attrs('outages'),known=f.schedule_known_until??o.known_until;
     const mode=o.mode??f.outage_mode,normal=mode==='normal'&&!isTrue(o.emergency);
     const assumed=isTrue(o.assumed_available);
-    const stale=!Number.isFinite(Date.parse(f.created_at))||Date.now()-Date.parse(f.created_at)>660000;
-    const warnings=[];
-    if(Array.isArray(f.curve)&&f.curve.length) {
-      if(!isTrue(f.weather_complete))warnings.push('Погодинна погода неповна · далі використано останню відому температуру.');
-      if(isTrue(f.reliability?.degraded))warnings.push('Точність знижена · обережне планування.');
-    }
-    if(o.warning&&(isTrue(o.emergency)||/аварійн/i.test(o.warning)))warnings.push(o.warning);
+    const stale=!Number.isFinite(Date.parse(f.created_at))||Date.now()-Date.parse(f.created_at)>420000;
     const help='<details class="forecast-help"><summary aria-label="Як читати прогноз" title="Як читати прогноз">ⓘ</summary><div><strong>Як читати прогноз</strong><p>Тло — комфортний діапазон. Прогноз — оцінка, пунктир показує майбутню температуру.</p><p>Камін — оцінка залишкового тепла. Час майбутнього горіння невідомий.</p><p>Після кінця відомого графіка мережі нагрів умовний; перед виконанням контролер перевіряє фактичну мережу.</p></div></details>';
-    return `<section class="card chart-card"><div class="card-heading"><h2>Наступні 24 години</h2>${help}</div><div class="section-meta"><span class="pill ${stale||isTrue(f.comfort_shortfall)?'warn':''}">${stale?'Прогноз застарів':isTrue(f.comfort_shortfall)?'Ризик зниження температури':'План утримує комфорт'}</span><span class="muted">Оновлено ${h(this.time(f.created_at))}</span></div>${this.forecastChart()}<div class="forecast-stats">${this.compactMetric('Мінімальна температура',fmt(this.state('forecast')),'°C','','minimum')}${this.compactMetric('Очікувана енергія',fmt(f.planned_kwh,2),'кВт·год','','energy')}${this.compactMetric('Горизонт прогнозу',fmt(f.horizon_hours,0),'год','','horizon')}${this.compactMetric(normal?(assumed?'Мережа у прогнозі':'Планові відключення'):'Графік мережі відомий до',normal?(assumed?'Доступна':'Не очікуються'):this.time(known,true),'','','schedule')}</div>${warnings.map(text=>`<p class="forecast-warning warn note" role="status">${h(text)}</p>`).join('')}</section>`;
+    return `<section class="card chart-card"><div class="card-heading"><h2>Наступні 24 години</h2>${help}</div><div class="section-meta"><span class="pill ${stale||isTrue(f.comfort_shortfall)?'warn':''}">${stale?'Попередній сценарій':'Прогноз температури'}</span><span class="muted">Оновлено ${h(this.time(f.created_at))}</span></div>${this.forecastChart()}<div class="forecast-stats">${this.compactMetric('Мінімальна температура',fmt(this.state('forecast')),'°C','','minimum')}${this.compactMetric('Очікувана енергія',fmt(f.planned_kwh,2),'кВт·год','','energy')}${this.compactMetric('Горизонт прогнозу',fmt(f.horizon_hours,0),'год','','horizon')}${this.compactMetric(normal?(assumed?'Мережа у прогнозі':'Планові відключення'):'Графік мережі відомий до',normal?(assumed?'Доступна':'Не очікуються'):this.time(known,true),'','','schedule')}</div></section>`;
   }
-  heatingPlan() {
+  heatingPlan(diagnostics=false) {
     const f=this.attrs('forecast'),segments=mergeSegments(f.heat_segments);
     const morning=Array.isArray(f.morning_runs_minutes)?f.morning_runs_minutes.reduce((sum,v)=>sum+(numeric(v)??0),0):null;
-    const stale=!Number.isFinite(Date.parse(f.created_at))||Date.now()-Date.parse(f.created_at)>660000;
+    const stale=!Number.isFinite(Date.parse(f.created_at))||Date.now()-Date.parse(f.created_at)>420000;
     const reserve=f.morning_reserve&&typeof f.morning_reserve==='object'?f.morning_reserve:null;
     const budget=f.cycle_energy&&typeof f.cycle_energy==='object'?f.cycle_energy:{};
     const budgetRow=numeric(budget.remaining_kwh)!==null?`<div class="plan-morning" data-cycle-budget><strong>Цикл${isTrue(budget.observation_complete)?'':' · часткові дані'}</strong><span>${fmt(budget.observed_kwh,2)} + ${fmt(budget.remaining_kwh,2)} = ${fmt(budget.projected_total_kwh,2)} кВт·год</span></div>`:'';
     const sourceNames={weather:'погода',grid:'мережа',thermal_state:'тепловий стан',power:'потужність',manual:'режим і дозволи',fallback:'штатне керування',model:'модель',execution:'виконання',initial_projection:'перший прогноз'};
-    const budgetDetails=numeric(budget.remaining_kwh)!==null?`<div class="plan-breakdown">${this.compactMetric('Передцикловий план',fmt(budget.baseline?.kwh,2),'кВт·год')}${this.compactMetric('Зміна оцінки циклу',fmt(budget.delta_from_baseline_kwh,2),'кВт·год')}</div><p class="muted note">Виміряно + залишок = оцінка всього циклу. База ${h(this.time(budget.baseline?.at,true))}. Зміни: ${h((Array.isArray(budget.change_sources)?budget.change_sources:[]).map(k=>sourceNames[k]||k).join(', '))}.${isTrue(budget.baseline_consumed)?' Початковий бюджет витрачено; залишкова потреба перевіряється, це не жорсткий stop.':''}</p>`:'';
+    const budgetDetails=numeric(budget.remaining_kwh)!==null?`<div class="plan-breakdown">${this.compactMetric('Фактична перерва живлення',fmt(budget.deviation?.outage_minutes,1),'хв')}${this.compactMetric('Середня потужність за запитом',fmt(budget.deviation?.request_average_kw,2),'кВт')}${this.compactMetric('Поточний мінімум',fmt(budget.deviation?.minimum_temperature,2),'°C')}</div>${budget.deviation?.violation_at?this.row('Ризик нижче мінімуму',this.time(Number(budget.deviation.violation_at),true)+' · '+fmt(budget.deviation.violation_temperature,3)+' °C < '+fmt(budget.deviation.lower,3)+' °C'):''}<div class="plan-breakdown">${this.compactMetric('Передцикловий план',fmt(budget.baseline?.kwh,2),'кВт·год')}${this.compactMetric('Зміна оцінки циклу',fmt(budget.delta_from_baseline_kwh,2),'кВт·год')}</div><p class="muted note">Виміряно + залишок = оцінка всього циклу. База ${h(this.time(budget.baseline?.at,true))}. Зміни: ${h((Array.isArray(budget.change_sources)?budget.change_sources:[]).map(k=>sourceNames[k]||k).join(', '))}.${isTrue(budget.baseline_consumed)?' Початковий бюджет витрачено; залишкова потреба перевіряється, це не жорсткий stop.':''}</p>`:'';
     const stresses=Array.isArray(f.stress_scenarios)?f.stress_scenarios:[];
     const stressDetails=stresses.length?`<div class="plan-breakdown">${stresses.map(r=>this.compactMetric(r.name==='cold_low_solar'?'Холодно / мало сонця':`Без мережі ${String(r.name).replace('blackout_','')} хв`,fmt(r.deficit_degree_hours,2),'°C·год дефіциту')).join('')}</div><p class="muted note">Гіпотетичні сценарії замороженого плану без перепланування. Це не прогноз аварії та не додатковий запит нагріву.</p>`:'';
     const execution=reserve?`<div class="plan-breakdown" data-reserve-execution>${this.compactMetric('Заплановано вранці',fmt(reserve.planned_minutes,1),'хв')}${this.compactMetric('Автоматично виконано',fmt(reserve.confirmed_completed_minutes,1),'хв')}${this.compactMetric('Фактична енергія ранку',fmt(reserve.confirmed_kwh,2),'кВт·год')}${this.compactMetric('Ручний нагрів вранці',fmt(reserve.manual_completed_minutes,1),'хв')}</div><p class="note ${isTrue(reserve.predicted_sufficient)?'muted':'warn'}">${h(reserve.impossibility_reason|| (reserve.reserve_sufficient===null?'Запас до наступного вікна умовний: бракує перевірки потрібного горизонту.':'Достатній за поточним сценарієм.'))}${numeric(reserve.day_deficit_minutes)>0?` Денна нижня межа: ${fmt(reserve.day_deficit_minutes,0)} хв, найбільше відхилення ${fmt(reserve.day_max_shortfall,2)} °C.`:''}</p>`:'';
+    if(!diagnostics)return this.section('План нагріву',`<div class="sessions-grid">${segments.map(s=>`<div class="session"><div><strong>${h(this.time(s.start,true))} → ${h(this.time(s.end))}</strong><span class="muted">${fmt((s.end-s.start)/60,0)} хв</span></div><span class="heat-dot"></span></div>`).join('')||'<p class="empty">Нагрів не запланований.</p>'}</div><button class="text-button" data-tab="model">План і виконання докладніше ↗</button>`,'plan-card');
     return this.section('План нагріву',`<p class="plan-reason muted">${h(f.split_reason||'Контролер розраховує оптимальні інтервали.')}</p><div class="sessions-grid">${segments.map(s=>`<div class="session"><div><strong>${h(this.time(s.start,true))} → ${h(this.time(s.end))}</strong><span class="muted">${fmt((s.end-s.start)/60,0)} хв${isTrue(s.conditional)?' · умовний інтервал':''}</span></div><span class="heat-dot"></span></div>`).join('')||'<p class="empty">Нагрів не запланований.</p>'}</div><div class="plan-morning"><strong>Ранковий прогрів</strong><span>${fmt(morning,0)} хв <small class="muted">· мін. ${fmt(f.morning_min_minutes,0)} хв</small></span></div>${execution}${budgetRow}${stale?'<p class="forecast-warning warn note">План застарів: потрібен новий розрахунок.</p>':''}<details class="plan-details"><summary>Подробиці плану</summary>${budgetDetails}${stressDetails}<div class="plan-breakdown">${this.compactMetric('Вечір',fmt(f.session_kwh?.evening,2),'кВт·год')}${this.compactMetric('Ранок',fmt(f.session_kwh?.morning,2),'кВт·год')}${this.compactMetric('Інші інтервали',fmt(f.session_kwh?.other,2),'кВт·год')}${this.compactMetric('Умовний нагрів',fmt(f.conditional_heat_minutes,0),'хв')}${this.compactMetric('Поза дозволеними годинами',fmt(f.outside_minutes,0),'хв')}${this.compactMetric('Перенесено через відключення',isTrue(f.outage_shifted)?'Так':'Ні')}</div><p class="muted note">${h(morning?'Ранковий прогрів зарезервовано.':f.split_reason||'Ранкового нагріву немає.')}</p></details>`, 'plan-card');
   }
+  nextHeatText() {
+    const f=this.attrs('forecast'),now=Date.now()/1000;
+    if(!Number.isFinite(Date.parse(f.created_at))||Date.now()-Date.parse(f.created_at)>420000)return 'уточнюється';
+    const segment=mergeSegments(f.heat_segments).find(s=>s.end>now);
+    return segment?segment.start<=now?'зараз':this.time(segment.start,true):'не потрібен';
+  }
+  overviewDecision() {
+    const c=this.attrs('controller'),reason=c.reason||'Очікуємо даних';
+    if(this.attrs('grid_status').raw==='off')return 'Очікуємо повернення мережі';
+    if(/дефіцит|пошук|Запас до наступного вікна/i.test(reason))return 'Очікування за планом';
+    return reason;
+  }
+  energyComparison(detailed=false) {
+    const now=Date.now()/1000,cycles=this.attrs('plan_history').energy_cycles||[];
+    const row=cycles.find(c=>Number(c.start)<=now&&Number(c.end)>now)||cycles.find(c=>Number(c.end)<=now);
+    if(!row)return detailed?this.section('Енергія: план і факт','<p class="empty">Ще немає збереженого циклу. Початковий план фіксується до нагріву.</p>'):'';
+    const initial=row.initial_plan||row.baseline,fact=numeric(row.meter_kwh)??numeric(row.observed_kwh);
+    const complete=numeric(row.meter_kwh)!==null||isTrue(row.complete),finished=now>=Number(row.end);
+    const current=numeric(row.latest_plan?.kwh)??numeric(row.last_prestart?.kwh),diff=fact!==null&&numeric(initial?.kwh)!==null?fact-Number(initial.kwh):null;
+    const metrics=`<div class="plan-energy-grid">${this.compactMetric(row.initial_plan&&!isTrue(row.initial_plan.legacy)?(isTrue(row.initial_plan.before_start)?'Початковий план':'Перша збережена оцінка'):'Збережена база',fmt(initial?.kwh,2),'кВт·год')}${this.compactMetric(row.latest_plan?'Актуальний план':'План перед стартом',fmt(current,2),'кВт·год')}${this.compactMetric(complete?'Факт':'Факт · частково',fmt(fact,2),'кВт·год')}</div>`;
+    return this.section(finished?'Останній цикл · план і факт':'Поточний цикл · план і факт',`<div class="muted note">${h(this.time(Number(row.start),true))} → ${h(this.time(Number(row.end),true))}</div>${metrics}${detailed?`${this.row('Відхилення від початкового',diff===null?'—':(diff>0?'+':'')+fmt(diff,2)+' кВт·год')}<details class="energy-notes"><summary>Якість обліку</summary>${this.row('Невизначені інтервали',fmt(Number(row.unknown_seconds||0)/60,1)+' хв')}${this.row('Без автоматичного запиту',fmt(row.other_kwh,2)+' кВт·год')}<p class="muted note">${complete?'Облік за лічильником розрахункової потужності.':'Показано лише підтверджену частину; прогалини не зараховані як нуль.'} Початкова база від ${h(this.time(initial?.at,true))} не змінюється під час перерахунків.</p></details>`:''}`,'plan-energy');
+  }
+  async selectComparison(cycle) {
+    this.comparisonCycle=cycle;this.comparisonError='';
+    if(this.comparisonCache?.has(cycle)){this.render();return;}
+    const request=globalThis.crypto?.randomUUID?.()||String(Date.now());this.comparisonPending=request;this.render();
+    try{
+      await this.hass.callApi('POST','events/heating_plan_history',{request_id:request,cycle_id:cycle});
+      if(this.comparisonPending!==request)return;
+      this.comparisonTimeout=setTimeout(()=>{if(this.comparisonPending===request){this.comparisonPending=null;this.comparisonError='Не вдалося отримати період. Виберіть його повторно.';this.render();}},20000);
+    }catch{this.comparisonPending=null;this.comparisonError='Не вдалося отримати історію.';this.render();}
+  }
+  temperatureComparison() {
+    const a=this.attrs('plan_history'),periods=Array.isArray(a.periods)?a.periods:[];
+    const id=this.comparisonCycle||periods[0]?.cycle_id;
+    const row=this.comparisonCache?.get(id)||(a.selected?.cycle_id===id?a.selected:null);
+    const controls=`<div class="comparison-tools"><label>Період<select data-comparison-period aria-label="Цикл нагріву">${periods.map(p=>`<option value="${h(p.cycle_id)}" ${p.cycle_id===id?'selected':''}>${h(this.time(Number(p.started_at),true))}</option>`).join('')||'<option>Ще немає циклів</option>'}</select></label><div class="history-ranges" role="group" aria-label="Горизонт порівняння">${[6,12,24].map(hours=>`<button data-comparison-range="${hours}" aria-pressed="${(this.comparisonRange||12)===hours}">${hours} год</button>`).join('')}</div></div>`;
+    if(!row)return this.section('Прогноз і фактична температура',controls+`<p class="empty">${h(this.comparisonError||(this.comparisonPending?'Завантажуємо…':'Ще немає зафіксованих циклів. Історія зберігатиметься після перезапуску.'))}</p>`,'comparison-card');
+    const start=Number(row.started_at),end=start+(this.comparisonRange||12)*3600;
+    const predicted=row.forecast?.curve||[],actual=row.actual||[],values=[...predicted,...actual].filter(p=>Number(p.ts)>=start&&Number(p.ts)<=end).map(p=>numeric(p.temperature)).filter(v=>v!==null);
+    const width=Math.max(220,Math.round(this.shadowRoot?.querySelector('.comparison-plot')?.clientWidth||Math.min(this.clientWidth-64||600,900)));
+    const height=240,left=42,right=12,top=15,bottom=205;
+    const low=values.length?Math.floor(Math.min(...values)-.5):20,high=values.length?Math.ceil(Math.max(...values)+.5):24;
+    const x=ts=>left+(ts-start)/(end-start)*(width-left-right),y=v=>bottom-(v-low)/(high-low)*(bottom-top);
+    const paths=(points,gap)=>{const rows=[];let last=null;for(const p of points){if(last&&Number(p.ts)-Number(last.ts)>gap)rows.push({ts:Number(last.ts)+1,state:'unavailable'});rows.push({ts:Number(p.ts),state:p.temperature??'unavailable'});last=p;}return historyPaths(rows,start,end,x,y);};
+    const horizontal=Array.from({length:5},(_,i)=>{const value=low+(high-low)*i/4;return `<line x1="${left}" x2="${width-right}" y1="${y(value)}" y2="${y(value)}" class="comparison-grid"/><text x="${left-8}" y="${y(value)+4}" text-anchor="end">${fmt(value,1)}</text>`;}).join('');
+    const ticks=[0,.5,1].map(t=>`<text x="${x(start+(end-start)*t)}" y="230" text-anchor="${t===0?'start':t===1?'end':'middle'}">${h(this.time(start+(end-start)*t))}</text>`).join('');
+    // Do not extend the last recorded observation into an unobserved future.
+    const actualEnd=Math.min(end,Number(actual.at(-1)?.ts||start));
+    const actualRows=actual.filter(p=>Number(p.ts)<=actualEnd);
+    const actualPaths=paths(actualRows.concat(actualEnd<end?[{ts:actualEnd+.001,temperature:null}]:[]),1200);
+    const svg=`<div class="comparison-plot"><svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Завчасний прогноз і виміряна температура">${horizontal}${ticks}${paths(predicted.concat(predicted.length&&Number(predicted.at(-1).ts)<end?[{ts:Number(predicted.at(-1).ts)+.001,temperature:null}]:[]),3600).map(d=>`<path data-comparison-line="forecast" d="${d}" fill="none" stroke="var(--history-return)" stroke-width="2" stroke-dasharray="5 4"/>`).join('')}${actualPaths.map(d=>`<path data-comparison-line="actual" d="${d}" fill="none" stroke="var(--history-room)" stroke-width="2.5"/>`).join('')}</svg></div>`;
+    return this.section('Прогноз і фактична температура',controls+svg+`<div class="comparison-legend"><span>┄ Очікувана · за 12 год до нагріву</span><span>━ Фактична температура</span></div><p class="muted note">${row.forecast?`Зафіксовано ${h(this.time(row.forecast.at,true))} · за ${fmt((start-Number(row.forecast.at))/3600,2)} год до початку. Прогноз незмінний.`:'Завчасного прогнозу немає. Його не відновлено заднім числом.'}${!isTrue(row.start_known)?' Початок фізичного нагріву до першого спостереження невідомий.':''}</p>`,'comparison-card');
+  }
   overview() {
-    const advice=this.powerAdvice();
     const c=this.attrs('controller'),budget=numeric(this.state('monthly_budget')),used=numeric(this.state('energy_monthly'));
-    return `<div class="overview"><div class="hero card"><div><h1 class="eyebrow">Комфорт у вашому домі</h1><div class="temperature">${fmt(this.state('temperature'))}<span>°C</span></div><p class="hero-target"><span>${h(c.comfort_zone||'Поточний комфорт')}</span><span>Ціль <strong>${fmt(c.target_temperature)} °C</strong></span></p><button class="hero-outside" data-info="${h(this.id('outside'))}"><span>Надворі</span> <strong>${fmt(this.state('outside'))} °C</strong></button></div><div class="hero-side"><span class="eyebrow">Рішення контролера</span><h2>${h(c.reason||'Очікуємо даних')}</h2><p class="muted">${h(c.proposed_action||'')}</p>${advice.recommended||advice.partial?`<div class="hero-power"><span>Рекомендація</span><strong>${h(advice.adviceValue)}${advice.recommend.confidence!=='validated_scenario'?' · умовно':''}</strong></div>`:''}<div class="comfort">Межі комфорту <strong>${fmt(c.lower_temperature)}–${fmt(c.upper_temperature)} °C</strong></div></div></div><div class="heat-sources">${this.boilerOverview()}${this.fireplaceOverview()}</div>${this.forecastOverview()}${this.heatingPlan()}<div class="columns"><div>${this.section('Температура й нагрів',this.historyChart(),'history-card')}${this.section('Енергія котла по годинах','<div class="native" data-native="energy"></div>')}</div><div>${this.section('Енергія за місяць',`<div class="large">${fmt(used,1)} <small>кВт·год</small></div><progress max="${budget!==null&&budget>0?budget:1}" value="${used??0}" aria-label="Місячна енергія"></progress><p class="muted">Орієнтир ${fmt(budget,0)} кВт·год${budget&&used!==null?' · '+fmt(used/budget*100,0)+' %':''}</p>`)}${this.section('Погода на наступну добу','<div class="native" data-native="weather"></div>'+this.field('weather_refresh','Оновити погодинну погоду'))}</div></div></div>`;
+    return `<div class="overview"><div class="hero card"><div><h1 class="eyebrow">Комфорт у вашому домі</h1><div class="temperature">${fmt(this.state('temperature'))}<span>°C</span></div><p class="hero-target"><span>${h(c.comfort_zone||'Поточний комфорт')}</span><span>Ціль <strong>${fmt(c.target_temperature)} °C</strong></span></p><button class="hero-outside" data-info="${h(this.id('outside'))}"><span>Надворі</span> <strong>${fmt(this.state('outside'))} °C</strong></button></div><div class="hero-side"><span class="eyebrow">Рішення контролера</span><h2>${h(this.overviewDecision())}</h2><p class="muted">Наступний нагрів <strong>${h(this.nextHeatText())}</strong></p><div class="comfort">Межі комфорту <strong>${fmt(c.lower_temperature)}–${fmt(c.upper_temperature)} °C</strong></div></div></div><div class="heat-sources">${this.boilerOverview()}${this.fireplaceOverview()}</div>${this.energyComparison()}${this.forecastOverview()}${this.heatingPlan()}<div class="columns"><div>${this.section('Температура й нагрів',this.historyChart(),'history-card')}${this.section('Енергія котла по годинах','<div class="native" data-native="energy"></div>')}</div><div>${this.section('Енергія за місяць',`<div class="large">${fmt(used,1)} <small>кВт·год</small></div><progress max="${budget!==null&&budget>0?budget:1}" value="${used??0}" aria-label="Місячна енергія"></progress><p class="muted">Орієнтир ${fmt(budget,0)} кВт·год${budget&&used!==null?' · '+fmt(used/budget*100,0)+' %':''}</p>`)}${this.section('Погода на наступну добу','<div class="native" data-native="weather"></div>'+this.field('weather_refresh','Оновити погодинну погоду'))}</div></div></div>`;
   }
   settings() {
     this.syncSystemSettings();
@@ -428,10 +478,16 @@ export class HeatingAIPanel extends HTMLElement {
   }
   syncSystemSettings() {
     const a=this.attrs('system_settings');
-    if(this.systemPending&&a.last_request_id===this.systemPending) {
+    const sent=this.systemSent;
+    const valuesMatch=sent&&numeric(a.persisted_revision??a.revision)>sent.revision&&Object.entries(sent.values).every(([key,value])=>{
+      const field=(a.fields||[]).find(f=>f.key===key);
+      return field&&(typeof value==='number'?numeric(field.value)===value:JSON.stringify(field.value)===JSON.stringify(value));
+    });
+    if((this.systemPending&&a.last_request_id===this.systemPending)||sent&&(a.last_request_id===sent.request||valuesMatch)) {
       if(isTrue(a.last_success)){this.systemDraft={};this.systemMessage=isTrue(a.model_pending)?'Налаштування прийнято; кандидат моделі очікує перевірки':'Зміни збережено';}
+      else if(valuesMatch){this.systemDraft={};this.systemMessage='Зміни збережено';}
       else this.systemMessage=a.last_error||'Зміни відхилено';
-      this.systemPending=null;clearTimeout(this.systemTimeout);
+      this.systemPending=null;this.systemSent=null;clearTimeout(this.systemTimeout);clearTimeout(this.systemRetryTimeout);
     }
   }
   async saveSystemSettings() {
@@ -440,10 +496,13 @@ export class HeatingAIPanel extends HTMLElement {
       this.systemMessage='Перевірте значення змінених полів';this.render();return;
     }
     const request=globalThis.crypto?.randomUUID?.()||String(Date.now());
+    this.systemSent={request,revision:numeric(this.attrs('system_settings').revision)??0,values:{...this.systemDraft}};
     this.systemPending=request;this.systemMessage='';this.render();
     try {
-      await this.hass.callApi('POST','events/heating_system_settings',{request_id:request,revision:numeric(this.attrs('system_settings').revision)??0,values:{...this.systemDraft}});
+      await this.hass.callApi('POST','events/heating_system_settings',{request_id:request,revision:this.systemSent.revision,values:this.systemSent.values});
+      if(this.systemPending!==request)return;
       this.systemTimeout=setTimeout(()=>{if(this.systemPending===request){this.systemMessage='Очікуємо підтвердження контролера: перерахунок може тривати довше. За потреби оновіть панель.';this.render();}},15000);
+      this.systemRetryTimeout=setTimeout(()=>{if(this.systemPending===request){this.systemPending=null;this.systemMessage='Підтвердження ще немає. Перевірте з’єднання або повторіть збереження.';this.render();}},60000);
     } catch(error){this.systemPending=null;this.systemMessage=`Не вдалося зберегти: ${error.message||'помилка Home Assistant'}`;}
     this.render();
   }
@@ -457,13 +516,13 @@ export class HeatingAIPanel extends HTMLElement {
     const updated=this.entity('summary')?.last_updated;
     const attempt=a.learning_attempt;
     const learning=attempt?`Остання спроба навчання ${this.time(attempt.time,true)}: ${{rejected:'кандидат відхилено',pending:'кандидат перевіряється',applied:'кандидат застосовано',proposed:'пропозицію перевірено',initial_validation:'початкова перевірка',storage_error:'помилка збереження'}[attempt.status]||'стан невідомий'}; ${isTrue(a.parameters?.validated)?'чинна модель працює':'модель збирає дані'}. ${attempt.reason||''}`:a.last_result||'Навчання ще не виконувалось';
-    return `<div class="model-page compact-page"><div class="page-title"><h1>Модель і ШІ</h1></div><section class="card model-stats">${this.compactMetric('Модель v'+(a.parameters?.version??'—'),this.state('model'),'','model')}${this.compactMetric('Годинна похибка',fmt(a.hour_mae,3),'°C','model')}${this.compactMetric('Придатні інтервали',fmt(a.usable_pairs,0),'','model')}${this.compactMetric('Запас тепла',fmt(this.state('environment')),'°C','environment')}</section><div class="model-grid">
-    ${this.section('Висновок за добу',`<p class="report-text">${h(this.state('summary'))}</p><div class="report-meta muted">Оновлено ${h(this.time(updated,true))}</div>${!Number.isFinite(Date.parse(updated))||Date.now()-Date.parse(updated)>660000?'<p class="warn pill">Дані звіту застаріли</p>':''}<div class="report-stats">${facts([['Охоплення',fmt(s.hours_collected),'год'],['Придатні проби',`${fmt(s.valid_samples,0)} / ${fmt(s.samples,0)}`],['Часове покриття',numeric(s.coverage)===null?'—':fmt(s.coverage*100,0),'%']])}</div>`, 'ai-report')}
+    return `<div class="model-page compact-page"><div class="page-title"><h1>Модель і ШІ</h1></div><section class="card model-stats">${this.compactMetric('Модель v'+(a.parameters?.version??'—'),isTrue(a.parameters?.validated)?'Працює':'Навчається','','model')}${this.compactMetric('Годинна похибка',fmt(a.hour_mae,3),'°C','model')}${this.compactMetric('Придатні інтервали',fmt(a.usable_pairs,0),'','model')}${this.compactMetric('Запас тепла',fmt(this.state('environment')),'°C','environment')}</section><div class="model-grid">
+    ${this.temperatureComparison()}${this.section('Висновок за добу',`<p class="report-text">${h(this.state('summary'))}</p><div class="report-meta muted">Оновлено ${h(this.time(updated,true))}</div>${!Number.isFinite(Date.parse(updated))||Date.now()-Date.parse(updated)>420000?'<p class="warn pill">Дані звіту застаріли</p>':''}<div class="report-stats">${facts([['Охоплення',fmt(s.hours_collected),'год'],['Придатні проби',`${fmt(s.valid_samples,0)} / ${fmt(s.samples,0)}`],['Часове покриття',numeric(s.coverage)===null?'—':fmt(s.coverage*100,0),'%']])}</div>`, 'ai-report')}
     ${this.section('Результат навчання',`<p class="learning-result">${h(learning)}</p>${a.learning_storage_error?`<p class="warn note">Помилка збереження навчання: ${h(a.learning_storage_error)}</p>`:''}<div class="fact-grid">${facts([['Останній аналіз',this.time(a.last_analysis,true)],['Останній успіх',this.time(a.learning_success?.time,true)],['Кількість проб',fmt(a.samples,0)]])}</div>`)}
     ${this.section('Дії',`${this.field('ai_auto_apply','Застосовувати перевірені пропозиції')}<div class="action-buttons">${this.field('rollback','Попередня модель')}${this.field('weather_refresh','Оновити погоду')}</div><div class="report-meta muted">Погодинні дані до ${h(this.time(f.weather_known_until,true))}</div>`, 'model-actions')}
     ${this.section('Модуляція котла',`<p class="model-meta muted">${h(a.power_learning_status||'')} · ${fmt(p.intervals,0)} інтервалів · ${fmt(p.minutes,0)} хв</p><div class="table-scroll"><table><thead><tr><th>Обратка</th><th>Потужність</th><th>Досвід</th></tr></thead><tbody>${(p.bands||[]).map(b=>`<tr><td>${fmt(b.return_min,0)}–${fmt(b.return_max,0)} °C</td><td>${fmt(b.measured_kw)} кВт</td><td>${fmt(b.minutes,0)} хв</td></tr>`).join('')||'<tr><td colspan="3">Очікуємо підтверджених сеансів.</td></tr>'}</tbody></table></div>`)}
     ${this.section('Підлога й погода',`<div class="fact-grid">${facts([['Виміряна обратка',fmt(env.raw_return),'°C'],['Зовнішній прогрів',fmt(env.external_gain_c_per_hour,3),'°C/год'],['Сонячна складова',isTrue(env.solar_validated)?'Перевірена':'Навчається'],['Днів спостережень',fmt(env.solar_learning_days,0)],['Поточна похибка',fmt(a.reliability?.recent_mae,2),'°C'],['Корекція погоди',fmt(f.local_weather_bias),'°C']])}</div>${isTrue(a.reliability?.degraded)?`<p class="warn pill">Точність знижена · запас ${fmt(env.upper_margin)} °C</p>`:''}`)}
-    ${this.powerDetails()}${this.section('Журнал рішень',`<div class="journal">${[...(a.journal||[])].reverse().map(r=>`<div class="entry"><time>${h(this.time(r.time,true))}</time><p>${h(r.reason)}</p></div>`).join('')||'<p class="empty">Журнал ще порожній.</p>'}</div>`, 'model-journal')}
+    ${this.energyComparison(true)}<details class="card execution-details"><summary>План і виконання · докладно</summary>${this.heatingPlan(true)}</details><details class="card power-diagnostics"><summary>Вимірювання потужності й вентиляція</summary>${this.powerDetails()}</details>${this.section('Журнал рішень',`<div class="journal">${[...(a.journal||[])].reverse().map(r=>`<div class="entry"><time>${h(this.time(r.time,true))}</time><p>${h(r.reason)}</p></div>`).join('')||'<p class="empty">Журнал ще порожній.</p>'}</div>`, 'model-journal')}
     <section class="card model-advanced"><details><summary>Параметри й діагностика</summary>${validation}<div class="parameter-grid">${Object.entries(a.parameters||{}).map(([key,value])=>this.row(key,typeof value==='number'?fmt(value,4):value)).join('')}</div><div class="fact-grid controller-facts">${facts([['Процес AppDaemon',this.state('process')==='on'?'Працює':'Не підтверджено'],['Контур керування',this.attrs('diagnostics').control_health||'Немає даних'],['Команди',this.state('permitted')==='on'?'Дозволені':'Не дозволені'],['Останній цикл',this.time(this.state('heartbeat'),true)]])}</div><p class="muted note">${h(this.controllerHealth().details)}</p><p class="muted note">Внутрішній режим Tenko не читається через зовнішній термостат. Запас тепла — еквівалент, а не температура поверхні підлоги. Зовнішній прогрів сам по собі не доводить сонячний внесок.</p><p class="muted note">Прогноз враховує енергію та модуляцію; початкова оцінка для невивчених температур ${fmt(f.power_prior_kw)} кВт. Годинна похибка не підтверджує довгий горизонт; метод, кількість і вік оцінок наведено окремо.</p></details></section>
     </div></div>`;
   }
@@ -474,14 +533,24 @@ export class HeatingAIPanel extends HTMLElement {
     const failure=d.control_health==='error'||c.control_state==='error';
     const age=Date.parse(f.created_at),stale=!Number.isFinite(age)||Date.now()-age>420000;
     const primary=c.error||d.control_error||c.reason;
+    const deficit=f.morning_reserve?.comfort_deficit;
+    const deficitText=!stale&&isTrue(f.weather_complete)&&isTrue(deficit?.coverage_complete)&&numeric(deficit.first_comfort_violation_at)!==null?
+      `${this.time(Number(deficit.first_comfort_violation_at),true)} очікується ${fmt(deficit.first_violation_temperature,Number(deficit.first_violation_shortfall)<.05?3:2)} °C — нижче мінімуму ${fmt(deficit.first_violation_lower,Number(deficit.first_violation_shortfall)<.05?3:2)} °C на ${fmt(deficit.first_violation_shortfall,Number(deficit.first_violation_shortfall)<.05?3:2)} °C${isTrue(deficit.outside_visible_horizon)?' · поза видимими 24 годинами':''}.`:'';
+    const emergency=this.attrs('outages');
+    const power=this.attrs('power_confirmed'),powerMode=this.attrs('power_model');
     const message=fallback?`Тимчасовий резерв auto · ${primary||'планове керування ще не відновлено'}`:
       failure?`Помилка контролера · ${primary||'потрібна перевірка'}`:
       !fresh?'Немає свіжого успішного циклу контролера.':
       !isTrue(c.quality)?'Контролеру бракує актуальних вимірювань.':
       this.attrs('grid_status').raw!=='on'?'Нагрів очікує підтвердження електромережі.':
+      isTrue(emergency.emergency)?emergency.warning||'Аварійні відключення: графік не гарантує світло.':
       d.storage_health==='degraded'?'Не вдалося зберегти частину діагностики — перевірте журнал.':
       d.validation_health==='degraded'?'Перевірка прогнозу обмежена; контур керування продовжує працювати.':
-      stale?'Прогноз застарів: це попередній сценарій.':'';
+      stale?'Прогноз застарів: це попередній сценарій.':
+      isTrue(power.power_without_request)?'Є потужність без автоматичного запиту — перевірте котел і вимірювання.':
+      isTrue(powerMode.mode_contradiction)?'Виміряна потужність суперечить вибраному режиму котла.':
+      deficitText||(!isTrue(f.weather_complete)&&f.curve?.length?'Погодинна погода неповна · далі використано останню відому температуру.':
+      isTrue(f.reliability?.degraded)?`Похибка останніх годинних прогнозів ${fmt(f.reliability.recent_mae,2)} °C.`:'');
     const applied=numeric(d.applied_plan?.applied_at);
     const appliedText=applied===null?'немає підтвердження':`${Math.max(0,Math.floor((Date.now()/1000-applied)/60))} хв тому`;
     const process=this.state('process');
@@ -491,7 +560,7 @@ export class HeatingAIPanel extends HTMLElement {
     if(!this.hass) return;
     const beat=Date.parse(this.state('heartbeat')), alive=this.state('alive')==='on'&&Number.isFinite(beat)&&Date.now()-beat<90000;
     const health=this.controllerHealth();
-    const html=`<style>${styles}</style><main><header><div class="brand"><span class="brand-icon">${icon('home')}</span><div><strong>Heating <span>AI</span></strong><small>Клімат вашого дому</small></div></div><div class="header-status"><span class="dot ${alive?'':'red'}"></span>${alive?'Контролер онлайн':'Перевірте контролер'}<span class="mode">${h(this.state('mode'))}</span><button class="menu-button" data-menu aria-label="Відкрити меню Home Assistant">${icon('menu')}</button></div></header><nav aria-label="Розділи клімату">${[['overview','Огляд'],['settings','Налаштування'],['model','Модель і ШІ']].map(([key,label])=>`<button data-tab="${key}" aria-current="${this.tab===key?'page':'false'}" class="${this.tab===key?'selected':''}">${label}</button>`).join('')}<a href="/climate-control">Поточні панелі ↗</a></nav><div class="notice ${this.error?'':'hidden'}" role="alert">${h(this.error || '')}</div><div class="notice ${health.message?'':'hidden'}" role="status" data-controller-health>${h(health.message)}<small class="health-details">${h(health.details)}</small></div><div class="content">${this.tab==='settings'?this.settings():this.tab==='model'?this.model():this.overview()}</div><footer>Тепло під контролем <span>Home Assistant · Heating AI ${VERSION}</span></footer></main>`;
+    const html=`<style>${styles}</style><main><header><div class="brand"><span class="brand-icon">${icon('home')}</span><div><strong>Heating <span>AI</span></strong><small>Клімат вашого дому</small></div></div><div class="header-status"><span class="dot ${alive?'':'red'}"></span>${alive?'Контролер онлайн':'Перевірте контролер'}<span class="mode">${h(this.state('mode'))}</span><button class="menu-button" data-menu aria-label="Відкрити меню Home Assistant">${icon('menu')}</button></div></header><nav aria-label="Розділи клімату">${[['overview','Огляд'],['settings','Налаштування'],['model','Модель і ШІ']].map(([key,label])=>`<button data-tab="${key}" aria-current="${this.tab===key?'page':'false'}" class="${this.tab===key?'selected':''}">${label}</button>`).join('')}<a href="/climate-control">Поточні панелі ↗</a></nav><div class="notice ${this.error?'':'hidden'}" role="alert">${h(this.error || '')}</div><div class="notice ${health.message&&!this.error?'':'hidden'}" role="status" data-controller-health>${h(health.message)}<small class="health-details">${this.tab==='overview'?'':h(health.details)}</small></div><div class="content">${this.tab==='settings'?this.settings():this.tab==='model'?this.model():this.overview()}</div><footer>Тепло під контролем <span>Home Assistant · Heating AI ${VERSION}</span></footer></main>`;
     const template=document.createElement('template');template.innerHTML=html;
     patchDOM(this.shadowRoot,template.content);
     const dialog=this.shadowRoot.querySelector('.system-dialog');
@@ -526,6 +595,7 @@ export class HeatingAIPanel extends HTMLElement {
     if(el.hasAttribute('data-system-close')){this.closeSystemHelp();return;}
     if(el.hasAttribute('data-system-save')){await this.saveSystemSettings();return;}
     if(el.hasAttribute('data-system-reset')){this.systemDraft={};this.systemMessage='';this.render();return;}
+    if(el.dataset.comparisonRange){this.comparisonRange=Number(el.dataset.comparisonRange);this.render();return;}
     if(el.dataset.historyRange){this.historyRange=Number(el.dataset.historyRange);this.historyCursor=null;this.render();return;}
     if(el.dataset.historySeries){const key=el.dataset.historySeries;if(this.historyVisible.has(key)){if(this.historyVisible.size>1)this.historyVisible.delete(key);}else this.historyVisible.add(key);this.render();return;}
     if(el.hasAttribute('data-history-refresh')){this.loadHistory(true);return;}
@@ -535,6 +605,7 @@ export class HeatingAIPanel extends HTMLElement {
     if(el.dataset.press){if(el.dataset.press==='rollback'&&!confirm('Повернути попередню модель? Поточна модель збережеться для наступного відкату.'))return;await this.call(el.dataset.press,'press',{});}
   }
   async changed(e) {
+    if(e.target.hasAttribute('data-comparison-period')){await this.selectComparison(e.target.value);return;}
     if(e.target.hasAttribute('data-system-key')) {
       const el=e.target;
       if(el.hasAttribute('data-json'))el.setCustomValidity('');
@@ -1155,6 +1226,17 @@ progress::-moz-progress-bar{background:var(--green)}
 
 }
 
+.plan-energy-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:8px}
+.plan-energy-grid .compact-metric{min-width:0;padding:4px 0}.plan-energy-grid strong{font-variant-numeric:tabular-nums;font-size:22px}
+.energy-notes>summary,.power-diagnostics>summary,.execution-details>summary{min-height:44px;display:flex;align-items:center;cursor:pointer;font-weight:600}.power-diagnostics>.card,.execution-details>.card{padding:8px 0 0;border:0;box-shadow:none;margin:0}
+.comparison-tools{display:flex;gap:12px;align-items:end;justify-content:space-between;flex-wrap:wrap}
+.comparison-tools label{display:grid;gap:4px;font-size:12px;color:var(--muted)}
+.comparison-tools select{min-height:44px;max-width:100%;background:var(--surface);color:inherit;border:1px solid var(--stroke);border-radius:8px;padding:8px;font:inherit}
+.comparison-plot{width:100%;min-width:0;margin-top:12px}.comparison-plot svg{display:block;overflow:hidden}
+.comparison-plot text{fill:var(--muted);font-size:11px}.comparison-grid{stroke:var(--stroke);stroke-width:1}
+.comparison-legend{display:flex;flex-wrap:wrap;gap:8px 20px;font-size:12px;color:var(--muted)}
+.comparison-legend span:first-child{color:var(--history-return)}.comparison-legend span:last-child{color:var(--history-room)}
+@container(max-width:600px){.plan-energy-grid{gap:8px}.plan-energy-grid .compact-metric>strong{font-size:19px}.plan-energy-grid .compact-metric>span{font-size:11px}}
 @container(max-width:350px){
   .temperature{font-size:38px}
   .temperature span{font-size:17px}

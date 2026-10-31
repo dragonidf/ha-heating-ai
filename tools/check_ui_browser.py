@@ -87,7 +87,36 @@ def check_theme_and_motion(page):
     assert page.evaluate('calls.length===0'), 'Theme and motion checks must not actuate anything'
 
 
+def check_plan_comparison(page):
+    assert page.locator('.overview .plan-energy-grid .compact-metric').count()==3
+    assert '24,17' in page.locator('.overview .plan-energy').inner_text()
+    assert '35,50' in page.locator('.overview .plan-energy').inner_text()
+    page.locator('nav [data-tab="model"]').click()
+    assert page.locator('[data-comparison-line="forecast"]').count()>0
+    assert page.locator('[data-comparison-line="actual"]').count()>1, 'Unknown sensor readings must break the line'
+    for width in (360,390,430,768,1440):
+        page.set_viewport_size({'width':width,'height':900})
+        for hours in (6,12,24):
+            page.locator(f'[data-comparison-range="{hours}"]').click()
+            page.evaluate('()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
+            assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,hours)
+            box=page.locator('.comparison-plot').bounding_box()
+            assert box['x']>=0 and box['x']+box['width']<=width
+        if width==390:page.locator('.comparison-card').screenshot(path=str(ARTIFACTS/'heating-frozen-comparison-390.png'))
+    page.locator('[data-comparison-period]').select_option('night-missing')
+    page.wait_for_function('comparisonRequests.length===1')
+    assert page.locator('[data-comparison-line="forecast"]').count()==0
+    assert 'не відновлено заднім числом' in page.locator('.comparison-card').inner_text()
+    page.locator('[data-comparison-period]').select_option('night-first')
+    assert page.locator('[data-comparison-line="forecast"]').count()>0
+    assert page.evaluate('calls.length===0'), 'History selection cannot control hardware'
+    page.locator('nav [data-tab="overview"]').click()
+    page.set_viewport_size({'width':1440,'height':1100})
+
+
 def check_compact_overview(page):
+    # WebKit can take longer than the real controller heartbeat period.
+    page.evaluate("setHeatingScenario({'sensor.heating_heartbeat':{state:new Date().toISOString()}})")
     # Interaction checks may have expanded advice; density is the collapsed view.
     if page.locator('.power-advice[open]').count():page.locator('.power-advice>summary').click()
     assert page.locator('.boiler-card').count()==1, 'Boiler metrics must share one card'
@@ -98,7 +127,7 @@ def check_compact_overview(page):
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
     assert headings==['Котел','Камін і циркуляція','Наступні 24 години','План нагріву'], headings
     assert page.locator('.chart-card + .plan-card').count()==1, 'Heating plan must immediately follow the forecast'
-    assert page.locator('.plan-details').get_attribute('open') is None
+    assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
     assert '17,50' in page.locator('.boiler-card').inner_text()
     assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
     for binary,power,expected in [('on','6000','true'),('off','9000','false'),('unavailable','3000','true'),('unavailable','unavailable','unknown')]:
@@ -134,7 +163,7 @@ def check_compact_overview(page):
             page.locator('.fireplace-card').screenshot(path=str(ARTIFACTS/f'heating-fireplace-{phase}-360.png'))
     assert len(set(accents))>=3, 'Off, burning and transitional phases need distinct accents'
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true}},'sensor.heating_outage_schedule':{attributes:{known_until:Date.now()/1000+86400}}})")
-    assert page.locator('.forecast-warning').count()==0, 'Complete forecast must not show generic warnings'
+    assert page.locator('[data-controller-health]:not(.hidden)').count()==0, 'Complete forecast must not show generic warnings'
     assert 'Тло — комфортний діапазон' not in page.locator('.chart-card').inner_text()
     assert 'Час майбутнього горіння невідомий' not in page.locator('.chart-card').inner_text()
     page.locator('.forecast-help summary').click()
@@ -144,43 +173,45 @@ def check_compact_overview(page):
     for missing in (0,42,59,60):
         page.evaluate('''missing=>setHeatingScenario({'sensor.heating_forecast':{attributes:{
             schedule_complete:true,weather_complete:true,weather_missing_minutes:missing}}})''',missing)
-        assert page.locator('.forecast-warning').count()==0, (missing,'Tolerated weather tail must not warn')
+        assert page.locator('[data-controller-health]:not(.hidden)').count()==0, (missing,'Tolerated weather tail must not warn')
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}}})")
-    assert page.locator('.forecast-warning').count()==0, 'Partial schedule is used without a generic incompleteness notice'
+    assert page.locator('[data-controller-health]:not(.hidden)').count()==0, 'Partial schedule is used without a generic incompleteness notice'
     for missing in (61,95,None):
         page.evaluate('''missing=>setHeatingScenario({'sensor.heating_forecast':{attributes:{
             schedule_complete:true,weather_complete:false,weather_missing_minutes:missing}}})''',missing)
-        assert 'Погодинна погода неповна' in page.locator('.forecast-warning').inner_text()
+        assert 'Погодинна погода неповна' in page.locator('[data-controller-health]:not(.hidden)').inner_text()
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true,weather_missing_minutes:42}},
-        'sensor.heating_outage_schedule':{attributes:{warning:'Аварійне відключення'}}})""")
-    warnings=page.locator('.forecast-warning').all_text_contents()
+        'sensor.heating_outage_schedule':{attributes:{emergency:true,warning:'Аварійне відключення'}}})""")
+    warnings=page.locator('[data-controller-health]:not(.hidden)').all_text_contents()
     assert all('Графік мережі неповний' not in warning for warning in warnings)
     assert any('Аварійне відключення' in warning for warning in warnings)
     assert all('Погодинна погода неповна' not in warning for warning in warnings)
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true,outage_mode:'normal'}},
         'sensor.heating_outage_schedule':{attributes:{mode:'normal',warning:null,emergency:false,outages:[]}}})""")
-    assert page.locator('.forecast-warning').count()==0, 'Normal mode must not warn about absent schedule'
+    assert page.locator('[data-controller-health]:not(.hidden)').count()==0, 'Normal mode must not warn about absent schedule'
     assert page.locator('[data-forecast-metric="schedule"] strong').inner_text()=='Не очікуються'
     page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true}},
         'sensor.heating_outage_schedule':{attributes:{mode:'normal',assumed_available:true,warning:null,emergency:false}}})""")
-    assert page.locator('.forecast-warning').count()==0
+    assert page.locator('[data-controller-health]:not(.hidden)').count()==0
     assert page.locator('[data-forecast-metric="schedule"] strong').inner_text()=='Доступна'
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true,outage_mode:'normal'}},
         'sensor.heating_outage_schedule':{attributes:{mode:'unknown',warning:'Графік недоступний'}}})""")
-    assert page.locator('.forecast-warning').count()==0, 'Missing schedule does not create a generic warning'
+    assert page.locator('[data-controller-health]:not(.hidden)').count()==0, 'Missing schedule does not create a generic warning'
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}},
         'sensor.heating_outage_schedule':{attributes:{mode:'scheduled',emergency:true,warning:'Аварійні відключення: графік не гарантує світло'}}})""")
-    assert any('Аварійні відключення' in text for text in page.locator('.forecast-warning').all_text_contents())
+    assert any('Аварійні відключення' in text for text in page.locator('[data-controller-health]:not(.hidden)').all_text_contents())
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{planned_kwh:null}}})")
     assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
     # Automatic completion is separate from the future plan and manual power.
     page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{morning_reserve:{
         planned_minutes:30,confirmed_completed_minutes:0,confirmed_kwh:0,manual_completed_minutes:12,
         reserve_sufficient:null,predicted_sufficient:true}}}})""")
+    page.locator('nav [data-tab="model"]').click()
+    page.locator('.execution-details>summary').click()
     metrics=page.locator('[data-reserve-execution]')
     assert 'Заплановано вранці' in metrics.inner_text()
     assert 'Автоматично виконано' in metrics.inner_text()
@@ -197,6 +228,7 @@ def check_compact_overview(page):
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{morning_reserve:null}}})")
     assert page.locator('[data-reserve-execution]').count()==0
     page.evaluate('panel.hass=mockHass')
+    page.locator('nav [data-tab="overview"]').click()
 
 
 def check_compact_tabs(page):
@@ -236,6 +268,8 @@ def check_compact_tabs(page):
         observed_kwh:12.3,remaining_kwh:4.2,projected_total_kwh:16.5,observation_complete:true,
         baseline:{kwh:17,at:Date.now()/1000},change_sources:['weather']},stress_scenarios:[
         {name:'cold_low_solar',deficit_degree_hours:0.4,hypothetical:true}]}}})""")
+    page.locator('nav [data-tab="model"]').click()
+    page.locator('.execution-details>summary').click()
     assert '16,50' in page.locator('[data-cycle-budget]').inner_text()
     page.locator('.plan-details summary').click()
     assert 'погода' in page.locator('.plan-details').inner_text()
@@ -245,6 +279,8 @@ def check_compact_tabs(page):
     assert 'часткові дані' in page.locator('[data-cycle-budget]').inner_text()
     assert '= —' in page.locator('[data-cycle-budget]').inner_text()
     page.evaluate('panel.hass=mockHass')
+    if page.locator('.execution-details[open]').count():page.locator('.execution-details>summary').click()
+    page.locator('nav [data-tab="overview"]').click()
 
 
 def check_system_settings(page):
@@ -326,7 +362,8 @@ def check_equipment(page):
         status:'model_bound_insufficient',reason:'Жоден режим не забезпечує весь комфорт',alternatives:[
         {mode:'fixed_3',nominal_kw:3,found:'true',feasible:'false',deficit_degree_hours:4},
         {mode:'fixed_9',nominal_kw:9,found:'true',feasible:'false',deficit_degree_hours:2}]}}}})""")
-    assert '9 кВт' in page.locator('.hero-power').inner_text()
+    assert page.locator('.hero-power').count()==0
+    assert '9 кВт' in page.locator('.power-advice').inner_text()
     assert 'Для зменшення дефіциту' in page.locator('.power-advice>summary').inner_text()
     assert page.locator('.hero').bounding_box()['height']<225, page.locator('.hero').bounding_box()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
@@ -389,6 +426,7 @@ def main(engine='chromium'):
                 mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,fields}}};
                 panel.hass={...mockHass};
             }''',system_fields({},dict(DEFAULT_MODEL,floor_air=.02839661755318365)))
+            check_plan_comparison(page)
             check_compact_overview(page)
             check_controller_incident(page)
             page.wait_for_function('nativeConfigs.length === 2')
