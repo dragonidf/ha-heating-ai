@@ -29,6 +29,21 @@ window.systemRequests=[];window.failSystem=false;
 window.mockHass={states,config:{time_zone:'Europe/Kyiv'},callService:async(domain,service,data)=>{window.calls.push({domain,service,data});if(window.failService)throw new Error('Немає доступу');}};
 mockHass.callApi=async(method,path,data)=>{
   if(path==='events/heating_plan_history'){
+    if(data.start!==undefined){
+      comparisonRequests.push(data);
+      const cycles=[];
+      for(let at=Math.floor(data.start/86400)*86400;at<data.end;at+=86400){
+        const started=at+2*3600;
+        cycles.push({cycle_id:String(started),started_at:started,start_known:true,
+          forecast:window.noComparisonForecast?null:{at:started-43200,source:'archive',plan_id:'original-'+started,
+          curve:Array.from({length:25},(_,i)=>({ts:started+i*1800,temperature:21+.3*Math.sin(i/6)}))}});
+      }
+      const actual=window.emptyComparison?[]:Array.from({length:Math.floor((data.end-data.start)/300)+1},(_,i)=>({ts:data.start+i*300,temperature:i%200===100?null:21.1+.4*Math.sin(i/40)}));
+      const comparison={...data,cycles:window.emptyComparison?[]:cycles,actual,warnings:[]};
+      const old=mockHass.states['sensor.heating_plan_history'];
+      mockHass.states={...mockHass.states,'sensor.heating_plan_history':{...old,attributes:{...old.attributes,comparison}}};
+      panel.hass={...mockHass};return;
+    }
     comparisonRequests.push(data);const old=mockHass.states['sensor.heating_plan_history'];
     mockHass.states={...mockHass.states,'sensor.heating_plan_history':{...old,attributes:{...old.attributes,selected:comparisonFixtures[data.cycle_id],request_id:data.request_id}}};
     panel.hass={...mockHass};return;

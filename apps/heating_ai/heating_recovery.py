@@ -12,6 +12,7 @@ import math
 import traceback
 import shutil
 import copy
+import zlib
 from heating_model import number,in_window,heating_cycle,step,held_action
 from heating_outages import schedule,blocked
 from heating_fallback import estimated_power
@@ -604,7 +605,7 @@ class HeatingRecovery:
             if value is False:return 'false'
             return '0' if isinstance(value,(int,float)) and value==0 else value
         self.publish('sensor.heating_plan_history','Історія прогнозів',**wire(dict(
-            request_id=request_id,selected=selected,
+            request_id=request_id,selected=selected,comparison=getattr(self,'history_comparison',None),
             periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
             energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
                 'latest_plan','observed_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
@@ -613,9 +614,37 @@ class HeatingRecovery:
 
     def plan_history_requested(self,event,data,kwargs=None,**extra):
         if not isinstance(data,dict) or not isinstance(data.get('request_id'),str):return
+        if 'start' in data or 'end' in data:
+            start,end=number(data.get('start')),number(data.get('end'))
+            now=self.now().timestamp()
+            if start is None or end is None or not 0<end-start<=31*86400 or end>now+60:return
+            if getattr(self,'history_loading',False):
+                self.history_queued=dict(data);return
+            self.history_loading=True
+            history=copy.deepcopy(self.memory.get('temperature_history') or {})
+            self.submit_to_executor(self.load_temperature_comparison,start,end,history,data['request_id'],
+                                    callback=self.plan_history_loaded)
+            return
         key=data.get('cycle_id')
         if key not in (self.memory.get('temperature_history') or {}):return
         self.publish_plan_history(key,data['request_id'])
+
+    def load_temperature_comparison(self,start,end,history,request_id):
+        """Executor work: read private evidence without holding the controller thread."""
+        try:
+            result=self.decision_journal.temperature_comparison(start,end,history)
+        except Exception:
+            result=dict(start=start,end=end,actual=[],cycles=[],error='Не вдалося прочитати історію. Повторіть завантаження.')
+        return dict(result,request_id=request_id)
+
+    def plan_history_loaded(self,kwargs=None,**extra):
+        result=(kwargs or extra).get('result')
+        self.history_loading=False
+        if isinstance(result,dict):
+            self.history_comparison=result
+            self.publish_plan_history(request_id=result['request_id'])
+        queued=getattr(self,'history_queued',None);self.history_queued=None
+        if queued:self.plan_history_requested('heating_plan_history',queued)
 
     def read_outage_schedule(self,now=None):
         source=self.cfg.get('outage_source') or self.cfg.get('outage_calendar')
@@ -945,6 +974,90 @@ class DecisionJournal:
         if hashlib.sha256(raw).hexdigest()!=digest:
             raise ValueError('Snapshot checksum mismatch')
         return json.loads(raw)
+
+    def temperature_comparison(self,start,end,stored=None):
+        """Read original issued snapshots and observations; never run a thermal model.
+
+        Archive reads are on demand in an executor. Only selected forecast
+        snapshots are opened; private model/configuration fields never leave here.
+        """
+        if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in (start,end)) or not 0<end-start<=31*86400:
+            raise ValueError('Invalid comparison interval')
+        actual={};cycles={};issues=[];warnings=set()
+        def observe(at,value,valid):
+            at=number(at);value=number(value)
+            if at is not None and start-1200<=at<=end:
+                actual[at]=dict(ts=at,temperature=value if valid and value is not None and 5<=value<=40 else None)
+        def stamp(value):
+            try:return datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()
+            except (ValueError,TypeError,AttributeError):return None
+        def curve(rows):
+            return sorted([dict(ts=number(p.get('ts')),temperature=number(p.get('temperature')))
+                for p in rows if isinstance(p,dict) and number(p.get('ts')) is not None and number(p.get('temperature')) is not None],key=lambda p:p['ts'])
+        def frozen(value):
+            if not isinstance(value,dict):return None
+            rows=curve(value.get('curve') or [])
+            return dict(at=value.get('at'),plan_id=value.get('plan_id'),curve=rows,source=value.get('source','persisted')) if rows else None
+        # Telemetry persists actual control temperatures even on days with no heat.
+        telemetry=self.directory.parent/'telemetry.jsonl'
+        if telemetry.exists():
+            with telemetry.open() as stream:
+                for line in stream:
+                    try:
+                        row=json.loads(line);observe(row.get('ts'),row.get('room'),row.get('quality') in (True,'true','on'))
+                    except (ValueError,AttributeError):warnings.add('malformed_telemetry')
+        first=datetime.fromtimestamp(start-36*3600,timezone.utc).strftime('%Y-%m-%d')
+        last=datetime.fromtimestamp(end,timezone.utc).strftime('%Y-%m-%d')
+        paths={p.name[:10]:p for p in self.directory.glob('????-??-??.jsonl.gz') if first<=p.name[:10]<=last}
+        paths.update({p.name[:10]:p for p in self.directory.glob('????-??-??.jsonl') if first<=p.name[:10]<=last})
+        previous=None
+        for day,path in sorted(paths.items()):
+            try:
+                with (gzip.open(path,'rt') if path.suffix=='.gz' else path.open()) as stream:
+                    for line in stream:
+                        try:
+                            record=json.loads(line);at=stamp(record.get('recorded_at'))
+                            if at is None or not start-36*3600<=at<=end:continue
+                            if record.get('external_attributes') in (True,'true'):
+                                record=self.read_snapshot(record['attributes_snapshot_id'])
+                            if record.get('snapshot_id') and record.get('event')=='full_recompute':
+                                issues.append((at,record['snapshot_id']))
+                            if 'power_w' not in record:continue
+                            power=number(record.get('power_w'))
+                            measured=record.get('power_quality')=='measured' and record.get('power_estimated') not in (True,'true')
+                            key=record.get('cycle_id')
+                            if key and power is not None and power>=1500 and measured and key not in cycles:
+                                edge=bool(previous and 0<at-previous['at']<=45 and previous['measured'] and
+                                          previous['power'] is not None and previous['power']<1500)
+                                cycles[key]=dict(cycle_id=key,started_at=at,start_known=edge,forecast=None)
+                            previous=dict(at=at,power=power,measured=measured)
+                        except (ValueError,TypeError,KeyError,OSError,AttributeError,EOFError,zlib.error):warnings.add('incomplete_journal')
+            except (OSError,EOFError,zlib.error):warnings.add('incomplete_journal')
+        # Select an original issue at least12h before the observed heating edge.
+        # A recent replay or a newly calculated curve is never eligible.
+        for entry in cycles.values():
+            at=entry['started_at']
+            if not entry['start_known']:continue
+            eligible=sorted(((issued,digest) for issued,digest in issues if 43200<=at-issued<=43800),reverse=True)
+            for issued,digest in eligible:
+                try:
+                    snapshot=self.read_snapshot(digest);plan=snapshot.get('new_plan') or {}
+                    rows=curve(plan.get('_calculation_curve') or plan.get('curve') or [])
+                    if rows and rows[0]['ts']<=at<=rows[-1]['ts']:
+                        entry['forecast']=dict(at=issued,plan_id=plan.get('plan_id'),curve=rows,source='archive',snapshot_id=digest)
+                        break
+                except (OSError,ValueError,TypeError,AttributeError,EOFError,zlib.error):warnings.add('missing_forecast_snapshot')
+        for key,value in (stored or {}).items():
+            if not isinstance(value,dict) or number(value.get('started_at')) is None:continue
+            for point in value.get('actual') or []:
+                observe(point.get('ts'),point.get('temperature'),point.get('temperature') is not None)
+            if value.get('forecast'):
+                cycles[key]=dict(cycle_id=key,started_at=value['started_at'],start_known=value.get('start_known'),forecast=frozen(value['forecast']))
+            elif key not in cycles:
+                cycles[key]=dict(cycle_id=key,started_at=value['started_at'],start_known=value.get('start_known'),forecast=None)
+        selected=sorted((c for c in cycles.values() if start-86400<=c['started_at']<=end),key=lambda c:c['started_at'])
+        return dict(start=start,end=end,actual=sorted(actual.values(),key=lambda p:p['ts']),cycles=selected,
+                    warnings=sorted(warnings))
 
     def append(self,record,snapshot=None,stamp=None):
         stamp=time.time() if stamp is None else stamp

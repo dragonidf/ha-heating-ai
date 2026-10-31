@@ -92,22 +92,45 @@ def check_plan_comparison(page):
     assert '24,17' in page.locator('.overview .plan-energy').inner_text()
     assert '35,50' in page.locator('.overview .plan-energy').inner_text()
     page.locator('nav [data-tab="model"]').click()
+    page.wait_for_selector('[data-comparison-line="forecast"]')
+    assert page.locator('[data-comparison-days="7"]').get_attribute('aria-pressed')=='true'
     assert page.locator('[data-comparison-line="forecast"]').count()>0
     assert page.locator('[data-comparison-line="actual"]').count()>1, 'Unknown sensor readings must break the line'
     for width in (360,390,430,768,1440):
         page.set_viewport_size({'width':width,'height':900})
-        for hours in (6,12,24):
-            page.locator(f'[data-comparison-range="{hours}"]').click()
+        for days in (1,7,30):
+            previous=page.evaluate('comparisonRequests.length')
+            page.locator(f'[data-comparison-days="{days}"]').click()
+            page.wait_for_function('n=>comparisonRequests.length>n',arg=previous)
             page.evaluate('()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
-            assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,hours)
+            assert page.locator(f'[data-comparison-days="{days}"]').get_attribute('aria-pressed')=='true'
+            assert page.evaluate('comparisonRequests.at(-1).end-comparisonRequests.at(-1).start')==days*86400
+            assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,days)
             box=page.locator('.comparison-plot').bounding_box()
             assert box['x']>=0 and box['x']+box['width']<=width
-        if width==390:page.locator('.comparison-card').screenshot(path=str(ARTIFACTS/'heating-frozen-comparison-390.png'))
-    page.locator('[data-comparison-period]').select_option('night-missing')
-    page.wait_for_function('comparisonRequests.length===1')
+        if width==390:
+            page.locator('[data-comparison-days="7"]').click()
+            page.locator('.comparison-card').screenshot(path=str(ARTIFACTS/'heating-frozen-comparison-390.png'))
+    page.locator('.comparison-plot').focus();page.locator('.comparison-plot').press('ArrowRight')
+    assert 'Очікувана' in page.locator('.comparison-readout').inner_text()
+    page.locator('.comparison-dates summary').click()
+    page.locator('[data-comparison-date="from"]').fill('2026-10-25')
+    page.locator('[data-comparison-date="to"]').fill('2026-10-26')
+    page.locator('[data-comparison-apply]').click()
+    assert page.evaluate('comparisonRequests.at(-1).end-comparisonRequests.at(-1).start')==49*3600
+    assert page.locator('[data-comparison-days][aria-pressed="true"]').count()==0
+    page.locator('.comparison-dates summary').click()
+    page.evaluate('window.noComparisonForecast=true')
+    page.locator('[data-comparison-days="7"]').click()
     assert page.locator('[data-comparison-line="forecast"]').count()==0
-    assert 'не відновлено заднім числом' in page.locator('.comparison-card').inner_text()
-    page.locator('[data-comparison-period]').select_option('night-first')
+    assert page.locator('[data-comparison-line="actual"]').count()>0
+    assert 'Показано фактичну температуру' in page.locator('.comparison-status').inner_text()
+    page.evaluate('window.noComparisonForecast=false;window.emptyComparison=true')
+    page.locator('[data-comparison-days="7"]').click()
+    assert 'Фактичних вимірів' in page.locator('.comparison-status').inner_text()
+    assert page.locator('.comparison-plot svg').count()==1
+    page.evaluate('window.emptyComparison=false')
+    page.locator('[data-comparison-days="7"]').click()
     assert page.locator('[data-comparison-line="forecast"]').count()>0
     assert page.evaluate('calls.length===0'), 'History selection cannot control hardware'
     page.locator('nav [data-tab="overview"]').click()
@@ -515,6 +538,9 @@ def main(engine='chromium'):
             page.evaluate("panel.style.removeProperty('width')")
             page.screenshot(path=str(ARTIFACTS/'heating-desktop.png'),full_page=True)
             for width in (1920,1440,1024,768,620,600,430,390,360,320):
+                # The expanded calendar checks can outlast a real heartbeat.
+                # Keep the live fixture alive; incident checks exercise staleness separately.
+                page.evaluate("mockHass.states={...mockHass.states,'sensor.heating_heartbeat':{...mockHass.states['sensor.heating_heartbeat'],state:new Date().toISOString()}};panel.hass={...mockHass}")
                 page.set_viewport_size({'width':width,'height':1000})
                 for tab in ('overview','settings','model'):
                     page.locator(f'nav [data-tab="{tab}"]').click()
@@ -620,6 +646,14 @@ def main(engine='chromium'):
                 phone.locator('.history-plot').tap()
                 phone.wait_for_selector('.history-crosshair',state='attached')
                 assert 'Котел:' in phone.locator('.history-readout').inner_text()
+            phone.locator('nav [data-tab="model"]').tap()
+            phone.wait_for_selector('[data-comparison-line="forecast"]')
+            phone.locator('[data-comparison-days="1"]').tap()
+            assert phone.locator('[data-comparison-days="1"]').get_attribute('aria-pressed')=='true'
+            phone.locator('[data-comparison-days="7"]').tap()
+            assert phone.evaluate('comparisonRequests.at(-1).end-comparisonRequests.at(-1).start')==7*86400
+            phone.locator('.comparison-plot').tap()
+            assert 'Фактична' in phone.locator('.comparison-readout').inner_text()
             mobile.close()
             page.evaluate("panel.hass={...mockHass,themes:{darkMode:false}};document.body.style.background='#fafafa';document.body.style.setProperty('--primary-text-color','#17271f');document.body.style.setProperty('--secondary-text-color','#56675d');document.body.style.setProperty('--ha-card-background','#fff')")
             page.locator('.history-card').screenshot(path=str(ARTIFACTS/f'heating-history-light-{engine}.png'))
