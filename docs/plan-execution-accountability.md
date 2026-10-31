@@ -8,6 +8,8 @@ The floor observer integrates credible counter deltas or contiguous measured pow
 
 The normal 15-second loop starts scheduled segments without waiting for a five-minute recalculation. Dispatch checks a segment against the current clock after calculation; grid, upper limits, ownership, outage masks and minimum switching times still apply. Repeated unchanged outage metadata no longer triggers new planning.
 
+An input-related temporary-auto fallback can retry on the next tick after every required input has recovered. Recovery requires valid room/return/outdoor/thermostat readings, confirmed available power, valid settings/model and actual grid availability; it schedules the ordinary full calculation, not a direct heat command. Failed thermostat commands and active control incidents keep their existing retry deadline. A new input fallback names its missing measurements; old state remains readable.
+
 Temperature comparisons freeze the last forecast issued at least 12 hours before a confirmed heating edge, with at most ten minutes of issue-cadence tolerance. Its values and issue time are copied once. Later plans cannot change it. An unknown start, restart gap or missing advance forecast is explicit missing evidence. Observation gaps break lines; neither series is extended beyond its available coverage. Periods and observations survive reload in private controller state, with a rolling month of comparisons.
 
 The AI tab defaults to a calendar week on one temperature chart, with 24-hour/30-day presets and custom inclusive dates interpreted in the HA timezone (including DST). It shows actual telemetry even when no heating cycle or advance forecast exists. Forecast coverage and each original issue time are explicit. Touch and arrow keys inspect the timeline.

@@ -978,6 +978,11 @@ class HeatingClimate(HeatingRecovery,Hass):
         once,once_text=self.once_state(grid,room,target,permitted and probe_ok and power is not None and valid)
         self.publish("sensor.heating_restore_status",once_text,friendly_name="Клімат — одноразовий запуск")
         quality=room is not None and probe_ok and outside is not None and power is not None
+        self.track_control_inputs([key for key,failed in {
+            'room':room is None,'return':not probe_ok,'outside':outside is None,
+            'power':power is None or getattr(self,'power_confirmation_pending',False),
+            'thermostat':thermostat is None or not 5<=thermostat<=40 or self.raw('thermostat') in ('unknown','unavailable',None),
+            'settings':not valid,'model':not self.model.get('validated'),'grid':grid!='on'}.items() if failed])
         self.sample(room,probe,outside,None if power is None else power/1000,fire,source,primary,thermostat,quality,settings)
         self.energy_tick()
         self.run_diagnostic('cycle_energy',self.observe_cycle_energy,now,settings,power,self.val('energy'),grid,automatic)

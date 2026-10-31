@@ -14,7 +14,7 @@ from heating_outages import schedule, signature
 from heating_model import DEFAULT_MODEL
 
 class AdapterModulationTests(unittest.TestCase):
-    def fast_tick(self,at,segments,once=False,initial_demand=True):
+    def fast_tick(self,at,segments,once=False,initial_demand=True,before_tick=None):
         app=HeatingClimate()
         app.climate_tz=ZoneInfo('Europe/Kiev')
         app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly')
@@ -44,6 +44,7 @@ class AdapterModulationTests(unittest.TestCase):
         app.fan_tick=lambda *args:None
         actions=[]
         app.apply_action=lambda action,once:actions.append(action)
+        if before_tick:before_tick(app)
         with patch('heating_climate.time.time',return_value=at.timestamp()):
             app.tick_inner()
         return actions

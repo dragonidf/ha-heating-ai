@@ -662,6 +662,21 @@ class HeatingRecovery:
                 in_window(self.now(),self.raw('sleep_start') or '23:00',self.raw('sleep_end') or '07:00')):
             return self.val('night_upper',self.val('upper',22.5)-.5)
         return self.val('upper',22.5)
+    def track_control_inputs(self,faults):
+        previous=getattr(self,'control_inputs_ready',None)
+        self.control_input_faults=list(faults)
+        self.control_inputs_ready=not faults
+        fallback=self.memory.get('temporary_fallback') or {}
+        input_fallback=(fallback.get('cause')=='inputs' or
+            fallback.get('reason')=='Недоступні дані або команда термостата')
+        # Only recovered input failures retry early. Command/control failures
+        # retain their existing deadlines and all dispatch guards still apply.
+        if (previous is False and not faults and input_fallback and
+                not (self.memory.get('control_incident') or {}).get('active') and
+                self.cfg.get('allow_actuation') and self.raw('armed')=='on' and
+                self.raw('mode')=='Автоматичне керування' and self.grid_state()=='on'):
+            self.next_compute=0
+
     def resume_temporary_fallback(self):
         fallback=self.memory.get('temporary_fallback')
         if (fallback and
@@ -764,12 +779,18 @@ class HeatingRecovery:
         if action=='fallback' and not release:
             stamp=time.time()
             if not self.memory.get('temporary_fallback'):
-                self.memory['temporary_fallback']=dict(reason='Недоступні дані або команда термостата',
+                faults=list(getattr(self,'control_input_faults',[]))
+                labels={'room':'температура кімнати','return':'температура обратки','outside':'температура надворі',
+                    'power':'потужність котла','thermostat':'дані термостата','settings':'межі температури або часу',
+                    'model':'готовність моделі','grid':'наявність мережі'}
+                reason=('Неперевірені дані: '+', '.join(labels.get(k,k) for k in faults)) if faults else 'Недоступні дані або команда термостата'
+                self.memory['temporary_fallback']=dict(reason=reason,cause='inputs' if faults else 'control',missing_inputs=faults,
                     entered_at=stamp,retry_at=self.next_compute if self.next_compute>stamp else stamp+300)
             fallback=self.memory['temporary_fallback']
             self.publish('sensor.heating_controller','Тимчасовий auto',friendly_name='Клімат — контролер',
                 reason=fallback['reason'],mode=self.raw('mode'),control_method='temporary_native_auto',
                 control_state='fallback',incident_id=(self.memory.get('control_incident') or {}).get('incident_id'),
+                missing_inputs=fallback.get('missing_inputs'),
                 error=(self.memory.get('control_incident') or {}).get('signature'),
                 entered_at=fallback.get('entered_at'),last_attempt_at=fallback.get('last_attempt_at'),
                 execution_state=(self.memory.get('command_diagnostic') or {}).get('status','unconfirmed'),

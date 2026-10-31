@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.7 — 2026-10-31
+
+- Retry the normal full plan on the next controller tick when all required inputs recover from a missing-input temporary-auto fallback. Avoid an unnecessary five-minute native-auto hold after a probe/meter comes back. Healthy ticks retain the normal interval.
+- Explain which inputs caused a new fallback. Preserve legacy fallback state, command/control-failure retry deadlines, manual pauses, actual-grid checks, measurement freshness/skew/confirmation, temperature limits and switching protections. Do not issue hardware commands from the recovery tracker.
+- Add regressions for the real unknown-probe recovery path, partial recovery, asynchronous 63-second power reports and protected command/manual/grid failures. Model coefficients and energy history remain intact.
+
 ## 0.3.6 — 2026-10-31
 
 - Recover the temperature comparison after a missed HA state push, panel detach/reconnect, WebView resume or network restoration. Read the completed result through a bounded REST fallback, accept matching shared-entity date ranges and redraw even when HA reuses its state object.
