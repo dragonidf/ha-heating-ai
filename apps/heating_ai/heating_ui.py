@@ -6,14 +6,35 @@ import math
 from pathlib import Path
 
 from heating_ui_assets import DIGEST, SOURCE, VERSION
-from heating_model import BOUNDS, DEFAULT_MODEL
+from heating_model import BOUNDS, DEFAULT_MODEL, number
+
+
+def forecast_for_panel(forecast):
+    """Compact display projection; control and replay keep the original intervals."""
+    curve=[{k:v for k,v in row.items() if k not in ('heat_segments','_fine','comfort_zone')}
+        for row in forecast.get('curve',[])]
+    sessions=[]
+    for row in sorted(forecast.get('heat_segments',[]),key=lambda s:s['start']):
+        last=sessions[-1] if sessions else None
+        if (last and abs(row['start']-last['end'])<=.001 and
+                (last.get('conditional') in (True,'true','on'))==(row.get('conditional') in (True,'true','on'))):
+            if number(last.get('kwh')) is not None and number(row.get('kwh')) is not None:
+                last['kwh']+=row['kwh']
+                last['power_kw']=round(last['kwh']*3600/(row['end']-last['start']),4)
+            else:last.pop('kwh',None);last.pop('power_kw',None)
+            last['end']=row['end']
+        else:sessions.append(dict(row))
+    reserve=forecast.get('morning_reserve')
+    if isinstance(reserve,dict):
+        reserve={k:v for k,v in reserve.items() if k not in ('search_passes','binding_constraints','search_check_key','search_limitation')}
+    return dict(curve=curve,heat_segments=sessions,morning_reserve=reserve)
 
 ENTITY_KEYS = (
     'room', 'return', 'outside', 'fan', 'weather', 'energy', 'target', 'lower', 'upper',
     'night_target', 'night_lower', 'night_upper', 'sleep_start', 'sleep_end', 'start', 'end',
     'monthly_budget', 'session_limit', 'native_setpoint', 'mode', 'strategy', 'armed',
     'restore_once', 'fan_control', 'fan_mode', 'fan_speed', 'fan_night_limit', 'fan_intense_speed',
-    'ai_auto_apply', 'rollback', 'fan_backup',
+    'ai_auto_apply', 'ai_report', 'rollback', 'fan_backup',
 )
 
 
@@ -26,7 +47,8 @@ _SYSTEM_ROWS = (
     ('outage_advance_limit','Графік і прогноз','Ліміт завчасного нагріву',180,0,360,5,'хв','Максимальне перенесення нагріву перед відключенням поза дозволеним вікном. Застосовується лише за чинними перевірками комфорту й відомої мережі.'),
     ('morning_min_minutes','Графік і прогноз','Мінімальний ранковий сеанс',30,5,30,5,'хв','Мінімальна тривалість ранкового сеансу за наявності потреби в теплі; не змушує котел гріти без потреби.'),
     ('weather_max_age','Графік і прогноз','Свіжість погодинної погоди',10800,300,10800,60,'с','Вік останнього отриманого прогнозу. Після цієї межі використовується чинний резервний розрахунок без погодинних даних.'),
-    ('room_max_age','Датчики','Свіжість кімнатного датчика',14400,300,14400,60,'с','Граничний вік heartbeat основного датчика. За перевищення застосовується наявний резерв температури термостата.'),
+    ('room_max_age','Датчики','Свіжість кімнатного датчика',14400,300,14400,60,'с','Верхня межа віку саме температури, не вологості. За достатньої історії попередження діє після 1,5 типового інтервалу звітів, непридатність — після 3 інтервалів, але не пізніше цієї межі. Резерв потребує свіжого термостата й підтвердженого зміщення.'),
+    ('thermostat_temperature_max_age','Датчики','Свіжість резервної температури',5400,300,14400,60,'с','Граничний вік звіту термостата для резервної температури. Потрібне також підтверджене зміщення, не старше доби. Не змінює перевірку прийняття команд термостатом.'),
     ('return_max_age','Датчики','Свіжість датчика обратки',1200,60,1200,60,'с','Після цього віку датчик не вважається придатним для автоматичного керування. Верхня межа залишається 20 хвилин.'),
     ('fireplace_max_age','Датчики','Свіжість датчика каміна',14400,300,14400,60,'с','Застарілий датчик не може створювати автоматичний запит циркуляції.'),
     ('fire_ignite_delta','Камін','Різниця для розпалювання',2,0,5,.1,'°C','Температура каміна мінус температура кімнати. Разом із додатним трендом визначає розпалювання; сама фаза не запускає вентилятор.'),
@@ -68,7 +90,7 @@ SYSTEM_FIELDS += [dict(key='boiler_power_mode',group='Котел і вимірю
 
 SYSTEM_FIELDS += [dict(key='power_measurement_policy',group='Котел і вимірювання',label='Перевірка вимірювань',default='legacy',target='config',kind='select',options={'legacy':'Попередній алгоритм + shadow A/B','audited':'Узгоджені A/B; непевні дані — unknown'},help='Узгоджені A/B перевіряють кожний timestamp і не оцінюють котел за порогом фази чи запитом термостата. За відсутності даних контролер використовує чинний безпечний резерв. Новий окремий облік якості не переписує старі кВт·год.')]
 SYSTEM_FIELDS += [dict(key='power_phase_topology',group='Котел і вимірювання',label='Підтверджена схема фаз · JSON',default={'verified':False,'phases':[]},target='config',kind='json',help='Для кожної з 3 фаз: input, loads [{entity, physical_id}], background_w і uncertainty_w. GRID інвертора включіть як одне підписане навантаження на підтвердженій фазі. physical_id має бути єдиним для двох інтеграцій того самого приладу. verified=true лише після перевірки реального розміщення лічильників. Непідтверджена схема не застосовується.')]
-SYSTEM_FIELDS += [dict(key='outage_missing_policy',group='Електромережа',label='Коли графік не опубліковано',default='unknown',target='config',kind='select',options={'assume_available':'Планувати доступну мережу','unknown':'Залишати невизначеність'},help='Це припущення для прогнозу: без опублікованого графіка можна планувати доступну мережу. Наявні відключення враховуються; фактична відсутність живлення й аварійний сигнал залишаються пріоритетними.')]
+SYSTEM_FIELDS += [dict(key='outage_missing_policy',group='Електромережа',label='Сумісність політики графіка',default='unknown',target='config',kind='select',options={'assume_available':'Перевіряти відсутність обмежень','unknown':'Залишати невизначеність'},help='Старий параметр збережено для сумісності. Жоден його варіант не перетворює недоступне чи застаріле джерело на підтверджене світло. Нормальний режим потребує свіжого позитивного підтвердження Svitlo; частковий графік залишається умовним.')]
 SYSTEM_DEFAULTS={f['key']:f['default'] for f in SYSTEM_FIELDS if f['target']=='config'}
 SYSTEM_FIXED = (
     ('forecast_hours','Горизонт прогнозу',24,'год','Фіксований горизонт чинного планувальника. Ця панель не змінює алгоритм прогнозування.'),

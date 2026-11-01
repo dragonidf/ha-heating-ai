@@ -21,7 +21,7 @@ class MeasurementContracts(unittest.TestCase):
         self.assertFalse(phase_residual({},self.readings(),100.)['valid'])
     def test_conflict_not_averaged(self):
         a=dict(valid=True,watts=3000.,quality='measured');b=dict(valid=True,watts=6000.,quality='estimated')
-        r=combine_power(a,b);self.assertIsNone(r['watts']);self.assertEqual(r['quality'],'unknown')
+        r=combine_power(a,b);self.assertIsNone(r['watts']);self.assertEqual(r['quality'],'contradictory')
     def test_actual_time_energy_restart_duplicates_and_unknown(self):
         state={}
         integrate_observation(state,0.,3000.,'measured')
@@ -219,10 +219,10 @@ class UpgradeEvidence(unittest.TestCase):
         raw={'mode':'unknown','valid':False,'emergency':False,'slots':[],'outages':[],'warning':'missing','source_fresh':False}
         self.assertIs(planning_schedule(raw,'unknown'),raw)
         self.assertIs(planning_schedule(raw,'assume_available',published=True),raw)
-        normal=availability(planning_schedule(raw,'assume_available'),100.,90000.)
-        self.assertTrue(normal['assumed']);self.assertEqual(normal['mode'],'normal');self.assertFalse(normal['source_fresh'])
-        self.assertTrue(schedule_covered(normal,100.,90000.));self.assertFalse(blocked(100.,90000.,normal['outages']))
-        self.assertIsNone(normal['warning']);self.assertFalse(raw['valid'])
+        unknown=availability(planning_schedule(raw,'assume_available'),100.,90000.)
+        self.assertEqual(unknown['mode'],'unknown');self.assertFalse(unknown['source_fresh'])
+        self.assertFalse(schedule_covered(unknown,100.,90000.));self.assertFalse(blocked(100.,90000.,unknown['outages']))
+        self.assertEqual(unknown['warning'],'missing');self.assertFalse(raw['valid'])
         emergency=dict(raw,emergency=True)
         self.assertIs(planning_schedule(emergency,'assume_available'),emergency)
         scheduled=dict(raw,mode='scheduled',valid=True,slots=[dict(start=100.,end=200.,off=True)],outages=[dict(start=100.,end=200.)])
@@ -232,8 +232,8 @@ class UpgradeEvidence(unittest.TestCase):
         from test_planned_execution import PlannedExecutionTests
         fixture=PlannedExecutionTests()
         self.assertEqual(fixture.cycle(missing_policy='assume_available',grid='off')[0],['off'])
-        self.assertEqual(fixture.planner_settings['outage_schedule']['mode'],'normal')
-        self.assertTrue(fixture.outage_status['assumed_available'])
+        self.assertEqual(fixture.planner_settings['outage_schedule']['mode'],'unknown')
+        self.assertFalse(fixture.outage_status['assumed_available'])
         self.assertEqual(fixture.cycle(missing_policy='assume_available',grid='on')[0],['heat'])
 
     def test_zero_equipment_metrics_survive_transport_without_mutating_counters(self):

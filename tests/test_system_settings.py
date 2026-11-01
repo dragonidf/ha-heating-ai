@@ -10,6 +10,18 @@ import heating_ui
 
 
 class SystemSettingsTests(unittest.TestCase):
+    def test_saved_sensor_age_limit_invalidates_the_cached_reporting_policy(self):
+        app=self.app();app.room_limits_at=12345.
+        self.assertTrue(self.submit(app,{'room_max_age':7200})['last_success'])
+        self.assertEqual(app.room_limits_at,0.)
+
+    def test_failed_persistence_does_not_apply_unsaved_runtime_configuration(self):
+        app=self.app();before=deepcopy((app.cfg,app.model,app.memory));app.save.side_effect=OSError('disk full')
+        status=self.submit(app,{'outage_max_age':7200,'boiler_power_mode':'fixed_6'})
+        self.assertFalse(status['last_success'])
+        self.assertEqual((app.cfg,app.model,app.memory),before)
+        self.assertEqual(app.next_compute,123456)
+
     def app(self):
         app=HeatingClimate();app.cfg={'allow_actuation':False};app.model=dict(DEFAULT_MODEL)
         app.memory={};app.next_compute=123456;app.save=Mock();app.journal=Mock();app.log=Mock()
@@ -29,9 +41,9 @@ class SystemSettingsTests(unittest.TestCase):
         self.assertEqual((app.cfg,app.model,app.memory),before);app.save.assert_not_called()
         text=str(app.published)
         self.assertNotIn('PRIVATE',text);self.assertNotIn('/private/data',text)
-        fields=app.published['sensor.heating_system_settings']['fields']
+        fields=heating_ui.system_fields(app.cfg,app.model)
         self.assertTrue(all(f['label'] and f['help'] and f['group'] for f in fields))
-        self.assertEqual(next(f['value'] for f in fields if f['key']=='outage_max_age'),7200)
+        self.assertEqual(app.published['sensor.heating_system_settings']['values']['outage_max_age'],7200)
 
     def test_explicit_config_change_persists_only_requested_override(self):
         app=self.app();status=self.submit(app,{'outage_max_age':7200,'fire_cooldown_seconds':420})

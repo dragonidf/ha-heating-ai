@@ -1,6 +1,7 @@
 """Temporary native-auto recovery and verified thermostat commands."""
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
@@ -13,9 +14,133 @@ import traceback
 import shutil
 import copy
 import zlib
-from heating_model import number,in_window,heating_cycle,step,held_action
+from heating_model import number,in_window,heating_cycle,step,held_action,comfort_at,local_boundary
 from heating_outages import schedule,blocked
 from heating_fallback import estimated_power
+
+def wire_values(value):
+    if isinstance(value,dict):return {k:wire_values(v) for k,v in value.items()}
+    if isinstance(value,list):return [wire_values(v) for v in value]
+    if value is False:return 'false'
+    return '0' if isinstance(value,(int,float)) and value==0 else value
+
+def cycle_energy_allowance(entry):
+    if not entry:return None
+    initial=entry.get('initial_plan') or entry.get('baseline')
+    if not initial or number(initial.get('kwh')) is None:return None
+    spent=max(0.,number(entry.get('observed_kwh')) or 0.)
+    if entry.get('complete') and number(entry.get('meter_kwh')) is not None:spent=entry['meter_kwh']
+    return dict(start=entry['start'],end=entry['end'],remaining_kwh=max(0.,initial['kwh']-spent),
+        known_spent_kwh=spent,fact_complete=bool(entry.get('complete')),initial_kwh=initial['kwh'])
+
+def cycle_quality_summary(entry,stamp):
+    initial=entry.get('initial_plan') or entry.get('baseline') or {}
+    known=number(entry.get('observed_kwh'));expected=number(initial.get('kwh'))
+    error=known-expected if known is not None and expected is not None else None
+    reported_error=error if entry.get('complete') or error is not None and error>0 else None
+    thermal=entry.get('thermal_quality') or {}
+    observed=max(0.,min(stamp,entry['end'])-entry['start'])
+    sessions=entry.get('initial_sessions');execution=entry.get('execution_quality')
+    if execution:
+        planned=sum(s['end']-s['start'] for s in sessions)/60 if isinstance(sessions,list) else None
+        first=min((s['start'] for s in sessions or []),default=None)
+        confirmed=number(entry.get('first_confirmed_heat_at'))
+        execution=dict(execution,planned_minutes=planned,unknown_seconds=entry.get('unknown_seconds'),
+            duration_difference_minutes=execution['confirmed_heating_minutes']-planned if planned is not None else None,
+            first_confirmed_timing_error_seconds=confirmed-first if first is not None and confirmed is not None and entry.get('first_heat_edge_known') else None)
+    return dict(start=entry['start'],end=entry['end'],completed=stamp>=entry['end'],initial_plan_kwh=expected,
+        known_energy_kwh=known,energy_complete=bool(entry.get('complete')),independent_energy_kwh=None,
+        energy_basis='calculated_meter_balance',counter_delta_kwh=entry.get('meter_kwh'),
+        energy_error_kwh=round(reported_error,5) if reported_error is not None else None,
+        energy_error_percent=round(reported_error/expected*100,2) if reported_error is not None and expected else None,
+        energy_error_lower_bound_kwh=round(error,5) if error is not None and not entry.get('complete') else None,
+        energy_error_is_lower_bound=not bool(entry.get('complete')),power_confidence='balance_without_independent_boiler_meter',
+        unknown_seconds=entry.get('unknown_seconds'),automatic_kwh=entry.get('automatic_kwh'),
+        other_kwh=entry.get('other_kwh'),transition_kwh=entry.get('transition_kwh'),
+        attribution='Причина не встановлена' if error is not None and error>0 else 'Перевищення не підтверджено',
+        comfort_violation_minutes=thermal.get('violation_minutes'),comfort_degree_hours=thermal.get('degree_hours'),
+        overheat_minutes=thermal.get('overheat_minutes'),overheat_degree_hours=thermal.get('overheat_degree_hours'),
+        sensor_coverage=round(thermal.get('known_seconds',0)/observed,4) if observed and thermal else None,
+        significant_replans=entry.get('significant_replans'),execution=execution,
+        review=entry.get('overrun_review'))
+
+def positive_exposure(left,right,seconds):
+    if left<=0 and right<=0:return 0.,0.
+    if left>=0 and right>=0:return seconds,seconds*(left+right)/2
+    positive=max(left,right);duration=seconds*positive/abs(right-left)
+    return duration,duration*positive/2
+
+def comparison_items(result):
+    items=[dict(kind='actual',value=p) for p in result.get('actual',[])]
+    for cycle in result.get('cycles',[]):
+        meta={k:v for k,v in cycle.items() if k!='forecast'};forecast=cycle.get('forecast')
+        if forecast:meta['forecast']={k:v for k,v in forecast.items() if k!='curve'}
+        items.append(dict(kind='cycle',value=meta))
+        items.extend(dict(kind='forecast',cycle_id=cycle['cycle_id'],value=p) for p in (forecast or {}).get('curve',[]))
+    items.extend(dict(kind='marker',value=p) for p in result.get('markers',[]))
+    for cycle in result.get('energy_cycles',[]):
+        items.append(dict(kind='energy',value={k:v for k,v in cycle.items() if k!='plan_reviews'}))
+        items.extend(dict(kind='review',value=dict(review,cycle_id=cycle['cycle_id'])) for review in cycle.get('plan_reviews',[]))
+    if result.get('error') or result.get('warnings'):
+        items.append(dict(kind='status',value={k:result[k] for k in ('error','warnings') if k in result}))
+    return items
+
+def comparison_page(items,offset,request_id,result_id,start,end):
+    if type(offset) is not int or not 0<=offset<=len(items):raise ValueError('Invalid history cursor')
+    page=dict(protocol=2,request_id=request_id,result_id=result_id,start=start,end=end,
+        offset=offset,next_offset=None,total=len(items),items=[])
+    cursor=offset
+    while cursor<len(items) and len(page['items'])<64:
+        item=items[cursor];page['items'].append(item);page['next_offset']=cursor+1
+        if len(json.dumps(page).encode())>7800:
+            page['items'].pop()
+            if not page['items']:
+                page['items'].append(dict(kind='error',value='Запис завеликий; оригінал збережено в приватному архіві.'));cursor+=1
+            break
+        cursor+=1
+    page['next_offset']=cursor if cursor<len(items) else None
+    return page
+
+def temperature_curve(rows):
+    """Public temperature evidence; a missing value is an explicit break."""
+    result=[]
+    for row in rows if isinstance(rows,list) else []:
+        if not isinstance(row,dict) or number(row.get('ts')) is None:continue
+        point={k:number(row.get(k)) for k in ('ts','temperature','lower','upper','target') if k in row or k=='temperature'}
+        segments=row.get('heat_segments')
+        if isinstance(segments,list):
+            point['heat_segments']=[{k:s[k] for k in ('start','end','kwh','conditional') if k in s}
+                for s in segments if isinstance(s,dict) and number(s.get('start')) is not None and number(s.get('end')) is not None]
+        result.append(point)
+    return sorted(result,key=lambda p:p['ts'])
+
+def temperature_at(rows,stamp):
+    before=None
+    for point in rows:
+        if point['ts']==stamp:return number(point.get('temperature'))
+        if point['ts']>stamp:
+            if not before or point['ts']-before['ts']>1800:return None
+            a,b=number(before.get('temperature')),number(point.get('temperature'))
+            return a+(b-a)*(stamp-before['ts'])/(point['ts']-before['ts']) if a is not None and b is not None else None
+        before=point
+    return None
+
+def select_temperature_forecast(candidates,reference,journal=None,warnings=None):
+    """Select original evidence before the cutoff; never replay a model."""
+    eligible=sorted((c for c in candidates if number(c.get('at')) is not None and c['at']<=reference-43200),
+                    key=lambda c:c['at'],reverse=True)
+    for candidate in eligible:
+        try:
+            original=journal.read_snapshot(candidate['snapshot_id']) if candidate.get('snapshot_id') and journal else candidate
+            plan=original.get('new_plan') or original
+            rows=temperature_curve(plan.get('_calculation_curve') or plan.get('curve') or [])
+            if rows and rows[0]['ts']<=reference<=rows[-1]['ts']:
+                return dict(at=candidate['at'],plan_id=plan.get('plan_id'),curve=rows,
+                    model_version=plan.get('model_version',(original.get('inputs',{}).get('model') or {}).get('version')),lead_hours=round((reference-candidate['at'])/3600,3),
+                    source=candidate.get('source','persisted'),snapshot_id=candidate.get('snapshot_id'))
+        except (OSError,ValueError,TypeError,AttributeError,EOFError,zlib.error):
+            if warnings is not None:warnings.add('missing_forecast_snapshot')
+    return None
 
 def prediction_contract(value):
     """Validate persisted diagnostic inputs without granting missing validity."""
@@ -107,11 +232,13 @@ class HeatingRecovery:
         incident=self.memory.get('control_incident') or {};fallback=self.memory.get('temporary_fallback')
         quarantine=self.memory.get('validation_quarantine') or []
         recent=bool(quarantine and self.now().timestamp()-quarantine[-1]['at']<300)
-        storage=self.memory.get('state_load_error') or getattr(getattr(self,'decision_journal',None),'error',None)
+        journal=getattr(self,'decision_journal',None)
+        archive=journal.health() if journal and hasattr(journal,'health') else {}
+        storage=self.memory.get('state_load_error') or getattr(journal,'error',None)
         control='fallback' if fallback else 'error' if incident.get('active') else 'healthy' if self.memory.get('last_successful_tick') else 'starting'
         state=('Помилка контролера' if control=='error' else 'Тимчасовий auto' if fallback else
                'Помилка збереження' if storage else 'Діагностика обмежена' if active or recent else 'Журнал доступний')
-        self.publish('sensor.heating_diagnostics',state,storage_health='degraded' if storage else 'healthy',
+        self.publish('sensor.heating_diagnostics',state,storage_health='degraded' if storage else 'warning' if archive.get('pressure') else 'healthy',archive_health=archive,
             storage_error=storage,journal_used_bytes=getattr(getattr(self,'decision_journal',None),'used_bytes',None),
             journal_max_bytes=getattr(getattr(self,'decision_journal',None),'max_bytes',None),
             storage_degraded=bool(storage),validation_health='degraded' if active or recent else 'healthy',control_health=control,
@@ -122,6 +249,27 @@ class HeatingRecovery:
             plan_execution=self.memory.get('plan_execution'),applied_plan=self.memory.get('applied_plan'),
             last_full_recompute=self.memory.get('last_full_recompute'),
             last_validation_rejection=(self.memory.get('validation_quarantine') or [None])[-1],**extra)
+
+    def publish_controller_quality(self,now):
+        completed=sorted((e for e in (self.memory.get('cycle_energy') or {}).values() if e['end']<=now.timestamp()),key=lambda e:e['end'])
+        latest=(completed[-1].get('quality_report') or cycle_quality_summary(completed[-1],now.timestamp())) if completed else None
+        groups=self.validation_summary()['groups'];mode=self.cfg.get('boiler_power_mode','unconfirmed')
+        temperature_errors=[p for p in self.memory.get('temperature_errors',[]) if p.get('model_version')==self.model.get('version') and p.get('physical_mode')==mode]
+        horizons=[]
+        for hours in (1,3,6,12,24):
+            group=next((g for g in groups if g['kind']=='frozen_plan' and g['horizon']==str(hours) and g['physical_mode']==mode),{})
+            observations=[p for p in temperature_errors if p['horizon']==hours]
+            leads=[p['actual_horizon_hours'] for p in observations]
+            horizons.append(dict(hours=hours,count=len(observations),legacy_count=group.get('count',0),
+                days=len({datetime.fromtimestamp(p['actual_at'],now.tzinfo).date() for p in observations}),
+                temperature_mae=round(sum(abs(p['error']) for p in observations)/len(observations),3) if observations else None,
+                actual_minimum_hours=min(leads) if leads else None,actual_maximum_hours=max(leads) if leads else None,
+                energy_mae=group.get('energy_mae'),energy_count=group.get('energy_count',0),last_at=max((p['actual_at'] for p in observations),default=None)))
+        journal=getattr(self,'decision_journal',None)
+        self.publish('sensor.heating_controller_quality','Цикл завершено' if latest else 'Очікуємо завершення циклу',
+            last_completed_cycle=latest,horizons=horizons,model_version=self.model.get('version'),
+            archive_health=journal.health() if journal and hasattr(journal,'health') else {},
+            prospective_only=True,independent_energy_measurement=False)
 
     async def verify_decision_history(self,kwargs=None,**extra):
         """Read Recorder itself; successful set_state is not persistence proof.
@@ -390,7 +538,7 @@ class HeatingRecovery:
                     intervals[-1]['end']=max(intervals[-1]['end'],segment['end'])
                 else:
                     intervals.append(dict(start=segment['start'],end=segment['end']))
-            targets=[(str(h),stamp+h*3600) for h in (6,12,24,36,48)]
+            targets=[(str(h),stamp+h*3600) for h in (1,3,6,12,24,36,48)]
             required=number((forecast.get('morning_reserve') or {}).get('assessment_until'))
             if required and required>stamp:targets.append(('required',required))
             queued=set()
@@ -458,12 +606,13 @@ class HeatingRecovery:
                     predicted=peak,model_version=self.model.get('version'))
         self.memory['peak_observation']=dict(at=stamp,request=requested)
 
-    def observe_cycle_energy(self,now,settings,power,energy,grid,automatic):
+    def observe_cycle_energy(self,now,settings,power,energy,grid,automatic,temperature=None,temperature_valid=False):
         cycle=heating_cycle(now,settings)
         if not cycle:return
         stamp=now.timestamp();ledger=self.memory.setdefault('cycle_energy',{})
         previous=self.memory.get('cycle_energy_observation')
         current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,grid=grid,power=power,
+            temperature=temperature,temperature_valid=temperature_valid,
             known=power is not None and grid in ('on','off') and
                   not getattr(self,'power_source','unknown').startswith(('unknown','unavailable')) and
                   not estimated_power(getattr(self,'power_source','unknown')))
@@ -479,10 +628,38 @@ class HeatingRecovery:
                 continue
             seconds=stamp-previous['at'];a=max(previous['at'],c['cycle_start']);b=min(stamp,c['cycle_end'])
             if b<=a:continue
+            if (0<seconds<=45 and previous.get('temperature_valid') and temperature_valid and
+                    number(previous.get('temperature')) is not None and number(temperature) is not None and
+                    all(number(settings.get(k)) is not None for k in ('target','lower','upper'))):
+                thermal=entry.setdefault('thermal_quality',dict(known_seconds=0.,violation_minutes=0.,degree_hours=0.,
+                    overheat_minutes=0.,overheat_degree_hours=0.))
+                cuts=[a,b]
+                for day in {datetime.fromtimestamp(a,now.tzinfo).date(),datetime.fromtimestamp(b,now.tzinfo).date()}:
+                    for key in ('sleep_start','sleep_end'):
+                        if settings.get(key):
+                            boundary=local_boundary(day,settings[key],now.tzinfo).timestamp()
+                            if a<boundary<b:cuts.append(boundary)
+                for left,right in zip(sorted(cuts),sorted(cuts)[1:]):
+                    _,low,high,_=comfort_at(datetime.fromtimestamp((left+right)/2,now.tzinfo),settings)
+                    before=previous['temperature']+(temperature-previous['temperature'])*(left-previous['at'])/seconds
+                    after=previous['temperature']+(temperature-previous['temperature'])*(right-previous['at'])/seconds
+                    cold,cold_area=positive_exposure(low-before,low-after,right-left)
+                    hot,hot_area=positive_exposure(before-high,after-high,right-left)
+                    thermal['known_seconds']+=right-left;thermal['violation_minutes']+=(cold+hot)/60
+                    thermal['degree_hours']+=(cold_area+hot_area)/3600
+                    thermal['overheat_minutes']+=hot/60;thermal['overheat_degree_hours']+=hot_area/3600
             if 0<seconds<=45 and previous.get('grid')==grid=='off':
                 entry['outage_seconds']=entry.get('outage_seconds',0.)+b-a
             if 0<seconds<=45 and previous['automatic'] and automatic:
                 entry['requested_seconds']=entry.get('requested_seconds',0.)+b-a
+            if 0<seconds<=45 and previous['known'] and current['known']:
+                if power>=1500 and 'first_confirmed_heat_at' not in entry:
+                    entry['first_confirmed_heat_at']=stamp if previous['power']<1500 else a
+                    entry['first_heat_edge_known']=previous['power']<1500
+                if previous['power']>=1500 and power>=1500:entry['measured_heat_seconds']=entry.get('measured_heat_seconds',0.)+b-a
+                entry['execution_quality']=dict(requested_minutes=round(entry.get('requested_seconds',0)/60,2),
+                    confirmed_heating_minutes=round(entry.get('measured_heat_seconds',0)/60,2),
+                    timing_resolution_seconds=45,unknown_seconds=entry['unknown_seconds'])
             before=number(previous.get('energy'));after=number(energy)
             counter_ok=(0<seconds<=45 and before is not None and after is not None and
                 0<=after-before<=10.5*seconds/3600+.00002)
@@ -502,6 +679,14 @@ class HeatingRecovery:
             else:
                 entry['unknown_seconds']+=b-a;entry['complete']=False
             entry['observed_until']=b
+        for entry in ledger.values():
+            initial=entry.get('initial_plan') or entry.get('baseline')
+            if initial and entry['observed_kwh']>initial['kwh'] and not entry.get('overrun_review'):
+                entry['overrun_review']=dict(at=stamp,known_kwh=entry['observed_kwh'],initial_kwh=initial['kwh'],
+                    attribution='Причина не встановлена',unknown_seconds=entry['unknown_seconds'])
+                if entry['start']<=stamp<entry['end']:self.next_compute=0
+            if stamp>=entry['end'] and not entry.get('quality_report'):
+                entry['quality_report']=cycle_quality_summary(entry,stamp)
         self.memory['cycle_energy_observation']=current
         self.memory['cycle_energy']={k:v for k,v in ledger.items() if v['end']>stamp-16*86400}
 
@@ -520,17 +705,41 @@ class HeatingRecovery:
             base=legacy_base
             entry.setdefault('initial_plan',dict(base,before_start=base['at']<entry['start'],legacy=True) if base else
                 dict(at=stamp,kwh=remaining,plan_id=forecast.get('plan_id'),before_start=stamp<entry['start']))
+        sessions=[]
+        for segment in sorted(forecast.get('heat_segments',[]),key=lambda s:s['start']):
+            a=max(entry['start'],segment['start']);b=min(entry['end'],segment['end'])
+            if b<=a:continue
+            if sessions and a<=sessions[-1]['end']+1:sessions[-1]['end']=max(b,sessions[-1]['end'])
+            else:sessions.append(dict(start=a,end=b))
+        initial=entry.get('initial_plan') or {}
+        if initial.get('at')==stamp and not initial.get('legacy'):
+            entry.setdefault('initial_sessions',sessions)
         hashes={k:hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
                 for k,v in context.items()}
         previous=entry.get('projection_inputs')
         changes=[k for k in hashes if previous and previous.get(k)!=hashes[k]]
         entry['projection_inputs']=hashes
-        spent=entry.get('meter_kwh',entry['observed_kwh'])
-        total=spent+remaining if entry['complete'] or number(entry.get('meter_kwh')) is not None else None
+        spent=entry['meter_kwh'] if entry['complete'] and number(entry.get('meter_kwh')) is not None else entry['observed_kwh']
+        total=spent+remaining
         baseline=entry.get('baseline')
         initial=entry.get('initial_plan') or baseline
+        prior=entry.get('latest_plan') or {}
+        deficit=number(reserve.get('deficit_degree_hours'))
+        if prior and prior.get('plan_id')!=forecast.get('plan_id') and (
+                abs(total-(number(prior.get('kwh')) or total))>=.05 or sessions!=entry.get('current_sessions',sessions)):
+            entry['significant_replans']=entry.get('significant_replans',0)+1
+            previous_deficit=number(prior.get('deficit_degree_hours'))
+            review=dict(at=stamp,plan_id=forecast.get('plan_id'),parent_plan_id=prior.get('plan_id'),
+                energy_increase_kwh=round(total-prior['kwh'],4) if number(prior.get('kwh')) is not None else None,
+                change_sources=changes,forecast_deficit_degree_hours=deficit,previous_deficit_degree_hours=previous_deficit,
+                projected_deficit_reduction=previous_deficit-deficit if previous_deficit is not None and deficit is not None else None,
+                comparison_basis='successive_forecasts_not_causal',
+                conditional=bool(reserve.get('conditional') or not forecast.get('weather_complete') or not forecast.get('schedule_complete')),
+                reason=forecast.get('stability_reason') or 'Оновлено прогноз за фактичними входами; причинний внесок не визначено')
+            entry['plan_reviews']=(entry.get('plan_reviews',[])+[review])[-32:]
+        entry['current_sessions']=sessions
         entry['latest_plan']=dict(at=stamp,kwh=round(total,4) if total is not None else None,
-            remaining_kwh=round(remaining,4),plan_id=forecast.get('plan_id'))
+            remaining_kwh=round(remaining,4),plan_id=forecast.get('plan_id'),deficit_degree_hours=deficit)
         detail=reserve.get('comfort_deficit') or {}
         requested=entry.get('requested_seconds',0.)
         deviation=dict(extra_kwh=round(total-initial['kwh'],4) if initial and total is not None else None,
@@ -545,7 +754,7 @@ class HeatingRecovery:
         return dict(cycle_id=key,observed_kwh=round(spent,4),remaining_kwh=round(remaining,4),
             initial_plan=initial,latest_plan=entry['latest_plan'],
             deviation=deviation,
-            fact_complete=entry['complete'] or number(entry.get('meter_kwh')) is not None,
+            fact_complete=entry['complete'],projection_complete=entry['complete'],
             initial_plan_is_prestart=bool(initial and initial['at']<=entry['start']),
             overrun_kwh=round(max(0.,spent-initial['kwh']),4) if initial else None,
             projected_total_kwh=round(total,4) if total is not None else None,
@@ -563,30 +772,88 @@ class HeatingRecovery:
     def observe_temperature_history(self,now,settings,room,power,quality,forecast=None):
         """Capture issued forecasts prospectively; never reconstruct an earlier issue."""
         stamp=now.timestamp();history=self.memory.setdefault('temperature_history',{})
+        checks=self.memory.get('temperature_checks') or [];errors=self.memory.get('temperature_errors') or []
+        if not isinstance(checks,list):
+            self.reject_validation('invalid_temperature_check',checks,stamp);checks=[]
+        errors=[p for p in errors if isinstance(p,dict) and number(p.get('actual_at')) is not None and
+            all(number(p.get(k)) is not None for k in ('horizon','actual_horizon_hours','error'))] if isinstance(errors,list) else []
+        self.memory['temperature_errors']=errors
+        sensor=getattr(self,'temperature_quality',{});age=number(sensor.get('primary_age_seconds'))
+        reported=number(sensor.get('primary_reported_at')) if 'primary_reported_at' in sensor else stamp-age if age is not None else None
+        cadence=number(sensor.get('cadence_seconds')) or 3600.
+        remaining=[]
+        for check in checks:
+            if (not isinstance(check,dict) or not isinstance(check.get('forecast'),dict) or
+                    any(number(check.get(k)) is None for k in ('target_at','issued_at','horizon')) or
+                    'model_version' not in check or 'physical_mode' not in check):
+                self.reject_validation('invalid_temperature_check',check,stamp);continue
+            target=check['target_at']
+            if quality and room is not None and reported is not None and target<=reported<=target+cadence*1.5:
+                source=check['forecast'];journal=getattr(self,'decision_journal',None)
+                try:
+                    original=journal.read_snapshot(source['snapshot_id']) if source.get('snapshot_id') and journal else source
+                    expected=temperature_at(original.get('curve') or [],reported)
+                except (OSError,ValueError,TypeError,AttributeError,EOFError,zlib.error):expected=None
+                if expected is not None:
+                    errors.append(dict(horizon=check['horizon'],issued_at=check['issued_at'],actual_at=reported,
+                        model_version=check['model_version'],physical_mode=check['physical_mode'],
+                        actual_horizon_hours=(reported-check['issued_at'])/3600,
+                        forecast_temperature=expected,actual_temperature=room,error=expected-room))
+                else:self.memory['temperature_validation_missing']=self.memory.get('temperature_validation_missing',0)+1
+            elif stamp>target+cadence*1.5:
+                self.memory['temperature_validation_missing']=self.memory.get('temperature_validation_missing',0)+1
+            else:remaining.append(check)
+        self.memory['temperature_checks']=remaining
+        errors[:]=[p for p in errors[-4096:] if p['actual_at']>=stamp-30*86400]
         candidates=self.memory.setdefault('temperature_forecasts',[])
         if forecast and stamp-(candidates[-1]['at'] if candidates else 0)>=290:
             rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
-            curve=[dict(ts=r['ts'],temperature=r['temperature']) for r in rows
-                   if number(r.get('ts')) is not None and number(r.get('temperature')) is not None]
+            curve=temperature_curve(rows)
             if curve:
-                candidates.append(dict(at=stamp,plan_id=forecast.get('plan_id'),curve=curve,
-                    weather_complete=forecast.get('weather_complete'),model_version=self.model.get('version')))
-        candidates[:]=[x for x in candidates if x['at']>=stamp-13*3600]
+                issued_at=number(forecast.get('issued_at')) or stamp
+                issued=dict(at=issued_at,plan_id=forecast.get('plan_id'),curve=curve,
+                    weather_complete=forecast.get('weather_complete'),model_version=self.model.get('version'))
+                journal=getattr(self,'decision_journal',None)
+                if journal:
+                    digest=journal.snapshot(issued,issued_at)
+                    journal.append(dict(event='temperature_forecast',action='observe',forecast_snapshot_id=digest,
+                        plan_id=issued['plan_id'],model_version=issued['model_version']),stamp=issued_at)
+                    candidates.append(dict(at=issued_at,snapshot_id=digest))
+                else:candidates.append(issued)
+                if issued_at-self.memory.get('temperature_validation_issued_at',0)>=3600:
+                    self.memory['temperature_validation_issued_at']=issued_at
+                    source=dict(at=issued_at,snapshot_id=digest) if journal else copy.deepcopy(issued)
+                    for horizon in (1,3,6,12,24):
+                        target=stamp+horizon*3600
+                        if temperature_at(curve,target) is not None:
+                            self.memory['temperature_checks'].append(dict(issued_at=issued_at,target_at=target,horizon=horizon,
+                                model_version=self.model.get('version'),physical_mode=getattr(self,'cfg',{}).get('boiler_power_mode','unconfirmed'),forecast=source))
+        candidates[:]=[x for x in candidates if x['at']>=stamp-36*3600]
         cycle=heating_cycle(now,settings)
         last=self.memory.get('temperature_history_power') or {}
+        if cycle and cycle['cycle_start']<=stamp<cycle['cycle_end'] and cycle['cycle_id'] not in history:
+            reference=cycle['cycle_start']
+            frozen=select_temperature_forecast(candidates,reference,getattr(self,'decision_journal',None))
+            history[cycle['cycle_id']]=dict(cycle_id=cycle['cycle_id'],cycle_start=reference,cycle_end=cycle['cycle_end'],
+                started_at=reference,reference_at=reference,reference_kind='window_start',start_known=False,
+                forecast=frozen,missing_reason=None if frozen else 'Завчасний прогноз не збережено',actual=[])
         if cycle and number(power) is not None and power>=1500:
             key=cycle['cycle_id'];entry=history.get(key)
             continuous=bool(last and 0<stamp-last['at']<=45 and number(last.get('power')) is not None and last['power']>=1500)
             if entry is None and not continuous:
                 edge=bool(last and 0<stamp-last['at']<=45 and number(last.get('power')) is not None and last['power']<1500)
-                eligible=[x for x in candidates if 12*3600<=stamp-x['at']<=12*3600+600 and
-                          x['curve'][0]['ts']<=stamp<=x['curve'][-1]['ts']]
-                frozen=copy.deepcopy(max(eligible,key=lambda x:x['at'])) if edge and eligible else None
+                frozen=select_temperature_forecast(candidates,stamp,getattr(self,'decision_journal',None)) if edge else None
                 history[key]=dict(cycle_id=key,cycle_start=cycle['cycle_start'],cycle_end=cycle['cycle_end'],
                     started_at=stamp,start_known=edge,forecast=frozen,actual=[])
+            elif entry is not None and not entry.get('physical_started_at') and not continuous:
+                edge=bool(last and 0<stamp-last['at']<=45 and number(last.get('power')) is not None and last['power']<1500)
+                entry.update(physical_started_at=stamp,start_known=edge)
         self.memory['temperature_history_power']=dict(at=stamp,power=power)
         for entry in history.values():
-            finish=min(entry['started_at']+86400,(entry.get('forecast') or {}).get('curve',[dict(ts=entry['started_at']+86400)])[-1]['ts'])
+            finish=entry['started_at']+86400
+            if entry.get('reference_kind')=='window_start':
+                day=datetime.fromtimestamp(entry['started_at'],now.tzinfo).date()+timedelta(days=1)
+                finish=local_boundary(day,settings['start'],now.tzinfo).timestamp()
             actual=entry['actual']
             if entry['started_at']<=stamp<=finish and (not actual or stamp-actual[-1]['ts']>=290 or
                     quality!=(actual[-1]['temperature'] is not None)):
@@ -605,24 +872,42 @@ class HeatingRecovery:
             if isinstance(value,list):return [wire(v) for v in value]
             if value is False:return 'false'
             return '0' if isinstance(value,(int,float)) and value==0 else value
+        comparison=getattr(self,'history_comparison',None)
+        summary=({k:comparison.get(k) for k in ('start','end','warnings','error')} if comparison else None)
+        if summary is not None:summary.update(actual_count=len(comparison.get('actual',[])),cycle_count=len(comparison.get('cycles',[])))
+        if summary is not None and getattr(self,'history_protocol',1)!=2:
+            summary.update(actual=[],cycles=[],requires_panel_reload=True,
+                error='Оновіть панель Heating AI після встановлення оновлення, щоб завантажити історію.')
+        selected=({k:selected.get(k) for k in ('cycle_id','started_at','reference_at','reference_kind','missing_reason')} if selected else None)
         self.publish('sensor.heating_plan_history','Історія прогнозів',**wire(dict(
-            request_id=request_id,selected=selected,comparison=getattr(self,'history_comparison',None),
+            protocol=2,request_id=request_id,selected=selected,comparison=summary,
             periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
             energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
                 'latest_plan','observed_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
                 'cycle_id':k} for k,v in sorted((self.memory.get('cycle_energy') or {}).items(),
-                key=lambda pair:pair[1]['start'],reverse=True)[:16]])))
+                key=lambda pair:pair[1]['start'],reverse=True)[:3]])))
 
     def plan_history_requested(self,event,data,kwargs=None,**extra):
-        if not isinstance(data,dict) or not isinstance(data.get('request_id'),str):return
+        if not isinstance(data,dict) or not isinstance(data.get('request_id'),str) or not 1<=len(data['request_id'])<=128:return
         if 'start' in data or 'end' in data:
             start,end=number(data.get('start')),number(data.get('end'))
             now=self.now().timestamp()
             if start is None or end is None or not 0<end-start<=31*86400 or end>now+60:return
+            if data.get('protocol')==2 and data.get('result_id'):
+                if not isinstance(data['result_id'],str) or len(data['result_id'])>128:return
+                cached=(getattr(self,'history_results',{}) or {}).get(data['result_id'])
+                if not cached or cached['start']!=start or cached['end']!=end or now-cached['at']>600:return
+                try:page=comparison_page(cached['items'],data.get('offset',0),data['request_id'],data['result_id'],start,end)
+                except ValueError:return
+                self.publish('sensor.heating_history_page','Історія · сторінка',**wire_values(page))
+                return
             if getattr(self,'history_loading',False):
+                if data['request_id']==getattr(self,'history_loading_id',None):return
                 self.history_queued=dict(data);return
             self.history_loading=True
+            self.history_loading_id=data['request_id'];self.history_protocol=data.get('protocol',1)
             history=copy.deepcopy(self.memory.get('temperature_history') or {})
+            history['__energy_cycles']=copy.deepcopy(self.memory.get('cycle_energy') or {})
             self.submit_to_executor(self.load_temperature_comparison,start,end,history,data['request_id'],
                                     callback=self.plan_history_loaded)
             return
@@ -633,7 +918,12 @@ class HeatingRecovery:
     def load_temperature_comparison(self,start,end,history,request_id):
         """Executor work: read private evidence without holding the controller thread."""
         try:
+            energy=history.pop('__energy_cycles',{})
             result=self.decision_journal.temperature_comparison(start,end,history)
+            fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','observed_kwh','meter_kwh',
+                'complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh','quality_report','overrun_review','plan_reviews')
+            result['energy_cycles']=[dict(cycle_id=k,**{f:v[f] for f in fields if f in v}) for k,v in energy.items()
+                if v['end']>start and v['start']<end]
         except Exception:
             result=dict(start=start,end=end,actual=[],cycles=[],error='Не вдалося прочитати історію. Повторіть завантаження.')
         return dict(result,request_id=request_id)
@@ -643,6 +933,15 @@ class HeatingRecovery:
         self.history_loading=False
         if isinstance(result,dict):
             self.history_comparison=result
+            if getattr(self,'history_protocol',1)==2 and 'start' in result and 'end' in result:
+                cache=getattr(self,'history_results',{});stamp=self.now().timestamp()
+                cache={k:v for k,v in cache.items() if stamp-v['at']<=600}
+                while len(cache)>=4:cache.pop(next(iter(cache)))
+                result_id=uuid4().hex
+                cache[result_id]=dict(at=stamp,start=result['start'],end=result['end'],items=comparison_items(result))
+                self.history_results=cache
+                page=comparison_page(cache[result_id]['items'],0,result['request_id'],result_id,result['start'],result['end'])
+                self.publish('sensor.heating_history_page','Історія · сторінка',**wire_values(page))
             self.publish_plan_history(request_id=result['request_id'])
         queued=getattr(self,'history_queued',None);self.history_queued=None
         if queued:self.plan_history_requested('heating_plan_history',queued)
@@ -737,13 +1036,13 @@ class HeatingRecovery:
         outage=self.read_outage_schedule()
         scheduled_off=bool(outage.get("valid") and blocked(time.time(),time.time()+15,outage["outages"]))
         if action=='heat' and (scheduled_off or self.grid_state()!='on' or
-                              room is not None and room>=self.active_upper()):
+                              room is None or room>=self.active_upper()):
             action="off"
         plan_forecast=(getattr(self,'decision_context',None) or {}).get('forecast')
         if action=='heat' and not once and isinstance(plan_forecast,dict) and 'heat_segments' in plan_forecast:
             if not any(s['start']<=time.time()<s['end'] for s in plan_forecast['heat_segments']):action='off'
         urgent=release or action=="fallback" or (action=="off" and (
-            scheduled_off or self.grid_state()!="on" or (room is not None and room>=self.active_upper()) or
+            scheduled_off or self.grid_state()!="on" or room is None or room>=self.active_upper() or
             getattr(self,'decision_context',{}).get('coast_overheat',False) or
             (not once and self.raw('strategy')=='Тільки в дозволені години' and
              not in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))))
@@ -935,6 +1234,18 @@ class DecisionJournal:
         self.used_bytes=None
         self.lock=RLock()
 
+    def health(self):
+        stamp=time.time();cached=getattr(self,'space_health',None)
+        if not cached or stamp-cached['at']>60:
+            try:
+                disk=shutil.disk_usage(self.directory.parent)
+                cached=dict(at=stamp,free_bytes=disk.free,disk_total_bytes=disk.total)
+            except OSError:cached=dict(at=stamp,free_bytes=None,disk_total_bytes=None)
+            self.space_health=cached
+        return dict(cached,used_bytes=self.used_bytes,max_bytes=self.max_bytes,
+            pressure=self.used_bytes is not None and self.used_bytes>=self.max_bytes*.9,
+            retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error)
+
     def _prepare(self,stamp):
         self.directory.mkdir(parents=True,exist_ok=True)
         if self.used_bytes is None or stamp-self.last_rotation>3600:
@@ -1005,7 +1316,7 @@ class DecisionJournal:
         """
         if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in (start,end)) or not 0<end-start<=31*86400:
             raise ValueError('Invalid comparison interval')
-        actual={};cycles={};issues=[];warnings=set()
+        actual={};cycles={};issues=[];warnings=set();observations={};markers=[]
         def observe(at,value,valid):
             at=number(at);value=number(value)
             if at is not None and start-1200<=at<=end:
@@ -1013,21 +1324,52 @@ class DecisionJournal:
         def stamp(value):
             try:return datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()
             except (ValueError,TypeError,AttributeError):return None
-        def curve(rows):
-            return sorted([dict(ts=number(p.get('ts')),temperature=number(p.get('temperature')))
-                for p in rows if isinstance(p,dict) and number(p.get('ts')) is not None and number(p.get('temperature')) is not None],key=lambda p:p['ts'])
+        curve=temperature_curve
         def frozen(value):
             if not isinstance(value,dict):return None
             rows=curve(value.get('curve') or [])
-            return dict(at=value.get('at'),plan_id=value.get('plan_id'),curve=rows,source=value.get('source','persisted')) if rows else None
+            return dict(**{k:value.get(k) for k in ('at','plan_id','lead_hours','model_version','snapshot_id')},
+                curve=rows,source=value.get('source','persisted')) if rows else None
         # Telemetry persists actual control temperatures even on days with no heat.
         telemetry=self.directory.parent/'telemetry.jsonl'
         if telemetry.exists():
             with telemetry.open() as stream:
                 for line in stream:
                     try:
-                        row=json.loads(line);observe(row.get('ts'),row.get('room'),row.get('quality') in (True,'true','on'))
+                        row=json.loads(line)
+                        observe(row.get('ts'),row.get('room'),row.get('room_valid',row.get('quality')) in (True,'true','on'))
+                        ts=number(row.get('ts'))
+                        if ts is not None and start-1200<=ts<=end:
+                            observations[ts]=row
+                            policy=row.get('comfort_policy') or {}
+                            if all(number(policy.get(k)) is not None for k in ('target','lower','upper')):
+                                _,lo,hi,_=comfort_at(datetime.fromtimestamp(ts,ZoneInfo('Europe/Kyiv')),policy)
+                                actual[ts].update(lower=lo,upper=hi)
                     except (ValueError,AttributeError):warnings.add('malformed_telemetry')
+        last=None;last_model=None
+        def mark(kind,a,b,**attrs):
+            if b<start or a>end:return
+            if markers and markers[-1]['kind']==kind and markers[-1]['end']==a and not attrs:
+                markers[-1]['end']=min(end,b)
+            else:markers.append(dict(kind=kind,start=max(start,a),end=min(end,b),**attrs))
+        for ts,row in sorted(observations.items()):
+            version=row.get('thermal_model_version')
+            if last_model is not None and version is not None and version!=last_model:
+                mark('model_change',ts,ts,model_version=version)
+            if version is not None:last_model=version
+            if last:
+                a,before=last
+                if 0<ts-a<=420:
+                    if before.get('grid')=='off':mark('grid_off',a,ts)
+                    if (before.get('power_quality')=='measured' and before.get('power_estimated') not in (True,'true')
+                            and number(before.get('power')) is not None and before['power']>=1.5):
+                        mark('actual_heat',a,ts)
+                    if before.get('grid') not in ('on','off') or before.get('power_quality') in ('unknown','contradictory'):
+                        mark('unknown',a,ts)
+                else:mark('unknown',a,ts)
+            if row.get('grid')=='unknown' or row.get('power_quality') in ('unknown','contradictory'):
+                mark('unknown',ts,ts)
+            last=ts,row
         first=datetime.fromtimestamp(start-36*3600,timezone.utc).strftime('%Y-%m-%d')
         last=datetime.fromtimestamp(end,timezone.utc).strftime('%Y-%m-%d')
         paths={p.name[:10]:p for p in self.directory.glob('????-??-??.jsonl.gz') if first<=p.name[:10]<=last}
@@ -1042,46 +1384,48 @@ class DecisionJournal:
                             if at is None or not start-36*3600<=at<=end:continue
                             if record.get('external_attributes') in (True,'true'):
                                 record=self.read_snapshot(record['attributes_snapshot_id'])
-                            if record.get('snapshot_id') and record.get('event')=='full_recompute':
-                                issues.append((at,record['snapshot_id']))
+                            if record.get('event')=='temperature_forecast' and record.get('forecast_snapshot_id'):
+                                issues.append(dict(at=at,snapshot_id=record['forecast_snapshot_id'],source='archive'))
+                            elif record.get('snapshot_id') and record.get('event')=='full_recompute':
+                                issues.append(dict(at=at,snapshot_id=record['snapshot_id'],source='archive'))
+                            reference=number((record.get('reserve') or {}).get('cycle_start'))
+                            key=record.get('cycle_id')
+                            if key and reference is not None and start-86400<=reference<=end and key not in cycles:
+                                cycles[key]=dict(cycle_id=key,started_at=reference,reference_at=reference,
+                                    reference_kind='window_start',start_known=False,forecast=None)
                             if 'power_w' not in record:continue
                             power=number(record.get('power_w'))
                             measured=record.get('power_quality')=='measured' and record.get('power_estimated') not in (True,'true')
-                            key=record.get('cycle_id')
                             continuous=bool(previous and 0<at-previous['at']<=45 and previous['measured'] and
                                             previous['power'] is not None and previous['power']>=1500)
                             if key and power is not None and power>=1500 and measured and key not in cycles and not continuous:
                                 edge=bool(previous and 0<at-previous['at']<=45 and previous['measured'] and
                                           previous['power'] is not None and previous['power']<1500)
                                 cycles[key]=dict(cycle_id=key,started_at=at,start_known=edge,forecast=None)
+                            elif key in cycles and power is not None and power>=1500 and measured and not continuous and not cycles[key].get('physical_started_at'):
+                                edge=bool(previous and 0<at-previous['at']<=45 and previous['measured'] and previous['power'] is not None and previous['power']<1500)
+                                cycles[key].update(physical_started_at=at,start_known=edge)
                             previous=dict(at=at,power=power,measured=measured)
                         except (ValueError,TypeError,KeyError,OSError,AttributeError,EOFError,zlib.error):warnings.add('incomplete_journal')
             except (OSError,EOFError,zlib.error):warnings.add('incomplete_journal')
         # Select an original issue at least12h before the observed heating edge.
         # A recent replay or a newly calculated curve is never eligible.
         for entry in cycles.values():
-            at=entry['started_at']
-            if not entry['start_known']:continue
-            eligible=sorted(((issued,digest) for issued,digest in issues if 43200<=at-issued<=43800),reverse=True)
-            for issued,digest in eligible:
-                try:
-                    snapshot=self.read_snapshot(digest);plan=snapshot.get('new_plan') or {}
-                    rows=curve(plan.get('_calculation_curve') or plan.get('curve') or [])
-                    if rows and rows[0]['ts']<=at<=rows[-1]['ts']:
-                        entry['forecast']=dict(at=issued,plan_id=plan.get('plan_id'),curve=rows,source='archive',snapshot_id=digest)
-                        break
-                except (OSError,ValueError,TypeError,AttributeError,EOFError,zlib.error):warnings.add('missing_forecast_snapshot')
+            at=entry.get('reference_at',entry['started_at'])
+            if not entry['start_known'] and entry.get('reference_kind')!='window_start':continue
+            entry['forecast']=select_temperature_forecast(issues,at,self,warnings)
         for key,value in (stored or {}).items():
             if not isinstance(value,dict) or number(value.get('started_at')) is None:continue
             for point in value.get('actual') or []:
                 observe(point.get('ts'),point.get('temperature'),point.get('temperature') is not None)
             if value.get('forecast'):
-                cycles[key]=dict(cycle_id=key,started_at=value['started_at'],start_known=value.get('start_known'),forecast=frozen(value['forecast']))
+                cycles[key]={k:value.get(k) for k in ('cycle_id','started_at','start_known','reference_at','reference_kind','physical_started_at')}
+                cycles[key]['forecast']=frozen(value['forecast'])
             elif key not in cycles:
                 cycles[key]=dict(cycle_id=key,started_at=value['started_at'],start_known=value.get('start_known'),forecast=None)
         selected=sorted((c for c in cycles.values() if start-86400<=c['started_at']<=end),key=lambda c:c['started_at'])
         return dict(start=start,end=end,actual=sorted(actual.values(),key=lambda p:p['ts']),cycles=selected,
-                    warnings=sorted(warnings))
+                    markers=markers,warnings=sorted(warnings))
 
     def append(self,record,snapshot=None,stamp=None):
         stamp=time.time() if stamp is None else stamp

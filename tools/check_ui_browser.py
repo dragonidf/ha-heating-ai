@@ -73,9 +73,11 @@ def check_theme_and_motion(page):
             page.set_viewport_size({'width':width,'height':1000})
             for tab in ('overview','settings','model'):
                 page.locator(f'nav [data-tab="{tab}"]').click()
+                if tab=='overview' and not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
                 assert page.locator('h1').count()==1, (name,tab,'missing/duplicate page heading')
                 assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (name,tab)
             page.locator('nav [data-tab="overview"]').click()
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             assert page.locator('.hero').evaluate('el=>getComputedStyle(el).borderRadius')==radius, (name,width)
             if name in ('material-dark','material-light'):
                 page.screenshot(path=str(ARTIFACTS/f'heating-theme-{name}-{width}.png'),full_page=True)
@@ -113,15 +115,18 @@ def check_comparison_delivery(page):
     assert page.locator('[data-comparison-line="actual"]').count()>0
     page.locator('[data-comparison-days="7"]').click()
     page.locator('nav [data-tab="overview"]').click()
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
 
 
 def check_plan_comparison(page):
-    assert page.locator('.overview .plan-energy-grid .compact-metric').count()==3
+    assert page.locator('.overview .plan-energy-grid .compact-metric').count()==2
     assert '24,17' in page.locator('.overview .plan-energy').inner_text()
     assert '35,50' in page.locator('.overview .plan-energy').inner_text()
     page.locator('nav [data-tab="model"]').click()
+    page.wait_for_function('panel.comparisonPending===null')
     page.wait_for_selector('[data-comparison-line="forecast"]')
     assert page.locator('[data-comparison-days="7"]').get_attribute('aria-pressed')=='true'
+    page.wait_for_function('panel.comparisonPending===null')
     assert page.locator('[data-comparison-line="forecast"]').count()>0
     assert page.locator('[data-comparison-line="actual"]').count()>1, 'Unknown sensor readings must break the line'
     for width in (360,390,430,768,1440):
@@ -131,6 +136,7 @@ def check_plan_comparison(page):
             page.locator(f'[data-comparison-days="{days}"]').click()
             page.wait_for_function('n=>comparisonRequests.length>n',arg=previous)
             page.evaluate('()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
+            page.wait_for_function('panel.comparisonPending===null')
             assert page.locator(f'[data-comparison-days="{days}"]').get_attribute('aria-pressed')=='true'
             assert page.evaluate('comparisonRequests.at(-1).end-comparisonRequests.at(-1).start')==days*86400
             assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,days)
@@ -150,24 +156,29 @@ def check_plan_comparison(page):
     page.locator('.comparison-dates summary').click()
     page.evaluate('window.noComparisonForecast=true')
     page.locator('[data-comparison-days="7"]').click()
+    page.wait_for_function('panel.comparisonPending===null')
     assert page.locator('[data-comparison-line="forecast"]').count()==0
     assert page.locator('[data-comparison-line="actual"]').count()>0
     assert 'Показано фактичну температуру' in page.locator('.comparison-status').inner_text()
     page.evaluate('window.noComparisonForecast=false;window.emptyComparison=true')
     page.locator('[data-comparison-days="7"]').click()
+    page.wait_for_function('panel.comparisonPending===null')
     assert 'Фактичних вимірів' in page.locator('.comparison-status').inner_text()
     assert page.locator('.comparison-plot svg').count()==1
     page.evaluate('window.emptyComparison=false')
     page.locator('[data-comparison-days="7"]').click()
+    page.wait_for_function('panel.comparisonPending===null')
     assert page.locator('[data-comparison-line="forecast"]').count()>0
     assert page.evaluate('calls.length===0'), 'History selection cannot control hardware'
     page.locator('nav [data-tab="overview"]').click()
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
     page.set_viewport_size({'width':1440,'height':1100})
 
 
 def check_compact_overview(page):
     # WebKit can take longer than the real controller heartbeat period.
     page.evaluate("setHeatingScenario({'sensor.heating_heartbeat':{state:new Date().toISOString()}})")
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
     # Interaction checks may have expanded advice; density is the collapsed view.
     if page.locator('.power-advice[open]').count():page.locator('.power-advice>summary').click()
     assert page.locator('.boiler-card').count()==1, 'Boiler metrics must share one card'
@@ -176,7 +187,7 @@ def check_compact_overview(page):
     assert page.locator('.overview>.metrics').count()==0, 'Old standalone metrics must be removed'
     assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
-    assert headings==['Котел','Камін і циркуляція','Наступні 24 години','План нагріву'], headings
+    assert headings==['Наступні 24 години','План нагріву','Котел','Камін і циркуляція'], headings
     assert page.locator('.chart-card + .plan-card').count()==1, 'Heating plan must immediately follow the forecast'
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
     assert '17,50' in page.locator('.boiler-card').inner_text()
@@ -250,7 +261,7 @@ def check_compact_overview(page):
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true,outage_mode:'normal'}},
         'sensor.heating_outage_schedule':{attributes:{mode:'unknown',warning:'Графік недоступний'}}})""")
-    assert page.locator('[data-controller-health]:not(.hidden)').count()==0, 'Missing schedule does not create a generic warning'
+    assert 'Графік недоступний' in page.locator('[data-controller-health]:not(.hidden)').inner_text(), 'Unknown source must remain a warning'
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true}},
         'sensor.heating_outage_schedule':{attributes:{mode:'scheduled',emergency:true,warning:'Аварійні відключення: графік не гарантує світло'}}})""")
@@ -262,6 +273,7 @@ def check_compact_overview(page):
         planned_minutes:30,confirmed_completed_minutes:0,confirmed_kwh:0,manual_completed_minutes:12,
         reserve_sufficient:null,predicted_sufficient:true}}}})""")
     page.locator('nav [data-tab="model"]').click()
+    if not page.locator('.model-tools[open]').count():page.locator('.model-tools>summary').click()
     page.locator('.execution-details>summary').click()
     metrics=page.locator('[data-reserve-execution]')
     assert 'Заплановано вранці' in metrics.inner_text()
@@ -280,6 +292,7 @@ def check_compact_overview(page):
     assert page.locator('[data-reserve-execution]').count()==0
     page.evaluate('panel.hass=mockHass')
     page.locator('nav [data-tab="overview"]').click()
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
 
 
 def check_compact_tabs(page):
@@ -294,6 +307,7 @@ def check_compact_tabs(page):
     page.evaluate('calls=[];panel.hass=mockHass')
     page.locator('nav [data-tab="model"]').click()
     assert page.locator('.model-page .model-stats .compact-metric').count()==4
+    page.locator('.model-tools>summary').click()
     assert page.locator('.modulation-details').get_attribute('open') is None
     page.locator('.modulation-details>summary').click()
     assert page.locator('.modulation-details tbody tr').count()==3
@@ -319,11 +333,13 @@ def check_compact_tabs(page):
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.locator('.model-advanced summary').click()
     page.locator('nav [data-tab="overview"]').click()
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
     page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{cycle_energy:{
         observed_kwh:12.3,remaining_kwh:4.2,projected_total_kwh:16.5,observation_complete:true,
         baseline:{kwh:17,at:Date.now()/1000},change_sources:['weather']},stress_scenarios:[
         {name:'cold_low_solar',deficit_degree_hours:0.4,hypothetical:true}]}}})""")
     page.locator('nav [data-tab="model"]').click()
+    if not page.locator('.model-tools[open]').count():page.locator('.model-tools>summary').click()
     page.locator('.execution-details>summary').click()
     assert '16,50' in page.locator('[data-cycle-budget]').inner_text()
     page.locator('.plan-details summary').click()
@@ -336,6 +352,7 @@ def check_compact_tabs(page):
     page.evaluate('panel.hass=mockHass')
     if page.locator('.execution-details[open]').count():page.locator('.execution-details>summary').click()
     page.locator('nav [data-tab="overview"]').click()
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
 
 
 def check_system_settings(page):
@@ -345,9 +362,9 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==34, fields.count()
+    assert fields.count()==35, fields.count()
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==63
+    assert panel.locator('.system-help').count()==64
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()
@@ -361,11 +378,11 @@ def check_system_settings(page):
         assert 'undefined' not in page.locator('.system-dialog').inner_text()
         page.locator('[data-system-close]').click()
     assert page.evaluate('systemRequests.length')==0
-    before=page.evaluate("panel.hass.states['sensor.heating_system_settings'].attributes.fields.find(f=>f.key==='outage_max_age').value")
+    before=page.evaluate("panel.hass.states['sensor.heating_system_settings'].attributes.values.outage_max_age")
     field=page.locator('[data-system-key="outage_max_age"]')
     field.fill('7200');field.press('Tab')
     assert page.evaluate('systemRequests.length')==0, 'Editing a draft must not apply it'
-    assert page.evaluate("panel.hass.states['sensor.heating_system_settings'].attributes.fields.find(f=>f.key==='outage_max_age').value")==before
+    assert page.evaluate("panel.hass.states['sensor.heating_system_settings'].attributes.values.outage_max_age")==before
     page.locator('[data-system-save]').last.click()
     page.wait_for_function('systemRequests.length===1')
     assert page.evaluate('systemRequests[0].path')=='events/heating_system_settings'
@@ -383,7 +400,7 @@ def check_system_settings(page):
         page.evaluate('()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), (width,page.evaluate('({document:document.documentElement.scrollWidth,viewport:innerWidth,body:document.body.getBoundingClientRect().width})'),page.locator('heating-ai-panel').evaluate("el=>[...el.shadowRoot.querySelectorAll('*')].filter(x=>x.getBoundingClientRect().right>innerWidth||x.scrollWidth>x.clientWidth+1).map(x=>[x.tagName,x.className,x.getBoundingClientRect().width,x.scrollWidth,x.clientWidth,(x.textContent||'').slice(0,70)])"))
         for control in page.locator('[data-system-key],.system-help').all():
-            assert control.bounding_box()['height']>=40
+            assert control.bounding_box()['height']>=44
         page.locator('[data-system-help="floor_air"]').click()
         box=page.locator('.system-dialog').bounding_box()
         assert box['x']>=0 and box['x']+box['width']<=width
@@ -396,9 +413,11 @@ def check_system_settings(page):
     page.set_viewport_size({'width':1440,'height':1100})
     page.evaluate('systemRequests=[];calls=[]')
     page.locator('nav [data-tab="overview"]').click()
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
 
 
 def check_equipment(page):
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
     page.set_viewport_size({'width':360,'height':800})
     for mode in ('fixed_3','fixed_6','fixed_9','auto','unconfirmed'):
         page.evaluate("""mode=>setHeatingScenario({
@@ -426,7 +445,8 @@ def check_equipment(page):
     page.evaluate('panel.hass=mockHass')
     page.locator('nav [data-tab="settings"]').click()
     headings=page.locator('.settings-grid>.card h2').all_text_contents()
-    assert headings==['Керування опаленням','Комфорт','Котел','Години нагріву','Циркуляція','Вентиляція'],headings
+    assert headings==['Керування опаленням','Комфорт','Години нагріву','Циркуляція','Котел','Вентиляція'],headings
+    page.locator('.additional-settings>summary').click()
     assert page.locator('[data-system-key="floor_air"]').evaluate('el=>el.validity.stepMismatch')
     page.evaluate("mockHass.states={...mockHass.states,'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},'fan.bath':{state:'unavailable',attributes:{friendly_name:'Витяжка ванної'}}};panel.hass={...mockHass}")
     assert page.locator('[data-system-key="recuperator_entity"]').evaluate('el=>el.tagName')=='SELECT'
@@ -442,11 +462,13 @@ def check_equipment(page):
     page.wait_for_function("!document.querySelector('heating-ai-panel').shadowRoot.querySelector('[data-system-key=boiler_power_mode]').disabled")
     page.evaluate('systemRequests=[];panel.hass=mockHass')
     page.locator('nav [data-tab="overview"]').click()
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
     if page.locator('.power-advice[open]').count():page.locator('.power-advice>summary').click()
     page.set_viewport_size({'width':1440,'height':1100})
 
 
 def check_controller_incident(page):
+    if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
     page.set_viewport_size({'width':360,'height':800})
     page.evaluate("""setHeatingScenario({
         'sensor.heating_controller':{state:'Тимчасовий auto',attributes:{control_method:'temporary_native_auto',reason:'Помилка циклу: null record'}},
@@ -455,7 +477,7 @@ def check_controller_incident(page):
     assert 'бракує актуальних' not in page.locator('[data-controller-health]').inner_text()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'0',attributes:{timestamp:new Date(Date.now()-600000).toISOString()}}})""")
-    assert page.locator('.boiler-status').inner_text()=='Немає даних'
+    assert page.locator('.boiler-status').inner_text()=='Немає даних', page.locator('.boiler-status').inner_text()
     assert page.locator('.boiler-metrics strong').first.inner_text()=='—'
     page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'0',attributes:{timestamp:new Date().toISOString()}}})""")
     assert page.locator('.boiler-status').inner_text()=='Очікування'
@@ -476,9 +498,9 @@ def main(engine='chromium'):
             errors=[]
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
-            page.wait_for_selector('heating-ai-panel >> text=Накопиченого тепла достатньо')
+            page.wait_for_selector('heating-ai-panel >> text=Зберігає тепло')
             page.evaluate('''fields=>{
-                mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,fields}}};
+                mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,persisted_revision:0,schema_version:1,values:Object.fromEntries(fields.map(f=>[f.key,f.value]))}}};
                 panel.hass={...mockHass};
             }''',system_fields({},dict(DEFAULT_MODEL,floor_air=.02839661755318365)))
             check_comparison_delivery(page)
@@ -505,7 +527,7 @@ def main(engine='chromium'):
             assert page.locator('[data-series="fireplace"]').count()==1
             assert 'оцінка залишкового тепла' in page.locator('[data-series="fireplace"] title').text_content()
             assert page.locator('.fireplace-card').count()==1, 'Fireplace must have a visible overview card'
-            assert page.locator('.fireplace-card').bounding_box()['y']<page.locator('.chart-card').bounding_box()['y'], 'Fireplace should precede charts'
+            assert page.locator('.fireplace-card').bounding_box()['y']>page.locator('.plan-card').bounding_box()['y'], 'Source details should follow the main forecast and plan'
             page.evaluate('''() => {
                 const updated={...mockHass.states,
                   'sensor.heating_fireplace':{state:'Горить',attributes:{temperature:25.6,delta:4.1,trend:1.2}},
@@ -525,6 +547,7 @@ def main(engine='chromium'):
             page.locator('[data-settings-target="fireplace-settings"]').click()
             assert page.locator('#fireplace-settings [data-control="fan_mode"]').is_visible()
             page.locator('nav [data-tab="overview"]').click()
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             page.evaluate('panel.hass=mockHass')
             page.locator('[data-press="weather_refresh"]').click()
             page.wait_for_function('calls.length === 1')
@@ -540,9 +563,11 @@ def main(engine='chromium'):
             reachable=set()
             for tab in ('overview','settings','model'):
                 page.locator(f'nav [data-tab="{tab}"]').click()
+                if tab=='overview' and not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
                 reachable.update(page.locator('[data-control],[data-press]').evaluate_all('els=>els.map(el=>el.dataset.control || el.dataset.press)'))
             assert expected_controls<=reachable, ('Missing original controls',expected_controls-reachable)
             page.locator('nav [data-tab="overview"]').click()
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             # A live measurement must not tear down native HA chart subscriptions.
             page.wait_for_function('panel.nativeCards.size === 2')
             page.evaluate('''() => {
@@ -573,17 +598,18 @@ def main(engine='chromium'):
                 page.set_viewport_size({'width':width,'height':1000})
                 for tab in ('overview','settings','model'):
                     page.locator(f'nav [data-tab="{tab}"]').click()
+                    if tab=='overview' and not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), (width,tab)
                     assert page.evaluate('''()=>{const ids=[...panel.shadowRoot.querySelectorAll('[id]')].map(el=>el.id);return ids.length===new Set(ids).size}'''), (width,tab,'duplicate IDs')
                     if tab in ('settings','model'):
-                        for control in page.locator('.field input,.field select,.field button').all():
-                            assert control.bounding_box()['height']>=40, (width,tab,'small touch target')
+                        for control in page.locator('.field input:visible,.field select:visible,.field button:visible').all():
+                            assert control.bounding_box()['height']>=44, (width,tab,'small touch target')
                         if width in (360,390,430,768):
                             assert page.locator('main').bounding_box()['height']<(2200 if tab=='settings' else 2700), (width,tab,'page not compact',page.locator('main').bounding_box()['height'])
                     if tab=='overview':
                         if width in (360,430):check_compact_overview(page)
                         wait_for_chart_layout(page)
-                        svg=page.locator('.chart-card svg')
+                        svg=page.locator('.forecast-plot svg')
                         assert svg.bounding_box()['height']>=250, (width,'chart too short')
                         font=svg.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')
                         assert font>=10.5, (width,'unreadable chart labels',font)
@@ -639,6 +665,7 @@ def main(engine='chromium'):
             assert page.locator('[data-control="target"]').is_disabled()
             page.evaluate("mockHass.states['sensor.heating_controller'].attributes.reason='<img src=x onerror=alert(1)>'; panel.hass=mockHass")
             page.locator('nav [data-tab="overview"]').click()
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             assert page.locator('heating-ai-panel img').count()==0
             page.evaluate('emptyHistory=true');page.locator('[data-history-refresh]').click()
             page.wait_for_selector('[data-history-lane="boiler"][data-state="unknown"]')
@@ -664,6 +691,7 @@ def main(engine='chromium'):
             phone=mobile.new_page()
             phone.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
             phone.wait_for_selector('.forecast-plot svg')
+            phone.locator('.overview-details>summary').tap()
             for size in ({'width':390,'height':844},{'width':844,'height':390},{'width':360,'height':800}):
                 phone.set_viewport_size(size)
                 wait_for_chart_layout(phone)
@@ -691,10 +719,12 @@ def main(engine='chromium'):
             page.evaluate("setHeatingScenario({'sensor.heating_ai_summary':{state:'Новий AI-звіт без очікування циклу'}})")
             assert 'Новий AI-звіт без очікування циклу' in page.locator('.content').inner_text()
             page.locator('nav [data-tab="overview"]').click()
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             page.evaluate('panel.hass={...mockHass,states:{}}')
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             assert page.locator('.boiler-card').get_attribute('data-heating')=='unknown'
             assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
-            assert page.locator('.boiler-status').inner_text()=='Немає даних'
+            assert page.locator('.boiler-status').inner_text()=='Немає даних', page.locator('.boiler-status').inner_text()
             assert not errors, errors
             browser.close()
             print(f'{engine}: browser checks passed: physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')

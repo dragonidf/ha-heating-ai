@@ -9,11 +9,11 @@ EMERGENCY_WARNING = "Аварійні відключення: графік не 
 
 
 def planning_schedule(data,policy='unknown',published=False):
-    """Optional owner-selected forecast assumption; never a physical grid signal."""
-    if (policy=='assume_available' and not published and data.get('mode')=='unknown' and
-            not data.get('emergency') and not data.get('slots') and not data.get('outages')):
-        return dict(data,source_mode='unknown',mode='normal',valid=True,assumed=True,
-                    reason='Мережа без графіка: доступна у прогнозі',warning=None)
+    """Legacy setting remains readable; only schedule() can certify normal.
+
+    A preference cannot turn unavailable, stale or contradictory source data
+    into known coverage. Healthy explicit no-restrictions data is already normal.
+    """
     return data
 
 

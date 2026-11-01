@@ -2,6 +2,8 @@
 import argparse
 import hashlib
 import json
+import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +12,17 @@ ROOT = Path(__file__).resolve().parents[1]
 def build(check=False):
     version = (ROOT/'VERSION').read_text().strip()
     source = (ROOT/'frontend/heating-panel.js').read_text()
+    sys.path.insert(0,str(ROOT/'apps/heating_ai'))
+    from heating_ui import system_fields
+    from heating_model import DEFAULT_MODEL
+    schema=[{k:v for k,v in field.items() if k!='value'} for field in system_fields({},DEFAULT_MODEL)]
+    pattern=r'/\* settings-schema:start \*/.*?/\* settings-schema:end \*/'
+    block='/* settings-schema:start */\nconst SYSTEM_SCHEMA = '+json.dumps(schema,ensure_ascii=False,separators=(',',':'))+';\n/* settings-schema:end */'
+    if not re.search(pattern,source,re.S):raise SystemExit('Missing static settings schema marker')
+    rendered=re.sub(pattern,lambda match:block,source,flags=re.S)
+    if rendered!=source:
+        if check:raise SystemExit('Run python tools/build_ui.py to refresh the static settings schema')
+        (ROOT/'frontend/heating-panel.js').write_text(rendered);source=rendered
     if f"const VERSION = '{version}';" not in source:
         raise SystemExit('Frontend VERSION does not match VERSION')
     digest = hashlib.sha256(source.encode()).hexdigest()[:16]

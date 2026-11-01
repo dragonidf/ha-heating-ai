@@ -119,8 +119,8 @@ def phase_residual(topology,readings,stamp):
 def combine_power(a,b):
     if a.get('valid'):
         if b.get('valid') and abs(a['watts']-b['watts'])>max(500.,abs(a['watts'])*.2):
-            return dict(watts=None,quality='unknown',reason='methods_conflict',independent=False)
-        return dict(watts=a['watts'],quality='measured',reason='primary_balance',independent=False)
+            return dict(watts=None,quality='contradictory',reason='methods_conflict',independent=False)
+        return dict(watts=a['watts'],quality=a.get('quality','measured'),reason=a.get('reason','primary_balance'),independent=False)
     if b.get('valid'):return dict(watts=b['watts'],quality='estimated',reason='phase_residual',independent=False)
     return dict(watts=None,quality='unknown',reason=a.get('reason') or b.get('reason') or 'no_measurement',independent=False)
 

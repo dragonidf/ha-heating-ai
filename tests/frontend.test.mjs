@@ -4,6 +4,95 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('home energy compares the immutable initial plan with known fact in the same cycle',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.time=()=> '23:00';p.compactMetric=(label,value)=>`<metric>${label}: ${value}</metric>`;
+  p.attrs=()=>({energy_cycles:[{start:Date.now()/1000-3600,end:Date.now()/1000+3600,
+    initial_plan:{kwh:10,before_start:true},observed_kwh:12,meter_kwh:15,complete:'false',latest_plan:{kwh:18}}]});
+  const markup=p.energyComparison();assert.equal((markup.match(/<metric>/g)||[]).length,2);
+  assert.match(markup,/12,00/);assert.doesNotMatch(markup,/15,00|18,00/);assert.match(markup,/частково/);
+});
+test('home minimum uses the real forecast sensor state rather than an absent attribute',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.pending=new Set();p.entity=()=>null;
+  p.attrs=k=>k==='controller'?{quality:true}:{};p.state=k=>k==='forecast'?'21.4':'unavailable';
+  p.controllerHealth=()=>({stale:false});
+  for(const method of ['energyComparison','forecastOverview','heatingPlan','boilerOverview','fireplaceOverview','historyChart'])p[method]=()=>'';
+  assert.match(p.overview(),/Очікуваний мінімум <strong>21,4 °C/);
+});
+test('history graph is the first model content and labels the actual advance lead',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.attrs=()=>({});p.state=()=> 'unavailable';p.entity=()=>null;
+  p.temperatureComparison=()=>'<central-comparison />';p.energyComparison=()=>'';p.heatingPlan=()=>'';
+  p.powerDetails=()=>'';p.field=()=>'';p.controllerHealth=()=>({details:''});
+  const markup=p.model();assert.ok(markup.indexOf('<central-comparison />')<markup.indexOf('model-stats'));
+});
+test('completed cycle details keep partial fact and unexplained excess explicit',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.attrs=()=>({});p.time=()=> '01.11 07:00';
+  p.comparisonData={energy_cycles:[{cycle_id:'night',start:1,end:2,initial_plan:{kwh:10},latest_plan:{kwh:14},
+    observed_kwh:12,complete:'false',unknown_seconds:600}],reviews:[{cycle_id:'night',at:1,energy_increase_kwh:4,projected_deficit_reduction:.2}]};
+  const markup=p.cycleHistory();assert.match(markup,/12,00/);assert.match(markup,/частково/);
+  assert.match(markup,/Причина не встановлена/);assert.match(markup,/План/);assert.match(markup,/10,00/);
+});
+test('comparison zoom preserves the requested archive range and shows evidence markers',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=100+7*86400;
+  p.comparisonCursor=100+3*86400;p.render=()=>{};p.time=()=> '01.11';p.attrs=()=>({});
+  p.shadowRoot={querySelector:()=>null};p.clientWidth=390;
+  p.comparisonData={start:p.comparisonStart,end:p.comparisonEnd,actual:[{ts:200,temperature:21,lower:20.5,upper:22}],
+    cycles:[],markers:[{kind:'actual_heat',start:300,end:900},{kind:'model_change',start:1000,end:1000,model_version:7}]};
+  p.zoomComparison('in');assert.equal(p.comparisonWindow().end-p.comparisonWindow().start,7*86400);
+  assert.equal(p.comparisonView().end-p.comparisonView().start,3.5*86400);
+  p.zoomComparison('reset');const markup=p.temperatureComparison();
+  assert.match(markup,/data-comparison-marker="actual_heat"/);assert.match(markup,/data-comparison-marker="model_change"/);
+  assert.match(markup,/data-comparison-comfort/);
+});
+test('undo stages prior settings and requires saving, and rejects a newer client revision',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={boiler_power_mode:'fixed_6'};p.render=()=>{};
+  p.shadowRoot={querySelectorAll:()=>[]};let a={revision:2,values:{boiler_power_mode:'auto'}};
+  p.attrs=()=>a;p._hass={callApi:async(_,__,payload)=>{a={revision:3,persisted_revision:3,values:{boiler_power_mode:'fixed_6'},last_request_id:payload.request_id,last_success:true};p.syncSystemSettings();}};
+  await p.saveSystemSettings();assert.equal(p.systemDraft.boiler_power_mode,undefined);
+  p.undoSystemSettings();assert.equal(p.systemDraft.boiler_power_mode,'auto');
+  assert.equal(a.values.boiler_power_mode,'fixed_6'); // no service call from Undo
+  p.systemDraft={};a.revision=4;p.undoSystemSettings();assert.deepEqual(p.systemDraft,{});
+});
+test('all missed page pushes recover through REST without a polling delay per page',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='rest';
+  p.isConnected=true;p.render=()=>{};p.id=k=>k;p.attrs=()=>({});let current;
+  p._hass={callApi:async(method,path,data)=>{
+    if(method==='GET')return {attributes:current};
+    const offset=data.offset||0;current={protocol:2,request_id:'rest',result_id:'immutable',start:100,end:1000,
+      offset,total:3,next_offset:offset<2?offset+1:null,items:[{kind:'actual',value:{ts:100+offset*300,temperature:21}}]};
+  }};
+  try {
+    await p._hass.callApi('POST','',{offset:0});await p.readComparison('rest');
+    for(let i=0;i<20;i++)await Promise.resolve();
+    assert.equal(p.comparisonPending,null);assert.equal(p.comparisonData.actual.length,3);
+  } finally {p.cancelComparison();}
+});
+test('healthy missing schedule stays neutral but unknown source remains an explicit warning',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);let mode='unknown';
+  p.state=k=>k==='heartbeat'?new Date().toISOString():'on';p.time=()=> '00:00';
+  p.attrs=k=>({controller:{quality:true},forecast:{created_at:new Date().toISOString(),weather_complete:true},
+    grid_status:{raw:'on'},outages:{mode,warning:'Джерело Svitlo недоступне'}})[k]||{};
+  assert.match(p.controllerHealth().message,/Svitlo/);mode='normal';assert.equal(p.controllerHealth().message,'');
+});
+test('expert help opens with the compact values schema and no runtime error',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.systemHelp='room_max_age';p.systemDraft={};
+  p.attrs=()=>({schema_version:1,values:{room_max_age:7200}});p.entity=()=>null;p.state=()=> 'unavailable';p.id=x=>x;
+  const markup=p.systemSettings();assert.match(markup,/<dialog/);assert.match(markup,/Свіжість кімнатного датчика/);
+  assert.equal(p.systemFields().find(f=>f.key==='room_max_age').value,7200);
+});
+test('paged history ignores duplicate and foreign pages and completes only after every point',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='mine';
+  p.requestComparisonPage=()=>{};p.render=()=>{};
+  const first={protocol:2,request_id:'mine',result_id:'frozen',start:100,end:1000,offset:0,next_offset:2,total:4,
+    items:[{kind:'actual',value:{ts:100,temperature:0}},{kind:'actual',value:{ts:200,temperature:null}}]};
+  assert.equal(p.acceptComparisonPage(first),false);assert.equal(p.comparisonData,undefined);
+  assert.equal(p.acceptComparisonPage(first),false);
+  assert.equal(p.acceptComparisonPage({...first,request_id:'another',start:200,offset:2}),false);
+  const last={...first,offset:2,next_offset:null,items:[{kind:'cycle',value:{cycle_id:'night',started_at:100,forecast:{at:-43100,plan_id:'original'}}},
+    {kind:'forecast',cycle_id:'night',value:{ts:100,temperature:21}}]};
+  assert.equal(p.acceptComparisonPage(last),true);assert.equal(p.comparisonPending,null);
+  assert.deepEqual(p.comparisonData.actual,[{ts:100,temperature:0},{ts:200,temperature:null}]);
+  assert.equal(p.comparisonData.cycles[0].forecast.curve[0].temperature,21);
+});
 test('comparison range controls are real delegated click targets',async()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.render=()=>{};
   p.loadComparison=async()=>{};
@@ -44,6 +133,11 @@ test('a response for another date range cannot replace the requested comparison'
   const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='active';
   assert.equal(p.acceptComparison({start:200,end:1100,actual:[],cycles:[]}),false);
   assert.equal(p.comparisonPending,'active');assert.equal(p.comparisonData,undefined);
+});
+test('a legacy client refresh notice cannot replace another clients paged history',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='active';
+  assert.equal(p.acceptComparison({start:100,end:1000,actual:[],cycles:[],requires_panel_reload:'true',error:'Оновіть панель'}),false);
+  assert.equal(p.comparisonPending,'active');
 });
 test('saving a boiler mode ignores untouched advanced coefficient step validity',async()=>{
   const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={boiler_power_mode:'fixed_6'};panel.render=()=>{};
@@ -145,6 +239,13 @@ test('sessions merge without hiding conditional heat and never mutate the foreca
   const original=JSON.stringify(rows);
   assert.deepEqual(mergeSegments(rows),[{start:0,end:20},{start:20,end:40,conditional:'true'}]);
   assert.equal(JSON.stringify(rows),original);
+});
+test('merged heat sessions preserve their total energy and show absolute dates',()=>{
+  const start=Date.parse('2026-11-01T23:00:00+02:00')/1000;
+  const rows=[{start,end:start+300,kwh:.5,power_kw:6},{start:start+300,end:start+600,kwh:.25,power_kw:3}];
+  const merged=mergeSegments(rows);assert.equal(merged[0].kwh,.75);assert.equal(merged[0].power_kw,4.5);
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.attrs=()=>({created_at:new Date().toISOString(),heat_segments:rows});
+  const markup=p.heatingPlan();assert.match(markup,/0,75 кВт·год/);assert.match(markup,/4,5 кВт/);
 });
 test('controller health prioritizes fallback error over generic measurement warning',()=>{
   const panel=Object.create(HeatingAIPanel.prototype);

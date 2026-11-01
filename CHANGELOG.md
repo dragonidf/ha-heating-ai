@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.8 — 2026-11-01
+
+- Preserve immutable advance temperature forecasts independently of physical boiler starts. Select the latest original issue at least 12 hours before the checkpoint, disclose its real lead, and retain actual observations beyond the forecast tail through the next local window, including DST. Add prospective 1/3/6/12/24-hour checks using real sensor-report timestamps and persisted original curves.
+- Replace oversized history attributes with authenticated, read-only, range/cursor pages; retain compact summaries and receipts in HA. Generate the static expert-settings schema with the frontend. Compact the current forecast without changing private planning inputs or archives: no repeated per-point sessions, session-average display power, one current observation and full technical evidence in the private journal.
+- Keep the immutable initial cycle energy reference even when some measurements are unknown; subtract known spend before planning the remainder. Record plan increases, projected comfort changes and completed-cycle quality; distinguish partial fact from savings and preserve safety above the soft budget. Add observed execution timing/duration and source/coverage diagnostics without resetting counters or coefficients.
+- Derive room-age warnings and rejection limits from observed reporting cadence within the owner's maximum; validate thermostat fallback age and bias. Reject a prepared heat command if its temperature source disappears before dispatch. Report audited source freshness from the same readings used for control, retain contradictory measurements, and distinguish a grid-confirmed inferred zero from an independent meter reading.
+- Keep unhealthy/stale Svitlo data and unknown tomorrow coverage conditional. The old missing-schedule preference remains loadable but cannot certify an unhealthy source as normal; healthy, fresh no-restrictions mode remains available. Actual grid state, outage parsing and emergency protections stay authoritative.
+- Simplify the overview around comfort, next heat, same-cycle initial plan/fact and the 24-hour forecast. Keep source details collapsed; put the forecast comparison first on Model/AI, with zoom, comfort/events, cycle details and separate analytical reports. Group basic/additional/expert settings, add staged Undo and transactional save rollback, and support HA themes, 320px screens, 44px targets and 200% text.
+- Expand regression, generated, pairwise and two-client browser coverage. Full release evidence and physical limitations: [QA audit](docs/qa-audit-2026-11-01.md). Synthetic tests and offline counterfactuals do not establish real energy savings; verify new completed cycles separately.
+
 ## 0.3.7 — 2026-10-31
 
 - Retry the normal full plan on the next controller tick when all required inputs recover from a missing-input temporary-auto fallback. Avoid an unnecessary five-minute native-auto hold after a probe/meter comes back. Healthy ticks retain the normal interval.

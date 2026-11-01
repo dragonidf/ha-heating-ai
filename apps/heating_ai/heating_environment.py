@@ -10,6 +10,14 @@ from datetime import datetime
 
 ENVIRONMENT_POLICY_VERSION=5
 
+def room_reporting_limits(samples,max_age):
+    reports=sorted({finite(r.get('room_reported_at')) for r in samples if finite(r.get('room_reported_at')) is not None})
+    gaps=[b-a for a,b in zip(reports,reports[1:]) if 60<b-a<=max_age]
+    cadence=sorted(gaps)[int(.9*(len(gaps)-1))] if len(gaps)>=12 else None
+    return dict(cadence_seconds=round(cadence,1) if cadence else None,intervals=len(gaps),
+        warning_seconds=min(max_age,cadence*1.5) if cadence else max_age/2,
+        critical_seconds=min(max_age,cadence*3) if cadence else max_age)
+
 
 def finite(value):
     try:

@@ -43,3 +43,5 @@ jobs:
         run: |
           python tools/check_ui_browser.py
           python tools/check_ui_browser.py --browser webkit
+          python tools/check_ui_accessibility.py
+          python tools/check_ui_accessibility.py --browser webkit
