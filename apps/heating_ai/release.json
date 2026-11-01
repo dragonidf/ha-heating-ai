@@ -5,10 +5,10 @@
     "heating_fallback.py": "3898e7f86476f3122bc6e094f9ffd072680929874174f92420904a17b1bbf0ce",
     "heating_model.py": "4231bf6444f4c6707b9fc10caa7635fcc0fba2b8aefce3f89fa089fc5f9401c5",
     "heating_outages.py": "f3b410c68fb60e2cffd1430ffbc0b66a77c505fafebe51fadfce04ca839bc163",
-    "heating_recovery.py": "f3f1cce6f8c4333ac069e413e4569529505f86c335af147d5ac3670252a96cf8",
+    "heating_recovery.py": "d35638c3bc932253e7184a76c5350007f09a7b86c2f24fc12e66607839273573",
     "heating_stability.py": "636d1efc46aef82325eb0add82efb5b5572202c4bb609f91b796a38efc1967e8",
     "heating_ui.py": "48fd1c9da4357a12aa044df737288bf95689b883415d9cf9e514de83de34a652",
-    "heating_ui_assets.py": "6bae6ad911299e5a9f092105b3e08a94c7ded6faf6ed6c8aa887489ff3056794"
+    "heating_ui_assets.py": "eb15b4ee117190c5040786ea3b6655dec562b03382a1c325459ce49b8f7ac5bd"
   },
-  "version": "0.3.9"
+  "version": "0.3.10"
 }

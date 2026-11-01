@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.10 — 2026-11-01
+
+- Size the default private journal budget from observed daily archive volume, the existing retention window, two extra days and 25% headroom. Expand only with verified free disk space, in 64 MiB steps, up to 1 GiB and at most 10% of space above the disk reserve. Explicit custom budgets remain fixed.
+- Reserve at least 2 GiB / 10% of the disk for other applications; refuse new diagnostic writes when that reserve is reached. Preserve existing lossless compaction, snapshot checksums, file format, retention and protected history; no data migration or reset. Recompute capacity safely after restart and expose its basis/ceiling in diagnostics.
+- Add regressions for retention headroom, restart, fixed limits, low/unknown free space and the hard ceiling. This storage change does not modify thermal planning or allow unknown power to become measured.
+
 ## 0.3.9 — 2026-11-01
 
 - Show measured archive-budget usage separately from free disk space in model quality diagnostics; preserve protected history and the existing retention policy.

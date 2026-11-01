@@ -1224,10 +1224,16 @@ class DecisionJournal:
     At least seven days are protected. If the disk budget cannot retain them,
     stop adding evidence and report degradation instead of deleting that week.
     """
-    def __init__(self,directory,retention_days=14,max_bytes=256*1024*1024):
+    DEFAULT_MAX_BYTES=256*1024*1024
+    HARD_MAX_BYTES=1024*1024*1024
+    CAPACITY_QUANTUM=64*1024*1024
+    MIN_FREE_BYTES=2*1024*1024*1024
+
+    def __init__(self,directory,retention_days=14,max_bytes=None):
         self.directory=Path(directory)/'decision_history'
         self.retention=max(7,retention_days)*86400
-        self.max_bytes=max_bytes
+        self.auto_capacity=max_bytes is None
+        self.max_bytes=self.DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
         self.error=None
         self.last_rotation=0
         self.last_compaction=0
@@ -1244,7 +1250,28 @@ class DecisionJournal:
             self.space_health=cached
         return dict(cached,used_bytes=self.used_bytes,max_bytes=self.max_bytes,
             pressure=self.used_bytes is not None and self.used_bytes>=self.max_bytes*.9,
-            retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error)
+            retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error,
+            capacity_policy='retention_headroom' if self.auto_capacity else 'fixed',
+            hard_max_bytes=self.HARD_MAX_BYTES if self.auto_capacity else self.max_bytes,
+            required_bytes=getattr(self,'capacity_required_bytes',None),
+            disk_reserve_bytes=getattr(self,'disk_reserve_bytes',None))
+
+    def _capacity_headroom(self,stamp):
+        if not self.auto_capacity:return
+        space=self.health();free=space.get('free_bytes');total=space.get('disk_total_bytes')
+        if free is None or total is None:return
+        self.disk_reserve_bytes=max(self.MIN_FREE_BYTES,int(total*.1))
+        if free<=self.disk_reserve_bytes:
+            raise OSError('Diagnostic disk reserve reached; protected history retained')
+        if self.used_bytes<self.max_bytes*.8:return
+        days=max(1.,(stamp-getattr(self,'oldest_at',stamp))/86400)
+        # Retain observed daily volume for the configured window, two extra days
+        # and 25% headroom; never consume more than 10% of spare physical space.
+        required=max(self.used_bytes*1.25,self.used_bytes/days*(self.retention/86400+2)*1.25)
+        self.capacity_required_bytes=math.ceil(required)
+        desired=math.ceil(required/self.CAPACITY_QUANTUM)*self.CAPACITY_QUANTUM
+        ceiling=min(self.HARD_MAX_BYTES,int(self.used_bytes+(free-self.disk_reserve_bytes)*.1))
+        self.max_bytes=max(self.max_bytes,min(desired,ceiling))
 
     def _prepare(self,stamp):
         self.directory.mkdir(parents=True,exist_ok=True)
@@ -1253,7 +1280,9 @@ class DecisionJournal:
                 if p.is_file() and p.stat().st_mtime<stamp-self.retention:
                     p.unlink()
             self.last_rotation=stamp
-            self.used_bytes=sum(p.stat().st_size for p in self.directory.iterdir() if p.is_file())
+            files=[p.stat() for p in self.directory.iterdir() if p.is_file()]
+            self.used_bytes=sum(p.st_size for p in files)
+            self.oldest_at=min((p.st_mtime for p in files),default=stamp)
         if self.used_bytes>=self.max_bytes*.9 and stamp-self.last_compaction>60:
             self.last_compaction=stamp
             day=datetime.fromtimestamp(stamp,timezone.utc).strftime('%Y-%m-%d')
@@ -1277,6 +1306,7 @@ class DecisionJournal:
                     if not existing:self.used_bytes+=archive.stat().st_size
                 finally:
                     temporary.unlink(missing_ok=True)
+        self._capacity_headroom(stamp)
         if self.used_bytes>=self.max_bytes:
             raise OSError('Diagnostic disk budget exhausted; protected history retained')
 
