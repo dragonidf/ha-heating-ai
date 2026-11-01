@@ -125,6 +125,39 @@ def combine_power(a,b):
     return dict(watts=None,quality='unknown',reason=a.get('reason') or b.get('reason') or 'no_measurement',independent=False)
 
 
+def partial_balance_bounds(entities,readings,stamp):
+    """Documented total / three load groups / signed inverter-GRID balance.
+
+    An unmetered group makes boiler watts unknowable. Keep an interval instead
+    of assigning that group zero or assuming its name means physical phase A/B/C.
+    """
+    invalid=dict(valid=False,watts=None,quality='unknown',independent=False)
+    if not isinstance(entities,list) or len(entities)!=5 or len(set(entities))!=5:return dict(invalid,reason='unsupported_balance_layout')
+    core=aligned_power(readings,[entities[0],entities[4]],stamp)
+    if not core['valid']:return dict(invalid,reason=core['reason'])
+    known=[];missing=[]
+    for entity in entities[1:4]:
+        (known if aligned_power(readings,[entity],stamp,max_age=90)['valid'] else missing).append(entity)
+    if len(missing)!=1:return dict(invalid,reason='requires_one_unknown_group')
+    # These are bounds for a degraded control reserve, never a measured balance.
+    aligned=aligned_power(readings,[entities[0],*known,entities[4]],stamp,max_age=90,max_skew=90)
+    if not aligned['valid']:return dict(invalid,reason=aligned['reason'])
+    values=aligned['values'];remaining=values[entities[0]]-sum(values[e] for e in [*known,entities[4]])
+    if values[entities[0]]<0 or any(values[e]<0 for e in known) or remaining < -100:return dict(invalid,reason='contradictory_balance')
+    return dict(valid=True,watts=None,quality='unknown',independent=False,lower_w=0.,upper_w=max(0.,remaining),
+                unknown_components=missing,known_components=known,reason='unattributed_residual',
+                oldest_at=aligned['oldest_at'],skew_seconds=aligned['skew_seconds'],at=stamp)
+
+
+def reserve_control_prior(bounds,mode,target,current,physical_mode):
+    """An assumed control input, not an observation or a TEN-stage detection."""
+    if not bounds.get('valid') or physical_mode not in ('fixed_3','fixed_6','fixed_9'):return None
+    target=number(target);current=number(current)
+    if mode not in ('off','auto','heat') or target is None or current is None or not 5<=current<=40:return None
+    demand=mode=='heat' and target-current>=1. or mode=='auto' and target>current
+    return min(float(physical_mode[-1])*1000,bounds['upper_w']) if demand else 0.
+
+
 def integrate_observation(state,stamp,watts,quality,max_hold=45.,restart=False):
     """Causal left integration, bounded hold; persistent totals, no gap backfill."""
     previous=state.get('last')

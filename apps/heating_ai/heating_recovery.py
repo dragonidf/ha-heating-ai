@@ -1189,10 +1189,17 @@ class HeatingRecovery:
         if self.grid_state()!="on":
             return
         power=self.val("power")
-        self.memory.setdefault('command_diagnostic',{}).update(boiler_confirmed=power is not None and power>=(500 if self.cfg.get('power_measurement_policy')=='audited' else 1500),
-            power_checked_at=time.time(),confirmed_power_w=power)
+        threshold=500 if self.cfg.get('power_measurement_policy')=='audited' else 1500
+        bounds=getattr(self,'control_power_bounds',{}) or {};prior=number(getattr(self,'control_power_prior',None))
+        reserve=(self.cfg.get('power_partial_reserve')=='enabled' and getattr(self,'current_power_w',None) is None
+                 and bounds.get('valid') and -5<=time.time()-bounds.get('at',0)<=45)
+        estimated_response=bool(reserve and prior is not None and prior>=threshold)
+        confirmed=not reserve and power is not None and power>=threshold
+        self.memory.setdefault('command_diagnostic',{}).update(boiler_confirmed=bool(confirmed),
+            power_checked_at=time.time(),confirmed_power_w=None if reserve else power,
+            response_estimated=estimated_response,assumed_power_w=prior if estimated_response else None)
         self.decision_event('boiler_response',force=True)
-        if power is None or power<(500 if self.cfg.get('power_measurement_policy')=='audited' else 1500):
+        if not confirmed and not estimated_response:
             self.notify_once("Команду heat прийнято, але нагрів котла за потужністю не підтвердився")
             self.enter_temporary_fallback('Запит нагріву прийнято, але потужність не підтверджена')
         elif self.memory.get("once") and self.memory["once"].get("active_at") is None:
@@ -1500,11 +1507,12 @@ class DecisionJournal:
             return result
 
 
-def confirmed_morning(memory,now,settings,power,energy,grid,automatic,power_source):
+def confirmed_morning(memory,now,settings,power,energy,grid,automatic,power_source,control_reserve=False):
     """Integrate adjacent confirmed observations; never command elapsed time.
 
     A restart invalidates the previous observation in initialize(). Totals survive.
     Both endpoints must have real balance power and identical execution ownership.
+    Optional reserve minutes describe accepted requests, never confirmed heat.
     """
     cycle=heating_cycle(now,settings)
     if not cycle:
@@ -1514,8 +1522,13 @@ def confirmed_morning(memory,now,settings,power,energy,grid,automatic,power_sour
     stamp=now.timestamp();previous=memory.get('morning_observation')
     inside=bool(cycle['morning_start'] is not None and cycle['morning_start']<=stamp<=cycle['morning_end'])
     valid=inside and grid=='on' and power_source=='balance' and power is not None and power>=1500
-    current=dict(ts=stamp,cycle_id=cycle['cycle_id'],valid=valid,automatic=automatic,
+    reserve=inside and grid=='on' and automatic and control_reserve
+    if reserve:entry['unknown_energy']=True
+    current=dict(ts=stamp,cycle_id=cycle['cycle_id'],valid=valid,automatic=automatic,reserve=reserve,
                  energy=energy,power=power)
+    if (reserve and previous and previous.get('reserve') and previous['cycle_id']==cycle['cycle_id']
+            and 0<stamp-previous['ts']<=45):
+        entry['reserve_request_minutes']=entry.get('reserve_request_minutes',0.)+(stamp-previous['ts'])/60
     contiguous=bool(previous and previous['cycle_id']==cycle['cycle_id'] and
         previous['valid'] and valid and 0<stamp-previous['ts']<=45 and
         previous['automatic']==automatic)
@@ -1536,4 +1549,6 @@ def confirmed_morning(memory,now,settings,power,energy,grid,automatic,power_sour
                 confirmed_morning_kwh=round(entry['kwh'],5) if number(energy) is not None and not entry.get('unknown_energy') else None,
                 manual_completed_minutes=round(entry['manual_minutes'],3),
                 manual_morning_kwh=round(entry['manual_kwh'],5),
-                morning_elapsed_minutes=round(entry['minutes'],3) if automatic and valid else 0.)
+                estimated_morning_request_minutes=round(entry.get('reserve_request_minutes',0.),3),
+                morning_elapsed_minutes=round(entry['minutes']+entry.get('reserve_request_minutes',0.),3)
+                    if entry.get('reserve_request_minutes',0.)>0 or automatic and valid else 0.)

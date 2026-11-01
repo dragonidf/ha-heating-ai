@@ -134,7 +134,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         return None
     if priority and settings['_reserve_needed'] and context and context['morning_end'] and context['morning_end']>start:
         current=[s for s in all_segments if context['morning_start']<=s['start']<context['morning_end']]
-        if settings.get('confirmed_completed_minutes',0)<settings.get('morning_min_minutes',30) and not current and not reserve_checked:
+        if max(number(settings.get('confirmed_completed_minutes')) or 0.,number(settings.get('morning_elapsed_minutes')) or 0.)<settings.get('morning_min_minutes',30) and not current and not reserve_checked:
             return None
     calculation_rows=rows
     rows=[r for r in rows if r['ts']<=public_finish+.001]

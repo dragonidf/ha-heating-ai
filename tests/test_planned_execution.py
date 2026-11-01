@@ -8,8 +8,11 @@ from heating_model import DEFAULT_MODEL
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None):
         app=HeatingClimate()
+        self.created_app=app
+        app.control_power_prior=reserve_prior
+        app.control_power_bounds=dict(valid=reserve_prior is not None,unknown_components=['group1'],upper_w=6000.)
         at=datetime(2026,10,14,0,5,tzinfo=ZoneInfo('Europe/Kiev'))
         app.climate_tz=at.tzinfo
         app.now=lambda:at
@@ -35,7 +38,7 @@ class PlannedExecutionTests(unittest.TestCase):
         app.get_state=lambda entity,**kwargs:outage[0] if entity=='sensor.svitlo' else 'off' if entity=='binary_sensor.emergency' else None
         app.heartbeat_fresh=lambda *a:True
         app.grid_state=lambda:grid
-        app.update_heating_power=lambda:0
+        app.update_heating_power=lambda:measured_power
         app.stage_update=lambda *a:None
         app.fireplace=lambda *a:(0,False)
         app.once_state=lambda *a:(once,'test')

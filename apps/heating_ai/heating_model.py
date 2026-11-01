@@ -428,6 +428,7 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
                 actual_limits['first_comfort_violation_at']>=now.timestamp()+86400)),
         planned_minutes=round(planned,2),planned_kwh=round(sum(s.get('kwh',0.) for s in cycle_segments),4),
         confirmed_completed_minutes=round(completed,2),
+        estimated_request_minutes=round(number(settings.get('estimated_morning_request_minutes')) or 0.,2),
         confirmed_kwh=number(settings.get('confirmed_morning_kwh')),
         no_morning_counterfactual=settings.get('_no_morning_metrics'),
         manual_completed_minutes=number(settings.get('manual_completed_minutes')) or 0.,

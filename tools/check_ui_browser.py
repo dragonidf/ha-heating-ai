@@ -362,9 +362,9 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==35, fields.count()
+    assert fields.count()==36, fields.count()
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==64
+    assert panel.locator('.system-help').count()==65
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()
@@ -725,6 +725,15 @@ def main(engine='chromium'):
             assert page.locator('.boiler-card').get_attribute('data-heating')=='unknown'
             assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
             assert page.locator('.boiler-status').inner_text()=='Немає даних', page.locator('.boiler-status').inner_text()
+            page.evaluate("setHeatingScenario({'sensor.heating_heartbeat':{state:new Date().toISOString()},'sensor.heating_controller':{attributes:{quality:true,control_power_basis:'partial_meter_reserve'}},'sensor.heating_power_confirmed':{state:'unavailable',attributes:{timestamp:new Date().toISOString(),assumed_control_w:6000,control_reserve:{valid:true,upper_w:6200}}},'binary_sensor.heating_boiler_active':{state:'unavailable'}})")
+            assert 'Резервний облік' in page.locator('[data-controller-health]').inner_text()
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
+            page.wait_for_selector('.boiler-card >> text=Для розрахунку:')
+            assert 'Для розрахунку: 6,0' in page.locator('.boiler-card').inner_text()
+            assert page.locator('.boiler-card').get_attribute('data-heating')=='unknown'
+            for width in (320,390,1440):
+                page.set_viewport_size({'width':width,'height':900})
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             assert not errors, errors
             browser.close()
             print(f'{engine}: browser checks passed: physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')

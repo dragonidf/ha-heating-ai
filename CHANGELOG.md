@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.11 — 2026-11-02
+
+- Add an opt-in control reserve for one unavailable load-group meter in the documented total/three-groups/inverter-GRID balance. Keep healthy groups and signed GRID measurements; leave the unmetered remainder as an interval, not measured boiler watts. No physical A/B/C mapping or double subtraction of appliances is assumed.
+- Continue an explicitly approximate plan with a configured fixed 3/6/9 kW profile and thermostat request. Actual watts, energy and heating markers remain unknown; these assumptions do not train the model, invent historical energy or add unobserved heat to the floor inventory. Preserve grid, permission, sensor, outage and upper-temperature guards; use the hotter return-water proxy for the reserve coast safety check.
+- Keep estimated morning request minutes separate from physically confirmed heating and prevent repeated minimum sessions solely due to missing metering. Label a successful reserve response as estimated, retain the native fallback on missing core sources, two failed groups, stale/contradictory data, unknown profile or failed thermostat commands.
+- Add regressions for each failed group, stale/skewed sources, W/kW and signed GRID, 3 kW household loads, unchanged physical safety vetoes, floor inventory, response confidence and morning completion. Show the reserve explicitly without presenting assumed power as confirmed heating.
+
 ## 0.3.10 — 2026-11-01
 
 - Size the default private journal budget from observed daily archive volume, the existing retention window, two extra days and 25% headroom. Expand only with verified free disk space, in 64 MiB steps, up to 1 GiB and at most 10% of space above the disk reserve. Explicit custom budgets remain fixed.

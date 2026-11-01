@@ -4,6 +4,19 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('partial-meter reserve is visible without calling assumed watts actual boiler heating',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';
+  const data={controller:{quality:true,control_power_basis:'partial_meter_reserve'},
+    forecast:{created_at:new Date().toISOString(),weather_complete:true},grid_status:{raw:'on'},
+    power_confirmed:{assumed_control_w:6000,control_reserve:{valid:true,upper_w:6200}}};
+  p.attrs=k=>data[k]||{};p.state=k=>k==='heartbeat'?new Date().toISOString():'unavailable';
+  assert.match(p.controllerHealth().message,/Резервний облік/);
+  p.powerAdvice=()=>({recommend:{},mode:'6 кВт',recommended:false,partial:false,adviceValue:'—'});
+  const markup=p.boilerOverview();assert.match(markup,/Для розрахунку.*6,0/);
+  assert.doesNotMatch(markup,/data-heating="true"/);assert.match(markup,/Фактичне споживання не підтверджене/);
+  data.power_confirmed.timestamp=new Date(Date.now()-180000).toISOString();
+  assert.doesNotMatch(p.boilerOverview(),/Для розрахунку:/);
+});
 test('quality shows real archive pressure without deleting history or claiming the disk is full',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.section=(title,body)=>body;
   p.attrs=()=>({archive_health:{used_bytes:257864750,max_bytes:268435456,free_bytes:39350693888,pressure:'true'}});

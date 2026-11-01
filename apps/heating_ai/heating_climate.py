@@ -13,7 +13,7 @@ import calendar
 import shutil
 import hashlib
 from copy import deepcopy
-from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation)
+from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation,partial_balance_bounds,reserve_control_prior)
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
@@ -505,6 +505,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         if not a['valid']:a['quality']='unknown'
         if grid_off:a=dict(a,valid=True,watts=0.,quality='estimated',meter_valid=a['valid'],reason='confirmed_grid_only_supply_off')
         b=phase_residual(self.cfg.get('power_phase_topology') or {},readings,stamp);final=combine_power(a,b)
+        if (final['quality']=='unknown' and not grid_off and self.cfg.get('power_partial_reserve')=='enabled'):
+            final['control_reserve']=partial_balance_bounds(list(self.cfg.get('power_balance_sources') or []),readings,stamp)
         return dict(a={k:v for k,v in a.items() if k!='values'},b=b,**final,at=stamp)
 
     def observe_power_quality(self,stamp,primary,power,grid_off):
@@ -922,6 +924,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.update_heating_power()
     def update_heating_power(self):
         stamp=time.time()
+        self.control_power_prior=None;self.control_power_bounds={}
         self.power_update_at=stamp
         primary=self.val("power_balance")
         dependencies=self.cfg.get('power_balance_sources',[])
@@ -944,6 +947,11 @@ class HeatingClimate(HeatingRecovery,Hass):
             source=('fallback_grid_off' if grid_off and assessment['quality']=='estimated' else
                 'balance' if assessment['quality']=='measured' else 'fallback_audited_residual' if assessment['quality']=='estimated' else 'unavailable')
             active=None
+            self.control_power_bounds=assessment.get('control_reserve') or {}
+            if self.control_power_bounds.get('valid') and self.grid_state()=='on':
+                self.control_power_prior=reserve_control_prior(self.control_power_bounds,self.raw('thermostat'),
+                    self.val('thermostat',attribute='temperature'),self.val('thermostat',attribute='current_temperature'),
+                    self.cfg.get('boiler_power_mode'))
         if source!=getattr(self,"power_source",None):
             self.power_estimator.update(stamp,None)
         self.power_source=source
@@ -978,6 +986,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      measurement_basis='confirmed_grid_off' if grid_off else 'meter_balance',independent=False,
                      power_without_request=power is not None and power>=1500 and not requested,
                      uncertainty='Несвіжі складові балансу' if stale else 'Помилка або невідомий стан вимірювачів' if fault!='off' else None,
+                     control_reserve=self.control_power_bounds,assumed_control_w=self.control_power_prior,
                      fallback_raw_w=raw if source.startswith("fallback") else None,
                      timestamp=self.now().isoformat())
         self.run_diagnostic('power_observation',self.observe_power_quality,stamp,primary,power,grid_off)
@@ -1029,6 +1038,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         grid=self.grid_state()
         power=self.update_heating_power()
         self.stage_update(power/1000 if power is not None else None)
+        measured_power=power
+        reserve_active=power is None and getattr(self,'control_power_prior',None) is not None
+        if reserve_active:power=self.control_power_prior
         fire,fire_active=self.fireplace(room)
         permitted=bool(self.cfg.get("allow_actuation",False)) and self.raw("armed")=="on"
         self.publish("binary_sensor.heating_actuation_permitted","on" if permitted else "off",
@@ -1057,8 +1069,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         command_at=number(self.memory.get("command_at"))
         automatic=(self.raw('mode')=='Автоматичне керування' and permitted and
                    self.memory.get('owned',False) and self.memory.get('last_command')=='heat')
-        settings.update(confirmed_morning(self.memory,now,settings,power,self.val('energy'),grid,
-                                         automatic,getattr(self,'power_source','unknown')))
+        settings.update(confirmed_morning(self.memory,now,settings,measured_power,self.val('energy'),grid,
+                                         automatic,getattr(self,'power_source','unknown'),
+                                         control_reserve=reserve_active and power>=500 and
+                                         (self.memory.get('command_diagnostic') or {}).get('status')=='confirmed'))
         settings["outage_schedule"] = outage_data
         settings["outage_advance_limit"] = self.cfg.get("outage_advance_limit",180)
         settings.update({k:system_values(self.cfg)[k] for k in ('risk_cold_delta','risk_blackout_short_minutes','risk_blackout_long_minutes')})
@@ -1095,9 +1109,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             'power':power is None or getattr(self,'power_confirmation_pending',False),
             'thermostat':thermostat is None or not 5<=thermostat<=40 or self.raw('thermostat') in ('unknown','unavailable',None),
             'settings':not valid,'model':not self.model.get('validated'),'grid':grid!='on'}.items() if failed])
-        self.sample(room,probe,outside,None if power is None else power/1000,fire,source,primary,thermostat,quality,settings)
+        self.sample(room,probe,outside,None if measured_power is None else measured_power/1000,fire,source,primary,thermostat,quality and not reserve_active,settings)
         self.energy_tick()
-        self.run_diagnostic('cycle_energy',self.observe_cycle_energy,now,settings,power,self.val('energy'),grid,automatic,
+        self.run_diagnostic('cycle_energy',self.observe_cycle_energy,now,settings,measured_power,self.val('energy'),grid,automatic,
             temperature=room,temperature_valid=source=='Вітальня' and room is not None and
             getattr(self,'temperature_quality',{}).get('primary_status','normal')=='normal')
         self.run_diagnostic('controller_quality',self.publish_controller_quality,now)
@@ -1107,26 +1121,34 @@ class HeatingClimate(HeatingRecovery,Hass):
                     if e['start']==current_cycle.get('cycle_start') and e['end']==current_cycle.get('cycle_end')),None)
         allowance=cycle_energy_allowance(cycle)
         if allowance:settings['cycle_energy_budget']=allowance
-        self.run_diagnostic('temperature_history',self.observe_temperature_history,now,settings,room,power,
+        self.run_diagnostic('temperature_history',self.observe_temperature_history,now,settings,room,measured_power,
                             source=='Вітальня' and room is not None)
         measured_fire=None if self.memory.get('fire_phase')=='Датчик недоступний' else fire
-        self.run_diagnostic('forecast_validation',self.validate_reserve_predictions,now,room,power,
-            quality=source=='Вітальня' and room is not None and power is not None and outside is not None,
+        self.run_diagnostic('forecast_validation',self.validate_reserve_predictions,now,room,measured_power,
+            quality=source=='Вітальня' and room is not None and measured_power is not None and outside is not None,
             measurements=dict(floor=(self.memory.get('floor_observer') or {}).get('estimate',probe),outside=outside,fire=measured_fire))
-        self.run_diagnostic('peak_validation',self.observe_stop_peak,now,room,power,source=='Вітальня' and room is not None)
+        self.run_diagnostic('peak_validation',self.observe_stop_peak,now,room,measured_power,source=='Вітальня' and room is not None)
         settings['reserve_errors']=self.memory.get('reserve_errors',[])
         profile=power_profile(self.cfg.get('boiler_power_mode','unconfirmed'),self.memory.get('power_calibrations'),
             self.memory.get('modulation_profile',dict(bands=[],intervals=0,minutes=0)),self.memory.get('equipment_version',0))
         settings['modulation_profile']=profile
+        if reserve_active:
+            settings['control_power_basis']='partial_meter_reserve'
+            settings['unknown_power_components']=list(self.control_power_bounds.get('unknown_components',[]))
         settings['equipment_version']=self.memory.get('equipment_version',0)
         settings['thermal_model_version']=self.model.get('version')
         settings['ventilation_model']=self.memory.get('ventilation_model') or {}
         settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
         floor=probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
+        if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason='partial_meter_reserve')
         if quality:
-            thermal,floor=observe_floor(self.memory.get('floor_observer'),now.timestamp(),
-                                       room,probe,power/1000,grid,self.model,energy_kwh=self.val('energy'))
+            inventory=self.memory.get('floor_observer')
+            if reserve_active and number((inventory or {}).get('estimate')) is None:
+                inventory=dict(at=now.timestamp(),estimate=min(room,probe),power_kw=0.,energy_kwh=None)
+            thermal,floor=observe_floor(inventory,now.timestamp(),
+                                       room,probe,0. if reserve_active else power/1000,grid,self.model,
+                                       energy_kwh=None if reserve_active else self.val('energy'))
             self.memory['floor_observer']=thermal
             weather_state=self.raw('weather',attribute='all') if self.cfg.get('weather') else None
             condition=weather_state.get('state') if isinstance(weather_state,dict) else None
@@ -1135,7 +1157,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             try:reported=datetime.fromisoformat(reported.replace('Z','+00:00')).timestamp()
             except (AttributeError,ValueError,TypeError):reported=None
             solar=observe_gain(self.memory.get('solar_observer'),now.timestamp(),room,floor,
-                               outside,fire,power>=1500,self.model,self.climate_tz,condition,
+                               outside,fire,reserve_active or power>=1500,self.model,self.climate_tz,condition,
                                secondary=thermostat,reported_at=reported)
             self.memory['solar_observer']=solar
             settings['environment']={'solar':dict(solar)}
@@ -1178,8 +1200,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['environment_weather']=usable_weather
         peak=None;coast_overheat=False
         if quality and valid:
-            peak,_=coast(room,floor,outside,fire,self.model)
-            coast_overheat=coast_exceeds_profile(now,room,floor,outside,fire,self.model,settings)
+            guard_floor=max(floor,probe) if reserve_active else floor
+            peak,_=coast(room,guard_floor,outside,fire,self.model)
+            coast_overheat=coast_exceeds_profile(now,room,guard_floor,outside,fire,self.model,settings)
         settings['actuator']=dict(action=self.memory.get('last_command'),changed_at=command_at or 0.,
             safety_stop=grid!='on' or not permitted or self.raw('mode')!='Автоматичне керування' or
                         room is not None and room>=upper or coast_overheat and not once)
@@ -1245,6 +1268,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                          cycle_energy=forecast['cycle_energy'],
                          stress_scenarios=forecast['stress_scenarios'],
                          planned_kwh=forecast["energy"],horizon_hours=forecast["horizon_hours"],
+                         control_power_basis='partial_meter_reserve' if reserve_active else getattr(self,'power_source','unknown'),
+                         estimated_morning_request_minutes=settings.get('estimated_morning_request_minutes',0.),
                          validated=self.model.get("validated",False) and not environment_quality['degraded'] and not profile.get('assumed',True),
                          power_assumption=profile.get('assumption'),ventilation_validated=bool((settings.get('ventilation_model') or {}).get('validated')),
                          equipment_version=settings.get('equipment_version'),
@@ -1342,6 +1367,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      control_method="heat_offset_v2",thermostat_temperature=thermostat,
                      proposed_setpoint=thermostat+(2 if demand else -2) if thermostat is not None else None,
                      source=source,quality=quality,mode=self.raw("mode"),grid=grid,return_valid=probe_ok,
+                     control_power_basis='partial_meter_reserve' if reserve_active else getattr(self,'power_source','unknown'),
                      outage_preheat=preheat,outage_shifted=bool(forecast and forecast["outage_shifted"]),
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,
                      comfort_shortfall=bool(forecast and forecast["comfort_shortfall"]),
