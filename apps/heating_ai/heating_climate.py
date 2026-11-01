@@ -613,6 +613,14 @@ class HeatingClimate(HeatingRecovery,Hass):
             return "unknown"
         if not self.heartbeat_fresh(self.cfg["input_heartbeat"],300):
             return "unknown"
+        if self.cfg.get('power_measurement_policy')=='audited':
+            # Local load meters describe the power balance, not input phase presence.
+            voltages=self.cfg.get('input_voltages') or []
+            if len(voltages)!=3:return 'unknown'
+            for entity in voltages:
+                voltage=number(self.get_state(entity))
+                if voltage is None or voltage<150 or not self.fresh(entity,300):return 'unknown'
+            return 'on'
         for voltage_id,heartbeats in zip(self.cfg["input_voltages"],self.cfg["phase_heartbeats"]):
             v=number(self.get_state(voltage_id))
             if v is None or v<150 or not self.heartbeat_fresh(heartbeats,300):

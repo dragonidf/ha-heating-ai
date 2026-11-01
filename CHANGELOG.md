@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.9 — 2026-11-01
+
+- Show measured archive-budget usage separately from free disk space in model quality diagnostics; preserve protected history and the existing retention policy.
+- Separate audited grid presence from local load-meter availability. A live production check found all three input voltages and Deye confirming supply, while stale/unavailable local branch meters forced grid `unknown`. The audited policy now requires all three fresh input-voltage readings plus the existing Deye/connection guards. Missing/stale/low input voltage, incomplete phase bindings and actual grid loss remain unsafe; the legacy policy retains its prior behavior.
+- Keep power-balance faults unknown: this correction does not substitute missing load measurements, certify boiler watts or invent consumed energy. Add red regressions for the false unknown, stale input with fresh local meters, missing phase bindings and unchanged outage/inverter/legacy guards. No Deye, Zigbee2MQTT, source entities or other application settings are changed.
+
 ## 0.3.8 — 2026-11-01
 
 - Preserve immutable advance temperature forecasts independently of physical boiler starts. Select the latest original issue at least 12 hours before the checkpoint, disclose its real lead, and retain actual observations beyond the forecast tail through the next local window, including DST. Add prospective 1/3/6/12/24-hour checks using real sensor-report timestamps and persisted original curves.

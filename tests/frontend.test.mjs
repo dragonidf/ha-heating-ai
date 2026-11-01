@@ -4,6 +4,13 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('quality shows real archive pressure without deleting history or claiming the disk is full',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.section=(title,body)=>body;
+  p.attrs=()=>({archive_health:{used_bytes:257864750,max_bytes:268435456,free_bytes:39350693888,pressure:'true'}});
+  const markup=p.controllerQuality();assert.match(markup,/96/);assert.match(markup,/Архів/);
+  assert.match(markup,/ліміту/);assert.match(markup,/зберігається/);assert.doesNotMatch(markup,/диск заповнений/);
+  p.attrs=()=>({});assert.doesNotMatch(p.controllerQuality(),/NaN|undefined/);
+});
 test('home energy compares the immutable initial plan with known fact in the same cycle',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.time=()=> '23:00';p.compactMetric=(label,value)=>`<metric>${label}: ${value}</metric>`;
   p.attrs=()=>({energy_cycles:[{start:Date.now()/1000-3600,end:Date.now()/1000+3600,
