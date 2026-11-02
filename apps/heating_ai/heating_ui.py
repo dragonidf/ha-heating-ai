@@ -7,6 +7,7 @@ from pathlib import Path
 
 from heating_ui_assets import DIGEST, SOURCE, VERSION
 from heating_model import BOUNDS, DEFAULT_MODEL, number
+from heating_fallback import validate_inlet_config
 
 
 def forecast_for_panel(forecast):
@@ -92,6 +93,8 @@ SYSTEM_FIELDS += [dict(key='power_measurement_policy',group='Котел і ви�
 SYSTEM_FIELDS += [dict(key='power_partial_reserve',group='Котел і вимірювання',label='Резерв при втраті одного лічильника',default='disabled',target='config',kind='select',options={'disabled':'Штатний auto при втраті обліку','enabled':'Продовжити орієнтовний план'},help='Для чинного балансу: загальний ввід, три споживчі групи й GRID інвертора. Справні складові віднімаються; за однієї невідомої групи залишок є лише верхньою межею. План використовує припущення фізичного fixed_3/6/9 і запит термостата. Невідомі Вт та кВт·год не стають виміряними, не навчають модель і не додають тепла до запасу підлоги. Дві несправні групи, втрата вводу/GRID, невідомий режим або несвіжі дані залишають штатний auto. Точність енергії у резерві не підтверджена.')]
 SYSTEM_FIELDS += [dict(key='power_phase_topology',group='Котел і вимірювання',label='Підтверджена схема фаз · JSON',default={'verified':False,'phases':[]},target='config',kind='json',help='Для кожної з 3 фаз: input, loads [{entity, physical_id}], background_w і uncertainty_w. GRID інвертора включіть як одне підписане навантаження на підтвердженій фазі. physical_id має бути єдиним для двох інтеграцій того самого приладу. verified=true лише після перевірки реального розміщення лічильників. Непідтверджена схема не застосовується.')]
 SYSTEM_FIELDS += [dict(key='outage_missing_policy',group='Електромережа',label='Сумісність політики графіка',default='unknown',target='config',kind='select',options={'assume_available':'Перевіряти відсутність обмежень','unknown':'Залишати невизначеність'},help='Старий параметр збережено для сумісності. Жоден його варіант не перетворює недоступне чи застаріле джерело на підтверджене світло. Нормальний режим потребує свіжого позитивного підтвердження Svitlo; частковий графік залишається умовним.')]
+SYSTEM_FIELDS += [dict(key='power_accounting_method',group='Котел і вимірювання',label='Джерело обліку котла',default='legacy',target='config',kind='select',options={'legacy':'Попередній баланс','inlet':'Ввід мінус відомі споживачі'},help='Новий метод не використовує Faza 1/2/3. Перевіряє суму вводу, три його фази, запит термостата та фізичний режим. Номінальні 3/6/9 кВт — розрахунок, не незалежний вимір. Старий лічильник зберігається.'),
+    dict(key='power_inlet_config',group='Котел і вимірювання',label='Ввід і неперекривні споживачі · JSON',default={},target='config',kind='json',help='total — загальна активна потужність; phases — три фазові потужності цього вводу. loads: physical_id, entities (локальний сенсор і його резервні дублікати), signed для GRID Deye, phase 0/1/2 або null. Прилад віднімається один раз. Не додавайте LOAD/АКБ та прилади всередині вже врахованої гілки GRID. Невідомі фази перевіряються перебором; відсутні чи застарілі значення не замінюються нулем.')]
 SYSTEM_DEFAULTS={f['key']:f['default'] for f in SYSTEM_FIELDS if f['target']=='config'}
 SYSTEM_FIXED = (
     ('forecast_hours','Горизонт прогнозу',24,'год','Фіксований горизонт чинного планувальника. Ця панель не змінює алгоритм прогнозування.'),
@@ -128,7 +131,7 @@ def validate_system_settings(values,cfg,model):
             raise ValueError('Параметр не доступний для редагування')
         field=schema[key]
         if field['kind']=='json':
-            value=validate_phase_topology(value)
+            value=validate_inlet_config(value) if key=='power_inlet_config' else validate_phase_topology(value)
         elif field['kind']=='select':
             if not isinstance(value,str) or value not in field['options']:raise ValueError('Невідомий режим котла')
         elif field['kind']=='entity':
@@ -141,6 +144,8 @@ def validate_system_settings(values,cfg,model):
             raise ValueError(field['label']+': значення поза дозволеними межами')
         clean[key]=value
     p={**system_values(cfg),**{k:v for k,v in clean.items() if schema[k]['target']=='config'}}
+    if p['power_accounting_method']=='inlet' and not p['power_inlet_config']:
+        raise ValueError('Спочатку задайте схему вводу та споживачів')
     if p['risk_blackout_short_minutes']>p['risk_blackout_long_minutes']:
         raise ValueError('Короткий blackout не може бути довшим за довгий')
     if not (p['fire_ignite_delta']<p['fire_start_delta']<=p['fire_intense_delta'] and

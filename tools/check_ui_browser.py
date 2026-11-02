@@ -362,9 +362,9 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==36, fields.count()
+    assert fields.count()==38, fields.count()
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==65
+    assert panel.locator('.system-help').count()==67
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()
@@ -734,6 +734,20 @@ def main(engine='chromium'):
             for width in (320,390,1440):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            page.evaluate("""setHeatingScenario({
+                'sensor.heating_controller':{attributes:{control_power_basis:'fallback_inlet_stage'}},
+                'sensor.heating_power_confirmed':{state:'6000',attributes:{timestamp:new Date().toISOString(),measurement_basis:'nominal_inlet_stage',assumed_control_w:null}},
+                'binary_sensor.heating_boiler_active':{state:'on'},
+                'sensor.heating_plan_history':{attributes:{energy_cycles:[{start:Date.now()/1000-3600,end:Date.now()/1000+3600,observed_kwh:1,calculated_kwh:2,complete:false,initial_plan:{kwh:4}}]}}
+            })""")
+            page.evaluate("panel.hass={...panel.hass,themes:{darkMode:false}}")
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
+            page.wait_for_function("document.querySelector('heating-ai-panel').shadowRoot.querySelector('.boiler-status').textContent.includes('розрахунок')")
+            assert 'Облік · розрахунок' in page.locator('.plan-energy').inner_text()
+            for width in (320,390,1440):
+                page.set_viewport_size({'width':width,'height':900})
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                page.locator('.boiler-card').screenshot(path=str(ARTIFACTS/f'heating-inlet-{width}-{engine}.png'))
             assert not errors, errors
             browser.close()
             print(f'{engine}: browser checks passed: physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')

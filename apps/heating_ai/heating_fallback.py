@@ -1,5 +1,105 @@
 """Conservative, labelled power estimate used only during primary meter faults."""
 from heating_model import number
+from itertools import product
+import re
+
+
+def validate_inlet_config(value):
+    """One aggregate and its phases; each physical consumer is deducted once."""
+    if not isinstance(value,dict):raise ValueError('Потрібен об’єкт схеми вводу')
+    if not value:return {}
+    phases=value.get('phases');loads=value.get('loads');total=value.get('total')
+    entity=lambda e:isinstance(e,str) and re.fullmatch(r'sensor\.[a-z0-9_]+',e)
+    if not entity(total) or not isinstance(phases,list) or len(phases)!=3 or not all(entity(e) for e in phases):
+        raise ValueError('Потрібні загальна потужність і три різні потужності фаз вводу')
+    if not isinstance(loads,list) or not 1<=len(loads)<=4:raise ValueError('Потрібні 1–4 неперекривні групи споживачів')
+    seen=[total,*phases];physical=[];clean=[]
+    for load in loads:
+        if not isinstance(load,dict):raise ValueError('Некоректна група споживачів')
+        identity=load.get('physical_id');aliases=load.get('entities');phase=load.get('phase')
+        if not isinstance(identity,str) or not 1<=len(identity)<=80 or identity in physical:raise ValueError('Фізичний прилад має бути унікальним')
+        if not isinstance(aliases,list) or not 1<=len(aliases)<=3 or not all(entity(e) for e in aliases):raise ValueError('Потрібні сенсори потужності приладу')
+        if phase is not None and (isinstance(phase,bool) or phase not in (0,1,2)):raise ValueError('Фаза: 0, 1, 2 або null, якщо невідома')
+        if 'signed' in load and not isinstance(load['signed'],bool):raise ValueError('signed має бути true або false')
+        physical.append(identity);seen.extend(aliases)
+        clean.append(dict(physical_id=identity,entities=list(aliases),phase=phase,signed=load.get('signed',False)))
+    if len(seen)!=len(set(seen)):raise ValueError('Ввід, фази та споживачі не можуть дублюватися')
+    return dict(total=total,phases=list(phases),loads=clean)
+
+
+def inlet_entities(config):
+    if not config:return []
+    return [config['total'],*config['phases'],*[e for load in config['loads'] for e in load['entities']]]
+
+
+def inlet_stage(config,readings,stamp,mode,thermostat,target,current,controller_request=False,
+                model_kw=None,model_valid=False,window_kw=None):
+    """Nominal-stage estimate, never independent metering or a learning target.
+
+    Unknown load phases are enumerated, not inferred from device names. Even a
+    unique electrical fit cannot distinguish an unmetered, coincident heater.
+    """
+    result=dict(valid=False,watts=None,quality='unknown',independent=False,reason='inlet_not_configured')
+    try:config=validate_inlet_config(config)
+    except (TypeError,ValueError):return result
+    if not config:return result
+    core=aligned_power(readings,[config['total'],*config['phases']],stamp)
+    if not core['valid']:return dict(result,reason=core['reason'],entity=core.get('entity'))
+    values=core['values'];total=values[config['total']];phases=[values[e] for e in config['phases']]
+    if abs(total-sum(phases))>max(200.,abs(total)*.05):return dict(result,reason='inlet_sum_conflict')
+    result.update(control_reserve=dict(valid=True,at=stamp,lower_w=0.,upper_w=max(0.,total),
+        unknown_components=[],reason='inlet_stage_unconfirmed'),residual_w=None)
+    loads=[];chosen=[];missing=[]
+    for load in config['loads']:
+        fresh=[]
+        for entity in load['entities']:
+            item=aligned_power(readings,[entity],stamp)
+            if item['valid']:fresh.append((entity,item['values'][entity]))
+        if not fresh:missing.append(load['physical_id']);continue
+        entity,watts=fresh[0]
+        if any(abs(watts-other)>max(150.,abs(watts)*.1) for _,other in fresh[1:]):
+            return dict(result,reason='load_alias_conflict',load=load['physical_id'])
+        if watts<0 and not load['signed']:return dict(result,reason='negative_consumer',load=load['physical_id'])
+        loads.append((watts,load['phase']));chosen.append(entity)
+    deducted=sum(w for w,_ in loads);residual=total-deducted
+    result.update(residual_w=residual,deducted_w=deducted,selected_sources=chosen)
+    result['control_reserve'].update(upper_w=max(0.,residual),unknown_components=missing)
+    if missing:return dict(result,reason='consumer_unavailable')
+    aligned=aligned_power(readings,[config['total'],*config['phases'],*chosen],stamp)
+    if not aligned['valid']:return dict(result,reason=aligned['reason'],entity=aligned.get('entity'))
+    target=number(target);current=number(current)
+    demand=(thermostat in ('heat','auto') and target is not None and current is not None and
+            5<=current<=40 and (thermostat=='heat' and controller_request or target-current>=.5))
+    if residual< -300:return dict(result,reason='negative_residual')
+    candidates=[0] if abs(residual)<=300 else [k for k in (3,6,9) if abs(residual-k*1000)<=max(500.,k*120)]
+    if not candidates:return dict(result,reason='stage_mismatch')
+    if candidates[0] and not demand:return dict(result,reason='power_without_demand')
+    if mode not in ('fixed_3','fixed_6','fixed_9','auto'):return dict(result,reason='physical_mode_unconfirmed')
+    if mode.startswith('fixed_'):candidates=[k for k in candidates if k in (0,int(mode[-1]))]
+    if not candidates:return dict(result,reason='physical_mode_conflict')
+    fits=[];discrete=False
+    for allocation in product(*[(p,) if p is not None else (0,1,2) for _,p in loads]):
+        remainder=list(phases)
+        for (watts,_),phase in zip(loads,allocation):remainder[phase]-=watts
+        for mask in product((0,1),repeat=3):
+            stage=3*sum(mask)
+            if stage in candidates and all(abs(w-3000*on)<=max(450.,abs(3000*on)*.15) for w,on in zip(remainder,mask)):
+                fits.append(stage);discrete=True
+        # Meter reports may average switching over an interval. Enforce the
+        # per-phase TEN ceiling without calling duty fractions physical stages.
+        if all(-450<=w<=3450 for w in remainder):
+            capacity=sum(min(3000.,max(0.,w)) for w in remainder)
+            fits.extend(k for k in candidates if k and capacity>=k*1000-max(500.,k*120))
+    if len(set(fits))!=1:return dict(result,reason='phase_stage_conflict')
+    stage=fits[0]
+    check='not_applicable'
+    if mode=='auto':
+        check='provisional' if not model_valid else 'collecting' if window_kw is None else 'compatible'
+        if model_valid and number(window_kw) is not None and number(model_kw) is not None and abs(window_kw-model_kw)>3.:
+            return dict(result,reason='return_model_conflict',model_check='conflict',quality='contradictory')
+    return dict(result,valid=True,watts=stage*1000.,quality='estimated',reason='nominal_inlet_stage',
+        stage_kw=stage,phase_check='discrete_fit' if discrete else 'bounded_average',
+        model_check=check,model_kw=model_kw,window_kw=window_kw,skew_seconds=aligned['skew_seconds'])
 
 def estimated_power(source):
     # A confirmed loss of boiler supply proves zero; thermostat inference does not.
@@ -154,7 +254,7 @@ def reserve_control_prior(bounds,mode,target,current,physical_mode):
     if not bounds.get('valid') or physical_mode not in ('fixed_3','fixed_6','fixed_9'):return None
     target=number(target);current=number(current)
     if mode not in ('off','auto','heat') or target is None or current is None or not 5<=current<=40:return None
-    demand=mode=='heat' and target-current>=1. or mode=='auto' and target>current
+    demand=mode=='heat' and target-current>=1. or mode=='auto' and target-current>=.5
     return min(float(physical_mode[-1])*1000,bounds['upper_w']) if demand else 0.
 
 

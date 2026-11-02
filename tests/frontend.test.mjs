@@ -4,6 +4,17 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('inlet nominal accounting is labelled as calculated in the boiler and cycle cards',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';
+  const now=Date.now()/1000;
+  const data={power_confirmed:{measurement_basis:'nominal_inlet_stage',timestamp:new Date().toISOString()},
+    plan_history:{energy_cycles:[{start:now-3600,end:now+3600,observed_kwh:1,calculated_kwh:2,complete:false,initial_plan:{kwh:4}}]}};
+  p.attrs=k=>data[k]||{};p.state=k=>({power_confirmed:'6000',boiler_active:'on'})[k]||'unavailable';
+  p.powerAdvice=()=>({recommend:{},mode:'6 кВт',recommended:false,partial:false,adviceValue:'—'});
+  assert.match(p.boilerOverview(),/Гріє · розрахунок/);
+  assert.match(p.energyComparison(),/Облік · розрахунок/);
+  assert.match(p.energyComparison(),/3,00/);
+});
 test('partial-meter reserve is visible without calling assumed watts actual boiler heating',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';
   const data={controller:{quality:true,control_power_basis:'partial_meter_reserve'},

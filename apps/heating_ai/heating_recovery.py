@@ -28,10 +28,10 @@ def cycle_energy_allowance(entry):
     if not entry:return None
     initial=entry.get('initial_plan') or entry.get('baseline')
     if not initial or number(initial.get('kwh')) is None:return None
-    spent=max(0.,number(entry.get('observed_kwh')) or 0.)
+    spent=max(0.,number(entry.get('observed_kwh')) or 0.)+max(0.,number(entry.get('calculated_kwh')) or 0.)
     if entry.get('complete') and number(entry.get('meter_kwh')) is not None:spent=entry['meter_kwh']
     return dict(start=entry['start'],end=entry['end'],remaining_kwh=max(0.,initial['kwh']-spent),
-        known_spent_kwh=spent,fact_complete=bool(entry.get('complete')),initial_kwh=initial['kwh'])
+        known_spent_kwh=spent,calculated_spent_kwh=entry.get('calculated_kwh',0.),fact_complete=bool(entry.get('complete')),initial_kwh=initial['kwh'])
 
 def cycle_quality_summary(entry,stamp):
     initial=entry.get('initial_plan') or entry.get('baseline') or {}
@@ -49,7 +49,7 @@ def cycle_quality_summary(entry,stamp):
             duration_difference_minutes=execution['confirmed_heating_minutes']-planned if planned is not None else None,
             first_confirmed_timing_error_seconds=confirmed-first if first is not None and confirmed is not None and entry.get('first_heat_edge_known') else None)
     return dict(start=entry['start'],end=entry['end'],completed=stamp>=entry['end'],initial_plan_kwh=expected,
-        known_energy_kwh=known,energy_complete=bool(entry.get('complete')),independent_energy_kwh=None,
+        known_energy_kwh=known,calculated_energy_kwh=entry.get('calculated_kwh',0.),energy_complete=bool(entry.get('complete')),independent_energy_kwh=None,
         energy_basis='calculated_meter_balance',counter_delta_kwh=entry.get('meter_kwh'),
         energy_error_kwh=round(reported_error,5) if reported_error is not None else None,
         energy_error_percent=round(reported_error/expected*100,2) if reported_error is not None and expected else None,
@@ -612,6 +612,7 @@ class HeatingRecovery:
         stamp=now.timestamp();ledger=self.memory.setdefault('cycle_energy',{})
         previous=self.memory.get('cycle_energy_observation')
         current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,grid=grid,power=power,
+            calculated=power is not None and grid in ('on','off') and getattr(self,'power_source','')=='fallback_inlet_stage',
             temperature=temperature,temperature_valid=temperature_valid,
             known=power is not None and grid in ('on','off') and
                   not getattr(self,'power_source','unknown').startswith(('unknown','unavailable')) and
@@ -676,13 +677,22 @@ class HeatingRecovery:
                 kwh=(after-before)*(b-a)/seconds;entry['observed_kwh']+=kwh
                 kind=('automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
                 entry[kind+'_kwh']+=kwh
+            elif counter_ok and previous.get('calculated') and current.get('calculated'):
+                kwh=(after-before)*(b-a)/seconds
+                entry['calculated_kwh']=entry.get('calculated_kwh',0.)+kwh
+                kind=('automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
+                entry['calculated_'+kind+'_kwh']=entry.get('calculated_'+kind+'_kwh',0.)+kwh
+                entry['calculated_seconds']=entry.get('calculated_seconds',0.)+b-a
+                entry['complete']=False
             else:
                 entry['unknown_seconds']+=b-a;entry['complete']=False
             entry['observed_until']=b
         for entry in ledger.values():
             initial=entry.get('initial_plan') or entry.get('baseline')
-            if initial and entry['observed_kwh']>initial['kwh'] and not entry.get('overrun_review'):
+            accounted=entry['observed_kwh']+entry.get('calculated_kwh',0.)
+            if initial and accounted>initial['kwh'] and not entry.get('overrun_review'):
                 entry['overrun_review']=dict(at=stamp,known_kwh=entry['observed_kwh'],initial_kwh=initial['kwh'],
+                    calculated_kwh=entry.get('calculated_kwh',0.),accounted_kwh=accounted,
                     attribution='Причина не встановлена',unknown_seconds=entry['unknown_seconds'])
                 if entry['start']<=stamp<entry['end']:self.next_compute=0
             if stamp>=entry['end'] and not entry.get('quality_report'):
@@ -719,7 +729,7 @@ class HeatingRecovery:
         previous=entry.get('projection_inputs')
         changes=[k for k in hashes if previous and previous.get(k)!=hashes[k]]
         entry['projection_inputs']=hashes
-        spent=entry['meter_kwh'] if entry['complete'] and number(entry.get('meter_kwh')) is not None else entry['observed_kwh']
+        spent=entry['meter_kwh'] if entry['complete'] and number(entry.get('meter_kwh')) is not None else entry['observed_kwh']+entry.get('calculated_kwh',0.)
         total=spent+remaining
         baseline=entry.get('baseline')
         initial=entry.get('initial_plan') or baseline
@@ -751,7 +761,7 @@ class HeatingRecovery:
             lower=detail.get('first_violation_lower'),
             attribution='measured_execution_and_current_forecast; causal shares are not independently identified')
         entry['latest_plan']['deviation']=deviation
-        return dict(cycle_id=key,observed_kwh=round(spent,4),remaining_kwh=round(remaining,4),
+        return dict(cycle_id=key,observed_kwh=round(spent,4),calculated_kwh=entry.get('calculated_kwh',0.),remaining_kwh=round(remaining,4),
             initial_plan=initial,latest_plan=entry['latest_plan'],
             deviation=deviation,
             fact_complete=entry['complete'],projection_complete=entry['complete'],
@@ -883,7 +893,7 @@ class HeatingRecovery:
             protocol=2,request_id=request_id,selected=selected,comparison=summary,
             periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
             energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
-                'latest_plan','observed_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
+                'latest_plan','observed_kwh','calculated_kwh','calculated_seconds','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
                 'cycle_id':k} for k,v in sorted((self.memory.get('cycle_energy') or {}).items(),
                 key=lambda pair:pair[1]['start'],reverse=True)[:3]])))
 
@@ -920,7 +930,7 @@ class HeatingRecovery:
         try:
             energy=history.pop('__energy_cycles',{})
             result=self.decision_journal.temperature_comparison(start,end,history)
-            fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','observed_kwh','meter_kwh',
+            fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','observed_kwh','calculated_kwh','calculated_seconds','meter_kwh',
                 'complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh','quality_report','overrun_review','plan_reviews')
             result['energy_cycles']=[dict(cycle_id=k,**{f:v[f] for f in fields if f in v}) for k,v in energy.items()
                 if v['end']>start and v['start']<end]
@@ -1188,15 +1198,16 @@ class HeatingRecovery:
             return
         if self.grid_state()!="on":
             return
-        power=self.val("power")
+        inlet=self.cfg.get('power_accounting_method')=='inlet'
+        power=getattr(self,'current_power_w',None) if inlet else self.val("power")
         threshold=500 if self.cfg.get('power_measurement_policy')=='audited' else 1500
         bounds=getattr(self,'control_power_bounds',{}) or {};prior=number(getattr(self,'control_power_prior',None))
-        reserve=(self.cfg.get('power_partial_reserve')=='enabled' and getattr(self,'current_power_w',None) is None
+        reserve=((inlet or self.cfg.get('power_partial_reserve')=='enabled') and getattr(self,'current_power_w',None) is None
                  and bounds.get('valid') and -5<=time.time()-bounds.get('at',0)<=45)
-        estimated_response=bool(reserve and prior is not None and prior>=threshold)
-        confirmed=not reserve and power is not None and power>=threshold
+        estimated_response=bool(reserve and prior is not None and prior>=threshold or inlet and power is not None and power>=threshold)
+        confirmed=not inlet and not reserve and power is not None and power>=threshold
         self.memory.setdefault('command_diagnostic',{}).update(boiler_confirmed=bool(confirmed),
-            power_checked_at=time.time(),confirmed_power_w=None if reserve else power,
+            power_checked_at=time.time(),confirmed_power_w=None if reserve or inlet else power,
             response_estimated=estimated_response,assumed_power_w=prior if estimated_response else None)
         self.decision_event('boiler_response',force=True)
         if not confirmed and not estimated_response:

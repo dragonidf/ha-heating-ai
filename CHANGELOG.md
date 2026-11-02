@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.12 — 2026-11-02
+
+- Add inlet-based nominal boiler accounting independent of Faza 1/2/3. Validate active-power units, real report ages, alignment and aggregate/phase consistency. Subtract each configured physical consumer once, using fresh local/cloud aliases as alternatives; keep signed Deye GRID separate from LOAD/battery and reject conflicting aliases.
+- Require a thermostat heat request or a setpoint gap of at least 0.5 °C. Match only the selected fixed 3/6/9 kW stage (or a genuine pause); AUTO identifies electrical stages and cross-checks a continuous return-temperature window against a validated profile. Uncalibrated modulation stays explicitly provisional.
+- Enumerate unknown consumer phase allocations without assuming Faza names identify input phases. Reject more than one nominal 3 kW TEN per phase, unrelated residuals, stale/missing consumers and contradictory readings. A conservative control reserve can retain planning with fresh core data, but never creates accounted heat or energy.
+- Persist a separate nominal-energy counter seeded once from the existing total. Preserve legacy entities/history, classify all nominal kWh as calculated, bound sample holds and omit restart gaps. Keep calculated cycle spend separate from measured balance energy, subtract it from the soft remaining plan and exclude it from coefficient/modulation learning and independent accuracy claims.
+- Show calculated heating/energy explicitly in the panel; expose the active method and validated source configuration under expert settings. Preserve permissions, grid checks, thermostat command verification, morning request credit, native fallback and rollback-compatible equipment persistence.
+
 ## 0.3.11 — 2026-11-02
 
 - Add an opt-in control reserve for one unavailable load-group meter in the documented total/three-groups/inverter-GRID balance. Keep healthy groups and signed GRID measurements; leave the unmetered remainder as an interval, not measured boiler watts. No physical A/B/C mapping or double subtraction of appliances is assumed.

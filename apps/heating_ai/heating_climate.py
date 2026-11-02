@@ -13,7 +13,7 @@ import calendar
 import shutil
 import hashlib
 from copy import deepcopy
-from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation,partial_balance_bounds,reserve_control_prior)
+from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation,partial_balance_bounds,reserve_control_prior,inlet_stage,inlet_entities)
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
@@ -226,6 +226,9 @@ class HeatingClimate(HeatingRecovery,Hass):
     def raw(self,key,attribute=None):
         return self.get_state(self.cfg[key],attribute=attribute)
     def val(self,key,default=None,attribute=None):
+        if key=="energy" and self.cfg.get("power_accounting_method")=="inlet":
+            counter=self.memory.get("inlet_energy") or {}
+            return counter.get("origin_kwh",0.)+counter.get("estimated_kwh",0.) if counter else default
         v=number(self.raw(key,attribute))
         return default if v is None else v
     def fresh(self,entity,seconds):
@@ -283,8 +286,8 @@ class HeatingClimate(HeatingRecovery,Hass):
     def restore_system_settings(self):
         equipment=self.memory.get('equipment_settings') or {}
         if isinstance(equipment,dict):
-            for key,value in equipment.items():
-                if key not in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity','outage_missing_policy'):continue
+            for key,value in sorted(equipment.items(),key=lambda pair:pair[0]=='power_accounting_method'):
+                if key not in ('boiler_power_mode','power_measurement_policy','power_phase_topology','power_accounting_method','power_inlet_config','recuperator_entity','bath_entity','outage_missing_policy'):continue
                 try:
                     clean,_=validate_system_settings({key:value},self.cfg,self.model);self.cfg.update(clean)
                 except (ValueError,TypeError):self.log('Invalid saved equipment field: %s',key,level='WARNING')
@@ -320,15 +323,16 @@ class HeatingClimate(HeatingRecovery,Hass):
                 entities=[config.get(k) for k in ('recuperator_entity','bath_entity') if config.get(k)]
                 for phase in (config.get('power_phase_topology') or {}).get('phases',[]):
                     entities.append(phase['input']);entities.extend(load['entity'] for load in phase['loads'])
+                entities.extend(inlet_entities(config.get('power_inlet_config') or {}))
                 if any(self.get_state(entity,attribute='all') is None for entity in entities):raise ValueError('Сутність не існує в Home Assistant')
             before=deepcopy((self.cfg,self.model,self.memory,self.next_compute))
-            volatile=('ventilation_totals','ventilation_at','stage_totals')
+            volatile=('ventilation_totals','ventilation_at','stage_totals','inlet_accounting_started','inlet_stage_candidate','inlet_power_window')
             previous_runtime={k:deepcopy(getattr(self,k)) for k in volatile if hasattr(self,k)}
             estimator=deepcopy(self.power_estimator.__dict__) if hasattr(self,'power_estimator') else None
             self.settings_transaction=True
             if model and not self.consider({**self.model,**model},'Налаштування користувача',apply=True):
                 raise ValueError(self.memory.get('last_result','Модель не пройшла перевірку'))
-            equipment={k:v for k,v in config.items() if k in ('boiler_power_mode','power_measurement_policy','power_phase_topology','recuperator_entity','bath_entity','outage_missing_policy')}
+            equipment={k:v for k,v in config.items() if k in ('boiler_power_mode','power_measurement_policy','power_phase_topology','power_accounting_method','power_inlet_config','recuperator_entity','bath_entity','outage_missing_policy')}
             for k in equipment:config.pop(k,None)
             changed={k:v for k,v in equipment.items() if self.cfg.get(k)!=v}
             if changed:
@@ -343,6 +347,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.memory['equipment_settings']={**(self.memory.get('equipment_settings') or {}),**equipment}
                 for k in equipment:config.pop(k,None)
                 self.cfg.update(equipment);self.configure_ventilation()
+                if any(k in changed for k in ('boiler_power_mode','power_accounting_method','power_inlet_config')):
+                    self.inlet_accounting_started=False
+                    self.inlet_stage_candidate=None;self.inlet_power_window=[]
                 if hasattr(self,'power_estimator'):
                     self.power_estimator.window=10. if self.cfg.get('power_measurement_policy')=='audited' else 20.
                     self.power_estimator.threshold=500. if self.cfg.get('power_measurement_policy')=='audited' else 2000.
@@ -445,7 +452,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory['ventilation_model']=dict(fit,fit_day=today)
 
     def read_power_snapshot(self,entities):
-        template="""{% set ns=namespace(rows={}) %}{% for id in entities %}{% set s=states[id] %}{% if s is not none %}{% set ns.rows=dict(ns.rows,**{id:dict(value=s.state,at=as_timestamp(s.last_reported if s.last_reported is defined else s.last_updated,none),unit=s.attributes.get('unit_of_measurement'),temperature=s.attributes.get('current_temperature'),kind='active')}) %}{% endif %}{% endfor %}{{ ns.rows|tojson }}"""
+        template="""{% set ns=namespace(rows={}) %}{% for id in entities %}{% set s=states[id] %}{% if s is not none %}{% set ns.rows=dict(ns.rows,**{id:dict(value=s.state,at=as_timestamp(s.last_reported if s.last_reported is defined else s.last_updated,none),unit=s.attributes.get('unit_of_measurement'),temperature=s.attributes.get('current_temperature'),target=s.attributes.get('temperature'),kind='active')}) %}{% endif %}{% endfor %}{{ ns.rows|tojson }}"""
         result=self.render_template(template,variables=dict(entities=entities))
         if isinstance(result,str):result=json.loads(result)
         if not isinstance(result,dict) or any(not isinstance(row,dict) for row in result.values()):
@@ -454,14 +461,15 @@ class HeatingClimate(HeatingRecovery,Hass):
 
     def live_source_snapshot(self,stamp):
         entities=list(self.cfg.get('power_balance_sources') or [])
-        topology=self.cfg.get('power_phase_topology') or {}
+        if self.cfg.get('power_accounting_method')=='inlet':entities=inlet_entities(self.cfg.get('power_inlet_config') or {})
+        topology={} if self.cfg.get('power_accounting_method')=='inlet' else self.cfg.get('power_phase_topology') or {}
         phases=topology.get('phases') if isinstance(topology,dict) else None
         for phase in phases if isinstance(phases,list) else []:
             if not isinstance(phase,dict):continue
             entities.append(phase.get('input'))
             loads=phase.get('loads')
             if isinstance(loads,list):entities.extend(x.get('entity') for x in loads if isinstance(x,dict))
-        wanted=sorted(set(entities+[self.cfg.get(k) for k in ('power_balance','room','thermostat')])-{None})
+        wanted=sorted(set(entities+[self.cfg.get(k) for k in (('room','thermostat') if self.cfg.get('power_accounting_method')=='inlet' else ('power_balance','room','thermostat'))])-{None})
         # One HA batch also covers unchanged temperature reports missed by AD.
         if stamp-getattr(self,'power_snapshot_at',0)>=10 or wanted!=getattr(self,'power_snapshot_entities',None):
             self.power_snapshot=self.run_diagnostic('power_snapshot',self.read_power_snapshot,wanted,default={})
@@ -577,7 +585,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             bands=[{k:b.get(k) for k in ('return_min','return_max','power_kw','minutes')} for b in profile.get('bands',[])[:16]],
             mode_contradiction=self.memory.get('mode_contradiction',False),
             recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
-            energy=self.memory.get('power_observation_ledger'),
+            energy=self.memory.get('inlet_energy') if self.cfg.get('power_accounting_method')=='inlet' else self.memory.get('power_observation_ledger'),
             accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')))
         self.publish('sensor.heating_ventilation','Враховано' if (self.memory.get('ventilation_model') or {}).get('validated') else 'Навчання; чинна базова модель',
             **wire(dict(friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
@@ -615,7 +623,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             return "unknown"
         if not self.heartbeat_fresh(self.cfg["input_heartbeat"],300):
             return "unknown"
-        if self.cfg.get('power_measurement_policy')=='audited':
+        if self.cfg.get('power_measurement_policy')=='audited' or self.cfg.get('power_accounting_method')=='inlet':
             # Local load meters describe the power balance, not input phase presence.
             voltages=self.cfg.get('input_voltages') or []
             if len(voltages)!=3:return 'unknown'
@@ -630,7 +638,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         return "on"
     def source_temperature(self):
         stamp=time.time()
-        live=(self.cfg.get('power_measurement_policy')=='audited' and getattr(self,'runtime_ready',False) and
+        live=((self.cfg.get('power_measurement_policy')=='audited' or self.cfg.get('power_accounting_method')=='inlet') and getattr(self,'runtime_ready',False) and
               callable(getattr(self,'render_template',None)))
         readings=self.live_source_snapshot(stamp) if live else {}
         if stamp-getattr(self,'room_limits_at',0)>3600 or not hasattr(self,'room_limits'):
@@ -743,7 +751,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         row['external_gain']=(self.memory.get('solar_observer') or {}).get('observed_gain',0.)
         row["power_source"]=getattr(self,"power_source","balance")
         row['power_quality']=getattr(self,'power_quality','unknown')
-        if row['power_quality'] in ('unknown','contradictory') or getattr(self,'power_confirmation_pending',False):row['quality']=False
+        if row['power_quality'] in ('unknown','contradictory') or getattr(self,'power_confirmation_pending',False) or getattr(self,'power_source','')=='fallback_inlet_stage':row['quality']=False
         if getattr(self,'temperature_quality',{}).get('primary_status','normal')!='normal':row['quality']=False
         row['room_valid']=bool(source=='Вітальня' and primary is not None and
             getattr(self,'temperature_quality',{}).get('primary_status','normal')=='normal')
@@ -793,7 +801,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         with self.telemetry.open("a") as file:
             file.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+"\n")
         pairs=[r for r in self.samples[-288:] if r.get("source")=="Вітальня" and
-               r.get('quality') and number(r.get("thermostat")) is not None and number(r.get("room")) is not None and
+               r.get('room_valid',r.get('quality')) and number(r.get("thermostat")) is not None and number(r.get("room")) is not None and
                number(r.get('thermostat_reported_at')) is not None and
                0<=r['ts']-r['thermostat_reported_at']<=self.cfg.get('thermostat_temperature_max_age',5400)]
         if len(pairs)>=12 and pairs[-1]["ts"]-pairs[0]["ts"]>=4*3600 and max(r["room"] for r in pairs)-min(r["room"] for r in pairs)>=.5:
@@ -920,9 +928,100 @@ class HeatingClimate(HeatingRecovery,Hass):
             return False,"Завершено за лімітом"
         return True,"Одноразовий нагрів після повернення мережі"
     def balance_changed(self,entity,attribute,old,new,kwargs=None,**extra):
+        if self.cfg.get('power_accounting_method')=='inlet':return
         if time.time()-getattr(self,'power_update_at',0)<5:return
         self.update_heating_power()
+    def update_inlet_power(self):
+        stamp=time.time();self.power_update_at=stamp
+        self.control_power_prior=None;self.control_power_bounds={}
+        config=self.cfg.get('power_inlet_config') or {}
+        readings=self.live_source_snapshot(stamp)
+        stamp=max(stamp,self.power_snapshot_at)
+        therm=readings.get(self.cfg.get('thermostat')) or {}
+        at=number(therm.get('at'))
+        thermostat=therm.get('value') if at is not None and 0<=stamp-at<=self.cfg.get('thermostat_temperature_max_age',5400) else None
+        requested=(self.memory.get('last_command')=='heat' and self.memory.get('owned',False) and
+            not self.memory.get('temporary_fallback') and self.raw('mode')=='Автоматичне керування' and self.raw('armed')=='on')
+        profile=power_profile(self.cfg.get('boiler_power_mode','unconfirmed'),self.memory.get('power_calibrations'),
+            self.memory.get('modulation_profile'),self.memory.get('equipment_version',0))
+        probe=self.val('return')
+        expected=modulation_power(probe,profile) if probe is not None else None
+        window=getattr(self,'inlet_power_window',[])
+        continuous=(len(window)>=20 and window[-1]['at']-window[0]['at']>=285 and
+            stamp-window[-1]['at']<=45 and all(0<b['at']-a['at']<=45 for a,b in zip(window,window[1:])))
+        stable_probe=probe is not None and all(number(row.get('probe')) is not None and abs(row['probe']-probe)<=2 for row in window)
+        average=sum(row['watts'] for row in window)/len(window)/1000 if continuous and stable_probe else None
+        assessment=inlet_stage(config,readings,stamp,self.cfg.get('boiler_power_mode','unconfirmed'),
+            thermostat,therm.get('target'),therm.get('temperature'),controller_request=requested,
+            model_kw=expected,model_valid=profile.get('validated') is True and not profile.get('assumed',True),window_kw=average)
+        grid=self.grid_state();raw=assessment['watts']
+        if grid=='off':assessment=dict(assessment,valid=True,watts=0.,quality='estimated',reason='confirmed_grid_off');raw=0.
+        elif grid!='on':assessment=dict(assessment,valid=False,watts=None,quality='unknown',reason='grid_unknown');raw=None
+        window=[row for row in window if 0<stamp-row['at']<=300]
+        if raw is not None and requested:window.append(dict(at=stamp,watts=raw,probe=probe))
+        else:window=[]
+        self.inlet_power_window=window
+        candidate=getattr(self,'inlet_stage_candidate',None)
+        if raw is None or not candidate or candidate['watts']!=raw or stamp-candidate['at']>45:
+            candidate=dict(watts=raw,since=stamp,at=stamp)
+        stable=raw is not None and (raw==0. or stamp-candidate['since']>=15)
+        candidate['at']=stamp;self.inlet_stage_candidate=candidate
+        power=raw if stable else None
+        if getattr(self,'power_confirmation_pending',False) and stable:self.next_compute=0
+        self.power_confirmation_pending=raw is not None and not stable
+        self.current_power_w=power
+        self.power_source='fallback_grid_off' if grid=='off' else 'fallback_inlet_stage' if power is not None else 'unavailable'
+        self.power_quality=assessment['quality'] if stable else 'contradictory' if assessment['quality']=='contradictory' else 'unknown'
+        self.fallback_interval=True
+        if power is None:self.measurement_valid_since=stamp
+        bounds=assessment.get('control_reserve') or {}
+        self.control_power_bounds=bounds
+        if grid=='on' and bounds.get('valid'):
+            self.control_power_prior=reserve_control_prior(bounds,thermostat,therm.get('target'),therm.get('temperature'),self.cfg.get('boiler_power_mode'))
+            if self.cfg.get('boiler_power_mode')=='auto' and thermostat in ('heat','auto') and number(therm.get('target')) is not None and number(therm.get('temperature')) is not None and number(therm['target'])-number(therm['temperature'])>=.5:
+                self.control_power_prior=min(bounds['upper_w'],(expected if expected is not None else 3.)*1000)
+        counter=self.memory.setdefault('inlet_energy',dict(origin_kwh=max(0.,number(self.raw('energy')) or 0.),started_at=stamp))
+        before=counter.get('estimated_kwh',0.);previous=deepcopy(counter.get('last'))
+        integrate_observation(counter,stamp,power,'estimated' if power is not None else 'unknown',restart=not getattr(self,'inlet_accounting_started',False))
+        self.inlet_accounting_started=True
+        month=self.now().strftime('%Y-%m');months=counter.setdefault('months',{})
+        if month not in months:
+            first_month=datetime.fromtimestamp(counter['started_at'],self.now().tzinfo).strftime('%Y-%m')==month
+            months[month]=dict(origin_kwh=max(0.,number(self.get_state(self.cfg['monthly_energy'])) or 0.) if first_month and self.cfg.get('monthly_energy') else 0.,calculated_kwh=0.)
+        delta=counter.get('estimated_kwh',0.)-before
+        if delta>0 and previous:
+            seconds=min(45.,stamp-previous['at']);left=previous['at'];end=left+seconds
+            while left<end:
+                at=datetime.fromtimestamp(left,self.now().tzinfo);key=at.strftime('%Y-%m')
+                boundary=at.replace(year=at.year+(at.month==12),month=at.month%12+1,day=1,hour=0,minute=0,second=0,microsecond=0).timestamp()
+                right=min(end,boundary);entry=months.setdefault(key,dict(origin_kwh=0.,calculated_kwh=0.))
+                entry['calculated_kwh']+=delta*(right-left)/seconds;left=right
+        counter['months']={k:v for k,v in sorted(months.items())[-3:]}
+        monthly=counter['months'][month]
+        self.publish('sensor.heating_accounted_monthly',monthly['origin_kwh']+monthly['calculated_kwh'],
+            friendly_name='Котел — облік за місяць',unit_of_measurement='kWh',device_class='energy',
+            state_class='total_increasing',estimated=True,period=month,legacy_entity=self.cfg.get('monthly_energy'))
+        self.power_observation=dict(assessment,at=stamp,policy='inlet',controller_power_w=power,
+            controller_source=self.power_source,a=dict(watts=assessment.get('residual_w')),b=dict(reason='one_ten_per_phase'))
+        self.publish('sensor.heating_energy_total',self.val('energy'),friendly_name='Котел — розрахункова енергія',
+            unit_of_measurement='kWh',device_class='energy',state_class='total_increasing',estimated=True,
+            basis='nominal_inlet_stage',origin_kwh=counter['origin_kwh'],calculated_since_switch_kwh=counter.get('estimated_kwh',0.),
+            unknown_seconds=counter.get('unknown_seconds',0.),started_at=counter['started_at'],legacy_entity=self.cfg.get('energy'))
+        self.publish('sensor.heating_power_confirmed',power,friendly_name='Котел — розрахункова потужність ТЕНів',
+            unit_of_measurement='W',device_class='power',state_class='measurement',power_source=self.power_source,
+            power_quality=self.power_quality,estimated=True,independent=False,measurement_version=3,
+            measurement_basis='nominal_inlet_stage',confirmation_pending=self.power_confirmation_pending,
+            requested_heating=requested,primary_failed=False,power_fault=None,stale_sources=[],
+            raw_balance_w=assessment.get('residual_w'),assessment=assessment,
+            control_reserve=bounds,assumed_control_w=self.control_power_prior if power is None else None,timestamp=self.now().isoformat())
+        journal=getattr(self,'decision_journal',None)
+        if journal and stamp-getattr(self,'power_minute_at',stamp-60)>=60:
+            journal.append(dict(event='power_minute',reason='inlet_stage',power=self.power_observation,energy=dict(counter)),stamp=stamp)
+            self.power_minute_at=stamp
+        return power
+
     def update_heating_power(self):
+        if self.cfg.get('power_accounting_method')=='inlet':return self.update_inlet_power()
         stamp=time.time()
         self.control_power_prior=None;self.control_power_bounds={}
         self.power_update_at=stamp
@@ -1071,7 +1170,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                    self.memory.get('owned',False) and self.memory.get('last_command')=='heat')
         settings.update(confirmed_morning(self.memory,now,settings,measured_power,self.val('energy'),grid,
                                          automatic,getattr(self,'power_source','unknown'),
-                                         control_reserve=reserve_active and power>=500 and
+                                         control_reserve=(reserve_active or getattr(self,'power_source','')=='fallback_inlet_stage') and power>=500 and
                                          (self.memory.get('command_diagnostic') or {}).get('status')=='confirmed'))
         settings["outage_schedule"] = outage_data
         settings["outage_advance_limit"] = self.cfg.get("outage_advance_limit",180)
@@ -1090,6 +1189,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                      warning=outage_data['warning'])
         budget=self.val("monthly_budget",0)
         month_used=number(self.get_state(self.cfg["monthly_energy"]))
+        if self.cfg.get('power_accounting_method')=='inlet':
+            month=(self.memory.get('inlet_energy',{}).get('months') or {}).get(now.strftime('%Y-%m')) or {}
+            month_used=month.get('origin_kwh',0.)+month.get('calculated_kwh',0.)
         expected=budget*now.day/calendar.monthrange(now.year,now.month)[1]
         settings["budget_multiplier"]=max(1.,min(3.,(month_used/max(1.,expected))**2)) if budget>0 and month_used is not None else 1.
         tariff=self.val("tariff")
@@ -1133,7 +1235,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory.get('modulation_profile',dict(bands=[],intervals=0,minutes=0)),self.memory.get('equipment_version',0))
         settings['modulation_profile']=profile
         if reserve_active:
-            settings['control_power_basis']='partial_meter_reserve'
+            settings['control_power_basis']='inlet_stage_reserve' if self.cfg.get('power_accounting_method')=='inlet' else 'partial_meter_reserve'
             settings['unknown_power_components']=list(self.control_power_bounds.get('unknown_components',[]))
         settings['equipment_version']=self.memory.get('equipment_version',0)
         settings['thermal_model_version']=self.model.get('version')
@@ -1141,7 +1243,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
         floor=probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
-        if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason='partial_meter_reserve')
+        if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason=settings['control_power_basis'])
+        elif getattr(self,'power_source','')=='fallback_inlet_stage':environment_quality=dict(environment_quality,degraded=True,input_reason='nominal_inlet_stage')
         if quality:
             inventory=self.memory.get('floor_observer')
             if reserve_active and number((inventory or {}).get('estimate')) is None:
@@ -1268,7 +1371,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          cycle_energy=forecast['cycle_energy'],
                          stress_scenarios=forecast['stress_scenarios'],
                          planned_kwh=forecast["energy"],horizon_hours=forecast["horizon_hours"],
-                         control_power_basis='partial_meter_reserve' if reserve_active else getattr(self,'power_source','unknown'),
+                         control_power_basis=settings['control_power_basis'] if reserve_active else getattr(self,'power_source','unknown'),
                          estimated_morning_request_minutes=settings.get('estimated_morning_request_minutes',0.),
                          validated=self.model.get("validated",False) and not environment_quality['degraded'] and not profile.get('assumed',True),
                          power_assumption=profile.get('assumption'),ventilation_validated=bool((settings.get('ventilation_model') or {}).get('validated')),
@@ -1304,7 +1407,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          power_learning_intervals=profile['intervals'],
                          power_learning_minutes=profile['minutes'],
                          power_prior_kw=3.,power_estimate_provisional=True,
-                         actual_session_kwh=self.actual_session_energy())
+                         actual_session_kwh=self.actual_session_energy(),session_energy_estimated=self.cfg.get('power_accounting_method')=='inlet')
             one_hour=next((r for r in forecast["curve"] if r["ts"]>=time.time()+3500),None)
             if one_hour:
                 expected_energy=sum(r["kwh"] for r in forecast["curve"][:2])
@@ -1367,7 +1470,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      control_method="heat_offset_v2",thermostat_temperature=thermostat,
                      proposed_setpoint=thermostat+(2 if demand else -2) if thermostat is not None else None,
                      source=source,quality=quality,mode=self.raw("mode"),grid=grid,return_valid=probe_ok,
-                     control_power_basis='partial_meter_reserve' if reserve_active else getattr(self,'power_source','unknown'),
+                     control_power_basis=settings['control_power_basis'] if reserve_active else getattr(self,'power_source','unknown'),
                      outage_preheat=preheat,outage_shifted=bool(forecast and forecast["outage_shifted"]),
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,
                      comfort_shortfall=bool(forecast and forecast["comfort_shortfall"]),
@@ -1481,7 +1584,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 rate=self.val("tariff")
                 bins.append({"start":previous["ts"],"end":stamp,"kwh":round(delta,6),
                              "night":night,"cost":round(delta*rate,5) if rate is not None else None,
-                             "quality":self.val("power") is not None,"historical":False,
+                             "quality":getattr(self,"current_power_w",None) is not None,"historical":False,
                              "estimated":estimated_power(getattr(self,"power_source",""))})
         if total is not None:
             self.memory["energy_last"]={"ts":stamp,"total":total}
@@ -1493,7 +1596,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 continue
             weight=min(1.,max(0.,(b["end"]-max(b["start"],stamp-86400))/max(1,b["end"]-b["start"])))
             rolling+=b["kwh"]*weight
-            approximate |= bool(b.get("historical"))
+            approximate |= bool(b.get("historical") or b.get("estimated"))
         self.publish("sensor.heating_energy_24h",round(rolling,3),friendly_name="Котел — останні 24 години",
                      unit_of_measurement="kWh",device_class="energy",estimated_hourly_history=approximate)
         month_start=self.now().replace(day=1,hour=0,minute=0,second=0,microsecond=0).timestamp()
