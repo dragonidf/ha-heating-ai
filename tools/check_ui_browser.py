@@ -748,9 +748,21 @@ def main(engine='chromium'):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                 page.locator('.boiler-card').screenshot(path=str(ARTIFACTS/f'heating-inlet-{width}-{engine}.png'))
+            page.evaluate("""setHeatingScenario({
+                'sensor.heating_forecast':{attributes:{plan_id:'long-fixture',created_at:new Date().toISOString()}},
+                'sensor.heating_forecast_outlook':{state:'Прогноз температури',attributes:{plan_id:'long-fixture',created_at:new Date().toISOString(),horizon_hours:36,
+                    curve:Array.from({length:72},(_,i)=>[Date.now()/1000+(i+1)*1800,21.2,20.5,22,21]),heat_segments:[]}}
+            })""")
+            page.locator('[data-forecast-horizon="extended"]').click()
+            assert '36,0 год' in page.locator('.chart-card h2').inner_text()
+            for width in (320,390,1440):
+                page.set_viewport_size({'width':width,'height':900})
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            page.locator('[data-forecast-horizon="24"]').click()
+            assert page.locator('.chart-card h2').inner_text()=='Наступні 24 години'
             assert not errors, errors
             browser.close()
-            print(f'{engine}: browser checks passed: physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')
+            print(f'{engine}: browser checks passed: extended forecast toggle, physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')
     finally:
         server.shutdown()
 

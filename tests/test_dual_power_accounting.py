@@ -25,7 +25,7 @@ class DualPowerTests(unittest.TestCase):
         self.assertEqual(result['method'],'group_balance')
         self.assertEqual(result['deducted_w'],4000.)
         self.assertEqual(result['reserve']['watts'],6000.)
-        self.assertEqual(result['quality'],'estimated')
+        self.assertEqual(result['quality'],'measured')
         self.assertFalse(result['independent'])
 
     def test_each_failed_local_group_can_use_its_cloud_alias_in_kw(self):

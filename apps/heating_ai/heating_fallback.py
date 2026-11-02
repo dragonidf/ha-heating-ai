@@ -112,6 +112,8 @@ def inlet_power(config,readings,stamp,*args,**kwargs):
         # nominal stage of disagreement is a real conflict, not an averaging error.
         if reserve.get('valid') and abs(primary['watts']-reserve['watts'])>1500:
             return dict(reserve,valid=False,watts=None,quality='contradictory',reason='methods_conflict',primary=primary)
+        primary['held_sources']=[h for h in held if h['entity'] in [config['total'],*selected]]
+        primary['quality']='estimated' if primary['held_sources'] else 'measured'
         return dict(primary,reserve=dict(valid=reserve['valid'],watts=reserve['watts'],reason=reserve['reason']))
     return dict(reserve,primary=primary)
 
@@ -248,7 +250,7 @@ def reconcile_energy(memory,payload,stamp,tz):
         if applied[key].get('evidence_sha256')!=evidence:raise ValueError('Recovery id вже має інші вимірювання')
         return deepcopy(memory)
     counter=memory.get('inlet_energy') or {}
-    total=sum(counter.get(k,0.) for k in ('origin_kwh','estimated_kwh','recovered_kwh'))
+    total=sum(counter.get(k,0.) for k in ('origin_kwh','measured_kwh','estimated_kwh','recovered_kwh'))
     baseline=number(payload.get('expected_total'))
     if not counter or baseline is None or abs(total-baseline)>.0001:raise ValueError('Лічильник змінився; перевірте baseline')
     bins=payload.get('bins')

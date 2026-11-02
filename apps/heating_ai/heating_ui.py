@@ -8,6 +8,8 @@ from pathlib import Path
 from heating_ui_assets import DIGEST, SOURCE, VERSION
 from heating_model import BOUNDS, DEFAULT_MODEL, number
 from heating_fallback import validate_inlet_config
+from datetime import datetime
+from heating_model import comfort_at
 
 
 def forecast_for_panel(forecast):
@@ -29,6 +31,26 @@ def forecast_for_panel(forecast):
     if isinstance(reserve,dict):
         reserve={k:v for k,v in reserve.items() if k not in ('search_passes','binding_constraints','search_check_key','search_limitation')}
     return dict(curve=curve,heat_segments=sessions,morning_reserve=reserve)
+
+
+def forecast_outlook_for_panel(forecast,now,settings):
+    """Expose already computed lookahead; no extra search or invented sessions."""
+    rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
+    points=[]
+    for row in rows:
+        target,lower,upper,_=comfort_at(datetime.fromtimestamp(row['ts']-.001,now.tzinfo),settings)
+        points.append([row['ts'],row['temperature'],lower,upper,target])
+    sessions=forecast_for_panel(dict(heat_segments=[s for r in rows for s in r.get('heat_segments',[])]))['heat_segments']
+    finish=points[-1][0] if points else now.timestamp()
+    weather_until=number(forecast.get('weather_known_until'))
+    return dict(curve=points,heat_segments=[[s['start'],s['end'],1 if s.get('conditional') in (True,'true','on') else 0] for s in sessions],
+        weather_complete=weather_until is not None and weather_until>=finish-3600,
+        weather_missing_minutes=round(max(0.,finish-weather_until)/60,1) if weather_until is not None else None,
+        planned_kwh=round(sum(r.get('kwh',0.) for r in rows),3),
+        minimum=min((r['temperature'] for r in rows),default=None),
+        horizon_hours=round((points[-1][0]-now.timestamp())/3600,2) if points else 0.,
+        created_at=now.isoformat(),plan_id=forecast.get('plan_id'),
+        assumption='Той самий план і поточні припущення; невідомі погода та мережа умовні.')
 
 ENTITY_KEYS = (
     'room', 'return', 'outside', 'fan', 'weather', 'energy', 'target', 'lower', 'upper',

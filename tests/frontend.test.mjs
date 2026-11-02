@@ -4,6 +4,24 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('compact history decodes AppDaemon wire zeros, gaps and cycle identity',async()=>{
+  const {unpackHistoryItems}=await import('../frontend/heating-panel.js');
+  const page={encoding:'columns-v1',cycle_ids:['night'],items:[['0',null,15,100,null,21,22],[1,'0',3,101,'0'],[2,{kind:'marker',value:{kind:'grid_off'}}]]};
+  const rows=unpackHistoryItems(page);assert.equal(rows.length,3);
+  assert.equal(rows[0].value.temperature,null);assert.equal(rows[1].cycle_id,'night');
+  assert.equal(numeric(rows[1].value.temperature),0);
+  assert.equal(unpackHistoryItems({...page,items:[[1,10,3,1,2]]}),null);
+  assert.equal(unpackHistoryItems({...page,items:[['0',null,15,1]]}),null);
+});
+test('extended forecast uses the matching plan only and preserves unknown plan identity',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.forecastExtended=true;
+  p.attrs=()=>({plan_id:'current',curve:[{ts:1,temperature:21}],horizon_hours:24});
+  p._hass={states:{'sensor.heating_forecast_outlook':{attributes:{plan_id:'current',horizon_hours:36,curve:[[1,21,20,22,21],[2,20.8,20,22,21]],heat_segments:[[1,2,'0'],[3,4,1]]}}}};
+  assert.equal(p.forecastData().horizon_hours,36);assert.equal(p.forecastData().curve.length,2);
+  assert.deepEqual(p.forecastData().heat_segments.map(s=>s.conditional),[false,true]);
+  p.hass.states['sensor.heating_forecast_outlook'].attributes.plan_id='old';
+  assert.equal(p.forecastData().horizon_hours,24);
+});
 test('a wholly unmeasured cycle is not displayed as zero actual consumption',()=>{
   const p=Object.create(HeatingAIPanel.prototype),now=Date.now()/1000;
   const row={start:now-3600,end:now+3600,initial_plan:{kwh:4},observed_kwh:0,complete:false,unknown_seconds:3600};

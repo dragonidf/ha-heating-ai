@@ -1,14 +1,14 @@
 {
   "module_hashes": {
-    "heating_climate.py": "67679c06c46ddc5bcada401bd14e3f707e2565ec87af8de1a40e9aafd2751d4b",
+    "heating_climate.py": "ae3c9a7ba56b75e850dea526b65a0f2204cb882be64834695c11ee5190ced62a",
     "heating_environment.py": "e9f7af927a35e93dc66f94614f9a865d195486bd0c7fe5951103713dbb4707b8",
-    "heating_fallback.py": "085422d1a13b952d22a40791aa913296fbba398f952b4e1d74045fed2136f0b3",
+    "heating_fallback.py": "da872cbf269bbae62eb2ee79dd2b4ace6fe00cce9e23f8a2a792024ac8c34389",
     "heating_model.py": "9028b4bd811d37052b4c4b01b226d0ddb6f8d88871479483c07bd547a20bdc5a",
     "heating_outages.py": "f3b410c68fb60e2cffd1430ffbc0b66a77c505fafebe51fadfce04ca839bc163",
-    "heating_recovery.py": "773af7b274691e9e5f4119589dc608e86ad8a9579f572cf8e2e31e4f3a6f404b",
+    "heating_recovery.py": "6e7c4f4264829eae150e020efa5ead8d04884d22239559ce971a7819f3cf068d",
     "heating_stability.py": "3d2c3afcc0a82cc089715920c7bf0444b8d2963e56e6ddf24be27d8ab88887b4",
-    "heating_ui.py": "75139662100123b2ce039c81e012045d2f4006dc1df47a785f02457414182908",
-    "heating_ui_assets.py": "fed3ed8f2aa6a9bb713ceb947fe080d899ce8a05df2437b9da3a977701f50b37"
+    "heating_ui.py": "96797163342cf797681526e36c416d4187dee672f7e5a954f5ff1140aec7d926",
+    "heating_ui_assets.py": "016592b2c8b0e695b5dfeaef732428c545d866062f99e48163b2a43ea4c4c359"
   },
-  "version": "0.3.16"
+  "version": "0.3.17"
 }

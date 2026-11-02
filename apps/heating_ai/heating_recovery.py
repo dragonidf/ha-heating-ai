@@ -85,17 +85,56 @@ def comparison_items(result):
         items.append(dict(kind='status',value={k:result[k] for k in ('error','warnings') if k in result}))
     return items
 
-def comparison_page(items,offset,request_id,result_id,start,end):
+HISTORY_COLUMNS=(('ts','temperature','lower','upper'),('ts','temperature','lower','upper','target','heat_segments'))
+
+def unpack_history_items(page):
+    if page.get('encoding')!='columns-v1':return page['items']
+    result=[]
+    for item in page['items']:
+        kind=item[0]
+        if kind==2:result.append(item[1]);continue
+        cycle,mask,values=item[1],item[2],iter(item[3:])
+        value={key:next(values) for i,key in enumerate(HISTORY_COLUMNS[kind]) if mask & (1<<i)}
+        row=dict(kind='actual' if kind==0 else 'forecast',value=value)
+        if kind==1:row['cycle_id']=page['cycle_ids'][cycle]
+        result.append(row)
+    return result
+
+def comparison_page(items,offset,request_id,result_id,start,end,compact=False):
     if type(offset) is not int or not 0<=offset<=len(items):raise ValueError('Invalid history cursor')
     page=dict(protocol=2,request_id=request_id,result_id=result_id,start=start,end=end,
         offset=offset,next_offset=None,total=len(items),items=[])
+    if compact:page.update(encoding='columns-v1',cycle_ids=[])
+    size=len(json.dumps(wire_values(page)).encode())+100
+    cycle_bytes=2
     cursor=offset
-    while cursor<len(items) and len(page['items'])<64:
-        item=items[cursor];page['items'].append(item);page['next_offset']=cursor+1
-        if len(json.dumps(page).encode())>7800:
+    while cursor<len(items) and len(page['items'])<(512 if compact else 64):
+        item=items[cursor];packed=item
+        if compact:
+            kind={'actual':0,'forecast':1}.get(item.get('kind'));value=item.get('value',{})
+            if kind is not None and set(item)<={'kind','value','cycle_id'} and set(value)<=set(HISTORY_COLUMNS[kind]):
+                cycle=None
+                if kind==1:
+                    key=item['cycle_id']
+                    if key not in page['cycle_ids']:page['cycle_ids'].append(key)
+                    cycle=page['cycle_ids'].index(key)
+                packed=[kind,cycle,sum(1<<i for i,k in enumerate(HISTORY_COLUMNS[kind]) if k in value),
+                    *[value[k] for k in HISTORY_COLUMNS[kind] if k in value]]
+            else:packed=[2,item]
+        if compact:
+            cycles=len(json.dumps(page['cycle_ids']).encode())
+            added=len(json.dumps(wire_values(packed)).encode())+2+cycles-cycle_bytes
+            if size+added>7700:
+                if not page['items']:
+                    page['items'].append([2,dict(kind='error',value='Запис завеликий; оригінал збережено в приватному архіві.')]);cursor+=1
+                break
+            size+=added;cycle_bytes=cycles
+        page['items'].append(packed);page['next_offset']=cursor+1
+        if not compact and len(json.dumps(page).encode())>7800:
             page['items'].pop()
             if not page['items']:
-                page['items'].append(dict(kind='error',value='Запис завеликий; оригінал збережено в приватному архіві.'));cursor+=1
+                error=dict(kind='error',value='Запис завеликий; оригінал збережено в приватному архіві.')
+                page['items'].append([2,error] if compact else error);cursor+=1
             break
         cursor+=1
     page['next_offset']=cursor if cursor<len(items) else None
@@ -256,13 +295,14 @@ class HeatingRecovery:
         groups=self.validation_summary()['groups'];mode=self.cfg.get('boiler_power_mode','unconfirmed')
         temperature_errors=[p for p in self.memory.get('temperature_errors',[]) if p.get('model_version')==self.model.get('version') and p.get('physical_mode')==mode]
         horizons=[]
-        for hours in (1,3,6,12,24):
+        for hours in (1,3,6,12,24,36,48):
             group=next((g for g in groups if g['kind']=='frozen_plan' and g['horizon']==str(hours) and g['physical_mode']==mode),{})
             observations=[p for p in temperature_errors if p['horizon']==hours]
             leads=[p['actual_horizon_hours'] for p in observations]
             horizons.append(dict(hours=hours,count=len(observations),legacy_count=group.get('count',0),
                 days=len({datetime.fromtimestamp(p['actual_at'],now.tzinfo).date() for p in observations}),
                 temperature_mae=round(sum(abs(p['error']) for p in observations)/len(observations),3) if observations else None,
+                pending=sum(p.get('horizon')==hours for p in self.memory.get('temperature_checks',[]) if isinstance(p,dict)),
                 actual_minimum_hours=min(leads) if leads else None,actual_maximum_hours=max(leads) if leads else None,
                 energy_mae=group.get('energy_mae'),energy_count=group.get('energy_count',0),last_at=max((p['actual_at'] for p in observations),default=None)))
         journal=getattr(self,'decision_journal',None)
@@ -612,7 +652,7 @@ class HeatingRecovery:
         stamp=now.timestamp();ledger=self.memory.setdefault('cycle_energy',{})
         previous=self.memory.get('cycle_energy_observation')
         current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,grid=grid,power=power,
-            calculated=power is not None and grid in ('on','off') and getattr(self,'power_source','')=='fallback_inlet_stage',
+            calculated=power is not None and grid in ('on','off') and getattr(self,'power_source','') in ('fallback_inlet_stage','fallback_group_balance'),
             temperature=temperature,temperature_valid=temperature_valid,
             known=power is not None and grid in ('on','off') and
                   not getattr(self,'power_source','unknown').startswith(('unknown','unavailable')) and
@@ -791,6 +831,8 @@ class HeatingRecovery:
         sensor=getattr(self,'temperature_quality',{});age=number(sensor.get('primary_age_seconds'))
         reported=number(sensor.get('primary_reported_at')) if 'primary_reported_at' in sensor else stamp-age if age is not None else None
         cadence=number(sensor.get('cadence_seconds')) or 3600.
+        previous=self.memory.get('temperature_validation_observation') or {}
+        if not isinstance(previous,dict):previous={}
         remaining=[]
         for check in checks:
             if (not isinstance(check,dict) or not isinstance(check.get('forecast'),dict) or
@@ -800,20 +842,34 @@ class HeatingRecovery:
             target=check['target_at']
             if quality and room is not None and reported is not None and target<=reported<=target+cadence*1.5:
                 source=check['forecast'];journal=getattr(self,'decision_journal',None)
+                original={}
                 try:
                     original=journal.read_snapshot(source['snapshot_id']) if source.get('snapshot_id') and journal else source
                     expected=temperature_at(original.get('curve') or [],reported)
                 except (OSError,ValueError,TypeError,AttributeError,EOFError,zlib.error):expected=None
+                basis='sensor_report';actual=room;actual_at=reported
+                # A 24h curve can end between sensor reports. Compare its exact
+                # endpoint with bracketed measurements, never extend old evidence.
+                before=number(previous.get('at'));before_room=number(previous.get('room'))
+                if (expected is None and before is not None and before_room is not None and
+                        before<=target<=reported and 0<reported-before<=min(5400.,cadence*1.5)):
+                    expected=temperature_at(original.get('curve') or [],target)
+                    actual=before_room+(room-before_room)*(target-before)/(reported-before)
+                    actual_at=target;basis='interpolated_reports'
                 if expected is not None:
                     errors.append(dict(horizon=check['horizon'],issued_at=check['issued_at'],actual_at=reported,
                         model_version=check['model_version'],physical_mode=check['physical_mode'],
-                        actual_horizon_hours=(reported-check['issued_at'])/3600,
-                        forecast_temperature=expected,actual_temperature=room,error=expected-room))
+                        actual_horizon_hours=(actual_at-check['issued_at'])/3600,
+                        actual_temperature_basis=basis,comparison_at=actual_at,
+                        report_before=before if basis=='interpolated_reports' else None,
+                        forecast_temperature=expected,actual_temperature=actual,error=expected-actual))
                 else:self.memory['temperature_validation_missing']=self.memory.get('temperature_validation_missing',0)+1
             elif stamp>target+cadence*1.5:
                 self.memory['temperature_validation_missing']=self.memory.get('temperature_validation_missing',0)+1
             else:remaining.append(check)
         self.memory['temperature_checks']=remaining
+        if quality and room is not None and reported is not None and reported<=stamp and reported>=previous.get('at',0):
+            self.memory['temperature_validation_observation']=dict(at=reported,room=room)
         errors[:]=[p for p in errors[-4096:] if p['actual_at']>=stamp-30*86400]
         candidates=self.memory.setdefault('temperature_forecasts',[])
         if forecast and stamp-(candidates[-1]['at'] if candidates else 0)>=290:
@@ -833,7 +889,7 @@ class HeatingRecovery:
                 if issued_at-self.memory.get('temperature_validation_issued_at',0)>=3600:
                     self.memory['temperature_validation_issued_at']=issued_at
                     source=dict(at=issued_at,snapshot_id=digest) if journal else copy.deepcopy(issued)
-                    for horizon in (1,3,6,12,24):
+                    for horizon in (1,3,6,12,24,36,48):
                         target=stamp+horizon*3600
                         if temperature_at(curve,target) is not None:
                             self.memory['temperature_checks'].append(dict(issued_at=issued_at,target_at=target,horizon=horizon,
@@ -870,8 +926,10 @@ class HeatingRecovery:
                 actual.append(dict(ts=stamp,temperature=room if quality else None))
         self.memory['temperature_history']={k:v for k,v in history.items() if v['started_at']>stamp-30*86400}
 
-    def publish_plan_history(self,cycle_id=None,request_id=None):
-        history=self.memory.get('temperature_history') or {}
+    def publish_plan_history(self,cycle_id=None,request_id=None,source=None):
+        history=({k:v for k,v in source.items() if k!='__energy_cycles'} if source is not None else self.memory.get('temperature_history') or {})
+        energy=source.get('__energy_cycles',{}) if source is not None else self.memory.get('cycle_energy') or {}
+        if source is None:self.history_read_snapshot=copy.deepcopy({**history,'__energy_cycles':energy})
         keys=sorted(history,key=lambda k:history[k]['started_at'],reverse=True)
         selected=history.get(cycle_id or getattr(self,'history_selected',None))
         if selected is None and keys:selected=history[keys[0]]
@@ -894,10 +952,14 @@ class HeatingRecovery:
             periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
             energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
                 'latest_plan','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
-                'cycle_id':k} for k,v in sorted((self.memory.get('cycle_energy') or {}).items(),
+                'cycle_id':k} for k,v in sorted(energy.items(),
                 key=lambda pair:pair[1]['start'],reverse=True)[:3]])))
 
     def plan_history_requested(self,event,data,kwargs=None,**extra):
+        with getattr(self,'history_request_lock',RLock()):
+            self._plan_history_requested(event,data,kwargs,**extra)
+
+    def _plan_history_requested(self,event,data,kwargs=None,**extra):
         if not isinstance(data,dict) or not isinstance(data.get('request_id'),str) or not 1<=len(data['request_id'])<=128:return
         if 'start' in data or 'end' in data:
             start,end=number(data.get('start')),number(data.get('end'))
@@ -907,23 +969,32 @@ class HeatingRecovery:
                 if not isinstance(data['result_id'],str) or len(data['result_id'])>128:return
                 cached=(getattr(self,'history_results',{}) or {}).get(data['result_id'])
                 if not cached or cached['start']!=start or cached['end']!=end or now-cached['at']>600:return
-                try:page=comparison_page(cached['items'],data.get('offset',0),data['request_id'],data['result_id'],start,end)
+                try:page=comparison_page(cached['items'],data.get('offset',0),data['request_id'],data['result_id'],start,end,compact=data.get('compact') is True)
                 except ValueError:return
                 self.publish('sensor.heating_history_page','Історія · сторінка',**wire_values(page))
                 return
+            if data.get('protocol')==2 and not data.get('refresh'):
+                cached=next(((key,value) for key,value in (getattr(self,'history_results',{}) or {}).items()
+                    if value['start']==start and value['end']==end and now-value['at']<=600),None)
+                if cached:
+                    key,value=cached
+                    page=comparison_page(value['items'],0,data['request_id'],key,start,end,compact=data.get('compact') is True)
+                    self.publish('sensor.heating_history_page','Історія · сторінка',**wire_values(page));return
             if getattr(self,'history_loading',False):
                 if data['request_id']==getattr(self,'history_loading_id',None):return
                 self.history_queued=dict(data);return
             self.history_loading=True
+            self.history_compact=data.get('compact') is True
             self.history_loading_id=data['request_id'];self.history_protocol=data.get('protocol',1)
-            history=copy.deepcopy(self.memory.get('temperature_history') or {})
-            history['__energy_cycles']=copy.deepcopy(self.memory.get('cycle_energy') or {})
+            history=copy.deepcopy(getattr(self,'history_read_snapshot',None) or self.memory.get('temperature_history') or {})
+            if '__energy_cycles' not in history:history['__energy_cycles']=copy.deepcopy(self.memory.get('cycle_energy') or {})
             self.submit_to_executor(self.load_temperature_comparison,start,end,history,data['request_id'],
                                     callback=self.plan_history_loaded)
             return
         key=data.get('cycle_id')
-        if key not in (self.memory.get('temperature_history') or {}):return
-        self.publish_plan_history(key,data['request_id'])
+        snapshot=getattr(self,'history_read_snapshot',None)
+        if key not in (snapshot if snapshot is not None else self.memory.get('temperature_history') or {}):return
+        self.publish_plan_history(key,data['request_id'],source=snapshot)
 
     def load_temperature_comparison(self,start,end,history,request_id):
         """Executor work: read private evidence without holding the controller thread."""
@@ -939,6 +1010,10 @@ class HeatingRecovery:
         return dict(result,request_id=request_id)
 
     def plan_history_loaded(self,kwargs=None,**extra):
+        with getattr(self,'history_request_lock',RLock()):
+            self._plan_history_loaded(kwargs,**extra)
+
+    def _plan_history_loaded(self,kwargs=None,**extra):
         result=(kwargs or extra).get('result')
         self.history_loading=False
         if isinstance(result,dict):
@@ -950,7 +1025,7 @@ class HeatingRecovery:
                 result_id=uuid4().hex
                 cache[result_id]=dict(at=stamp,start=result['start'],end=result['end'],items=comparison_items(result))
                 self.history_results=cache
-                page=comparison_page(cache[result_id]['items'],0,result['request_id'],result_id,result['start'],result['end'])
+                page=comparison_page(cache[result_id]['items'],0,result['request_id'],result_id,result['start'],result['end'],compact=getattr(self,'history_compact',False))
                 self.publish('sensor.heating_history_page','Історія · сторінка',**wire_values(page))
             self.publish_plan_history(request_id=result['request_id'])
         queued=getattr(self,'history_queued',None);self.history_queued=None

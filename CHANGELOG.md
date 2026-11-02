@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.17 — 2026-11-02
+
+- Classify the fresh, aligned household-group balance as measured balance instead of nominal fallback. Preserve independent=false, the derived-balance basis, and explicit estimates for held standby or appliance-stage reserve. Count measured and estimated increments together without losing prior counters or reconciled energy; allow fresh group measurements through existing calibration and validation gates.
+- Complete 24-hour temperature checks at a curve endpoint using explicitly labelled interpolation between nearby real reports. Never extrapolate a frozen forecast or fill missing measurements. Keep prospective checks across reloads and queue 36/48-hour checks when the original calculation covers them, independently of power and unpublished outage schedules. Show pending checks separately from completed evidence.
+- Expose the existing calculation beyond 24 hours through a compact separate outlook sensor and a dashboard horizon switch. Keep the control plan and the default 24-hour view; no additional planner search or invented future sessions.
+- Serve history requests outside the controller thread using immutable read snapshots and a dedicated request lock. Add an opt-in, lossless compact page encoding with the existing request/range/result checks and compatibility for older open panels. On the same 3,003 archived items, reduce transfer from 59 to 28 pages and about 395 to 205 kB; benchmark results are local, not a production network-latency claim.
+
 ## 0.3.16 — 2026-11-02
 
 - Add two non-overlapping inlet balances: household meter groups with local/cloud aliases as the primary source, and individually metered appliances as the reserve. The reserve supports up to eight consumers, including dishwasher, washer and dryer. Never subtract appliances twice inside their parent groups or Deye LOAD/GRID. Preserve signed-grid, actual supply and per-phase TEN capacity checks.

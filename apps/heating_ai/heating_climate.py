@@ -22,7 +22,7 @@ from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,c
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power
 from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
-                        system_fields, system_values, validate_system_settings,forecast_for_panel)
+                        system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
 
 class HeatingClimate(HeatingRecovery,Hass):
     def initialize(self):
@@ -117,7 +117,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.listen_event(self.night_event,"heating_fan_night_request")
         self.listen_event(self.system_settings_changed,'heating_system_settings')
         self.listen_event(self.energy_recovery_requested,'heating_energy_recovery')
-        self.listen_event(self.plan_history_requested,'heating_plan_history')
+        self.history_request_lock=RLock()
+        self.history_read_snapshot=deepcopy({**self.memory.get('temperature_history',{}),'__energy_cycles':self.memory.get('cycle_energy',{})})
+        self.listen_event(self.plan_history_requested,'heating_plan_history',pin=False)
         self.listen_state(self.proposal_changed,self.cfg["ai_proposal"])
         self.listen_state(self.ai_report_changed,self.cfg["ai_report"])
         self.listen_state(self.rollback,self.cfg["rollback"])
@@ -250,7 +252,7 @@ class HeatingClimate(HeatingRecovery,Hass):
     def val(self,key,default=None,attribute=None):
         if key=="energy" and self.cfg.get("power_accounting_method")=="inlet":
             counter=self.memory.get("inlet_energy") or {}
-            return counter.get("origin_kwh",0.)+counter.get("estimated_kwh",0.)+counter.get('recovered_kwh',0.) if counter else default
+            return sum(counter.get(k,0.) for k in ('origin_kwh','measured_kwh','estimated_kwh','recovered_kwh')) if counter else default
         v=number(self.raw(key,attribute))
         return default if v is None else v
     def fresh(self,entity,seconds):
@@ -773,7 +775,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         row['external_gain']=(self.memory.get('solar_observer') or {}).get('observed_gain',0.)
         row["power_source"]=getattr(self,"power_source","balance")
         row['power_quality']=getattr(self,'power_quality','unknown')
-        if row['power_quality'] in ('unknown','contradictory') or getattr(self,'power_confirmation_pending',False) or getattr(self,'power_source','')=='fallback_inlet_stage':row['quality']=False
+        if row['power_quality'] in ('unknown','contradictory') or getattr(self,'power_confirmation_pending',False) or estimated_power(getattr(self,'power_source','')):row['quality']=False
         if getattr(self,'temperature_quality',{}).get('primary_status','normal')!='normal':row['quality']=False
         row['room_valid']=bool(source=='Вітальня' and primary is not None and
             getattr(self,'temperature_quality',{}).get('primary_status','normal')=='normal')
@@ -995,9 +997,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         if getattr(self,'power_confirmation_pending',False) and stable:self.next_compute=0
         self.power_confirmation_pending=raw is not None and not stable
         self.current_power_w=power
-        self.power_source='fallback_grid_off' if grid=='off' else 'fallback_inlet_stage' if power is not None else 'unavailable'
+        self.power_source=('fallback_grid_off' if grid=='off' else 'balance' if power is not None and assessment['quality']=='measured' else 'fallback_group_balance' if power is not None and assessment.get('method')=='group_balance' else 'fallback_inlet_stage' if power is not None else 'unavailable')
         self.power_quality=assessment['quality'] if stable else 'contradictory' if assessment['quality']=='contradictory' else 'unknown'
-        self.fallback_interval=True
+        self.fallback_interval=getattr(self,'fallback_interval',False) or estimated_power(self.power_source)
         if power is None:self.measurement_valid_since=stamp
         bounds=assessment.get('control_reserve') or {}
         self.control_power_bounds=bounds
@@ -1008,14 +1010,14 @@ class HeatingClimate(HeatingRecovery,Hass):
         if not self.memory.get('inlet_energy'):
             self.memory['inlet_energy']=dict(origin_kwh=max(0.,number(self.raw('energy')) or 0.),started_at=stamp)
         counter=self.memory['inlet_energy']
-        before=counter.get('estimated_kwh',0.);previous=deepcopy(counter.get('last'))
-        integrate_observation(counter,stamp,power,'estimated' if power is not None else 'unknown',restart=not getattr(self,'inlet_accounting_started',False))
+        before=sum(counter.get(k,0.) for k in ('estimated_kwh','measured_kwh'));previous=deepcopy(counter.get('last'))
+        integrate_observation(counter,stamp,power,self.power_quality if power is not None else 'unknown',restart=not getattr(self,'inlet_accounting_started',False))
         self.inlet_accounting_started=True
         month=self.now().strftime('%Y-%m');months=counter.setdefault('months',{})
         if month not in months:
             first_month=datetime.fromtimestamp(counter['started_at'],self.now().tzinfo).strftime('%Y-%m')==month
             months[month]=dict(origin_kwh=max(0.,number(self.get_state(self.cfg['monthly_energy'])) or 0.) if first_month and self.cfg.get('monthly_energy') else 0.,calculated_kwh=0.)
-        delta=counter.get('estimated_kwh',0.)-before
+        delta=sum(counter.get(k,0.) for k in ('estimated_kwh','measured_kwh'))-before
         if delta>0 and previous:
             seconds=min(45.,stamp-previous['at']);left=previous['at'];end=left+seconds
             while left<end:
@@ -1032,11 +1034,11 @@ class HeatingClimate(HeatingRecovery,Hass):
             controller_source=self.power_source,a=dict(watts=assessment.get('residual_w')),b=dict(reason='one_ten_per_phase'))
         self.publish('sensor.heating_energy_total',self.val('energy'),friendly_name='Котел — розрахункова енергія',
             unit_of_measurement='kWh',device_class='energy',state_class='total_increasing',estimated=True,
-            basis=assessment.get('method','nominal_inlet_stage'),origin_kwh=counter['origin_kwh'],calculated_since_switch_kwh=counter.get('estimated_kwh',0.),
+            basis=assessment.get('method','nominal_inlet_stage'),origin_kwh=counter['origin_kwh'],measured_since_switch_kwh=counter.get('measured_kwh',0.),calculated_since_switch_kwh=counter.get('estimated_kwh',0.),
             recovered_kwh=counter.get('recovered_kwh',0.),unknown_seconds=counter.get('unknown_seconds',0.),started_at=counter['started_at'],legacy_entity=self.cfg.get('energy'))
         self.publish('sensor.heating_power_confirmed',power,friendly_name='Котел — розрахункова потужність ТЕНів',
             unit_of_measurement='W',device_class='power',state_class='measurement',power_source=self.power_source,
-            power_quality=self.power_quality,estimated=True,independent=False,measurement_version=3,
+            power_quality=self.power_quality,estimated=estimated_power(self.power_source),independent=False,measurement_version=3,
             measurement_basis=assessment.get('method','nominal_inlet_stage'),confirmation_pending=self.power_confirmation_pending,
             requested_heating=requested,primary_failed=bool(config.get('groups') and assessment.get('method')!='group_balance'),
             active_method=assessment.get('method'),power_fault=assessment['reason'] if power is None else None,stale_sources=[],
@@ -1198,7 +1200,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                    self.memory.get('owned',False) and self.memory.get('last_command')=='heat')
         settings.update(confirmed_morning(self.memory,now,settings,measured_power,self.val('energy'),grid,
                                          automatic,getattr(self,'power_source','unknown'),
-                                         control_reserve=(reserve_active or getattr(self,'power_source','')=='fallback_inlet_stage') and power>=500 and
+                                         control_reserve=(reserve_active or getattr(self,'power_source','') in ('fallback_inlet_stage','fallback_group_balance')) and power>=500 and
                                          (self.memory.get('command_diagnostic') or {}).get('status')=='confirmed'))
         settings["outage_schedule"] = outage_data
         settings["outage_advance_limit"] = self.cfg.get("outage_advance_limit",180)
@@ -1392,6 +1394,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['plan_reference']=plan_reference
             self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status='calculated')
             panel_forecast=forecast_for_panel(forecast)
+            self.publish('sensor.heating_forecast_outlook','Прогноз температури',
+                **forecast_outlook_for_panel(forecast,now,settings))
             self.publish("sensor.heating_forecast",forecast["minimum"],friendly_name="Клімат — мінімум прогнозу",
                          unit_of_measurement="°C",device_class="temperature",curve=panel_forecast["curve"],
                          actual_curve=[{"ts":r["ts"],"temperature":r["room"] if r.get('room_valid',r.get('quality')) else None} for r in self.samples[-1:]],
