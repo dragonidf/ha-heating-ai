@@ -754,7 +754,7 @@ class HeatingRecovery:
         requested=entry.get('requested_seconds',0.)
         deviation=dict(extra_kwh=round(total-initial['kwh'],4) if initial and total is not None else None,
             outage_minutes=round(entry.get('outage_seconds',0.)/60,2),
-            request_average_kw=round(entry['automatic_kwh']*3600/requested,3) if requested else None,
+            request_average_kw=round((entry['automatic_kwh']+entry.get('calculated_automatic_kwh',0.))*3600/requested,3) if requested else None,
             minimum_temperature=detail.get('minimum_before_next_heat'),
             violation_at=detail.get('first_comfort_violation_at'),
             violation_temperature=detail.get('first_violation_temperature'),
@@ -893,7 +893,7 @@ class HeatingRecovery:
             protocol=2,request_id=request_id,selected=selected,comparison=summary,
             periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
             energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
-                'latest_plan','observed_kwh','calculated_kwh','calculated_seconds','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
+                'latest_plan','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
                 'cycle_id':k} for k,v in sorted((self.memory.get('cycle_energy') or {}).items(),
                 key=lambda pair:pair[1]['start'],reverse=True)[:3]])))
 
@@ -930,7 +930,7 @@ class HeatingRecovery:
         try:
             energy=history.pop('__energy_cycles',{})
             result=self.decision_journal.temperature_comparison(start,end,history)
-            fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','observed_kwh','calculated_kwh','calculated_seconds','meter_kwh',
+            fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh',
                 'complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh','quality_report','overrun_review','plan_reviews')
             result['energy_cycles']=[dict(cycle_id=k,**{f:v[f] for f in fields if f in v}) for k,v in energy.items()
                 if v['end']>start and v['start']<end]

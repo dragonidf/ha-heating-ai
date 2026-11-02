@@ -89,6 +89,14 @@ class InletAccountingTests(unittest.TestCase):
         self.readings['total']['value']=100
         self.assertIsNone(self.stage()['watts'])
 
+    def test_unverified_inlet_export_cannot_create_a_false_nine_kw_stage(self):
+        self.readings['grid']['value']=-1500
+        self.readings['local']['value']=self.readings['cloud']['value']=0
+        for e,v in dict(total=7500,a=1500,b=3000,c=3000).items():self.readings[e]['value']=v
+        result=self.stage(mode='auto')
+        self.assertIsNone(result['watts'])
+        self.assertEqual(result['reason'],'inlet_export_unverified')
+
     def test_auto_model_is_check_not_an_invented_measurement(self):
         provisional=self.stage(mode='auto',model_kw=3.,model_valid=False)
         self.assertEqual(provisional['watts'],6000.)
@@ -165,6 +173,19 @@ class InletAccountingTests(unittest.TestCase):
         self.assertTrue(app.memory['command_diagnostic']['response_estimated'])
         self.assertIsNone(app.memory['command_diagnostic']['confirmed_power_w'])
 
+    def test_native_auto_collects_return_model_window_without_controller_ownership(self):
+        app=self.app();app.cfg['boiler_power_mode']='auto';app.memory['owned']=False
+        for e,v in dict(total=10300,a=4300,b=3000,c=3000).items():self.readings[e]['value']=v
+        snapshot=app.live_source_snapshot
+        def native(stamp):
+            result=snapshot(stamp);result['climate.boiler']['value']='auto';return result
+        app.live_source_snapshot=native
+        with patch('heating_climate.power_profile',return_value=dict(validated=True,assumed=False)),patch('heating_climate.modulation_power',return_value=3.):
+            for sec in range(0,301,15):
+                with patch('heating_climate.time.time',return_value=self.at+sec):power=app.update_heating_power()
+        self.assertIsNone(power)
+        self.assertEqual(app.power_observation['reason'],'return_model_conflict')
+
     def test_invalid_duplicate_config_and_atomic_method_selection(self):
         cfg=deepcopy(self.config);cfg['loads'][1]['entities']=['sensor.grid']
         with self.assertRaises(ValueError):validate_system_settings(dict(power_inlet_config=cfg),{},DEFAULT_MODEL)
@@ -192,6 +213,16 @@ class InletAccountingTests(unittest.TestCase):
         entry['initial_plan']=dict(kwh=1.)
         self.assertAlmostEqual(cycle_energy_allowance(entry)['remaining_kwh'],.95)
         self.assertFalse(entry['complete'])
+
+    def test_native_nominal_energy_is_exported_as_other_not_automatic(self):
+        app=self.app();app.power_source='fallback_inlet_stage'
+        now=datetime(2026,11,2,0,0,tzinfo=timezone.utc)
+        for sec in (0,15,30):
+            app.observe_cycle_energy(datetime.fromtimestamp(now.timestamp()+sec,timezone.utc),dict(start='23:00',end='07:00'),6000.,100.+sec*6/3600,'on',False)
+        app.publish_plan_history()
+        cycle=app.published['sensor.heating_plan_history']['energy_cycles'][0]
+        self.assertAlmostEqual(cycle['calculated_other_kwh'],.05)
+        self.assertEqual(float(cycle['automatic_kwh']),0.)
 
 
 if __name__=='__main__':unittest.main()

@@ -60,6 +60,9 @@ def inlet_stage(config,readings,stamp,mode,thermostat,target,current,controller_
         if any(abs(watts-other)>max(150.,abs(watts)*.1) for _,other in fresh[1:]):
             return dict(result,reason='load_alias_conflict',load=load['physical_id'])
         if watts<0 and not load['signed']:return dict(result,reason='negative_consumer',load=load['physical_id'])
+        # The site's inlet export sign has not been verified. Absolute phase
+        # readings plus negative GRID can otherwise turn 6 kW into a false 9 kW.
+        if watts< -100 and load['signed']:return dict(result,reason='inlet_export_unverified',load=load['physical_id'])
         loads.append((watts,load['phase']));chosen.append(entity)
     deducted=sum(w for w,_ in loads);residual=total-deducted
     result.update(residual_w=residual,deducted_w=deducted,selected_sources=chosen)

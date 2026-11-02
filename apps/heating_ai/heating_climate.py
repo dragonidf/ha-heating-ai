@@ -958,7 +958,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         if grid=='off':assessment=dict(assessment,valid=True,watts=0.,quality='estimated',reason='confirmed_grid_off');raw=0.
         elif grid!='on':assessment=dict(assessment,valid=False,watts=None,quality='unknown',reason='grid_unknown');raw=None
         window=[row for row in window if 0<stamp-row['at']<=300]
-        if raw is not None and requested:window.append(dict(at=stamp,watts=raw,probe=probe))
+        target=number(therm.get('target'));current=number(therm.get('temperature'))
+        model_request=requested or thermostat in ('heat','auto') and target is not None and current is not None and target-current>=.5
+        if raw is not None and model_request:window.append(dict(at=stamp,watts=raw,probe=probe))
         else:window=[]
         self.inlet_power_window=window
         candidate=getattr(self,'inlet_stage_candidate',None)

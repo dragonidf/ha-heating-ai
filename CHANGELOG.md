@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.13 — 2026-11-02
+
+- Collect the inlet/return-temperature validation window for native thermostat AUTO demand as well as controller-owned heating. A validated physical AUTO profile can now flag a sustained electrical/model contradiction during native operation; provisional profiles remain explicitly provisional. Add an adapter regression without controller ownership. Preserve separate automatic/native/manual nominal subtotals in history and label nominal energy deviations as approximate, rather than measured lower bounds. Reject material GRID export while inlet export-sign semantics are unverified, preventing absolute phase readings from creating a false TEN stage.
+
 ## 0.3.12 — 2026-11-02
 
 - Add inlet-based nominal boiler accounting independent of Faza 1/2/3. Validate active-power units, real report ages, alignment and aggregate/phase consistency. Subtract each configured physical consumer once, using fresh local/cloud aliases as alternatives; keep signed Deye GRID separate from LOAD/battery and reject conflicting aliases.
