@@ -8,7 +8,7 @@ from heating_model import DEFAULT_MODEL
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None,probe_available=True,stored_floor=None,grid_sequence=None,real_planner=False):
         app=HeatingClimate()
         self.created_app=app
         app.control_power_prior=reserve_prior
@@ -19,6 +19,7 @@ class PlannedExecutionTests(unittest.TestCase):
         app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly',night_target='night')
         if missing_policy:app.cfg['outage_missing_policy']=missing_policy
         app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
+        if stored_floor is not None:app.memory['floor_observer']=dict(at=at.timestamp()-900,estimate=stored_floor,power_kw=0.)
         app.model=dict(DEFAULT_MODEL,validated=True,version=4)
         app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
         if weather_age is not None:
@@ -36,13 +37,14 @@ class PlannedExecutionTests(unittest.TestCase):
         if outage_sequence:
             app.cfg.update(outage_source='sensor.svitlo',outage_emergency='binary_sensor.emergency')
         app.get_state=lambda entity,**kwargs:outage[0] if entity=='sensor.svitlo' else 'off' if entity=='binary_sensor.emergency' else None
-        app.heartbeat_fresh=lambda *a:True
-        app.grid_state=lambda:grid
+        app.heartbeat_fresh=lambda *a:probe_available
+        current_grid=[grid];app.grid_state=lambda:current_grid[0]
         app.update_heating_power=lambda:measured_power
         app.stage_update=lambda *a:None
         app.fireplace=lambda *a:(0,False)
         app.once_state=lambda *a:(once,'test')
-        app.sample=lambda *a:None;app.energy_tick=lambda:None;app.fan_tick=lambda *a:None
+        app.sample_calls=[];app.sample=lambda *a:app.sample_calls.append(a)
+        app.energy_tick=lambda:None;app.fan_tick=lambda *a:None
         app.resume_temporary_fallback=lambda:None;app.save=lambda:None;app.journal=lambda *a:None
         app.hour_mae=lambda:0.1;app.summary=lambda:{}
         app.actual_session_energy=lambda:None
@@ -56,11 +58,13 @@ class PlannedExecutionTests(unittest.TestCase):
             schedule_complete=True,weather_complete=True,weather_missing_minutes=weather_missing,
             split_comfort_applied=True,session_kwh={},night_air_target=21.5,
             split_reason='test',morning_min_minutes=30,morning_runs_minutes=[60],curve=[])
+        from heating_stability import stable_plan
         with patch('heating_climate.time.time',return_value=at.timestamp()), \
-             patch('heating_climate.stable_plan',return_value=(forecast,{})) as planner, \
+             patch('heating_climate.stable_plan',return_value=(forecast,{}),side_effect=stable_plan if real_planner else None) as planner, \
              patch('heating_climate.coast',return_value=(peak,[])), \
              patch('heating_climate.coast_exceeds_profile',return_value=overheat):
-            for phase in outage_sequence or (None,):
+            for index,phase in enumerate(outage_sequence or [None]*len(grid_sequence or [grid])):
+                current_grid[0]=(grid_sequence or [grid])[index] if grid_sequence else grid
                 outage[0]=dict(state='No data' if phase=='normal' else 'Grid ON',attributes=dict(
                     region='kiivska-oblast',queue='3.1',updated=at.isoformat(),
                     now_status='nosched' if phase=='normal' else 'on',

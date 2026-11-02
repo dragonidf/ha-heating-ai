@@ -760,6 +760,22 @@ def main(engine='chromium'):
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.locator('[data-forecast-horizon="24"]').click()
             assert page.locator('.chart-card h2').inner_text()=='Наступні 24 години'
+            for grid in ('off','unknown'):
+                page.evaluate("""grid=>setHeatingScenario({
+                    'sensor.heating_grid':{attributes:{raw:grid}},
+                    'sensor.heating_controller':{attributes:{quality:false,control_method:'heat_offset_v2'}},
+                    'sensor.heating_diagnostics':{attributes:{control_health:'healthy'}},
+                    'sensor.heating_power_confirmed':{state:'unavailable'},
+                    'binary_sensor.heating_boiler_active':{state:'unavailable'}
+                })""",grid)
+                text=page.locator('[data-controller-health]').inner_text()
+                assert ('Немає електромережі' if grid=='off' else 'підтвердження електромережі') in text
+                assert 'бракує актуальних' not in text
+                assert page.locator('.forecast-plot svg path').count()>0
+                assert page.locator('.plan-card .session').count()>0
+                for width in (320,390,1440):
+                    page.set_viewport_size({'width':width,'height':900})
+                    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             assert not errors, errors
             browser.close()
             print(f'{engine}: browser checks passed: extended forecast toggle, physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')

@@ -92,10 +92,14 @@ def unpack_history_items(page):
     if page.get('encoding')!='columns-v1':return page['items']
     result=[]
     for item in page['items']:
-        kind=item[0]
+        kind=int(item[0])
         if kind==2:result.append(item[1]);continue
-        cycle,mask,values=item[1],item[2],iter(item[3:])
-        value={key:next(values) for i,key in enumerate(HISTORY_COLUMNS[kind]) if mask & (1<<i)}
+        cycle,mask,values=int(item[1]),int(item[2]),iter(item[3:])
+        value={}
+        for i,key in enumerate(HISTORY_COLUMNS[kind]):
+            if mask & (1<<i):
+                raw=next(values)
+                value[key]=None if raw=='~' else raw if key=='heat_segments' else number(raw)
         row=dict(kind='actual' if kind==0 else 'forecast',value=value)
         if kind==1:row['cycle_id']=page['cycle_ids'][cycle]
         result.append(row)
@@ -114,13 +118,15 @@ def comparison_page(items,offset,request_id,result_id,start,end,compact=False):
         if compact:
             kind={'actual':0,'forecast':1}.get(item.get('kind'));value=item.get('value',{})
             if kind is not None and set(item)<={'kind','value','cycle_id'} and set(value)<=set(HISTORY_COLUMNS[kind]):
-                cycle=None
+                # AppDaemon drops None array elements. Use a real positional
+                # placeholder and a sentinel for explicit missing field values.
+                cycle=0
                 if kind==1:
                     key=item['cycle_id']
                     if key not in page['cycle_ids']:page['cycle_ids'].append(key)
                     cycle=page['cycle_ids'].index(key)
                 packed=[kind,cycle,sum(1<<i for i,k in enumerate(HISTORY_COLUMNS[kind]) if k in value),
-                    *[value[k] for k in HISTORY_COLUMNS[kind] if k in value]]
+                    *[value[k] if value[k] is not None else '~' for k in HISTORY_COLUMNS[kind] if k in value]]
             else:packed=[2,item]
         if compact:
             cycles=len(json.dumps(page['cycle_ids']).encode())

@@ -4,6 +4,14 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('grid loss explains unavailable electric measurements without calling the controller broken',()=>{
+  const p=Object.create(HeatingAIPanel.prototype),attrs={controller:{quality:false},diagnostics:{control_health:'healthy'},forecast:{created_at:new Date().toISOString()},grid_status:{raw:'off'}};
+  p.attrs=k=>attrs[k]||{};p.state=k=>k==='heartbeat'?new Date().toISOString():'on';p.time=()=>'';
+  assert.match(p.controllerHealth().message,/Немає електромережі/);
+  assert.doesNotMatch(p.controllerHealth().message,/бракує актуальних/);
+  attrs.grid_status.raw='unknown';assert.match(p.controllerHealth().message,/підтвердження електромережі/);
+  attrs.grid_status.raw='on';assert.match(p.controllerHealth().message,/бракує актуальних/);
+});
 test('compact history decodes AppDaemon wire zeros, gaps and cycle identity',async()=>{
   const {unpackHistoryItems}=await import('../frontend/heating-panel.js');
   const page={encoding:'columns-v1',cycle_ids:['night'],items:[['0',null,15,100,null,21,22],[1,'0',3,101,'0'],[2,{kind:'marker',value:{kind:'grid_off'}}]]};
@@ -12,6 +20,13 @@ test('compact history decodes AppDaemon wire zeros, gaps and cycle identity',asy
   assert.equal(numeric(rows[1].value.temperature),0);
   assert.equal(unpackHistoryItems({...page,items:[[1,10,3,1,2]]}),null);
   assert.equal(unpackHistoryItems({...page,items:[['0',null,15,1]]}),null);
+});
+test('compact history decodes real HA rows and explicit null sentinels without shifting columns',async()=>{
+  const {unpackHistoryItems}=await import('../frontend/heating-panel.js');
+  const rows=unpackHistoryItems({encoding:'columns-v1',cycle_ids:['night'],items:[['0','0',3,100,21.5],['0','0',15,101,'~','~',22],[1,'0',3,102,'0']]});
+  assert.equal(rows.length,3);assert.deepEqual(rows[0].value,{ts:100,temperature:21.5});
+  assert.deepEqual(rows[1].value,{ts:101,temperature:null,lower:null,upper:22});
+  assert.equal(numeric(rows[2].value.temperature),0);
 });
 test('extended forecast uses the matching plan only and preserves unknown plan identity',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.forecastExtended=true;

@@ -1165,10 +1165,12 @@ class HeatingClimate(HeatingRecovery,Hass):
         if outside is None:
             outside=self.val("weather",attribute="temperature")
         grid=self.grid_state()
+        if grid!=getattr(self,'planning_grid_state',grid):self.next_compute=0
+        self.planning_grid_state=grid
         power=self.update_heating_power()
         self.stage_update(power/1000 if power is not None else None)
         measured_power=power
-        reserve_active=power is None and getattr(self,'control_power_prior',None) is not None
+        reserve_active=grid=='on' and power is None and getattr(self,'control_power_prior',None) is not None
         if reserve_active:power=self.control_power_prior
         fire,fire_active=self.fireplace(room)
         permitted=bool(self.cfg.get("allow_actuation",False)) and self.raw("armed")=="on"
@@ -1236,6 +1238,15 @@ class HeatingClimate(HeatingRecovery,Hass):
         once,once_text=self.once_state(grid,room,target,permitted and probe_ok and power is not None and valid)
         self.publish("sensor.heating_restore_status",once_text,friendly_name="Клімат — одноразовий запуск")
         quality=room is not None and probe_ok and outside is not None and power is not None
+        # Electrical availability gates execution, not a future thermal scenario.
+        # A stored heat estimate may replace an unavailable return probe only
+        # during a grid interruption; it is never a fresh sensor measurement.
+        inventory=self.memory.get('floor_observer') or {}
+        stored_floor=number(inventory.get('estimate'));inventory_at=number(inventory.get('at'))
+        stored_floor_ok=(stored_floor is not None and 0<stored_floor<65 and inventory_at is not None
+                         and 0<=now.timestamp()-inventory_at<=86400)
+        forecast_probe=probe if probe_ok else stored_floor if grid!='on' and stored_floor_ok else None
+        forecast_quality=room is not None and outside is not None and forecast_probe is not None
         self.track_control_inputs([key for key,failed in {
             'room':room is None,'return':not probe_ok,'outside':outside is None,
             'power':power is None or getattr(self,'power_confirmation_pending',False),
@@ -1271,17 +1282,17 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['thermal_model_version']=self.model.get('version')
         settings['ventilation_model']=self.memory.get('ventilation_model') or {}
         settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
-        floor=probe
+        floor=forecast_probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
         if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason=settings['control_power_basis'])
         elif getattr(self,'power_source','')=='fallback_inlet_stage':environment_quality=dict(environment_quality,degraded=True,input_reason='nominal_inlet_stage')
-        if quality:
+        if forecast_quality:
             inventory=self.memory.get('floor_observer')
             if reserve_active and number((inventory or {}).get('estimate')) is None:
                 inventory=dict(at=now.timestamp(),estimate=min(room,probe),power_kw=0.,energy_kwh=None)
             thermal,floor=observe_floor(inventory,now.timestamp(),
-                                       room,probe,0. if reserve_active else power/1000,grid,self.model,
-                                       energy_kwh=None if reserve_active else self.val('energy'))
+                                       room,forecast_probe,None if power is None else 0. if reserve_active else power/1000,grid,self.model,
+                                       energy_kwh=None if reserve_active or measured_power is None else self.val('energy'))
             self.memory['floor_observer']=thermal
             weather_state=self.raw('weather',attribute='all') if self.cfg.get('weather') else None
             condition=weather_state.get('state') if isinstance(weather_state,dict) else None
@@ -1290,7 +1301,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             try:reported=datetime.fromisoformat(reported.replace('Z','+00:00')).timestamp()
             except (AttributeError,ValueError,TypeError):reported=None
             solar=observe_gain(self.memory.get('solar_observer'),now.timestamp(),room,floor,
-                               outside,fire,reserve_active or power>=1500,self.model,self.climate_tz,condition,
+                               outside,fire,reserve_active or power is None or power>=1500,self.model,self.climate_tz,condition,
                                secondary=thermostat,reported_at=reported)
             self.memory['solar_observer']=solar
             settings['environment']={'solar':dict(solar)}
@@ -1298,7 +1309,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             settings['upper_margin']=round(environment_quality['upper_margin'],1)
             self.publish('sensor.heating_environment',round(floor,2),
                 friendly_name='Клімат — оцінка запасу тепла підлоги',unit_of_measurement='°C',
-                estimated=True,raw_return=probe,floor_source=thermal['source'],
+                estimated=True,raw_return=probe if probe_ok else None,return_estimated=not probe_ok,floor_source=thermal['source'],
                 external_gain_c_per_hour=round(solar.get('observed_gain',0.),3),
                 solar_learning_days=solar['days'],solar_validated=solar['validated'],
                 solar_coefficient=round(solar['coefficient'],3),weather_condition=condition,
@@ -1322,7 +1333,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             if avg is not None or power>=2000:
                 anchor=dict(return_c=probe,power_kw=min(9.,avg if avg is not None else power/1000))
         settings['modulation_anchor']=anchor
-        effective=modulation_power(probe,profile,anchor=anchor) if probe_ok else None
+        effective=modulation_power(forecast_probe,profile,anchor=anchor) if forecast_probe is not None else None
         prior_effective=number(self.memory.get('planned_effective_kw'))
         if (effective is not None and prior_effective is not None and
                 abs(effective-prior_effective)>=1.5 and
@@ -1332,7 +1343,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         usable_weather,weather_bias=anchor_weather(usable_weather,now.timestamp(),outside) if outside is not None else ([],0.)
         settings['environment_weather']=usable_weather
         peak=None;coast_overheat=False
-        if quality and valid:
+        if forecast_quality and valid:
             guard_floor=max(floor,probe) if reserve_active else floor
             peak,_=coast(room,guard_floor,outside,fire,self.model)
             coast_overheat=coast_exceeds_profile(now,room,guard_floor,outside,fire,self.model,settings)
@@ -1372,7 +1383,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         previous_reference=self.memory.get('plan_reference')
         forecast=None
         snapshot=None
-        if quality and valid:
+        if forecast_quality and valid:
             forecast,plan_reference=stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
                           power_kw=3.0,previous=self.memory.get('plan_reference'))
             forecast['issued_at']=time.time()
@@ -1404,8 +1415,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                          stress_scenarios=forecast['stress_scenarios'],
                          planned_kwh=forecast["energy"],horizon_hours=forecast["horizon_hours"],
                          control_power_basis=settings['control_power_basis'] if reserve_active else getattr(self,'power_source','unknown'),
+                         electrical_inputs_unavailable=measured_power is None,grid_state=grid,return_estimated=not probe_ok,
                          estimated_morning_request_minutes=settings.get('estimated_morning_request_minutes',0.),
-                         validated=self.model.get("validated",False) and not environment_quality['degraded'] and not profile.get('assumed',True),
+                         validated=self.model.get("validated",False) and not environment_quality['degraded'] and not profile.get('assumed',True) and measured_power is not None,
                          power_assumption=profile.get('assumption'),ventilation_validated=bool((settings.get('ventilation_model') or {}).get('validated')),
                          equipment_version=settings.get('equipment_version'),
                          structural_model_validated=self.model.get('validated',False),

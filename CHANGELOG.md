@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.19 — 2026-11-02
+
+- Keep the 24-hour thermal forecast and future heating plan available when electrical measurements disappear during an outage. Separate forecast inputs from execution eligibility: unknown power remains unknown in accounting and learning, and off/unknown grid still forbids heating commands.
+- Continue the existing stored-heat observer when the return sensor disappears during grid interruption, explicitly mark the estimated return basis, and require valid room/outdoor temperatures and a usable stored estimate. Recompute on actual grid-state transitions so a restored supply cannot reuse a pre-outage command without reassessment.
+- Explain grid loss before the generic missing-measurements warning. Add regressions for off/unknown supply, missing watts, missing return probe, safe recovery, a full real-planner curve, and narrow-screen forecast/plan visibility.
+- Preserve compact history array positions through AppDaemon serialization: use a non-null cycle placeholder and an explicit null sentinel, keeping gaps distinct from zero. Reproduce the actual HA payload and verify both decoders after transport sanitization.
+
 ## 0.3.18 — 2026-11-02
 
 - Fix history dispatch on AppDaemon installations where all worker threads are pinned. Use coroutine entry/result callbacks and offload blocking read/publication work with asyncio.to_thread, preserving the immutable history snapshot and request lock. No AppDaemon thread configuration or heating-control changes are required.

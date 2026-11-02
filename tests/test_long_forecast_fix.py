@@ -6,11 +6,22 @@ from unittest.mock import patch
 import test_dual_power_accounting as dual
 import test_inlet_accounting as inlet
 import test_plan_accountability as accountability
-from heating_recovery import comparison_page,unpack_history_items
+from heating_recovery import comparison_page,unpack_history_items,wire_values
 from heating_ui import forecast_outlook_for_panel
 
 
 class LongForecastFixTests(unittest.TestCase):
+    def test_compact_rows_survive_appdaemon_removal_of_null_array_elements(self):
+        items=[dict(kind='actual',value=dict(ts=100,temperature=21.5)),
+               dict(kind='actual',value=dict(ts=101,temperature=None,lower=None,upper=22.)),
+               dict(kind='forecast',cycle_id='night',value=dict(ts=102,temperature=0.,target=None,heat_segments=[]))]
+        def transport(value):
+            if isinstance(value,list):return [transport(v) for v in value if v is not None]
+            if isinstance(value,dict):return {k:transport(v) for k,v in value.items() if v is not None}
+            return value
+        page=transport(wire_values(comparison_page(items,0,'request','result',1,200,compact=True)))
+        self.assertEqual(unpack_history_items(page),items)
+
     def test_fresh_primary_is_balance_and_both_counter_classes_survive_switch(self):
         base=dual.DualPowerTests();base.setUp()
         fixture=inlet.InletAccountingTests();fixture.setUp();app=fixture.app()
