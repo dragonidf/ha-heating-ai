@@ -1,5 +1,6 @@
 """Temporary native-auto recovery and verified thermostat commands."""
 import time
+import asyncio
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -955,6 +956,13 @@ class HeatingRecovery:
                 'cycle_id':k} for k,v in sorted(energy.items(),
                 key=lambda pair:pair[1]['start'],reverse=True)[:3]])))
 
+    async def plan_history_event(self,event,data,kwargs=None,**extra):
+        # Async dispatch works even when AppDaemon has no unpinned threads.
+        await asyncio.to_thread(self.plan_history_requested,event,data,kwargs,**extra)
+
+    async def plan_history_result(self,kwargs=None,**extra):
+        await asyncio.to_thread(self.plan_history_loaded,kwargs,**extra)
+
     def plan_history_requested(self,event,data,kwargs=None,**extra):
         with getattr(self,'history_request_lock',RLock()):
             self._plan_history_requested(event,data,kwargs,**extra)
@@ -989,7 +997,7 @@ class HeatingRecovery:
             history=copy.deepcopy(getattr(self,'history_read_snapshot',None) or self.memory.get('temperature_history') or {})
             if '__energy_cycles' not in history:history['__energy_cycles']=copy.deepcopy(self.memory.get('cycle_energy') or {})
             self.submit_to_executor(self.load_temperature_comparison,start,end,history,data['request_id'],
-                                    callback=self.plan_history_loaded)
+                                    callback=self.plan_history_result)
             return
         key=data.get('cycle_id')
         snapshot=getattr(self,'history_read_snapshot',None)
@@ -1027,7 +1035,8 @@ class HeatingRecovery:
                 self.history_results=cache
                 page=comparison_page(cache[result_id]['items'],0,result['request_id'],result_id,result['start'],result['end'],compact=getattr(self,'history_compact',False))
                 self.publish('sensor.heating_history_page','Історія · сторінка',**wire_values(page))
-            self.publish_plan_history(request_id=result['request_id'])
+            source=getattr(self,'history_read_snapshot',None)
+            self.publish_plan_history(request_id=result['request_id'],**({'source':source} if source is not None else {}))
         queued=getattr(self,'history_queued',None);self.history_queued=None
         if queued:self.plan_history_requested('heating_plan_history',queued)
 

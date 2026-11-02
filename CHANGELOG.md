@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.18 — 2026-11-02
+
+- Fix history dispatch on AppDaemon installations where all worker threads are pinned. Use coroutine entry/result callbacks and offload blocking read/publication work with asyncio.to_thread, preserving the immutable history snapshot and request lock. No AppDaemon thread configuration or heating-control changes are required.
+- Reproduce the v0.3.17 failure against the exact AppDaemon 4.5.13 dispatcher; verify the async path with no unpinned workers. Add regressions for event-loop responsiveness, result publication from the immutable snapshot, and visible worker exceptions.
+
 ## 0.3.17 — 2026-11-02
 
 - Classify the fresh, aligned household-group balance as measured balance instead of nominal fallback. Preserve independent=false, the derived-balance basis, and explicit estimates for held standby or appliance-stage reserve. Count measured and estimated increments together without losing prior counters or reconciled energy; allow fresh group measurements through existing calibration and validation gates.

@@ -119,7 +119,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.listen_event(self.energy_recovery_requested,'heating_energy_recovery')
         self.history_request_lock=RLock()
         self.history_read_snapshot=deepcopy({**self.memory.get('temperature_history',{}),'__energy_cycles':self.memory.get('cycle_energy',{})})
-        self.listen_event(self.plan_history_requested,'heating_plan_history',pin=False)
+        self.listen_event(self.plan_history_event,'heating_plan_history')
         self.listen_state(self.proposal_changed,self.cfg["ai_proposal"])
         self.listen_state(self.ai_report_changed,self.cfg["ai_report"])
         self.listen_state(self.rollback,self.cfg["rollback"])
