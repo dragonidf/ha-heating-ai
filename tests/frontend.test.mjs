@@ -4,6 +4,14 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('a wholly unmeasured cycle is not displayed as zero actual consumption',()=>{
+  const p=Object.create(HeatingAIPanel.prototype),now=Date.now()/1000;
+  const row={start:now-3600,end:now+3600,initial_plan:{kwh:4},observed_kwh:0,complete:false,unknown_seconds:3600};
+  p.time=()=> '07:00';p.attrs=()=>({energy_cycles:[row]});
+  const text=p.energyComparison();assert.match(text,/немає даних/);assert.doesNotMatch(text,/0,00/);
+  row.complete=true;row.unknown_seconds=0;
+  assert.match(p.energyComparison(),/0,00/);
+});
 test('inlet nominal accounting is labelled as calculated in the boiler and cycle cards',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';
   const now=Date.now()/1000;

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.15 — 2026-11-02
+
+- Show missing actual energy as unavailable when an incomplete cycle has no accounted energy and unknown measurement time. Do not present an unmeasured night as 0.00 kWh in current or completed cycle cards. Preserve genuine complete zero-consumption cycles and calculated nominal energy. Add a frontend regression; no controller or accounting algorithm change.
+
 ## 0.3.14 — 2026-11-02
 
 - Keep a labelled control prior from fresh inlet total and signed GRID when quiet/stale input-phase watts prevent nominal accounting. Phase wattage and all consumer readings still gate accounted energy; actual grid voltage/permission guards stay authoritative. Missing or unverified signed GRID and contradictory totals remain unsafe. Reproduce the live post-heating quiet-phase case without generating watts or kWh.
