@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.16 — 2026-11-02
+
+- Add two non-overlapping inlet balances: household meter groups with local/cloud aliases as the primary source, and individually metered appliances as the reserve. The reserve supports up to eight consumers, including dishwasher, washer and dryer. Never subtract appliances twice inside their parent groups or Deye LOAD/GRID. Preserve signed-grid, actual supply and per-phase TEN capacity checks.
+- Label both methods as derived estimates. Keep the original power timestamps for explicitly held quiet standby with fresh same-device voltage; unavailable readings remain unknown. Debounce by stage rather than changing residual watts. Preserve the thermal model and exclude estimated energy from exact-power learning.
+- Add audited, idempotent Recorder energy reconciliation with evidence hashes, baseline/overlap/range checks, a state backup and atomic persistence. Restore dated rolling/monthly/cycle totals separately from measured energy without rewriting initial plans, telemetry or frozen forecasts. Failed saves roll back the correction.
+- Keep existing boiler power/mode/energy helper IDs; document migration of their energy source to the canonical controller total without importing the old integrator offset. Update source diagnostics and calculated-power captions.
+
 ## 0.3.15 — 2026-11-02
 
 - Show missing actual energy as unavailable when an incomplete cycle has no accounted energy and unknown measurement time. Do not present an unmeasured night as 0.00 kWh in current or completed cycle cards. Preserve genuine complete zero-consumption cycles and calculated nominal energy. Add a frontend regression; no controller or accounting algorithm change.

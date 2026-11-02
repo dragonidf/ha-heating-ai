@@ -13,7 +13,7 @@ import calendar
 import shutil
 import hashlib
 from copy import deepcopy
-from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation,partial_balance_bounds,reserve_control_prior,inlet_stage,inlet_entities)
+from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation,partial_balance_bounds,reserve_control_prior,inlet_power,inlet_entities,reconcile_energy)
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
@@ -116,6 +116,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.listen_event(self.weather_event,"heating_weather_forecast")
         self.listen_event(self.night_event,"heating_fan_night_request")
         self.listen_event(self.system_settings_changed,'heating_system_settings')
+        self.listen_event(self.energy_recovery_requested,'heating_energy_recovery')
         self.listen_event(self.plan_history_requested,'heating_plan_history')
         self.listen_state(self.proposal_changed,self.cfg["ai_proposal"])
         self.listen_state(self.ai_report_changed,self.cfg["ai_report"])
@@ -201,6 +202,27 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.log("Recovered %.5f kWh and %s samples",recovery["kwh"],changed)
     def now(self):
         return datetime.now(self.climate_tz)
+    def energy_recovery_requested(self,event,data,kwargs=None,**extra):
+        """Audited energy correction only; AppDaemon pins callbacks serially."""
+        before=self.memory;success=False;error=None;amount=None
+        try:
+            if not isinstance(data,dict) or self.cfg.get('power_accounting_method')!='inlet':raise ValueError('Потрібен активний облік вводу')
+            if self.update_in_progress() or self.memory.get('state_load_error'):raise ValueError('Відновлення зараз недоступне')
+            candidate=reconcile_energy(self.memory,data,time.time(),self.now().tzinfo)
+            backup=self.directory/'deployment_backups'/data['id'];backup.mkdir(parents=True,exist_ok=True)
+            if self.statefile.exists() and not (backup/'state.json').exists():shutil.copy2(self.statefile,backup/'state.json')
+            self.memory=candidate
+            self.save()
+            amount=candidate['applied_recoveries'][data['id']]['kwh'];success=True
+        except (ValueError,TypeError,OSError) as exc:
+            self.memory=before;error=str(exc)
+        self.publish('sensor.heating_energy_recovery',amount if success else 'Помилка',
+            friendly_name='Котел — відновлення обліку',unit_of_measurement='kWh',estimated=True,
+            success=success,error=error,recovery_id=data.get('id') if isinstance(data,dict) else None)
+        if success:
+            self.publish('sensor.heating_energy_total',self.val('energy'),unit_of_measurement='kWh',device_class='energy',
+                state_class='total_increasing',estimated=True,recovered_kwh=self.memory['inlet_energy'].get('recovered_kwh',0.))
+            self.energy_tick()
     def load_state(self):
         try:
             data=json.loads(self.statefile.read_text())
@@ -228,7 +250,7 @@ class HeatingClimate(HeatingRecovery,Hass):
     def val(self,key,default=None,attribute=None):
         if key=="energy" and self.cfg.get("power_accounting_method")=="inlet":
             counter=self.memory.get("inlet_energy") or {}
-            return counter.get("origin_kwh",0.)+counter.get("estimated_kwh",0.) if counter else default
+            return counter.get("origin_kwh",0.)+counter.get("estimated_kwh",0.)+counter.get('recovered_kwh',0.) if counter else default
         v=number(self.raw(key,attribute))
         return default if v is None else v
     def fresh(self,entity,seconds):
@@ -951,7 +973,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             stamp-window[-1]['at']<=45 and all(0<b['at']-a['at']<=45 for a,b in zip(window,window[1:])))
         stable_probe=probe is not None and all(number(row.get('probe')) is not None and abs(row['probe']-probe)<=2 for row in window)
         average=sum(row['watts'] for row in window)/len(window)/1000 if continuous and stable_probe else None
-        assessment=inlet_stage(config,readings,stamp,self.cfg.get('boiler_power_mode','unconfirmed'),
+        assessment=inlet_power(config,readings,stamp,self.cfg.get('boiler_power_mode','unconfirmed'),
             thermostat,therm.get('target'),therm.get('temperature'),controller_request=requested,
             model_kw=expected,model_valid=profile.get('validated') is True and not profile.get('assumed',True),window_kw=average)
         grid=self.grid_state();raw=assessment['watts']
@@ -964,8 +986,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         else:window=[]
         self.inlet_power_window=window
         candidate=getattr(self,'inlet_stage_candidate',None)
-        if raw is None or not candidate or candidate['watts']!=raw or stamp-candidate['at']>45:
-            candidate=dict(watts=raw,since=stamp,at=stamp)
+        stage=assessment.get('stage_kw') if raw is not None else None
+        if raw is None or not candidate or candidate.get('stage')!=stage or stamp-candidate['at']>45:
+            candidate=dict(watts=raw,stage=stage,since=stamp,at=stamp)
         stable=raw is not None and (raw==0. or stamp-candidate['since']>=15)
         candidate['at']=stamp;self.inlet_stage_candidate=candidate
         power=raw if stable else None
@@ -982,7 +1005,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.control_power_prior=reserve_control_prior(bounds,thermostat,therm.get('target'),therm.get('temperature'),self.cfg.get('boiler_power_mode'))
             if self.cfg.get('boiler_power_mode')=='auto' and thermostat in ('heat','auto') and number(therm.get('target')) is not None and number(therm.get('temperature')) is not None and number(therm['target'])-number(therm['temperature'])>=.5:
                 self.control_power_prior=min(bounds['upper_w'],(expected if expected is not None else 3.)*1000)
-        counter=self.memory.setdefault('inlet_energy',dict(origin_kwh=max(0.,number(self.raw('energy')) or 0.),started_at=stamp))
+        if not self.memory.get('inlet_energy'):
+            self.memory['inlet_energy']=dict(origin_kwh=max(0.,number(self.raw('energy')) or 0.),started_at=stamp)
+        counter=self.memory['inlet_energy']
         before=counter.get('estimated_kwh',0.);previous=deepcopy(counter.get('last'))
         integrate_observation(counter,stamp,power,'estimated' if power is not None else 'unknown',restart=not getattr(self,'inlet_accounting_started',False))
         self.inlet_accounting_started=True
@@ -1007,13 +1032,14 @@ class HeatingClimate(HeatingRecovery,Hass):
             controller_source=self.power_source,a=dict(watts=assessment.get('residual_w')),b=dict(reason='one_ten_per_phase'))
         self.publish('sensor.heating_energy_total',self.val('energy'),friendly_name='Котел — розрахункова енергія',
             unit_of_measurement='kWh',device_class='energy',state_class='total_increasing',estimated=True,
-            basis='nominal_inlet_stage',origin_kwh=counter['origin_kwh'],calculated_since_switch_kwh=counter.get('estimated_kwh',0.),
-            unknown_seconds=counter.get('unknown_seconds',0.),started_at=counter['started_at'],legacy_entity=self.cfg.get('energy'))
+            basis=assessment.get('method','nominal_inlet_stage'),origin_kwh=counter['origin_kwh'],calculated_since_switch_kwh=counter.get('estimated_kwh',0.),
+            recovered_kwh=counter.get('recovered_kwh',0.),unknown_seconds=counter.get('unknown_seconds',0.),started_at=counter['started_at'],legacy_entity=self.cfg.get('energy'))
         self.publish('sensor.heating_power_confirmed',power,friendly_name='Котел — розрахункова потужність ТЕНів',
             unit_of_measurement='W',device_class='power',state_class='measurement',power_source=self.power_source,
             power_quality=self.power_quality,estimated=True,independent=False,measurement_version=3,
-            measurement_basis='nominal_inlet_stage',confirmation_pending=self.power_confirmation_pending,
-            requested_heating=requested,primary_failed=False,power_fault=None,stale_sources=[],
+            measurement_basis=assessment.get('method','nominal_inlet_stage'),confirmation_pending=self.power_confirmation_pending,
+            requested_heating=requested,primary_failed=bool(config.get('groups') and assessment.get('method')!='group_balance'),
+            active_method=assessment.get('method'),power_fault=assessment['reason'] if power is None else None,stale_sources=[],
             raw_balance_w=assessment.get('residual_w'),assessment=assessment,
             control_reserve=bounds,assumed_control_w=self.control_power_prior if power is None else None,timestamp=self.now().isoformat())
         journal=getattr(self,'decision_journal',None)

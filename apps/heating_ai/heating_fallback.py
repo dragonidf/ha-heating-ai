@@ -1,6 +1,8 @@
 """Conservative, labelled power estimate used only during primary meter faults."""
 from heating_model import number
 from itertools import product
+from copy import deepcopy
+from datetime import datetime
 import re
 
 
@@ -12,9 +14,11 @@ def validate_inlet_config(value):
     entity=lambda e:isinstance(e,str) and re.fullmatch(r'sensor\.[a-z0-9_]+',e)
     if not entity(total) or not isinstance(phases,list) or len(phases)!=3 or not all(entity(e) for e in phases):
         raise ValueError('Потрібні загальна потужність і три різні потужності фаз вводу')
-    if not isinstance(loads,list) or not 1<=len(loads)<=4:raise ValueError('Потрібні 1–4 неперекривні групи споживачів')
+    if not isinstance(loads,list) or not 1<=len(loads)<=8:raise ValueError('Потрібні 1–8 неперекривних груп споживачів')
     seen=[total,*phases];physical=[];clean=[]
-    for load in loads:
+    groups=value.get('groups',[])
+    if not isinstance(groups,list) or len(groups) not in (0,3):raise ValueError('Основний баланс потребує трьох груп лічильників')
+    for load in loads+groups:
         if not isinstance(load,dict):raise ValueError('Некоректна група споживачів')
         identity=load.get('physical_id');aliases=load.get('entities');phase=load.get('phase')
         if isinstance(phase,str) and phase in ('0','1','2'):phase=int(phase)
@@ -27,12 +31,89 @@ def validate_inlet_config(value):
         physical.append(identity);seen.extend(aliases)
         clean.append(dict(physical_id=identity,entities=list(aliases),phase=phase,signed=signed))
     if len(seen)!=len(set(seen)):raise ValueError('Ввід, фази та споживачі не можуть дублюватися')
-    return dict(total=total,phases=list(phases),loads=clean)
+    result=dict(total=total,phases=list(phases),loads=clean[:len(loads)])
+    if groups:result['groups']=clean[len(loads):]
+    heartbeats=value.get('heartbeats',{})
+    if not isinstance(heartbeats,dict) or len(heartbeats)>40:raise ValueError('Некоректні датчики напруги для тихого споживання')
+    for source,aliases in heartbeats.items():
+        if source not in seen or not isinstance(aliases,list) or not 1<=len(aliases)<=3 or not all(entity(e) for e in aliases):
+            raise ValueError('Потрібна напруга того самого фізичного лічильника')
+    if heartbeats:result['heartbeats']={k:list(v) for k,v in heartbeats.items()}
+    return result
 
 
 def inlet_entities(config):
     if not config:return []
-    return [config['total'],*config['phases'],*[e for load in config['loads'] for e in load['entities']]]
+    return list(dict.fromkeys([config['total'],*config['phases'],
+        *[e for load in config['loads']+config.get('groups',[]) for e in load['entities']],
+        *[e for aliases in config.get('heartbeats',{}).values() for e in aliases]]))
+
+
+def inlet_power(config,readings,stamp,*args,**kwargs):
+    """Prefer the complete household-group balance; reserve uses appliances only.
+
+    Both are derived estimates sharing the inlet, never independent meters.
+    Quiet standby supported by fresh same-device voltage is explicitly held,
+    retaining its original power timestamp and never entering model training.
+    """
+    try:config=validate_inlet_config(config)
+    except (TypeError,ValueError):return dict(valid=False,watts=None,quality='unknown',reason='inlet_not_configured')
+    readings={k:dict(v) for k,v in readings.items()};held=[]
+    for entity,aliases in config.get('heartbeats',{}).items():
+        row=readings.get(entity) or {};watts=number(row.get('value'));at=number(row.get('at'))
+        if watts is not None and row.get('unit')=='kW':watts*=1000
+        if watts is None or at is None or at>stamp or row.get('unit') not in ('W','kW') or not 0<=watts<=50:continue
+        if aligned_power(readings,[config['total'],entity],stamp)['valid']:continue
+        for alias in aliases:
+            heartbeat=readings.get(alias) or {};voltage=number(heartbeat.get('value'));seen=number(heartbeat.get('at'))
+            if voltage is not None and heartbeat.get('unit')=='V' and 50<voltage<300 and seen is not None and 0<=stamp-seen<=90:
+                row['estimate_at']=seen
+                held.append(dict(entity=entity,power_at=at,voltage_entity=alias,voltage_at=seen,watts=watts));break
+    reserve=inlet_stage(config,readings,stamp,*args,**kwargs)
+    reserve.update(method='appliance_stage',held_sources=held)
+    if not config.get('groups'):return reserve
+    primary=dict(valid=False,watts=None,quality='unknown',reason='group_unavailable')
+    # Only GRID overlaps neither the household groups nor the boiler. Do not
+    # subtract appliances again: they are already within the group readings.
+    signed=[load for load in config['loads'] if load['signed']]
+    if len(signed)!=1:return dict(reserve,primary=dict(primary,reason='signed_grid_required'))
+    selected=[];conflict=None
+    for load in config['groups']+signed:
+        fresh=[]
+        for entity in load['entities']:
+            reading=aligned_power(readings,[config['total'],entity],stamp)
+            if reading['valid']:fresh.append((entity,reading['values'][entity]))
+        if not fresh:break
+        entity,watts=fresh[0]
+        if any(abs(watts-other)>max(150.,abs(watts)*.1) for _,other in fresh[1:]):conflict='load_alias_conflict';break
+        if watts< -100:conflict='inlet_export_unverified';break
+        selected.append(entity)
+    if conflict:primary['reason']=conflict
+    elif len(selected)==4:
+        aligned=aligned_power(readings,[config['total'],*selected],stamp)
+        if aligned['valid']:
+            values=aligned['values'];deducted=sum(values[e] for e in selected)
+            residual=values[config['total']]-deducted
+            stage=min((0,3,6,9),key=lambda k:abs(residual-k*1000))
+            if -300<=residual<=10500 and abs(residual-stage*1000)<=max(500.,stage*150):
+                primary=dict(valid=True,watts=0. if stage==0 else residual,quality='estimated',independent=False,
+                    reason='derived_group_balance',method='group_balance',stage_kw=stage,residual_w=residual,
+                    deducted_w=deducted,selected_sources=selected,held_sources=[h for h in held if h['entity'] in selected],
+                    control_reserve=reserve.get('control_reserve',{}))
+            else:primary['reason']='group_residual_conflict'
+        else:primary['reason']=aligned['reason']
+    if primary['valid']:
+        phases=aligned_power(readings,[config['total'],*config['phases']],stamp)
+        if phases['valid']:
+            values=phases['values'];capacity=sum(min(3450.,max(0.,values[e])) for e in config['phases'])
+            if abs(values[config['total']]-sum(values[e] for e in config['phases']))>max(200.,abs(values[config['total']])*.05) or capacity<primary['watts']-500:
+                return dict(reserve,valid=False,watts=None,quality='contradictory',reason='inlet_phase_capacity_conflict',primary=primary)
+        # A stage estimate can differ slightly from true residual watts. A full
+        # nominal stage of disagreement is a real conflict, not an averaging error.
+        if reserve.get('valid') and abs(primary['watts']-reserve['watts'])>1500:
+            return dict(reserve,valid=False,watts=None,quality='contradictory',reason='methods_conflict',primary=primary)
+        return dict(primary,reserve=dict(valid=reserve['valid'],watts=reserve['watts'],reason=reserve['reason']))
+    return dict(reserve,primary=primary)
 
 
 def inlet_stage(config,readings,stamp,mode,thermostat,target,current,controller_request=False,
@@ -93,6 +174,8 @@ def inlet_stage(config,readings,stamp,mode,thermostat,target,current,controller_
     if mode.startswith('fixed_'):candidates=[k for k in candidates if k in (0,int(mode[-1]))]
     if not candidates:return dict(result,reason='physical_mode_conflict')
     fits=[];discrete=False
+    # Zero loads have no phase allocation. Avoid 3**N equivalent placements.
+    loads=[(w,p) for w,p in loads if abs(w)>1]
     for allocation in product(*[(p,) if p is not None else (0,1,2) for _,p in loads]):
         remainder=list(phases)
         for (watts,_),phase in zip(loads,allocation):remainder[phase]-=watts
@@ -155,6 +238,59 @@ def recovered_energy(intervals, start, end):
 def recovered_coverage(intervals, start, end):
     return sum(max(0., min(end, r['end'])-max(start, r['start'])) for r in intervals)
 
+def reconcile_energy(memory,payload,stamp,tz):
+    """Idempotent Recorder reconciliation; never synthesizes training samples."""
+    key=payload.get('id');evidence=payload.get('evidence_sha256')
+    if not isinstance(key,str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}',key):raise ValueError('Некоректний recovery id')
+    if not isinstance(evidence,str) or not re.fullmatch(r'[a-f0-9]{64}',evidence):raise ValueError('Потрібна SHA256 перевірених вимірювань')
+    applied=memory.get('applied_recoveries',{})
+    if key in applied:
+        if applied[key].get('evidence_sha256')!=evidence:raise ValueError('Recovery id вже має інші вимірювання')
+        return deepcopy(memory)
+    counter=memory.get('inlet_energy') or {}
+    total=sum(counter.get(k,0.) for k in ('origin_kwh','estimated_kwh','recovered_kwh'))
+    baseline=number(payload.get('expected_total'))
+    if not counter or baseline is None or abs(total-baseline)>.0001:raise ValueError('Лічильник змінився; перевірте baseline')
+    bins=payload.get('bins')
+    if not isinstance(bins,list) or not 1<=len(bins)<=500:raise ValueError('Потрібні 1–500 перевірених інтервалів')
+    clean=[]
+    for row in bins:
+        if not isinstance(row,dict):raise ValueError('Некоректний інтервал')
+        a,b,kwh=(number(row.get(k)) for k in ('start','end','kwh'))
+        if any(v is None for v in (a,b,kwh)) or not stamp-32*86400<=a<b<=stamp or not 0<=kwh<=10.5*(b-a)/3600+.0001:
+            raise ValueError('Некоректний час або енергія інтервалу')
+        hour=datetime.fromtimestamp((a+b)/2,tz).hour
+        clean.append(dict(start=a,end=b,kwh=kwh,estimated=True,historical=False,quality=False,
+            night=hour>=23 or hour<7,cost=None,recovery_id=key))
+    clean.sort(key=lambda r:r['start'])
+    if any(a['end']>b['start'] for a,b in zip(clean,clean[1:])):raise ValueError('Інтервали перетинаються')
+    for row in clean:
+        if row['kwh']>0 and any(b.get('kwh',0)>0 and b['start']<row['end'] and b['end']>row['start'] for b in memory.get('energy_bins',[])):
+            raise ValueError('Інтервал уже містить обліковану енергію')
+    result=deepcopy(memory);counter=result['inlet_energy'];amount=sum(b['kwh'] for b in clean)
+    counter['recovered_kwh']=counter.get('recovered_kwh',0.)+amount
+    for row in clean:
+        left=row['start']
+        while left<row['end']:
+            dt=datetime.fromtimestamp(left,tz)
+            boundary=dt.replace(year=dt.year+(dt.month==12),month=dt.month%12+1,day=1,hour=0,minute=0,second=0,microsecond=0).timestamp()
+            right=min(row['end'],boundary);month=counter.setdefault('months',{}).setdefault(dt.strftime('%Y-%m'),dict(origin_kwh=0.,calculated_kwh=0.))
+            month['calculated_kwh']+=row['kwh']*(right-left)/(row['end']-row['start']);left=right
+    result.setdefault('energy_bins',[]).extend(clean)
+    result['energy_bins'].sort(key=lambda b:b['start'])
+    result['energy_last']=dict(ts=stamp,total=total+amount)
+    result.pop('cycle_energy_observation',None)
+    for cycle in result.get('cycle_energy',{}).values():
+        energy=sum(b['kwh']*max(0.,min(b['end'],cycle['end'])-max(b['start'],cycle['start']))/(b['end']-b['start']) for b in clean)
+        if energy:
+            cycle['calculated_kwh']=cycle.get('calculated_kwh',0.)+energy
+            cycle['calculated_transition_kwh']=cycle.get('calculated_transition_kwh',0.)+energy
+            cycle.setdefault('recoveries',[]).append(key);cycle['complete']=False;cycle.pop('quality_report',None)
+    result.setdefault('applied_recoveries',{})[key]=dict(kwh=amount,evidence_sha256=evidence,at=stamp,
+        start=clean[0]['start'],end=clean[-1]['end'],method=payload.get('method','audited_recorder_balance'),estimated=True)
+    return result
+
+
 def repair_samples(rows, recovery):
     intervals = recovery['intervals']
     changed = 0
@@ -191,7 +327,7 @@ def aligned_power(readings,entities,stamp,max_age=300,max_skew=30):
     """Validate the actual power timestamps, units and measurement kind."""
     values={};times=[]
     for entity in entities:
-        r=readings.get(entity) or {};value=number(r.get('value'));at=number(r.get('at'))
+        r=readings.get(entity) or {};value=number(r.get('value'));at=number(r.get('estimate_at',r.get('at')))
         if value is None or at is None:return dict(valid=False,reason='missing_measurement',entity=entity)
         if not 0<=stamp-at<=max_age:return dict(valid=False,reason='stale_power',entity=entity)
         if r.get('unit') not in ('W','kW') or r.get('kind','active')!='active':return dict(valid=False,reason='power_units',entity=entity)

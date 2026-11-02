@@ -20,6 +20,11 @@ test('inlet nominal accounting is labelled as calculated in the boiler and cycle
   p.attrs=k=>data[k]||{};p.state=k=>({power_confirmed:'6000',boiler_active:'on'})[k]||'unavailable';
   p.powerAdvice=()=>({recommend:{},mode:'6 кВт',recommended:false,partial:false,adviceValue:'—'});
   assert.match(p.boilerOverview(),/Гріє · розрахунок/);
+  for (const basis of ['group_balance','appliance_stage']) {
+    data.power_confirmed.measurement_basis=basis;
+    assert.match(p.boilerOverview(),/Гріє · розрахунок/);
+    assert.match(p.boilerOverview(),basis==='group_balance'?/баланс груп/:/окремі прилади/);
+  }
   assert.match(p.energyComparison(),/Облік · розрахунок/);
   assert.match(p.energyComparison(),/3,00/);
   assert.match(p.energyComparison(true),/≈/);
