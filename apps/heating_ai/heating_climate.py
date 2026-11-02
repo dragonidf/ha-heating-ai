@@ -18,7 +18,7 @@ from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,learn_power_modes,power_profile)
-from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance
+from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power
 from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
@@ -302,7 +302,7 @@ class HeatingClimate(HeatingRecovery,Hass):
     def publish_system_settings(self):
         self.publish('sensor.heating_system_settings','Налаштування системи',
                      friendly_name='Клімат — системні налаштування',schema_version=1,
-                     values={f['key']:('0' if f.get('value')==0 else f.get('value')) for f in system_fields(self.cfg,self.model)},
+                     values={f['key']:(wire_values(f.get('value')) if f['key']=='power_inlet_config' else '0' if f.get('value')==0 else f.get('value')) for f in system_fields(self.cfg,self.model)},
                      revision=self.memory.get('system_settings_revision',0),
                      persisted_revision=self.memory.get('system_settings_persisted_revision',self.memory.get('system_settings_revision',0)),
                      **getattr(self,'system_settings_result',self.memory.get('system_settings_receipt',{})))

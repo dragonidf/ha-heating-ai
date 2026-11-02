@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.14 — 2026-11-02
+
+- Keep a labelled control prior from fresh inlet total and signed GRID when quiet/stale input-phase watts prevent nominal accounting. Phase wattage and all consumer readings still gate accounted energy; actual grid voltage/permission guards stay authoritative. Missing or unverified signed GRID and contradictory totals remain unsafe. Reproduce the live post-heating quiet-phase case without generating watts or kWh.
+- Prefer a time-aligned cloud alias over an asynchronous local value. Preserve phase zero and signed boolean flags through AppDaemon settings transport so the source configuration can be edited and saved again. Add live-fixture and adapter regressions.
+
 ## 0.3.13 — 2026-11-02
 
 - Collect the inlet/return-temperature validation window for native thermostat AUTO demand as well as controller-owned heating. A validated physical AUTO profile can now flag a sustained electrical/model contradiction during native operation; provisional profiles remain explicitly provisional. Add an adapter regression without controller ownership. Preserve separate automatic/native/manual nominal subtotals in history and label nominal energy deviations as approximate, rather than measured lower bounds. Reject material GRID export while inlet export-sign semantics are unverified, preventing absolute phase readings from creating a false TEN stage.

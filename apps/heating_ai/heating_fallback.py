@@ -17,12 +17,15 @@ def validate_inlet_config(value):
     for load in loads:
         if not isinstance(load,dict):raise ValueError('Некоректна група споживачів')
         identity=load.get('physical_id');aliases=load.get('entities');phase=load.get('phase')
+        if isinstance(phase,str) and phase in ('0','1','2'):phase=int(phase)
+        signed=load.get('signed',False)
+        if isinstance(signed,str) and signed in ('true','false'):signed=signed=='true'
         if not isinstance(identity,str) or not 1<=len(identity)<=80 or identity in physical:raise ValueError('Фізичний прилад має бути унікальним')
         if not isinstance(aliases,list) or not 1<=len(aliases)<=3 or not all(entity(e) for e in aliases):raise ValueError('Потрібні сенсори потужності приладу')
         if phase is not None and (isinstance(phase,bool) or phase not in (0,1,2)):raise ValueError('Фаза: 0, 1, 2 або null, якщо невідома')
-        if 'signed' in load and not isinstance(load['signed'],bool):raise ValueError('signed має бути true або false')
+        if not isinstance(signed,bool):raise ValueError('signed має бути true або false')
         physical.append(identity);seen.extend(aliases)
-        clean.append(dict(physical_id=identity,entities=list(aliases),phase=phase,signed=load.get('signed',False)))
+        clean.append(dict(physical_id=identity,entities=list(aliases),phase=phase,signed=signed))
     if len(seen)!=len(set(seen)):raise ValueError('Ввід, фази та споживачі не можуть дублюватися')
     return dict(total=total,phases=list(phases),loads=clean)
 
@@ -43,17 +46,17 @@ def inlet_stage(config,readings,stamp,mode,thermostat,target,current,controller_
     try:config=validate_inlet_config(config)
     except (TypeError,ValueError):return result
     if not config:return result
-    core=aligned_power(readings,[config['total'],*config['phases']],stamp)
+    core=aligned_power(readings,[config['total']],stamp)
     if not core['valid']:return dict(result,reason=core['reason'],entity=core.get('entity'))
-    values=core['values'];total=values[config['total']];phases=[values[e] for e in config['phases']]
-    if abs(total-sum(phases))>max(200.,abs(total)*.05):return dict(result,reason='inlet_sum_conflict')
-    result.update(control_reserve=dict(valid=True,at=stamp,lower_w=0.,upper_w=max(0.,total),
+    total=core['values'][config['total']]
+    if total< -100:return dict(result,reason='inlet_export_unverified')
+    result.update(control_reserve=dict(valid=False,at=stamp,lower_w=0.,upper_w=max(0.,total),
         unknown_components=[],reason='inlet_stage_unconfirmed'),residual_w=None)
     loads=[];chosen=[];missing=[]
     for load in config['loads']:
         fresh=[]
         for entity in load['entities']:
-            item=aligned_power(readings,[entity],stamp)
+            item=aligned_power(readings,[config['total'],entity],stamp)
             if item['valid']:fresh.append((entity,item['values'][entity]))
         if not fresh:missing.append(load['physical_id']);continue
         entity,watts=fresh[0]
@@ -66,14 +69,23 @@ def inlet_stage(config,readings,stamp,mode,thermostat,target,current,controller_
         loads.append((watts,load['phase']));chosen.append(entity)
     deducted=sum(w for w,_ in loads);residual=total-deducted
     result.update(residual_w=residual,deducted_w=deducted,selected_sources=chosen)
-    result['control_reserve'].update(upper_w=max(0.,residual),unknown_components=missing)
+    # Phase wattage validates nominal accounting; it is not a prerequisite for
+    # a labelled control prior with fresh total / signed-GRID and live voltages.
+    result['control_reserve'].update(valid=not any(load['signed'] and load['physical_id'] in missing for load in config['loads']),
+        upper_w=max(0.,residual),unknown_components=missing)
+    if residual< -300:
+        result['control_reserve']['valid']=False
+        return dict(result,reason='negative_residual')
     if missing:return dict(result,reason='consumer_unavailable')
     aligned=aligned_power(readings,[config['total'],*config['phases'],*chosen],stamp)
     if not aligned['valid']:return dict(result,reason=aligned['reason'],entity=aligned.get('entity'))
+    phases=[aligned['values'][e] for e in config['phases']]
+    if abs(total-sum(phases))>max(200.,abs(total)*.05):
+        result['control_reserve']['valid']=False
+        return dict(result,reason='inlet_sum_conflict')
     target=number(target);current=number(current)
     demand=(thermostat in ('heat','auto') and target is not None and current is not None and
             5<=current<=40 and (thermostat=='heat' and controller_request or target-current>=.5))
-    if residual< -300:return dict(result,reason='negative_residual')
     candidates=[0] if abs(residual)<=300 else [k for k in (3,6,9) if abs(residual-k*1000)<=max(500.,k*120)]
     if not candidates:return dict(result,reason='stage_mismatch')
     if candidates[0] and not demand:return dict(result,reason='power_without_demand')

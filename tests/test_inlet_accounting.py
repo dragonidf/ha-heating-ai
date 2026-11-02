@@ -76,10 +76,25 @@ class InletAccountingTests(unittest.TestCase):
         result=self.stage();self.assertIsNone(result['watts'])
         self.assertTrue(result['control_reserve']['valid'])
 
+    def test_aligned_cloud_alias_wins_over_asynchronous_local_reading(self):
+        self.readings['local']['at']-=40
+        result=self.stage()
+        self.assertEqual(result['watts'],6000.)
+        self.assertIn('sensor.cloud',result['selected_sources'])
+
     def test_stale_core_skew_bad_units_and_alias_conflict(self):
         for e,k,v in [('total','at',self.at-301),('a','at',self.at-31),('b','unit','VA'),('cloud','value',4000)]:
             before=deepcopy(self.readings);self.readings[e][k]=v
             self.assertIsNone(self.stage()['watts'],(e,k,v));self.readings=before
+
+    def test_stale_quiet_input_phase_does_not_remove_conservative_control_bounds(self):
+        self.readings['a']['at']-=301
+        result=self.stage()
+        self.assertIsNone(result['watts'])
+        self.assertTrue(result['control_reserve']['valid'])
+        self.assertEqual(result['control_reserve']['upper_w'],6000.)
+        self.readings['grid']['at']-=301
+        self.assertFalse(self.stage().get('control_reserve',{}).get('valid',False))
 
     def test_known_household_load_cannot_become_ten(self):
         self.readings['local']['value']=4200;self.readings['cloud']['value']=4200
@@ -152,6 +167,16 @@ class InletAccountingTests(unittest.TestCase):
             app=self.app();app.grid_state=lambda:grid
             with patch('heating_climate.time.time',return_value=self.at):self.assertEqual(app.update_heating_power(),w)
 
+    def test_adapter_retains_plan_input_when_only_phase_watts_are_stale(self):
+        app=self.app();snapshot=app.live_source_snapshot
+        def quiet(stamp):
+            result=snapshot(stamp);result['sensor.a']['at']-=301;return result
+        app.live_source_snapshot=quiet
+        with patch('heating_climate.time.time',return_value=self.at):self.assertIsNone(app.update_heating_power())
+        self.assertEqual(app.control_power_prior,6000.)
+        self.assertTrue(app.control_power_bounds['valid'])
+        self.assertEqual(app.power_quality,'unknown')
+
     def test_month_boundary_prorates_nominal_energy_and_preserves_legacy_month(self):
         app=self.app();app.cfg['monthly_energy']='legacy_month'
         app.get_state=lambda entity,**kw:17. if entity=='legacy_month' else None
@@ -192,6 +217,16 @@ class InletAccountingTests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_system_settings(dict(power_accounting_method='inlet'),{},DEFAULT_MODEL)
         clean,_=validate_system_settings(dict(power_accounting_method='inlet',power_inlet_config=self.config),{},DEFAULT_MODEL)
         self.assertEqual(clean['power_accounting_method'],'inlet')
+
+    def test_settings_round_trip_preserves_zero_phase_and_wire_boolean(self):
+        app=self.app();app.cfg['power_inlet_config']['loads'][0]['phase']=0
+        app.publish_system_settings()
+        wire=app.published['sensor.heating_system_settings']['values']['power_inlet_config']
+        wire['loads'][0]['signed']='true'
+        self.assertEqual(wire['loads'][0]['phase'],'0')
+        clean,_=validate_system_settings(dict(power_inlet_config=wire),app.cfg,DEFAULT_MODEL)
+        self.assertIs(clean['power_inlet_config']['loads'][0]['signed'],True)
+        self.assertEqual(clean['power_inlet_config']['loads'][0]['phase'],0)
 
     def test_settings_survive_restart_without_losing_other_parameters(self):
         app=self.app();app.cfg={};app.memory.update(equipment_settings=dict(power_accounting_method='inlet',power_inlet_config=self.config),
