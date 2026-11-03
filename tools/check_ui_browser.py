@@ -192,7 +192,7 @@ def check_compact_overview(page):
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
     assert '17,50' in page.locator('.boiler-card').inner_text()
     assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
-    for binary,power,expected in [('on','6000','true'),('off','9000','false'),('unavailable','3000','true'),('unavailable','unavailable','unknown')]:
+    for binary,power,expected in [('on','6000','true'),('off','9000','true'),('off','0','false'),('unavailable','3000','true'),('unavailable','unavailable','unknown')]:
         page.evaluate('''([binary,power])=>setHeatingScenario({
             'binary_sensor.heating_boiler_active':{state:binary},
             'sensor.heating_power_confirmed':{state:power},
@@ -369,6 +369,7 @@ def check_system_settings(page):
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()
     page.keyboard.press('Escape')
+    page.locator('.system-dialog').wait_for(state='detached')
     assert page.locator('.system-dialog').count()==0
     assert page.evaluate('systemRequests.length')==0, 'Reading settings/help must not write'
     help_keys=panel.locator('[data-system-help]').evaluate_all('els=>els.map(el=>el.dataset.systemHelp)')
@@ -776,6 +777,34 @@ def main(engine='chromium'):
                 for width in (320,390,1440):
                     page.set_viewport_size({'width':width,'height':900})
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            page.evaluate("""setHeatingScenario({
+                'input_select.heating_mode':{state:'Спостереження'},
+                'sensor.heating_controller':{state:'Спостереження',attributes:{quality:true,mode:'Спостереження'}},
+                'sensor.heating_grid':{attributes:{raw:'on'}},
+                'sensor.heating_power_confirmed':{state:'6393',attributes:{timestamp:new Date().toISOString(),confirmation_pending:false}},
+                'binary_sensor.heating_boiler_active':{state:'off'}
+            })""")
+            page.locator('nav [data-tab="overview"]').click()
+            assert 'Гріє' in page.locator('.hero-side h2').inner_text()
+            assert 'Автокерування' in page.locator('.hero-side').inner_text()
+            assert 'призупинене' in page.locator('.hero-side').inner_text()
+            if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
+            assert page.locator('.boiler-card').get_attribute('data-heating')=='true'
+            assert '6,4' in page.locator('.boiler-metrics').inner_text()
+            page.evaluate("""setHeatingScenario({
+                'input_select.heating_mode':{state:'Автоматичне керування'},
+                'sensor.heating_controller':{attributes:{mode:'Автоматичне керування'}},
+                'sensor.heating_system_settings':{attributes:{values:{...mockHass.states['sensor.heating_system_settings'].attributes.values,boiler_power_mode:'fixed_9'}}},
+                'sensor.heating_power_model':{state:'fixed_9',attributes:{equipment_version:20}},
+                'sensor.heating_forecast':{attributes:{equipment_version:19}}
+            })""")
+            assert 'Обраний профіль' in page.locator('.power-advice').inner_text()
+            assert '9 кВт' in page.locator('.power-advice>summary').inner_text()
+            assert 'оновленим профілем' in page.locator('.plan-card').inner_text()
+            assert page.locator('.plan-card .session').count()==0
+            for width in (320,390,1440):
+                page.set_viewport_size({'width':width,'height':900})
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             assert not errors, errors
             browser.close()
             print(f'{engine}: browser checks passed: extended forecast toggle, physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')

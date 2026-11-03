@@ -10,6 +10,17 @@ import heating_ui
 
 
 class SystemSettingsTests(unittest.TestCase):
+    def test_saved_boiler_profile_is_published_immediately_and_old_sessions_invalidated(self):
+        app=self.app();app.cfg['boiler_power_mode']='fixed_6'
+        app.memory.update(equipment_version=9,planned_heat_segments=[{'start':1,'end':2}],power_recommendation={'mode':'fixed_6'})
+        app.publish_equipment();self.assertEqual(app.published['sensor.heating_power_model']['state'],'fixed_6')
+        status=self.submit(app,{'boiler_power_mode':'fixed_9'})
+        self.assertTrue(status['last_success'])
+        self.assertEqual(app.published['sensor.heating_power_model']['state'],'fixed_9')
+        self.assertEqual(app.published['sensor.heating_power_model']['equipment_version'],10)
+        self.assertEqual(app.memory['planned_heat_segments'],[])
+        self.assertNotIn('power_recommendation',app.memory)
+
     def test_saved_sensor_age_limit_invalidates_the_cached_reporting_policy(self):
         app=self.app();app.room_limits_at=12345.
         self.assertTrue(self.submit(app,{'room_max_age':7200})['last_success'])

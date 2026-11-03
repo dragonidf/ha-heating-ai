@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.20 — 2026-11-03
+
+- Move thermal searches and 3/6/9 kW advice into managed AppDaemon executor jobs with immutable input snapshots, single-flight dispatch and coroutine completion. Keep measurements, energy accounting, thermostat/fan guards, heartbeat and current status in the 15-second command loop. Reject superseded results; replay accepted sessions against current measurements and absolute timestamps before publication or execution.
+- Ignore a delayed watchdog/own-command thermostat event only when it predates the latest command and the actual thermostat still matches that command. Preserve detection of genuine manual changes. Fix repeated power-confirmation loss after controller delays without extending the bounded energy hold or filling unknown intervals; checkpoint state during background planning.
+- Give fresh measured boiler power priority in the main card and boiler card. Distinguish observation from automatic execution, show an ongoing physical heating session instead of a contradictory future start, and preserve unknown/stale values as unavailable. Add background-job and command-loop timing diagnostics.
+- Publish a saved boiler profile immediately, including after restart; use the persisted selection in the card, invalidate sessions from the previous profile, and mark its displayed forecast as pending until the replacement plan arrives. A profile selection describes the boiler and does not physically switch its TENs.
+
 ## 0.3.19 — 2026-11-02
 
 - Keep the 24-hour thermal forecast and future heating plan available when electrical measurements disappear during an outage. Separate forecast inputs from execution eligibility: unknown power remains unknown in accounting and learning, and off/unknown grid still forbids heating commands.

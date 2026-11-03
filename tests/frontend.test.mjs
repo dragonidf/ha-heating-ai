@@ -4,6 +4,25 @@ globalThis.HTMLElement=class {};
 globalThis.customElements={get:()=>false,define:()=>{}};
 globalThis.window={};
 const {HeatingAIPanel,numeric,escapeHTML,isTrue,mergeSegments,chartLayout,normalizeHistory,activityIntervals,historyPaths,calendarMidnight}=await import('../frontend/heating-panel.js');
+test('persisted profile selection is shown immediately and superseded plan is pending',()=>{
+  const p=Object.create(HeatingAIPanel.prototype),data={system_settings:{values:{boiler_power_mode:'fixed_9'}},power_model:{equipment_version:10},forecast:{equipment_version:9,created_at:new Date().toISOString()}};
+  p.attrs=k=>data[k]||{};p.state=k=>k==='power_model'?'fixed_6':'';p.section=(title,body)=>body;
+  assert.equal(p.powerAdvice().mode,'9 кВт');assert.equal(p.equipmentPlanPending(),true);
+  assert.match(p.nextHeatText(),/перераховується/);assert.match(p.heatingPlan(),/оновленим профілем/);
+  data.forecast.equipment_version=10;p.state=k=>k==='power_model'?'fixed_9':'';
+  assert.equal(p.equipmentPlanPending(),false);
+});
+test('actual heating overrides a waiting plan and observation never promises automatic execution',()=>{
+  const p=Object.create(HeatingAIPanel.prototype),values={power_confirmed:'6393',boiler_active:'off',mode:'Спостереження'};
+  const attrs={power_confirmed:{timestamp:new Date().toISOString()},controller:{quality:false},grid_status:{raw:'on'},forecast:{created_at:new Date().toISOString(),heat_segments:[{start:Date.now()/1000+600,end:Date.now()/1000+1200}]}};
+  p.state=k=>values[k];p.attrs=k=>attrs[k]||{};
+  assert.match(p.overviewDecision(),/Гріє/);assert.match(p.nextHeatText(),/призупин/);
+  values.mode='Автоматичне керування';assert.match(p.nextHeatText(),/поза активним сеансом/);
+  values.power_confirmed='unavailable';attrs.power_confirmed.confirmation_pending=true;values.boiler_active='unavailable';
+  assert.equal(p.boilerActual().power,null);assert.equal(p.boilerActual().heating,null);
+  values.power_confirmed='6393';values.boiler_active='on';attrs.power_confirmed={timestamp:new Date(Date.now()-100000).toISOString()};
+  assert.doesNotMatch(p.overviewDecision(),/Гріє/);
+});
 test('grid loss explains unavailable electric measurements without calling the controller broken',()=>{
   const p=Object.create(HeatingAIPanel.prototype),attrs={controller:{quality:false},diagnostics:{control_health:'healthy'},forecast:{created_at:new Date().toISOString()},grid_status:{raw:'off'}};
   p.attrs=k=>attrs[k]||{};p.state=k=>k==='heartbeat'?new Date().toISOString():'on';p.time=()=>'';

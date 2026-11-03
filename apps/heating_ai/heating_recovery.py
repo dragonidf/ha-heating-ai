@@ -272,6 +272,40 @@ class HeatingRecovery:
             if error:error.update(active=False,recovered_at=self.now().timestamp())
         return result
 
+    @staticmethod
+    def calculate_snapshot(kind,job_id,callback,args,kwargs):
+        started=time.monotonic()
+        try:return dict(kind=kind,id=job_id,result=callback(*args,**kwargs),seconds=time.monotonic()-started)
+        except Exception as exc:return dict(kind=kind,id=job_id,error=str(exc),seconds=time.monotonic()-started)
+
+    async def calculation_finished(self,kwargs=None,**extra):
+        result=(kwargs or extra).get('result')
+        if not isinstance(result,dict):return
+        with self.calculation_lock:
+            job=self.calculation_jobs.get(result.get('kind'))
+            if job and job['id']==result.get('id'):job['completed']=result
+
+    def poll_calculation(self,kind,key,callback,*args,**kwargs):
+        # Workers receive immutable inputs and cannot issue commands or publish state.
+        with self.calculation_lock:
+            job=self.calculation_jobs.get(kind)
+            if job:
+                done=job.get('completed')
+                if not done:return None
+                del self.calculation_jobs[kind]
+                if job['key']==key:
+                    if done.get('error'):raise RuntimeError(done['error'])
+                    self.calculation_durations=getattr(self,'calculation_durations',{})
+                    self.calculation_durations[kind]=done['seconds']
+                    return dict(job,result=done['result'],seconds=done['seconds'])
+            job=dict(id=uuid4().hex,key=copy.deepcopy(key),args=copy.deepcopy(args),kwargs=copy.deepcopy(kwargs),at=time.time())
+            self.calculation_jobs[kind]=job
+        try:self.submit_to_executor(self.calculate_snapshot,kind,job['id'],callback,job['args'],job['kwargs'],callback=self.calculation_finished)
+        except Exception:
+            with self.calculation_lock:self.calculation_jobs.pop(kind,None)
+            raise
+        return None
+
     def publish_diagnostic_health(self,**extra):
         errors=self.memory.get('diagnostic_errors') or {}
         active={k:{f:v.get(f) for f in ('incident_id','signature','first_at','last_at','count')} for k,v in errors.items() if v.get('active')}
@@ -294,6 +328,9 @@ class HeatingRecovery:
             recorder_status=self.memory.get('decision_recorder_status','pending'),
             plan_execution=self.memory.get('plan_execution'),applied_plan=self.memory.get('applied_plan'),
             last_full_recompute=self.memory.get('last_full_recompute'),
+            calculation_seconds=getattr(self,'calculation_durations',{}),
+            control_tick_seconds=getattr(self,'control_tick_seconds',None),
+            pending_calculations={k:v['at'] for k,v in getattr(self,'calculation_jobs',{}).items() if not v.get('completed')},
             last_validation_rejection=(self.memory.get('validation_quarantine') or [None])[-1],**extra)
 
     def publish_controller_quality(self,now):
@@ -1312,6 +1349,13 @@ class HeatingRecovery:
                 self.memory.get('temporary_fallback')):
             return
         expected=self.memory.get("expected_mode")
+        if isinstance(new,dict):
+            try:event_at=datetime.fromisoformat((new.get('last_updated') or new.get('last_changed')).replace('Z','+00:00')).timestamp()
+            except (TypeError,ValueError,AttributeError):event_at=None
+            target=number(self.memory.get('expected_setpoint'));actual=self.val('thermostat',attribute='temperature')
+            if (event_at is not None and event_at<=self.memory.get('command_at',0) and
+                    self.raw('thermostat')==expected and target is not None and actual is not None and abs(actual-target)<=.1):
+                return  # A queued watchdog/own-command event was already superseded.
         state=new.get("state") if isinstance(new,dict) else new
         temperature=number((new.get("attributes") or {}).get("temperature")) if isinstance(new,dict) else None
         manual=state not in (expected,"unknown","unavailable",None) or (temperature is not None and temperature!=self.memory.get("expected_setpoint"))

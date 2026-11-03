@@ -72,6 +72,11 @@ mockHass.callApi=async(method,path,data)=>{
   mockHass.states={...mockHass.states,'sensor.heating_system_settings':{...old,attributes:{...old.attributes,
     revision:old.attributes.revision+1,last_request_id:data.request_id,last_success:true,
     persisted_revision:old.attributes.revision+1,values:{...old.attributes.values,...data.values}}}};
+  if(data.values.boiler_power_mode){
+    const previous=mockHass.states['sensor.heating_power_model']||{attributes:{}};
+    mockHass.states={...mockHass.states,'sensor.heating_power_model':{state:data.values.boiler_power_mode,
+      attributes:{...previous.attributes,equipment_version:(previous.attributes.equipment_version||0)+1}}};
+  }
   panel.hass={...mockHass};
 };
 function publishComparisonPage(request,result){

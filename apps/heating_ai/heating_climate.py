@@ -17,10 +17,10 @@ from heating_fallback import (fallback_power,repair_samples,estimated_power,alig
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
-                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,learn_power_modes,power_profile)
+                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,learn_power_modes,power_profile,outdoor_at)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
-from heating_stability import stable_plan,replay,stress_scenarios,recommend_power
-from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits)
+from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference
+from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
 
@@ -54,6 +54,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory['predictions']=[]  # never validate across an unobserved restart gap
         self.release_version=json.loads((Path(__file__).resolve().parent/'release.json').read_text())['version']
         self.restore_system_settings()
+        previous=self.memory.get('plan_reference') or {}
+        if (not previous or (previous.get('policy') or {}).get('equipment_version')!=self.memory.get('equipment_version',0)):
+            self.memory['planned_heat_segments']=[]
         self.memory.setdefault("energy_bins",list(self.cfg.get("energy_history",[])))
         self.memory.setdefault("energy_last",self.cfg.get("energy_seed"))
         self.samples=[]
@@ -106,6 +109,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         # Serialize the two summary publishers without locking thermal planning.
         self.ai_summary_lock=RLock()
         self.ai_summary_attributes=None
+        self.calculation_lock=RLock();self.calculation_jobs={}
         ventilation=self.cfg.get('ventilation',{})
         if isinstance(ventilation,dict):
             for binding in ventilation.values():
@@ -139,6 +143,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.run_every(self.tick,self.datetime()+timedelta(seconds=2),15)
         self.runtime_ready=True
         self.publish_system_settings()
+        self.run_diagnostic('equipment_publish',self.publish_equipment)
         self.log("Climate controller loaded; allow_actuation=%s",self.cfg.get("allow_actuation",False))
         try:
             panel = install_panel(self.cfg)
@@ -274,6 +279,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         temp=self.statefile.with_suffix(".tmp")
         temp.write_text(json.dumps(self.memory,ensure_ascii=False,allow_nan=False))
         os.replace(temp,self.statefile)
+        self.last_saved_at=time.time()
     def publish(self,entity,state,**attributes):
         state=str(state) if state is not None else 'unavailable'
         # Text-only report sync must preserve its existing attribute snapshot.
@@ -371,6 +377,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.memory['equipment_settings']={**(self.memory.get('equipment_settings') or {}),**equipment}
                 for k in equipment:config.pop(k,None)
                 self.cfg.update(equipment);self.configure_ventilation()
+                if 'boiler_power_mode' in changed:
+                    self.memory['planned_heat_segments']=[];self.memory['demand']=False
+                    self.memory.pop('power_recommendation',None)
                 if any(k in changed for k in ('boiler_power_mode','power_accounting_method','power_inlet_config')):
                     self.inlet_accounting_started=False
                     self.inlet_stage_candidate=None;self.inlet_power_window=[]
@@ -411,6 +420,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.system_settings_result=dict(last_request_id=request if isinstance(request,str) else None,
                                          last_success=success,last_error=error,model_pending=bool(self.memory.get('pending_model')))
         self.publish_system_settings()
+        if success:self.run_diagnostic('equipment_publish',self.publish_equipment)
     def migrate_equipment_state(self):
         if self.memory.get('equipment_schema') or self.memory.get('state_load_error'):return
         import hashlib
@@ -588,10 +598,49 @@ class HeatingClimate(HeatingRecovery,Hass):
         context=(schedule_key,comfort,weather_key,self.model.get('version'))
         key=[hashlib.sha256(repr(context).encode()).hexdigest(),settings.get('equipment_version'),round(room*2),round(floor),round(outside),round(fire/5)]
         if stamp-old.get('computed_at',0)<900 and old.get('input_key')==key:return
-        result=recommend_power(now,room,floor,outside,fire,self.model,weather,settings,self.memory.get('power_calibrations'))
+        args=(now,room,floor,outside,fire,self.model,weather,settings,self.memory.get('power_calibrations'))
+        if getattr(self,'runtime_ready',False):
+            job=self.poll_calculation('power_advice',key,recommend_power,*args)
+            if job is None:return
+            result=job['result']
+        else:result=recommend_power(*args)
         if old.get('mode') and result.get('mode') and result['mode']<old['mode'] and stamp-old.get('changed_at',0)<900:return
         result.update(computed_at=stamp,input_key=key,changed_at=stamp if result.get('mode')!=old.get('mode') else old.get('changed_at',stamp))
         self.memory['power_recommendation']=result
+
+    def background_plan(self,now,room,floor,outside,fire,weather,settings,signature):
+        policy=planning_policy(settings)
+        policy.pop('ventilation_expected',None)  # Rolling duty is replayed using fresh observations.
+        schedule_key=signature[:2]+signature[3:] if isinstance(signature,(tuple,list)) and len(signature)==5 else signature
+        key=(self.model,policy,schedule_key,self.raw('mode'),self.raw('armed'),self.planning_grid_state)
+        args=(now,room,floor,outside,fire,self.model,weather,settings)
+        try:job=self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
+        except Exception:
+            self.next_compute=time.time()+300
+            raise
+        if job is None:return None
+        original,reference=job['result'];issued=job['args'];stamp=now.timestamp()
+        small=(abs(room-expected_thermal(reference,stamp,'temperature','room'))<.25 and
+               abs(floor-expected_thermal(reference,stamp,'return','floor'))<1. and
+               abs(outside-issued[3])<1. and abs(fire-issued[4])<1.)
+        changed_weather=(bool(weather)!=bool(issued[6]) or any(abs(row['temperature']-
+            outdoor_at(issued[6],datetime.fromtimestamp(row['ts'],now.tzinfo),issued[3]))>=1.
+            for row in weather if row['ts']>=stamp))
+        changed_gain=any(abs(gain_at(now+timedelta(hours=h),weather,settings)-
+            gain_at(now+timedelta(hours=h),issued[6],issued[7]))>=.1 for h in (0,3,12,18))
+        if not small or changed_weather or changed_gain:
+            self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
+            return None
+        fresh=replay(now,room,floor,outside,fire,self.model,weather,settings,reference['segments'],
+                     reference['split'],3.,reserve_checked=True)
+        if fresh is None:
+            self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
+            return None
+        for name in ('plan_id','parent_plan_id','plan_stable','search_policy_version','search_status','outage_shifted','outage_preheat','split_reason'):
+            if name in original:fresh[name]=original[name]
+        fresh.update(calculation_started_at=job['at'],calculation_seconds=job['seconds'],
+                     stability_reason='План розраховано у фоні та перевірено за поточними вимірами')
+        return fresh,plan_reference(now,room,floor,outside,fire,self.model,weather,settings,fresh)
 
     def publish_equipment(self,ventilation_support=None):
         # AppDaemon's nested attribute transport drops numeric zero/false.
@@ -989,10 +1038,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.inlet_power_window=window
         candidate=getattr(self,'inlet_stage_candidate',None)
         stage=assessment.get('stage_kw') if raw is not None else None
-        if raw is None or not candidate or candidate.get('stage')!=stage or stamp-candidate['at']>45:
+        if raw is None or not candidate or candidate.get('stage')!=stage or stamp-candidate['at']>45 and not candidate.get('confirmed'):
             candidate=dict(watts=raw,stage=stage,since=stamp,at=stamp)
         stable=raw is not None and (raw==0. or stamp-candidate['since']>=15)
-        candidate['at']=stamp;self.inlet_stage_candidate=candidate
+        candidate.update(at=stamp,confirmed=stable);self.inlet_stage_candidate=candidate
         power=raw if stable else None
         if getattr(self,'power_confirmation_pending',False) and stable:self.next_compute=0
         self.power_confirmation_pending=raw is not None and not stable
@@ -1130,8 +1179,10 @@ class HeatingClimate(HeatingRecovery,Hass):
     def tick(self,kwargs=None,**extra):
         if self.update_in_progress():
             return
+        started=time.monotonic()
         try:
             self.tick_inner()
+            self.control_tick_seconds=time.monotonic()-started
             self.memory['last_successful_tick']=self.now().isoformat()
             incident=self.memory.get('control_incident')
             if incident and not self.memory.get('temporary_fallback') and not self.memory.get('recovering_from_fallback'):
@@ -1350,7 +1401,18 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['actuator']=dict(action=self.memory.get('last_command'),changed_at=command_at or 0.,
             safety_stop=grid!='on' or not permitted or self.raw('mode')!='Автоматичне керування' or
                         room is not None and room>=upper or coast_overheat and not once)
-        if time.time()<self.next_compute:
+        background=getattr(self,'runtime_ready',False) and callable(getattr(self,'submit_to_executor',None))
+        ready=None
+        if background and forecast_quality and valid:
+            self.run_diagnostic('power_recommendation',self.update_power_recommendation,now,room,floor,outside,fire,usable_weather,settings,signature)
+            if time.time()>=self.next_compute:
+                ready=self.background_plan(now,room,floor,outside,fire,usable_weather,settings,signature)
+        control_attrs=dict(comfort_zone=comfort_zone,target_temperature=target,lower_temperature=lower,upper_temperature=upper,
+            source=source,quality=quality,mode=self.raw('mode'),grid=grid,return_valid=probe_ok,
+            control_power_basis=settings['control_power_basis'] if reserve_active else getattr(self,'power_source','unknown'),
+            model_ready=self.model.get('validated',False),model_version=self.model['version'],
+            calculation_pending=bool((getattr(self,'calculation_jobs',{}).get('plan') or {}).get('id')))
+        if time.time()<self.next_compute or background and forecast_quality and valid and ready is None:
             segments=self.memory.get("planned_heat_segments",[])
             demand=any(s["start"] <= now.timestamp() < s["end"] for s in segments)
             if once:
@@ -1371,9 +1433,17 @@ class HeatingClimate(HeatingRecovery,Hass):
                     inhibitions=[key for key,value in dict(grid=grid!='on',upper=room is not None and room>=upper,
                         outage=outage_now,manual=not permitted or self.raw('mode')!='Автоматичне керування').items() if value])
             self.decision_event('tick_change',action=action)
+            reason=('Немає мережі' if grid=='off' else 'Стан мережі не підтверджено' if grid=='unknown' else
+                    'Спостереження · автоматичні команди вимкнені' if action=='observe' else
+                    'Досягнуто верхню межу' if room is not None and room>=upper else
+                    'Планове відключення' if outage_now else
+                    'Недостатньо актуальних вимірювань' if not quality else
+                    'Заплановано нагрів' if demand else 'Очікування за поточним планом')
+            self.publish_control_decision(action,reason,demand,thermostat,**control_attrs)
             self.apply_action(action,False)
             self.fan_tick(grid,fire_active)
             self.publish("sensor.heating_heartbeat",now.isoformat(),friendly_name="Клімат — останній цикл",device_class="timestamp")
+            if getattr(self,'runtime_ready',False) and now.timestamp()-getattr(self,'last_saved_at',0)>=60:self.save()
             return
         self.next_compute=time.time()+300
         self.resume_temporary_fallback()
@@ -1384,12 +1454,12 @@ class HeatingClimate(HeatingRecovery,Hass):
         forecast=None
         snapshot=None
         if forecast_quality and valid:
-            forecast,plan_reference=stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
+            forecast,reference=ready if background else stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
                           power_kw=3.0,previous=self.memory.get('plan_reference'))
             forecast['issued_at']=time.time()
             self.run_diagnostic('temperature_history',self.observe_temperature_history,now,settings,room,power,
                                 source=='Вітальня' and room is not None,forecast)
-            self.run_diagnostic('power_recommendation',self.update_power_recommendation,now,room,floor,outside,fire,usable_weather,settings,signature)
+            if not background:self.run_diagnostic('power_recommendation',self.update_power_recommendation,now,room,floor,outside,fire,usable_weather,settings,signature)
             forecast['cycle_energy']=self.run_diagnostic('cycle_projection',self.cycle_budget,now,forecast,dict(weather=usable_weather,
                 grid={k:outage_data.get(k) for k in ('mode','valid','outages')},
                 thermal_state=dict(room=room,floor=floor,fire=fire,coast_peak=peak,
@@ -1402,7 +1472,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 now,room,floor,outside,fire,self.model,usable_weather,settings,forecast,
                 default=[dict(name='unavailable',available=False,hypothetical=True)])
             snapshot=self.remember_plan_inputs(now,room,floor,outside,fire,usable_weather,settings,forecast,previous_reference)
-            self.memory['plan_reference']=plan_reference
+            self.memory['plan_reference']=reference
             self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status='calculated')
             panel_forecast=forecast_for_panel(forecast)
             self.publish('sensor.heating_forecast_outlook','Прогноз температури',
@@ -1508,17 +1578,10 @@ class HeatingClimate(HeatingRecovery,Hass):
                      friendly_name="Клімат — оцінка інерційного піку",unit_of_measurement="°C",
                      device_class="temperature",validated=self.model.get("validated",False))
         if forecast:self.memory['plan_execution'].update(status='intended',intended_action=action)
-        self.publish("sensor.heating_controller","Спостереження" if action=="observe" else reason,
-                     comfort_zone=comfort_zone,target_temperature=target,lower_temperature=lower,upper_temperature=upper,
-                     friendly_name="Клімат — контролер",reason=reason,proposed_action="Нагрів · зсув уставки +2 °C" if demand else "Очікування · зсув уставки −2 °C",
-                     control_method="heat_offset_v2",thermostat_temperature=thermostat,
-                     proposed_setpoint=thermostat+(2 if demand else -2) if thermostat is not None else None,
-                     source=source,quality=quality,mode=self.raw("mode"),grid=grid,return_valid=probe_ok,
-                     control_power_basis=settings['control_power_basis'] if reserve_active else getattr(self,'power_source','unknown'),
+        self.publish_control_decision(action,reason,demand,thermostat,**control_attrs,
                      outage_preheat=preheat,outage_shifted=bool(forecast and forecast["outage_shifted"]),
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,
-                     comfort_shortfall=bool(forecast and forecast["comfort_shortfall"]),
-                     model_ready=self.model.get("validated",False),model_version=self.model["version"])
+                     comfort_shortfall=bool(forecast and forecast["comfort_shortfall"]))
         self.publish("sensor.heating_model","Точність знижена" if environment_quality['degraded'] else "Є короткострокові перевірки" if self.model.get("validated") else "Збір даних",
                      reliability=environment_quality,environment_version=1,
                      friendly_name="Клімат — модель",parameters=self.model,samples=len(self.samples),
@@ -1558,6 +1621,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.journal(reason)
         self.publish("sensor.heating_heartbeat",now.isoformat(),friendly_name="Клімат — останній цикл",device_class="timestamp")
         self.save()
+    def publish_control_decision(self,action,reason,demand,thermostat,**attributes):
+        self.publish('sensor.heating_controller','Спостереження' if action=='observe' else reason,
+            friendly_name='Клімат — контролер',reason=reason,
+            proposed_action='Спостереження · автоматичні команди вимкнені' if action=='observe' else
+                'Нагрів · зсув уставки +2 °C' if demand else 'Очікування · зсув уставки −2 °C',
+            control_method='heat_offset_v2',thermostat_temperature=thermostat,
+            proposed_setpoint=thermostat+(2 if demand else -2) if thermostat is not None else None,**attributes)
     def hour_mae(self):
         values=self.memory.get("hour_errors",[])
         return round(statistics.mean(values),3) if values else None
