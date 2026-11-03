@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.21 — 2026-11-03
+
+- Batch command-loop reads into a thread-local Home Assistant snapshot to avoid repeated synchronous event-loop round trips while numerical workers are busy. Refresh the snapshot immediately before dispatch so grid, permissions and thermostat checks use current states; preserve native namespace/domain semantics and clear snapshots after success or failure.
+- Keep same-frame synthetic publications visible to subsequent reads, including fallback status. Add regressions for cached reads, mutation isolation, worker isolation, fresh dispatch permissions and exception cleanup, plus per-stage and snapshot timing diagnostics for live verification.
+
 ## 0.3.20 — 2026-11-03
 
 - Move thermal searches and 3/6/9 kW advice into managed AppDaemon executor jobs with immutable input snapshots, single-flight dispatch and coroutine completion. Keep measurements, energy accounting, thermostat/fan guards, heartbeat and current status in the 15-second command loop. Reject superseded results; replay accepted sessions against current measurements and absolute timestamps before publication or execution.

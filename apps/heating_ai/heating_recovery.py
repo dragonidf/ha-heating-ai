@@ -256,6 +256,7 @@ class HeatingRecovery:
         return incident
 
     def run_diagnostic(self,stage,callback,*args,default=None,**kwargs):
+        started=time.monotonic()
         completed={k:list(self.memory[k]) if isinstance(self.memory.get(k),list) else [] for k in ('reserve_errors','forecast_validation')}
         try:
             result=callback(*args,**kwargs)
@@ -270,6 +271,9 @@ class HeatingRecovery:
         else:
             error=(self.memory.get('diagnostic_errors') or {}).get(stage)
             if error:error.update(active=False,recovered_at=self.now().timestamp())
+        finally:
+            self.diagnostic_seconds=getattr(self,'diagnostic_seconds',{})
+            self.diagnostic_seconds[stage]=time.monotonic()-started
         return result
 
     @staticmethod
@@ -330,6 +334,10 @@ class HeatingRecovery:
             last_full_recompute=self.memory.get('last_full_recompute'),
             calculation_seconds=getattr(self,'calculation_durations',{}),
             control_tick_seconds=getattr(self,'control_tick_seconds',None),
+            diagnostic_seconds=getattr(self,'diagnostic_seconds',{}),
+            state_snapshot_seconds=getattr(self,'state_snapshot_seconds',None),
+            state_snapshot_entities=getattr(self,'state_snapshot_entities',None),
+            state_cache_hits=getattr(getattr(self,'_tick_read_local',None),'hits',None),
             pending_calculations={k:v['at'] for k,v in getattr(self,'calculation_jobs',{}).items() if not v.get('completed')},
             last_validation_rejection=(self.memory.get('validation_quarantine') or [None])[-1],**extra)
 
@@ -1147,6 +1155,7 @@ class HeatingRecovery:
 
     def apply_action(self,action,once):
         requested_action=action
+        if getattr(getattr(self,'_tick_read_local',None),'states',None) is not None:self.refresh_tick_snapshot()
         if getattr(self,'update_in_progress',lambda:False)():
             return
         if not self.cfg.get("allow_actuation",False):

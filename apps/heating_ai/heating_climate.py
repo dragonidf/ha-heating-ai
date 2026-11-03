@@ -3,7 +3,7 @@ from appdaemon.plugins.hass.hassapi import Hass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from threading import RLock
+from threading import RLock,local
 from uuid import uuid4
 import json
 import os
@@ -254,6 +254,28 @@ class HeatingClimate(HeatingRecovery,Hass):
             return dict(state_load_error=str(exc),learning_storage_error='Не прочитано стан: '+str(exc))
     def raw(self,key,attribute=None):
         return self.get_state(self.cfg[key],attribute=attribute)
+    def get_state(self,entity_id=None,attribute=None,default=None,namespace=None,copy=True,**kwargs):
+        snapshot=getattr(getattr(self,'_tick_read_local',None),'states',None)
+        if snapshot is not None and namespace is None and not kwargs and ((entity_id is None and attribute is None) or (entity_id is not None and '.' in entity_id)):
+            self._tick_read_local.hits=getattr(self._tick_read_local,'hits',0)+1
+            row=snapshot if entity_id is None else snapshot.get(entity_id)
+            result=(row if entity_id is None or attribute=='all' else row.get('state') if attribute is None else
+                    (row.get('attributes') or {}).get(attribute,row.get(attribute,default))) if row is not None else default
+            return deepcopy(result) if copy and isinstance(result,(dict,list)) else result
+        return super().get_state(entity_id,attribute=attribute,default=default,namespace=namespace,copy=copy,**kwargs)
+
+    def refresh_tick_snapshot(self):
+        started=time.monotonic()
+        snapshot=super().get_state()
+        if not isinstance(snapshot,dict):raise ValueError('Invalid Home Assistant state snapshot')
+        if not hasattr(self,'_tick_read_local'):self._tick_read_local=local()
+        self._tick_read_local.states=snapshot
+        self.state_snapshot_seconds=getattr(self,'state_snapshot_seconds',0.)+time.monotonic()-started
+        self.state_snapshot_entities=len(snapshot)
+
+    def cache_published_state(self,entity,state,attributes):
+        snapshot=getattr(getattr(self,'_tick_read_local',None),'states',None)
+        if snapshot is not None:snapshot[entity]={**(snapshot.get(entity) or {}),'state':state,'attributes':deepcopy(attributes)}
     def val(self,key,default=None,attribute=None):
         if key=="energy" and self.cfg.get("power_accounting_method")=="inlet":
             counter=self.memory.get("inlet_energy") or {}
@@ -284,7 +306,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         state=str(state) if state is not None else 'unavailable'
         # Text-only report sync must preserve its existing attribute snapshot.
         if entity=='sensor.heating_ai_summary':
-            self.set_state(entity,state=state,attributes=attributes,replace=True);return
+            self.set_state(entity,state=state,attributes=attributes,replace=True)
+            self.cache_published_state(entity,state,attributes);return
         try:
             digest=hashlib.sha256(json.dumps([state,attributes],sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()[:20]
             existing=self.get_state(entity,attribute='all') or {}
@@ -293,6 +316,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             attributes['data_digest']=digest
         except (TypeError,ValueError):pass
         self.set_state(entity,state=state,attributes=attributes,replace=True)
+        self.cache_published_state(entity,state,attributes)
     def journal(self,reason,kind="decision"):
         records=self.memory.setdefault("journal",[])
         if records and records[-1]["reason"]==reason and records[-1]["kind"]==kind:
@@ -1181,6 +1205,10 @@ class HeatingClimate(HeatingRecovery,Hass):
             return
         started=time.monotonic()
         try:
+            if getattr(self,'runtime_ready',False) and callable(getattr(super(),'get_state',None)):
+                if not hasattr(self,'_tick_read_local'):self._tick_read_local=local()
+                self._tick_read_local.hits=0;self.state_snapshot_seconds=0.
+                self.refresh_tick_snapshot()
             self.tick_inner()
             self.control_tick_seconds=time.monotonic()-started
             self.memory['last_successful_tick']=self.now().isoformat()
@@ -1189,6 +1217,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 incident.update(active=False,recovered_at=self.now().timestamp())
             self.run_diagnostic('health_publish',self.publish_diagnostic_health)
         except Exception as exc:
+            if hasattr(self,'_tick_read_local'):self._tick_read_local.states=None
             incident=self.record_failure('control_tick',exc,critical=True)
             self.run_diagnostic("control_status",self.publish,"sensor.heating_controller","Помилка контролера",friendly_name="Клімат — контролер",
                          error=str(exc),reason='Помилка циклу: '+str(exc),incident_id=incident['incident_id'],
@@ -1200,6 +1229,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             except Exception as recovery_error:
                 self.record_failure('fallback_command',recovery_error)
             self.run_diagnostic('health_publish',self.publish_diagnostic_health)
+        finally:
+            if hasattr(self,'_tick_read_local'):self._tick_read_local.states=None
     def tick_inner(self):
         now=self.now()
         self.ventilation_tick(now.timestamp())
