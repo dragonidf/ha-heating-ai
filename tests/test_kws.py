@@ -77,3 +77,9 @@ class KWSTests(unittest.TestCase):
         a.observe_cycle_energy(at+timedelta(minutes=15),settings,6000,101.5,'on',True)
         self.assertAlmostEqual(sum(e['observed_kwh'] for e in a.memory['cycle_energy'].values()),1.0)  # Only 06:50–07:00 belongs to the heating cycle.
         self.assertFalse(any(e.get('counter_reset')for e in a.memory['cycle_energy'].values()))
+
+    def test_repeated_fresh_reports_do_not_shorten_counter_interval(self):
+        a=self.app();self.tick(a)
+        self.at+=885;self.row('energiia',50,'kWh');self.tick(a)
+        self.at+=15;self.row('energiia',51.5,'kWh');self.tick(a)
+        self.assertEqual(a.val('energy'),101.5)

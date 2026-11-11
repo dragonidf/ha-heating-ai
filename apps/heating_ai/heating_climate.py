@@ -1182,6 +1182,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                     counter.update(meter=value,at=at,reset_count=counter.get('reset_count',0)+1)
                     counter.pop('reset_candidate',None)
                 elif not reset:counter['reset_candidate']=dict(value=value,at=at)
+            elif value==previous:
+                counter.pop('reset_candidate',None)
             elif value-previous<=12*(at-counter['at'])/3600+.05:
                 counter['measured_kwh']+=value-previous
                 counter.update(meter=value,at=at);counter.pop('reset_candidate',None)

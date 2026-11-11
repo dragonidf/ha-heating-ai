@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.23 — 2026-11-11
+
+- Preserve the hardware energy interval when a repeated value carries a newer report timestamp. Add a regression for a delayed energy increment immediately following a fresh unchanged report; opt-in KWS deployment remains manual.
+
+
 ## 0.3.22 — 2026-11-11
 
 - Add opt-in KWS phase measurement (Tuya Local) with unit/freshness checks, voltage-supported quiet zeros, existing nominal hysteresis and 20-second stage confirmation. Preserve unknown readings; never use the delayed aggregate power sensor.
