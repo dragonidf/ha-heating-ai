@@ -277,6 +277,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         snapshot=getattr(getattr(self,'_tick_read_local',None),'states',None)
         if snapshot is not None:snapshot[entity]={**(snapshot.get(entity) or {}),'state':state,'attributes':deepcopy(attributes)}
     def val(self,key,default=None,attribute=None):
+        if key=="energy" and self.cfg.get("power_accounting_method")=="kws":
+            counter=self.memory.get("kws_energy") or {}
+            return counter["origin_kwh"]+counter["measured_kwh"] if counter else default
         if key=="energy" and self.cfg.get("power_accounting_method")=="inlet":
             counter=self.memory.get("inlet_energy") or {}
             return sum(counter.get(k,0.) for k in ('origin_kwh','measured_kwh','estimated_kwh','recovered_kwh')) if counter else default
@@ -682,7 +685,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             bands=[{k:b.get(k) for k in ('return_min','return_max','power_kw','minutes')} for b in profile.get('bands',[])[:16]],
             mode_contradiction=self.memory.get('mode_contradiction',False),
             recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
-            energy=self.memory.get('inlet_energy') if self.cfg.get('power_accounting_method')=='inlet' else self.memory.get('power_observation_ledger'),
+            energy=self.memory.get('kws_energy') if self.cfg.get('power_accounting_method')=='kws' else self.memory.get('inlet_energy') if self.cfg.get('power_accounting_method')=='inlet' else self.memory.get('power_observation_ledger'),
             accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')))
         self.publish('sensor.heating_ventilation','Враховано' if (self.memory.get('ventilation_model') or {}).get('validated') else 'Навчання; чинна базова модель',
             **wire(dict(friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
@@ -720,7 +723,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             return "unknown"
         if not self.heartbeat_fresh(self.cfg["input_heartbeat"],300):
             return "unknown"
-        if self.cfg.get('power_measurement_policy')=='audited' or self.cfg.get('power_accounting_method')=='inlet':
+        if self.cfg.get('power_measurement_policy')=='audited' or self.cfg.get('power_accounting_method') in ('inlet','kws'):
             # Local load meters describe the power balance, not input phase presence.
             voltages=self.cfg.get('input_voltages') or []
             if len(voltages)!=3:return 'unknown'
@@ -735,7 +738,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         return "on"
     def source_temperature(self):
         stamp=time.time()
-        live=((self.cfg.get('power_measurement_policy')=='audited' or self.cfg.get('power_accounting_method')=='inlet') and getattr(self,'runtime_ready',False) and
+        live=((self.cfg.get('power_measurement_policy')=='audited' or self.cfg.get('power_accounting_method') in ('inlet','kws')) and getattr(self,'runtime_ready',False) and
               callable(getattr(self,'render_template',None)))
         readings=self.live_source_snapshot(stamp) if live else {}
         if stamp-getattr(self,'room_limits_at',0)>3600 or not hasattr(self,'room_limits'):
@@ -1025,7 +1028,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             return False,"Завершено за лімітом"
         return True,"Одноразовий нагрів після повернення мережі"
     def balance_changed(self,entity,attribute,old,new,kwargs=None,**extra):
-        if self.cfg.get('power_accounting_method')=='inlet':return
+        if self.cfg.get('power_accounting_method') in ('inlet','kws'):return
         if time.time()-getattr(self,'power_update_at',0)<5:return
         self.update_heating_power()
     def update_inlet_power(self):
@@ -1123,7 +1126,90 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.power_minute_at=stamp
         return power
 
+    def kws_reading(self,suffix,unit,max_age):
+        entity='sensor.energy_meter_kotel_'+suffix
+        row=self.get_state(entity,attribute='all') or {}
+        value=number(row.get('state'));attrs=row.get('attributes') or {}
+        if value is None or value<0 or attrs.get('unit_of_measurement')!=unit:return None
+        if not self.fresh(entity,max_age):return None
+        return value
+
+    def update_kws_power(self):
+        stamp=time.time();phases=[];supported_zero=False
+        for phase in 'abc':
+            suffix='potuzhnist_'+phase
+            value=self.kws_reading(suffix,'kW',180)
+            if value is None:
+                row=self.get_state('sensor.energy_meter_kotel_'+suffix,attribute='all') or {}
+                attrs=row.get('attributes') or {}
+                if number(row.get('state'))==0 and attrs.get('unit_of_measurement')=='kW' and self.kws_reading('napruga_'+phase,'V',180) is not None:
+                    value=0.;supported_zero=True
+            phases.append(value)
+        power=None if any(v is None or v>4 for v in phases) else 1000*sum(phases)
+        self.current_power_w=power;self.control_power_prior=None;self.control_power_bounds={}
+        self.power_quality='unknown' if power is None else 'estimated' if supported_zero else 'measured'
+        self.power_source='unavailable' if power is None else 'fallback_kws_zero' if supported_zero else 'kws_phases'
+        self.power_confirmation_pending=False
+        self.power_observation=dict(at=stamp,watts=power,quality=self.power_quality,policy='kws',phases_kw=phases)
+        self.publish('sensor.heating_power_confirmed',power,unit_of_measurement='W',device_class='power',state_class='measurement',
+            power_source=self.power_source,power_quality=self.power_quality,measurement_basis='kws_phases',
+            independent=True,zero_voltage_supported=supported_zero,timestamp=self.now().isoformat())
+        self.update_kws_energy(stamp)
+        return power
+
+    def update_kws_energy(self,stamp):
+        value=self.kws_reading('energiia','kWh',1800)
+        if value is None:return
+        row=self.get_state('sensor.energy_meter_kotel_energiia',attribute='all') or {}
+        reported=row.get('last_reported') or row.get('last_updated')
+        try:at=datetime.fromisoformat(reported.replace('Z','+00:00')).timestamp()
+        except (AttributeError,ValueError,TypeError):return
+        counter=self.memory.get('kws_energy')
+        if not counter:
+            previous=self.memory.get('inlet_energy') or {}
+            origin=sum(previous.get(k,0.) for k in ('origin_kwh','measured_kwh','estimated_kwh','recovered_kwh')) if previous else number(self.raw('energy'))
+            if origin is None:return
+            counter=dict(origin_kwh=origin,measured_kwh=0.,meter=value,at=at,started_at=stamp)
+            self.memory['kws_energy']=counter
+            self.memory['energy_last']=dict(total=origin,ts=stamp)
+            self.save()  # Persist the migration anchor before accepting any delta.
+        elif at>counter['at']:
+            previous=counter['meter']
+            if value<previous:
+                reset=counter.get('reset_candidate')
+                if reset and at>reset['at'] and reset['value']<=value<previous and value-reset['value']<=12*(at-reset['at'])/3600+.05:
+                    counter['measured_kwh']+=value-reset['value']
+                    counter.update(meter=value,at=at,reset_count=counter.get('reset_count',0)+1)
+                    counter.pop('reset_candidate',None)
+                elif not reset:counter['reset_candidate']=dict(value=value,at=at)
+            elif value-previous<=12*(at-counter['at'])/3600+.05:
+                counter['measured_kwh']+=value-previous
+                counter.update(meter=value,at=at);counter.pop('reset_candidate',None)
+        total=counter['origin_kwh']+counter['measured_kwh']
+        self.publish('sensor.heating_energy_total',total,unit_of_measurement='kWh',device_class='energy',state_class='total_increasing',
+            basis='kws_counter_delta',origin_kwh=counter['origin_kwh'],measured_since_switch_kwh=counter['measured_kwh'],
+            started_at=counter['started_at'],reset_count=counter.get('reset_count',0),origin_quality='legacy_mixed')
+        self.publish('sensor.kotel_spozhita_energiia',total,unit_of_measurement='kWh',device_class='energy',state_class='total_increasing')
+
+    def kws_stage_update(self,power):
+        stamp=time.time();watts=None if power is None else power*1000
+        stage=nominal_mode(watts,self.stage)
+        if watts is not None and watts>=500 and stage=='off':stage='Нагрів'
+        if stage not in ('off','unavailable','Нагрів') and abs(watts-int(stage.split()[0])*1000)>1000:stage='Нагрів'
+        candidate=getattr(self,'kws_stage_candidate',None)
+        if stage=='unavailable':self.stage=stage;self.kws_stage_candidate=None
+        elif stage==self.stage:self.kws_stage_candidate=None
+        elif not candidate or candidate['stage']!=stage:self.kws_stage_candidate=dict(stage=stage,at=stamp)
+        elif stamp-candidate['at']>=20:self.stage=stage;self.kws_stage_candidate=None
+        pending=self.kws_stage_candidate is not None
+        self.publish('sensor.heating_boiler_stage',self.stage,physical_stage_confirmed=self.stage in ('3 кВт','6 кВт','9 кВт') and not pending,
+            confirmation_pending=pending,measurement_basis='kws_phases')
+        self.publish('binary_sensor.heating_boiler_active',None if watts is None or pending else 'on' if watts>=500 else 'off')
+        self.publish('sensor.kotel_potochna_potuzhnist',watts,unit_of_measurement='W',device_class='power',state_class='measurement')
+        self.publish('sensor.kotel_rezhim',self.stage)
+
     def update_heating_power(self):
+        if self.cfg.get("power_accounting_method")=="kws":return self.update_kws_power()
         if self.cfg.get('power_accounting_method')=='inlet':return self.update_inlet_power()
         stamp=time.time()
         self.control_power_prior=None;self.control_power_bounds={}
@@ -1194,6 +1280,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.run_diagnostic('power_observation',self.observe_power_quality,stamp,primary,power,grid_off)
         return power
     def stage_update(self,power):
+        if self.cfg.get("power_accounting_method")=="kws":return self.kws_stage_update(power)
         self.stage=nominal_mode(None if power is None else power*1000,self.stage)
         self.candidate=None
         self.publish("sensor.heating_boiler_stage",self.stage,friendly_name="Котел — діапазон потужності",physical_stage_confirmed=False,
@@ -1731,7 +1818,18 @@ class HeatingClimate(HeatingRecovery,Hass):
                              "night":night,"cost":round(delta*rate,5) if rate is not None else None,
                              "quality":getattr(self,"current_power_w",None) is not None,"historical":False,
                              "estimated":estimated_power(getattr(self,"power_source",""))})
-        if total is not None:
+        if self.cfg.get('power_accounting_method')=='kws' and total is not None and previous and total>previous['total']:
+            original=bins.pop();left=original['start'];duration=original['end']-left
+            while left<original['end']:
+                right=min(original['end'],(int(left)//3600+1)*3600)
+                at=datetime.fromtimestamp((left+right)/2,self.now().tzinfo)
+                night=in_window(at,'23:00','07:00');rate=self.val('tariff')
+                if rate is not None and night!=in_window(self.now(),'23:00','07:00'):rate*=.5 if night else 2
+                share=original['kwh']*(right-left)/duration
+                bins.append(dict(start=left,end=right,kwh=share,night=night,cost=share*rate if rate is not None else None,
+                    quality=True,historical=False,estimated=False,basis='kws_counter_delta',interval_allocation_estimated=True))
+                left=right
+        if total is not None and (self.cfg.get("power_accounting_method")!="kws" or not previous or total!=previous["total"]):
             self.memory["energy_last"]={"ts":stamp,"total":total}
         bins[:]=[b for b in bins if b["end"]>stamp-32*86400]
         rolling=0.

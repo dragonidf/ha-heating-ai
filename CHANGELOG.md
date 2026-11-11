@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.22 — 2026-11-11
+
+- Add opt-in KWS phase measurement (Tuya Local) with unit/freshness checks, voltage-supported quiet zeros, existing nominal hysteresis and 20-second stage confirmation. Preserve unknown readings; never use the delayed aggregate power sensor.
+- Anchor hardware-counter deltas to the existing accumulated total in state.json; preserve the anchor across restart, reject out-of-order/implausible readings and confirm resets without subtracting historical energy. Never integrate phase watts in parallel. Preserve interval bounds across repeated counter readings and split tariff allocations at hourly boundaries; allocations remain estimates.
+- Activation: after updating through HACS, choose «KWS · прямий фазовий вимір і лічильник» in System settings → boiler accounting source. Keep the physical boiler profile unchanged. No production configuration was changed during preparation.
+
+
 ## 0.3.21 — 2026-11-03
 
 - Batch command-loop reads into a thread-local Home Assistant snapshot to avoid repeated synchronous event-loop round trips while numerical workers are busy. Refresh the snapshot immediately before dispatch so grid, permissions and thermostat checks use current states; preserve native namespace/domain semantics and clear snapshots after success or failure.

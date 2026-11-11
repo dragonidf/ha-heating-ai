@@ -703,13 +703,16 @@ class HeatingRecovery:
         if not cycle:return
         stamp=now.timestamp();ledger=self.memory.setdefault('cycle_energy',{})
         previous=self.memory.get('cycle_energy_observation')
+        kws=getattr(self,'cfg',{}).get('power_accounting_method')=='kws'
+        counter_previous=self.memory.get('kws_cycle_counter') if kws else previous
         current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,grid=grid,power=power,
             calculated=power is not None and grid in ('on','off') and getattr(self,'power_source','') in ('fallback_inlet_stage','fallback_group_balance'),
             temperature=temperature,temperature_valid=temperature_valid,
             known=power is not None and grid in ('on','off') and
                   not getattr(self,'power_source','unknown').startswith(('unknown','unavailable')) and
                   not estimated_power(getattr(self,'power_source','unknown')))
-        for c in {(x['cycle_id'],x['cycle_start']):x for x in [cycle,*([previous['cycle']] if previous else [])]}.values():
+        for c in {(x['cycle_id'],x['cycle_start']):x for x in [cycle,*([previous['cycle']] if previous else []),*([counter_previous['cycle']] if kws and counter_previous else [])]}.values():
+            previous=self.memory.get('cycle_energy_observation')
             key=c['cycle_id']+'@'+str(c['cycle_start'])
             entry=ledger.setdefault(key,dict(start=c['cycle_start'],end=c['cycle_end'],observed_kwh=0.,
                 automatic_kwh=0.,other_kwh=0.,transition_kwh=0.,unknown_seconds=0.,complete=stamp<=c['cycle_start']))
@@ -720,8 +723,8 @@ class HeatingRecovery:
                 if gap:entry['unknown_seconds']+=gap;entry['complete']=False
                 continue
             seconds=stamp-previous['at'];a=max(previous['at'],c['cycle_start']);b=min(stamp,c['cycle_end'])
-            if b<=a:continue
-            if (0<seconds<=45 and previous.get('temperature_valid') and temperature_valid and
+            if b<=a and not kws:continue
+            if (b>a and 0<seconds<=45 and previous.get('temperature_valid') and temperature_valid and
                     number(previous.get('temperature')) is not None and number(temperature) is not None and
                     all(number(settings.get(k)) is not None for k in ('target','lower','upper'))):
                 thermal=entry.setdefault('thermal_quality',dict(known_seconds=0.,violation_minutes=0.,degree_hours=0.,
@@ -741,11 +744,11 @@ class HeatingRecovery:
                     thermal['known_seconds']+=right-left;thermal['violation_minutes']+=(cold+hot)/60
                     thermal['degree_hours']+=(cold_area+hot_area)/3600
                     thermal['overheat_minutes']+=hot/60;thermal['overheat_degree_hours']+=hot_area/3600
-            if 0<seconds<=45 and previous.get('grid')==grid=='off':
+            if b>a and 0<seconds<=45 and previous.get('grid')==grid=='off':
                 entry['outage_seconds']=entry.get('outage_seconds',0.)+b-a
-            if 0<seconds<=45 and previous['automatic'] and automatic:
+            if b>a and 0<seconds<=45 and previous['automatic'] and automatic:
                 entry['requested_seconds']=entry.get('requested_seconds',0.)+b-a
-            if 0<seconds<=45 and previous['known'] and current['known']:
+            if b>a and 0<seconds<=45 and previous['known'] and current['known']:
                 if power>=1500 and 'first_confirmed_heat_at' not in entry:
                     entry['first_confirmed_heat_at']=stamp if previous['power']<1500 else a
                     entry['first_heat_edge_known']=previous['power']<1500
@@ -753,8 +756,16 @@ class HeatingRecovery:
                 entry['execution_quality']=dict(requested_minutes=round(entry.get('requested_seconds',0)/60,2),
                     confirmed_heating_minutes=round(entry.get('measured_heat_seconds',0)/60,2),
                     timing_resolution_seconds=45,unknown_seconds=entry['unknown_seconds'])
+            if kws:
+                if not counter_previous or energy is None or energy==counter_previous.get('energy'):continue
+                previous=counter_previous
+                seconds=stamp-previous['at'];a=max(previous['at'],c['cycle_start']);b=min(stamp,c['cycle_end'])
+                if b<=a:continue
+                entry.pop('quality_report',None)
+                entry['energy_basis']='kws_counter_delta'
+                entry['energy_interval_allocation_estimated']=seconds>45
             before=number(previous.get('energy'));after=number(energy)
-            counter_ok=(0<seconds<=45 and before is not None and after is not None and
+            counter_ok=(0<seconds and (kws or seconds<=45) and before is not None and after is not None and
                 0<=after-before<=10.5*seconds/3600+.00002)
             if counter_ok:
                 if previous['at']<=c['cycle_start']<=stamp:
@@ -765,14 +776,14 @@ class HeatingRecovery:
             elif before is not None and after is not None and (after<before or
                     0<seconds<=45 and after-before>10.5*seconds/3600+.00002):
                 entry.pop('counter_start',None);entry.pop('meter_kwh',None);entry['counter_reset']=True
-            if counter_ok and previous['known'] and current['known']:
+            if counter_ok and (kws or previous['known'] and current['known']):
                 kwh=(after-before)*(b-a)/seconds;entry['observed_kwh']+=kwh
-                kind=('automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
+                kind=('transition' if kws and seconds>45 else 'automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
                 entry[kind+'_kwh']+=kwh
             elif counter_ok and previous.get('calculated') and current.get('calculated'):
                 kwh=(after-before)*(b-a)/seconds
                 entry['calculated_kwh']=entry.get('calculated_kwh',0.)+kwh
-                kind=('automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
+                kind=('transition' if kws and seconds>45 else 'automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
                 entry['calculated_'+kind+'_kwh']=entry.get('calculated_'+kind+'_kwh',0.)+kwh
                 entry['calculated_seconds']=entry.get('calculated_seconds',0.)+b-a
                 entry['complete']=False
@@ -789,6 +800,7 @@ class HeatingRecovery:
                 if entry['start']<=stamp<entry['end']:self.next_compute=0
             if stamp>=entry['end'] and not entry.get('quality_report'):
                 entry['quality_report']=cycle_quality_summary(entry,stamp)
+        if kws and energy is not None and (not counter_previous or energy!=counter_previous.get('energy')):self.memory['kws_cycle_counter']=current.copy()
         self.memory['cycle_energy_observation']=current
         self.memory['cycle_energy']={k:v for k,v in ledger.items() if v['end']>stamp-16*86400}
 
