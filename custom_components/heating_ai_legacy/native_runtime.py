@@ -110,11 +110,12 @@ def calculate_v1_coast(snapshot: dict[str, Any]) -> dict[str, Any]:
 class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """One small bounded background calculation, at most once per minute."""
 
-    def __init__(self, hass: HomeAssistant, mapping: dict[str, str]) -> None:
+    def __init__(self, hass: HomeAssistant, mapping: dict[str, str], entry: Any) -> None:
         super().__init__(
             hass, logger=__import__("logging").getLogger(__name__),
             name="Heating AI V1 pure-model observer",
             update_interval=timedelta(seconds=60),
+            config_entry=entry,
         )
         self.mapping = dict(mapping)
         self.hourly_weather: list[dict[str, float]] | None = None
