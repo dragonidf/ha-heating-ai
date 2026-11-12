@@ -152,7 +152,7 @@ async def verify() -> None:
                 assert checks["controls"] == 0, "Preview must not contain equipment controls"
                 if label=="mobile":
                     assert checks["has_horizontal_scroll"]
-                out=ROOT/"native-v1-preview-"+label+".png"
+                out=ROOT/("native-v1-preview-"+label+".png")
                 await page.screenshot(path=str(out),full_page=True)
                 print("PASS",label,json.dumps(checks,ensure_ascii=False))
             finally:
