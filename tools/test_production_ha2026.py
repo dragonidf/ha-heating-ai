@@ -47,10 +47,17 @@ async def exercise(directory):
     for entity in cfg["voltage_entities"]:
         hass.states.async_set(entity,230)
     commands = []
+    async def set_temperature(call):
+        commands.append(dict(call.data))
+        current = hass.states.get(cfg["thermostat"])
+        attributes = dict(current.attributes)
+        attributes["temperature"] = call.data["temperature"]
+        hass.states.async_set(cfg["thermostat"], current.state, attributes)
     async def hvac(call):
         commands.append(dict(call.data))
         current = hass.states.get(cfg["thermostat"])
         hass.states.async_set(cfg["thermostat"], call.data["hvac_mode"], dict(current.attributes))
+    hass.services.async_register("climate", "set_temperature", set_temperature)
     hass.services.async_register("climate", "set_hvac_mode", hvac)
     hass.services.async_register("persistent_notification", "create", lambda call: None)
     hass.services.async_register("persistent_notification", "dismiss", lambda call: None)
