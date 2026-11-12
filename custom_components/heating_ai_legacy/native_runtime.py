@@ -159,10 +159,15 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     async def _remember_read_only(self, at: float, room: float,
-                                  model: dict, model_at: float) -> None:
+                                  model: dict, model_at: float,
+                                  kws_total_kwh=None, kws_power_w=None) -> None:
         try:
+            # Execute the one explicitly qualified KWS transaction off-loop.
             await self.hass.async_add_executor_job(
-                observe_room, self.model_store, at, room
+                lambda: observe_room(
+                    self.model_store, at, room,
+                    counter_kwh=kws_total_kwh, boiler_power_w=kws_power_w,
+                )
             )
             if self._storage_directory is not None:
                 self.model_checkpoint = await self.hass.async_add_executor_job(
@@ -309,6 +314,8 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._remember_read_only(
                         stamp, snapshot["room"],
                         snapshot["learned_model_source"], snapshot["learned_model_at"],
+                        safety.get("kws_total_kwh"),
+                        safety.get("kws_power_w"),
                     ),
                     "heating_ai_v1_record_ha_cache_only",
                 )
