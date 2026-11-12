@@ -10,6 +10,19 @@ from math import isfinite
 from typing import Any
 
 
+def valid_policy(minimum_v: Any, maximum_v: Any,
+                 recovery_seconds: Any = 180.) -> bool:
+    """Validate the complete operator-set recovery band."""
+    settings = (minimum_v, maximum_v, recovery_seconds)
+    return (
+        all(type(value) in (int, float) and isfinite(value) for value in settings)
+        and 140 <= minimum_v <= 235
+        and 220 <= maximum_v <= 280
+        and minimum_v + 5 < maximum_v
+        and 30 <= recovery_seconds <= 900
+    )
+
+
 class VoltageGuard:
     def __init__(self):
         self.stable_since: float | None = None
@@ -40,14 +53,7 @@ class VoltageGuard:
             self.stable_since=None
         if grid is not True:
             return blocked("GRID_OFF_OR_UNKNOWN")
-        if (type(minimum_v) not in (int,float)
-            or type(maximum_v) not in (int,float)
-            or type(recovery_seconds) not in (int,float)
-            or not all(isfinite(v) for v in settings)
-            or not 140<=minimum_v<=235
-            or not 220<=maximum_v<=280
-            or minimum_v+5>=maximum_v
-            or not 30<=recovery_seconds<=900):
+        if not valid_policy(minimum_v, maximum_v, recovery_seconds):
             return blocked("LIMITS_UNCONFIGURED")
         if (not isinstance(phases_v,list) or len(phases_v)!=3
             or any(type(x) not in (float,int) or not isfinite(x)
