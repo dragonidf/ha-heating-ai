@@ -122,7 +122,7 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
     contents["manifest.json"] = nested_manifest
     for name in ("__init__.py", "const.py", "config_flow.py",
                  "native_runtime.py", "plan_snapshot.py",
-                 "native_planner.py", "native_sources.py",
+                 "native_planner.py", "native_sources.py", "native_api.py",
                  "sensor.py", "strings.json", "assets/panel.js"):
         contents[name] = (CARRIER / name).read_bytes()
         if name.endswith(".py"):

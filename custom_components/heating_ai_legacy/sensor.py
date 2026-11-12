@@ -34,6 +34,11 @@ class NativeV1ShadowStatus(CoordinatorEntity, SensorEntity):
             "legacy_plan_heat_windows": len(plan.get("segments", [])),
             "legacy_plan_execution": plan.get("source_execution_state"),
             "legacy_planned_kwh": plan.get("planned_kwh"),
+            "native_plan_status": data.get("native_plan_status", "BLOCKED_INPUTS"),
+            "native_plan_quality": data.get("native_plan_quality"),
+            "native_plan_reason": data.get("native_plan_reason"),
+            "native_plan_points": data.get("native_plan_points", 0),
+            "native_planned_kwh": data.get("native_planned_kwh"),
         }
         result.update({key: data[key] for key in (
             "physical_commands_enabled", "forecast_qualified",
