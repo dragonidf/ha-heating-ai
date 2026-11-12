@@ -40,6 +40,7 @@ async def lifecycle(readings) -> None:
 
     entry = SimpleNamespace(
         entry_id="synthetic-native-v1",
+        domain="heating_ai_legacy",
         data=dict(shadow=True, room="sensor.room", outside="sensor.outside"),
         runtime_data=None,
     )

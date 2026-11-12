@@ -32,7 +32,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry.data.get("shadow") is not True:
         raise ValueError("V1 native physical commissioning is not implemented")
     coordinator = V1ShadowCoordinator(
-        hass, dict(room=entry.data["room"], outside=entry.data["outside"])
+        hass, dict(room=entry.data["room"], outside=entry.data["outside"]), entry
     )
     await coordinator.async_config_entry_first_refresh()
     assets = Path(__file__).parent / "assets"
