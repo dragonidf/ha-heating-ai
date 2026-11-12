@@ -73,6 +73,7 @@ const stylesheet = [
   '.scroll{overflow-x:auto;scrollbar-width:thin}.chart{display:block;width:100%;min-width:750px;aspect-ratio:1080/390}',
   '.chart text{fill:#9aadc6;font-size:13px}.gridline{stroke:#34465c;stroke-width:1;stroke-dasharray:3 5}',
   '.actual{stroke:#63d3b4;stroke-width:3}.forecast{stroke:#77a8ff;stroke-width:3;stroke-dasharray:8 5}',
+  '.native{stroke:#f4a0bf;stroke-width:2.6;stroke-dasharray:10 4}',
   '.target{stroke:#ffbf6b;stroke-width:2;stroke-dasharray:3 6}.lower{stroke:#b18fff;stroke-width:1.5;stroke-dasharray:4 4}',
   '.heat{fill:#3fb48a;fill-opacity:.15}.now{stroke:#dbe3f0;stroke-width:1.5;stroke-dasharray:4 5}',
   '.note,.notice{font-size:12px;color:#aabbd0;line-height:1.6}.note{margin:9px 0 2px}.notice{padding:12px 15px;margin-top:13px}',
@@ -88,6 +89,9 @@ class HeatingV1NativePanel extends HTMLElement {
     this._historyAt = 0;
     this._historyPending = false;
     this._lastHass = null;
+    this._native = null;
+    this._nativeAt = 0;
+    this._nativePending = false;
     this._raf = 0;
     this.shadowRoot.innerHTML =
       '<style>' + stylesheet + '</style>' +
@@ -100,12 +104,14 @@ class HeatingV1NativePanel extends HTMLElement {
       '<div class="stat"><label>План V1</label><strong id="plan">—</strong></div></section>' +
       '<section class="chartbox"><div class="heading">Температура · план і факт</div>' +
       '<div class="key"><span style="--line:#63d3b4">Факт HA</span>' +
-      '<span style="--line:#77a8ff">Прогноз V1</span><span style="--line:#ffbf6b">Ціль</span>' +
+      '<span style="--line:#77a8ff">Прогноз V1</span><span style="--line:#f4a0bf">V1+ умовний</span>' +
+      '<span style="--line:#ffbf6b">Ціль</span>' +
       '<span style="--line:#b18fff">Нижня межа</span>' +
       '<span style="--line:#3fb48a">Можливий нагрів</span></div>' +
       '<div class="scroll"><svg class="chart" viewBox="0 0 1080 390" role="img" ' +
       'aria-label="Фактична температура, розрахована температура, ціль і вікна нагріву">' +
-      '</svg></div><p class="note" id="source"></p></section>' +
+      '</svg></div><p class="note" id="source"></p>' +
+      '<p class="note" id="native-status"></p></section>' +
       '<section class="notice">Це паралельний перегляд старого прогнозу V1. Він не є ' +
       'незалежним планом V1+ і не керує котлом, вентилятором чи рекуператором. ' +
       'Вручну обраний AUTO не перезапускається з цієї панелі.</section></main>';
@@ -149,6 +155,26 @@ class HeatingV1NativePanel extends HTMLElement {
       this._history = [];
     } finally { this._historyPending = false; }
   }
+  async nativeSnapshot(ha, now) {
+    const entryId = this._panel && this._panel.config && this._panel.config.entry_id;
+    if (this._nativePending || !entryId || typeof ha.callWS !== 'function' ||
+        now - this._nativeAt < 120) return;
+    this._nativeAt = now;
+    this._nativePending = true;
+    try {
+      const result = await ha.callWS({
+        type: 'heating_ai_legacy/native_snapshot',
+        entry_id: entryId,
+        version: [1, 0]
+      });
+      if (this.isConnected && result && result.physical_commands_enabled === false) {
+        this._native = result;
+        this.render();
+      }
+    } catch (_) {
+      this._native = null;
+    } finally { this._nativePending = false; }
+  }
   render() {
     const ha = this._lastHass;
     if (!ha || !ha.states) return;
@@ -165,6 +191,12 @@ class HeatingV1NativePanel extends HTMLElement {
     const created = Date.parse(attrs.created_at || '') / 1000;
     const fresh = Number.isFinite(created) && created <= now + 60 && now - created < 2 * HOUR;
     const prediction = fresh ? readPts(attrs.curve, since, until, false) : [];
+    const nativePlan = this._native;
+    const nativeValid = nativePlan &&
+      nativePlan.status === 'VIRTUAL_CONDITIONAL' &&
+      num(nativePlan.computed_at, now - 3600, now + 60) !== null;
+    const nativeCurve = nativeValid
+      ? readPts(nativePlan.forecast, since, until, false) : [];
     const fallback = fresh ? readPts(attrs.actual_curve, since, now + 60, true) : [];
     const history = this._history.length ? this._history : fallback;
     const windows = fresh && prediction.length > 1 ? segments(attrs.heat_segments, now, until) : [];
@@ -189,7 +221,7 @@ class HeatingV1NativePanel extends HTMLElement {
       : 'Немає актуального розрахунку V1; прогноз не домальовується.';
     const canvas = this.shadowRoot.querySelector('.chart');
     while (canvas.firstChild) canvas.removeChild(canvas.firstChild);
-    const all = history.concat(prediction);
+    const all = history.concat(prediction, nativeCurve);
     if (current !== null) all.push({ at: now, temperature: current });
     const temps = all.map(p => p.temperature).filter(p => p !== null);
     for (const p of prediction) for (const k of ['target', 'lower']) if (p[k] !== null) temps.push(p[k]);
@@ -211,6 +243,7 @@ class HeatingV1NativePanel extends HTMLElement {
     add(canvas, 'text', { x:x(now)+7, y:Y0 - 7 }, 'Зараз');
     plot(canvas, history, 'temperature', x, y, 'actual', 90*60);
     plot(canvas, prediction, 'temperature', x, y, 'forecast', 90*60);
+    plot(canvas, nativeCurve, 'temperature', x, y, 'native', 90*60);
     plot(canvas, prediction, 'target', x, y, 'target', 90*60);
     plot(canvas, prediction, 'lower', x, y, 'lower', 90*60);
     if (current !== null && roomState && roomState.last_updated) {
@@ -222,7 +255,13 @@ class HeatingV1NativePanel extends HTMLElement {
     }
     add(canvas, 'text',{x:X0,y:Y1+55},'−6 год · факт');
     add(canvas, 'text',{x:X1,y:Y1+55,'text-anchor':'end'},'+24 год · план');
+    const nativeStatus = this.shadowRoot.getElementById('native-status');
+    nativeStatus.textContent = nativeValid
+      ? 'Окремий розрахунок V1+ · ' + nativePlan.quality +
+        ' · ' + nativeCurve.length + ' точок. Умовний сценарій, команди заборонені.'
+      : 'Окремий розрахунок V1+: очікує перевірених джерел; не підміняється планом V1.';
     if (typeof roomId === 'string') void this.recorder(ha,roomId,now);
+    void this.nativeSnapshot(ha,now);
   }
 }
 const name = (() => {
