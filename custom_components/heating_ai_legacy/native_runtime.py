@@ -22,6 +22,7 @@ from .native_sources import normalize_hourly_weather, planner_snapshot
 from .native_planner import provisional_plan
 from .native_safety import observe as observe_safety
 from .native_persistence import observe_room
+from .native_model import remember as save_learned_model
 
 REQUIRED_COEFFICIENTS = (
     "floor_air", "room_loss", "floor_decay", "heat_gain", "fire_gain"
@@ -83,6 +84,8 @@ def sample_v1_inputs(hass: HomeAssistant, mapping: dict[str, str]) -> dict[str, 
     return dict(at=now.isoformat(), parameters=parameters,
                 plan_id=plan_id,
                 legacy_plan=mirror_legacy_plan(plan_attributes, now.timestamp()),
+                learned_model_source=dict(attrs),
+                learned_model_at=rows["model"].last_reported.timestamp(),
                 **values)
 
 
@@ -122,6 +125,8 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.mapping = dict(mapping)
         self.source_ids = dict(entry.data.get("source_ids", {}))
         self.model_store = None
+        self.model_checkpoint = None
+        self._storage_directory = None
         self.durable_ledger = None
         self.ledger_summary = None
         self._last_room_archive = 0.0
@@ -135,11 +140,14 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._closed = False
         self._weather_unsubscribe = None
 
-    def attach_private_state(self, store, ledger, status: dict) -> None:
+    def attach_private_state(self, store, ledger, status: dict,
+                             directory=None, checkpoint=None) -> None:
         """Attach state only after checksum and reboot-fence verification."""
         if status.get("fenced") is not True:
             raise ValueError("Refusing unfenced native command journal")
         self.model_store = store
+        self._storage_directory = directory
+        self.model_checkpoint = checkpoint
         self.durable_ledger = ledger
         self.ledger_summary = {
             "revision": status.get("revision"),
@@ -148,11 +156,16 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "physical_commands_enabled": False,
         }
 
-    async def _remember_read_only(self, at: float, room: float) -> None:
+    async def _remember_read_only(self, at: float, room: float,
+                                  model: dict, model_at: float) -> None:
         try:
             await self.hass.async_add_executor_job(
                 observe_room, self.model_store, at, room
             )
+            if self._storage_directory is not None:
+                self.model_checkpoint = await self.hass.async_add_executor_job(
+                    save_learned_model, self._storage_directory, model, model_at
+                )
         except Exception:
             # Archive failure must be visible; never repair or overwrite an
             # unknown/corrupted file automatically.
@@ -256,6 +269,9 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "fireplace_state": safety.get("fireplace_state"),
             "durable_journal": self.ledger_summary,
             "storage_fault": getattr(self, "_storage_fault", None),
+            "cached_model_version": (
+                (self.model_checkpoint or {}).get("model", {}).get("version")
+            ),
         }
         try:
             snapshot = sample_v1_inputs(self.hass, self.mapping)
@@ -278,7 +294,10 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     (self._room_archive_job is None or self._room_archive_job.done())):
                 self._last_room_archive = stamp
                 self._room_archive_job = self.hass.async_create_task(
-                    self._remember_read_only(stamp, snapshot["room"]),
+                    self._remember_read_only(
+                        stamp, snapshot["room"],
+                        snapshot["learned_model_source"], snapshot["learned_model_at"],
+                    ),
                     "heating_ai_v1_record_ha_cache_only",
                 )
 
