@@ -55,67 +55,83 @@ def _age(state: Any, now: datetime, limit: int) -> None:
         raise ValueError("required HA observation is stale")
 
 
-def sample_v1_inputs(hass: HomeAssistant, mapping: dict[str, str]) -> dict[str, Any]:
-    """Read a single bounded observation on HA's event loop; never call this in executor."""
-    now = datetime.now(timezone.utc)
-    entity_ids = dict(room=mapping["room"], outside=mapping["outside"],
-                      floor=ENVIRONMENT, model=MODEL)
-    values: dict[str, float] = {}
-    rows: dict[str, Any] = {}
-    for role, entity_id in entity_ids.items():
-        row = hass.states.get(entity_id)
-        if role == "model":
-            # Coefficients are versioned calibration metadata, not a
-            # physical sensor that must report each 15-minute window.
-            # Reject missing/corrupt calibration, but not an unchanged
-            # approved version whose HA timestamp is old.
-            if row is None or row.state in ("unknown","unavailable",""):
-                raise ValueError("trained V1 model unavailable")
-        else:
-            _age(row, now, 900 if role == "floor" else 300)
-        rows[role] = row
-    values["room"] = _number(rows["room"].state, -20, 55)
-    values["outside"] = _number(rows["outside"].state, -55, 60)
-    values["floor"] = _number(rows["floor"].state, 0, 90)
-    attrs = rows["model"].attributes.get("parameters")
-    if not isinstance(attrs, dict):
-        raise ValueError("V1 thermal coefficients not available")
-    if (
-        attrs.get("validated") not in (True, "true", "True")
-        or type(attrs.get("version")) is not int
-        or attrs["version"] < 0
+def sample_v1_inputs(
+    hass: HomeAssistant, mapping: dict[str,str],
+    *, model_checkpoint: dict | None = None,
+    floor_observer: dict | None = None,
+) -> dict[str, Any]:
+    """Require fresh *physical* sensors, accept checksummed calibration cache.
+
+    This is SHADOW-only. An untrusted model or missing measured floor/KWS
+    never becomes permission to actuate equipment.
+    """
+    now=datetime.now(timezone.utc)
+    room_state=hass.states.get(mapping["room"])
+    outside_state=hass.states.get(mapping["outside"])
+    _age(room_state,now,300)
+    _age(outside_state,now,300)
+    room=_number(room_state.state,-20,55)
+    outside=_number(outside_state.state,-55,60)
+    model_row=hass.states.get(MODEL)
+    observed=(model_row.attributes.get("parameters")
+              if model_row is not None and
+              model_row.state not in ("unknown","unavailable","")
+              else None)
+    source_kind="legacy_model"
+    if not isinstance(observed,dict) or (
+        observed.get("validated") not in (True,"true","True")
+        or type(observed.get("version")) is not int
     ):
-        raise ValueError("unvalidated or unversioned V1 model")
-    model_timestamp = (
-        getattr(rows["model"], "last_reported", None)
-        or getattr(rows["model"], "last_updated", None)
+        if not isinstance(model_checkpoint,dict):
+            raise ValueError("Neither legacy nor validated cached model")
+        observed=model_checkpoint.get("model")
+        model_at=model_checkpoint.get("observed_at")
+        if not isinstance(observed,dict):
+            raise ValueError("Cached thermal model is not trustworthy")
+        if type(model_at) not in (int,float) or not 0<model_at<=now.timestamp()+60:
+            raise ValueError("Cached model observation clock invalid")
+        source_kind="private_model_checkpoint"
+    else:
+        model_at=getattr(model_row,"last_reported",None) or getattr(model_row,"last_updated",None)
+        if (not isinstance(model_at,datetime) or model_at.tzinfo is None or
+                model_at>now+timedelta(seconds=60)):
+            raise ValueError("Legacy learned model has invalid provenance")
+        model_at=model_at.timestamp()
+    if (observed.get("validated") not in (True,"true","True")
+            or type(observed.get("version")) is not int or
+            observed["version"]<0):
+        raise ValueError("Thermal model invalid")
+    parameters={key:_number(observed.get(key),-10,10)
+                for key in REQUIRED_COEFFICIENTS}
+    floor_row=hass.states.get(ENVIRONMENT)
+    floor_source="legacy_floor"
+    try:
+        _age(floor_row,now,900)
+        floor=_number(floor_row.state,0,90)
+    except ValueError:
+        if not isinstance(floor_observer,dict):
+            raise ValueError("No recent native floor inventory")
+        at=floor_observer.get("at")
+        if (type(at) not in (float,int) or
+                not 0<=now.timestamp()-at<=1800):
+            raise ValueError("Native floor inventory is stale")
+        floor=_number(floor_observer.get("estimate"),0,90)
+        floor_source="native_floor_inventory"
+    source_plan=hass.states.get(FORECAST)
+    plan_attributes=None
+    plan_id=None
+    if source_plan and source_plan.state not in ("unknown","unavailable"):
+        fields=("created_at","curve","actual_curve","heat_segments",
+                "planned_kwh","plan_id","execution_state")
+        plan_attributes={key:source_plan.attributes.get(key) for key in fields}
+        plan_id=source_plan.attributes.get("plan_id")
+    return dict(
+        at=now.isoformat(),room=room,outside=outside,floor=floor,
+        parameters=parameters,plan_id=plan_id,
+        model_provenance=source_kind,floor_provenance=floor_source,
+        legacy_plan=mirror_legacy_plan(plan_attributes,now.timestamp()),
+        learned_model_source=dict(observed),learned_model_at=model_at,
     )
-    if (
-        not isinstance(model_timestamp, datetime)
-        or model_timestamp.tzinfo is None
-        or model_timestamp > now + timedelta(seconds=60)
-    ):
-        raise ValueError("trained V1 model provenance invalid")
-    parameters = {
-        key: _number(attrs.get(key), -10, 10)
-        for key in REQUIRED_COEFFICIENTS
-    }
-    # The 3h coast is an indicative no-boiler/no-fire calculation, not
-    # expected thermal execution. Preserve these limits even in SHADOW.
-    source_plan = hass.states.get(FORECAST)
-    plan_id = None
-    plan_attributes = None
-    if source_plan and source_plan.state not in ("unknown", "unavailable"):
-        fields = ("created_at", "curve", "actual_curve", "heat_segments",
-                  "planned_kwh", "plan_id", "execution_state")
-        plan_attributes = {key: source_plan.attributes.get(key) for key in fields}
-        plan_id = source_plan.attributes.get("plan_id")
-    return dict(at=now.isoformat(), parameters=parameters,
-                plan_id=plan_id,
-                legacy_plan=mirror_legacy_plan(plan_attributes, now.timestamp()),
-                learned_model_source=dict(attrs),
-                learned_model_at=model_timestamp.timestamp(),
-                **values)
 
 
 def calculate_v1_coast(snapshot: dict[str, Any]) -> dict[str, Any]:
