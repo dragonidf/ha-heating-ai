@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PLATFORMS, SOURCE_UI
 from .native_runtime import V1ShadowCoordinator
+from .native_api import register as register_preview_api
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -53,6 +54,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             state["static"] = True
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         forwarded = True
+        if not state.get("_api"):
+            register_preview_api(hass)
+            state["_api"] = True
+        state[entry.entry_id] = coordinator
         await panel_custom.async_register_panel(
             hass,
             frontend_url_path="heating-v1-preview",
@@ -60,6 +65,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             sidebar_title="Heating AI V1+",
             sidebar_icon="mdi:chart-line",
             module_url=f"/heating_ai_legacy/assets/panel.js?v={bundle}",
+            config={"entry_id": entry.entry_id},
             require_admin=True,
         )
         panel_registered = True
@@ -86,6 +92,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except (TypeError, ValueError, RuntimeError, asyncio.TimeoutError):
                 coordinator.receive_weather(None)
     except Exception:
+        state.pop(entry.entry_id, None)
         await coordinator.close()
         if panel_registered:
             frontend.async_remove_panel(
@@ -103,4 +110,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return False
     frontend.async_remove_panel(hass, "heating-v1-preview", warn_if_unknown=False)
     await entry.runtime_data.close()
+    hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return True
