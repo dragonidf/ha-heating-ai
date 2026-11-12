@@ -54,7 +54,7 @@ def parse_events(items: Any, now: float) -> dict:
             a,b=_time(start),_time(end)
         except ValueError:
             return dict(empty,reason="unqualified_calendar_interval")
-        if not (a<b and now-2*3600<=b and a<=now+HORIZON+3600):
+        if not (a < b and b > now and a < now + HORIZON):
             continue
         records.append(dict(start=max(a,now),end=min(b,now+HORIZON)))
     if not records:

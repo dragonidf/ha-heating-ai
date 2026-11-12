@@ -11,7 +11,8 @@ FORECAST = "sensor.heating_forecast"
 # No credential, personal state or location is bundled in this map.
 SOURCE_HINTS = {
     "thermostat": "climate.kotel",
-    "outage_calendar": "calendar.svitlo_kiivska_oblast_3_1",
+    "outage_calendar": "calendar.svitlo_svitlo_kiivska_oblast_3_1",
+    "fireplace_temp": "sensor.t_h_kamin_vitalnia_temperature",
     "grid": "input_select.indikator_merezhi_stan",
     "fireplace": "sensor.heating_fireplace",
     "kws_l1": "sensor.energy_meter_kotel_potuzhnist_a",
