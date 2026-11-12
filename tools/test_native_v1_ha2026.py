@@ -79,6 +79,7 @@ async def lifecycle(readings, directory) -> None:
         assert args["module_url"].startswith("/heating_ai_legacy/assets/panel.js?v=")
         assert args["webcomponent_name"] == "heating-v1-native-" + args["module_url"].split("=")[-1]
         assert args["config"]["entry_id"] == entry.entry_id
+        assert args["config"]["room"] == "sensor.room"
         assert args["require_admin"] is True
         assert api.call_count == 1
         assert hass.data[component.DOMAIN][entry.entry_id] is entry.runtime_data

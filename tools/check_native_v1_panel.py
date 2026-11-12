@@ -91,7 +91,11 @@ async def verify() -> None:
                     """({states,now,native}) => {
                         const element=document.createElement('heating-v1-native-preview');
                         document.body.appendChild(element);
-                        element.panel={config:{entry_id:'isolated-native-v1'}};
+                        element.panel={config:{
+                            entry_id:'isolated-native-v1',room:'sensor.room',
+                            entity_map:{room:'sensor.room',target:'input_number.heating_target',
+                                        mode:'input_select.heating_mode'}
+                        }};
                         element.hass={
                           states,
                           callApi:async()=>[[
@@ -110,7 +114,9 @@ async def verify() -> None:
                               physical_commands_enabled:false,
                               commands_sent:0,
                               forecast:native,
-                              heat_segments:[],
+                              heat_segments:[
+                                {start:now+900,end:now+5400,power_kw:3.0}
+                              ],
                             };
                           }
                         };
@@ -152,6 +158,26 @@ async def verify() -> None:
                 assert checks["controls"] == 0, "Preview must not contain equipment controls"
                 if label=="mobile":
                     assert checks["has_horizontal_scroll"]
+                # Native-only lifecycle: old AppDaemon sensors no longer exist.
+                await page.evaluate("""() => {
+                    const el=document.querySelector('heating-v1-native-preview');
+                    const old=el._lastHass;
+                    const states={...old.states};
+                    delete states['sensor.heating_ui'];
+                    delete states['sensor.heating_forecast'];
+                    delete states['sensor.heating_controller'];
+                    el.hass={...old,states};
+                }""")
+                await page.wait_for_function("""() => {
+                    const root=document.querySelector('heating-v1-native-preview')?.shadowRoot;
+                    return !!root?.querySelector('path.native') &&
+                        root?.querySelectorAll('rect.heat-native').length===1 &&
+                        root?.querySelectorAll('rect.heat').length===0 &&
+                        root?.getElementById('room')?.textContent.includes('21,3') &&
+                        root?.getElementById('source')?.textContent.includes('Незалежний прогноз V1+') &&
+                        root?.getElementById('plan')?.textContent.includes('умовних V1+') &&
+                        root?.querySelectorAll('button, input, select').length===0;
+                }""",timeout=12000)
                 out=ROOT/("native-v1-preview-"+label+".png")
                 await page.screenshot(path=str(out),full_page=True)
                 print("PASS",label,json.dumps(checks,ensure_ascii=False))
