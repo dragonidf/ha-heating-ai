@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from .const import DOMAIN, PLATFORMS, SOURCE_UI
 from .native_runtime import V1ShadowCoordinator
 from .native_api import register as register_preview_api
+from .native_persistence import bootstrap
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -35,6 +36,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, dict(room=entry.data["room"], outside=entry.data["outside"]), entry
     )
     await coordinator.async_config_entry_first_refresh()
+    # Only private native .storage is created. The old AppDaemon state.json,
+    # KWS counters, model, automation ownership and heater are never touched.
+    data_directory = hass.config.path(".storage", DOMAIN, entry.entry_id)
+    try:
+        native_store, ledger, journal = await hass.async_add_executor_job(
+            bootstrap, data_directory
+        )
+    except Exception as exc:
+        await coordinator.close()
+        raise ConfigEntryNotReady(
+            "V1+ private state or safety journal unavailable; no command authority"
+        ) from exc
+    coordinator.attach_private_state(native_store, ledger, journal)
     assets = Path(__file__).parent / "assets"
     panel = assets / "panel.js"
     if not panel.is_file():
