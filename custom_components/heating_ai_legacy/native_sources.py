@@ -125,7 +125,8 @@ def planner_snapshot(hass: Any, baseline: dict[str, Any],
                      hourly: list[dict[str, float]] | None,
                      received_at: float | None,
                      *, role_map: dict[str, str] | None = None,
-                     calendar_schedule: dict[str, Any] | None = None) -> dict[str, Any]:
+                     calendar_schedule: dict[str, Any] | None = None,
+                     fireplace_entity: str | None = None) -> dict[str, Any]:
     """One bounded source snapshot; fail closed before calling the optimizer."""
     now = datetime.fromisoformat(baseline["at"])
     if now.tzinfo is None:
@@ -159,14 +160,29 @@ def planner_snapshot(hass: Any, baseline: dict[str, Any],
         settings["outage_schedule"] = calendar_schedule
     else:
         settings["outage_schedule"] = previous_schedule
-    # The fireplace is a live observed source, not a programmable command.
-    fireplace = _state(hass, FIRE)
-    _fresh(fireplace, 1800, now)
-    if fireplace.state == "Неактивний":
-        fire_delta = 0.0
+    # Prefer the real fireplace sensor; V1's synthetic status disappears
+    # when AppDaemon is retired. Unknown ≠ 0 heat.
+    source_fireplace = None
+    if isinstance(fireplace_entity, str):
+        try:
+            source_fireplace = _state(hass, fireplace_entity)
+            _fresh(source_fireplace, 900, now)
+        except ValueError:
+            source_fireplace = None
+    if source_fireplace is not None:
+        c = _number(source_fireplace.state, -20, 65)
+        fire_delta = max(0.0, c - baseline["room"])
     else:
-        c = _number(fireplace.attributes.get("temperature"),-20,65)
-        fire_delta = max(0.0,c-baseline["room"])
+        # Legacy fallback is suitable only during SHADOW parity.
+        fireplace = _state(hass, FIRE)
+        _fresh(fireplace, 1800, now)
+        if fireplace.state == "Неактивний":
+            fire_delta = 0.0
+        elif fireplace.state == "Датчик недоступний":
+            raise ValueError("physical fireplace sensor unavailable")
+        else:
+            c = _number(fireplace.attributes.get("temperature"), -20, 65)
+            fire_delta = max(0.0, c - baseline["room"])
     return {
         "at": baseline["at"],
         "room": baseline["room"],
