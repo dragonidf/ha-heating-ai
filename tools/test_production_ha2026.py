@@ -14,6 +14,7 @@ from build_marketplace import build, ROOT
 
 async def exercise(directory):
     from homeassistant.core import HomeAssistant
+    from custom_components.heating_ai_legacy.critical_ledger import CriticalLedger
     from custom_components.heating_ai_legacy.production import NativeController
     from custom_components.heating_ai_legacy.native_controller.heating_model import DEFAULT_MODEL
     from custom_components.heating_ai_legacy.config_flow import HeatingAIV1OptionsFlow
@@ -54,6 +55,24 @@ async def exercise(directory):
     hass.services.async_register("persistent_notification", "create", lambda call: None)
     hass.services.async_register("persistent_notification", "dismiss", lambda call: None)
     controller = NativeController(hass,cfg)
+    # Production never receives command authority without the same durable,
+    # boot-fenced journal used by the config-entry runtime.  Keep the smoke
+    # test on that real safety path instead of injecting a permissive fake.
+    journal_dir = directory / "command-journal"
+    journal_dir.mkdir()
+    owner_id = "synthetic-ha-2026-smoke"
+    ledger = CriticalLedger(
+        journal_dir,
+        owner_id=owner_id,
+        boot_id="bootstrap-synthetic-ha-2026-smoke",
+        owner_epoch=0,
+    )
+    controller.attach_command_ledger(
+        ledger,
+        ledger.claim_boot(
+            "synthetic-ha-2026-smoke-boot", expected_owner_id=owner_id
+        ),
+    )
     try:
         # Real OptionsFlow APIs reject assigning the platform's read-only
         # config_entry property; the options constructor must remain portable.

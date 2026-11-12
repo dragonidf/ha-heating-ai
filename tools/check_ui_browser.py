@@ -187,7 +187,7 @@ def check_compact_overview(page):
     assert page.locator('.overview>.metrics').count()==0, 'Old standalone metrics must be removed'
     assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
-    assert headings==['Наступні 24 години','План нагріву','Котел','Камін і циркуляція'], headings
+    assert headings==['Факт −6 год → прогноз +24 год','План нагріву','Котел','Камін і циркуляція'], headings
     assert page.locator('.chart-card + .plan-card').count()==1, 'Heating plan must immediately follow the forecast'
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
     assert '17,50' in page.locator('.boiler-card').inner_text()
