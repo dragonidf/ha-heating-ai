@@ -1,4 +1,9 @@
 {
-  "name": "Heating AI — AppDaemon",
+  "name": "Heating AI V1 — AppDaemon delivery",
+  "homeassistant": "2026.11.0",
+  "zip_release": true,
+  "filename": "heating_ai_v1_marketplace.zip",
+  "content_in_root": true,
+  "hide_default_branch": true,
   "render_readme": true
 }
