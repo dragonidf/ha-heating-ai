@@ -1,5 +1,6 @@
 """3-phase voltage never overrides independent grid and a recovery latch."""
 import importlib
+from math import isfinite
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -57,7 +58,7 @@ class VoltageTests(unittest.TestCase):
                                         minimum_v=None,maximum_v=None)["status"],"LIMITS_UNCONFIGURED")
 
     def test_bogus_settings_do_not_open_gate(self):
-        for low,high in ((None,None),(230.,225.),(100.,400.)):
+        for low,high in ((None,None),(230.,225.),(100.,400.),(float("nan"),260.)):
             with self.subTest(low=low,high=high):
                 result=self.module.VoltageGuard().evaluate(
                     1000.,True,[230.,230.,230.],
@@ -65,6 +66,11 @@ class VoltageTests(unittest.TestCase):
                 )
                 self.assertFalse(result["voltage_qualified"])
                 self.assertFalse(result["physical_authority"])
+                self.assertTrue(all(
+                    value is None or isfinite(value)
+                    for value in (result["trip_low_v"],result["trip_high_v"],
+                                  result["recovery_low_v"],result["recovery_high_v"])
+                ))
 
     def test_operator_voltage_band_validation(self):
         valid=self.module.valid_policy

@@ -47,20 +47,20 @@ class VoltageGuard:
 
         def blocked(status, reason_code, **details):
             self.stable_since = None
+            minimum_ok = type(minimum_v) in (int, float) and isfinite(minimum_v)
+            maximum_ok = type(maximum_v) in (int, float) and isfinite(maximum_v)
             return dict(
                 status=status, reason_code=reason_code,
                 reason=details.pop("reason", reason_code),
                 voltage_qualified=False, sustained_seconds=0.,
                 physical_commands_enabled=False, physical_authority=False,
                 minimum_v=minimum_v, maximum_v=maximum_v,
-                trip_low_v=(minimum_v + LOW_MARGIN_V
-                            if type(minimum_v) in (int, float) else None),
-                trip_high_v=(maximum_v - HIGH_MARGIN_V
-                             if type(maximum_v) in (int, float) else None),
+                trip_low_v=(minimum_v + LOW_MARGIN_V if minimum_ok else None),
+                trip_high_v=(maximum_v - HIGH_MARGIN_V if maximum_ok else None),
                 recovery_low_v=(minimum_v + LOW_MARGIN_V + RECOVERY_HYSTERESIS_V
-                                if type(minimum_v) in (int, float) else None),
+                                if minimum_ok else None),
                 recovery_high_v=(maximum_v - HIGH_MARGIN_V - RECOVERY_HYSTERESIS_V
-                                 if type(maximum_v) in (int, float) else None),
+                                 if maximum_ok else None),
                 phases_v=phases_v if isinstance(phases_v, list) else None,
                 affected_phases=details.pop("affected_phases", []),
                 **details,
