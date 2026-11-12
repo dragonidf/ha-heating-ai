@@ -43,6 +43,7 @@ async def lifecycle(readings, directory) -> None:
         domain="heating_ai_legacy",
         async_on_unload=Mock(),
         data=dict(shadow=True, room="sensor.room", outside="sensor.outside"),
+        options={},
         runtime_data=None,
     )
     source = dict(readings)
@@ -98,7 +99,7 @@ def main() -> None:
         folder = Path(temp)
         archive = folder / "carrier.zip"
         summary = build(archive)
-        assert summary["files"] == 40
+        assert summary["files"] == 41
         target = folder / "isolated" / "custom_components" / "heating_ai_legacy"
         target.mkdir(parents=True)
         with zipfile.ZipFile(archive) as package:

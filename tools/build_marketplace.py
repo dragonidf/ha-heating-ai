@@ -126,7 +126,8 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
                  "native_safety.py", "native_intent.py", "native_calendar.py",
                  "native_outages.py", "native_store.py", "native_persistence.py",
                  "native_model.py", "native_fan.py", "native_fan_sources.py",
-                 "native_migration.py", "native_floor.py", "critical_ledger.py", "sensor.py", "strings.json",
+                 "native_migration.py", "native_floor.py", "native_voltage.py",
+                 "critical_ledger.py", "sensor.py", "strings.json",
                  "assets/panel.js"):
         contents[name] = (CARRIER / name).read_bytes()
         if name.endswith(".py"):

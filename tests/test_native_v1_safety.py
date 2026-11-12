@@ -19,6 +19,7 @@ class GuardAndPersistenceTests(unittest.TestCase):
         self.safety = importlib.import_module(PKG + ".native_safety")
         self.persist = importlib.import_module(PKG + ".native_persistence")
         self.model = importlib.import_module(PKG + ".native_model")
+        self.voltage = importlib.import_module(PKG + ".native_voltage")
 
     def tearDown(self):
         for name in list(sys.modules):
@@ -70,6 +71,33 @@ class GuardAndPersistenceTests(unittest.TestCase):
         self.assertEqual(result["kws_power_w"], 0)
         self.assertEqual(result["kws_total_kwh"], 100.0)
         self.assertIn("legacy_controller_active", result["source_warnings"])
+
+    def test_last_known_voltage_never_proves_live_grid(self):
+        hass,mapping,sources = self.states()
+        now = datetime.now(timezone.utc)
+        evidence={
+            "sensor.voltage_1":SimpleNamespace(state="229.8",
+                last_reported=now-timedelta(seconds=1000)),
+            "sensor.voltage_2":SimpleNamespace(state="231.4",
+                last_reported=now-timedelta(seconds=1000)),
+            "sensor.voltage_3":SimpleNamespace(state="230.0",
+                last_reported=now-timedelta(seconds=1000)),
+        }
+        previous_get=hass.states.get
+        hass.states.get=lambda entity_id: evidence.get(entity_id) or previous_get(entity_id)
+        sources.update(
+            voltage_l1="sensor.voltage_1",
+            voltage_l2="sensor.voltage_2",
+            voltage_l3="sensor.voltage_3",
+        )
+        observed=self.safety.observe(hass,mapping,sources)
+        self.assertEqual(observed["voltage_phases_v"],[None,None,None])
+        self.assertIn("mains_voltage_missing_or_stale",observed["source_warnings"])
+        guard=self.voltage.VoltageGuard()
+        result=guard.evaluate(1000.,observed["grid"],observed["voltage_phases_v"],
+                              minimum_v=190.,maximum_v=250.)
+        self.assertFalse(result["voltage_qualified"])
+        self.assertFalse(result["physical_commands_enabled"])
 
     def test_missing_kws_does_not_become_zero(self):
         hass,mapping,sources = self.states(manual=False,kws_ok=False)
