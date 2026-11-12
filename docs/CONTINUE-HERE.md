@@ -27,17 +27,14 @@ V2 залишається SHADOW без фізичних команд.
 3. Прочитати [ТЗ](v1-v2-modernization-spec.md),
    [реєстр](v1-v2-work-log.md), [матрицю перенесення](v2-transfer-checklist.md)
    та кореневий AGENTS.md. Не повторювати загальний аудит.
-4. Продовжити з remote head
-   `97bf637d7b7fbaa43c61556fb3794596f4113218`. Candidate workflow
-   [43311679116](https://github.com/dragonidf/ha-heating-ai/actions/runs/43311679116)
-   зелений. Tests run
-   [43311679018](https://github.com/dragonidf/ha-heating-ai/actions/runs/43311679018)
-   ще не release gate: `native-production` падає лише тому, що synthetic HA
-   fixture зареєстрував `climate.set_hvac_mode`, але реальний `apply_action`
-   після нового final guard спочатку викликає незареєстрований у fixture
-   `climate.set_temperature` (`ServiceNotFound`, job `131509066663`). Додати
-   synthetic `set_temperature`, який оновлює атрибут уставки, не послаблювати
-   production gateway, і повторити exact-head Linux CI.
+4. Взяти latest head PR25. Виправлення synthetic temperature service вже є
+   у aeb9228. Його native-production/Python PASS; browser gate мав застарілу
+   вимогу chart+plan adjacency. Поточний checkpoint перевіряє chart першою та
+   порядок chart < hero < plan < details. Дочекатися обох GitHub workflows;
+   наступні failures брати з job logs. Повні тести виконувати GitHub за прямим
+   дорученням власника. E6/E7 ще PARTIAL; не оголошувати production готовим.
+   Встановлення — замість V2. Старий V1 та його сутності не видаляти: лише
+   disable його writer/watchdog під час handoff, очищення власник зробить окремо.
 5. Після кожного завершеного етапу оновити реєстр і цю точку продовження,
    закомітити та перевірити віддалений SHA. Локальний файл не є checkpoint.
 

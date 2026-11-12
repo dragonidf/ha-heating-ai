@@ -107,3 +107,18 @@ actual points, 48 replay points), explicitly not a full telemetry backtest.
 Recorder over two hours returned complete, non-paginated samples at about
 240 heartbeat, 148 controller, 19 diagnostics and 1 energy-total writes/hour.
 Raw telemetry, energy values and configuration were not committed.
+
+### 12.11.2026 — resume: browser gate and deployment destination
+
+Owner уточнив: новий V1 встановлюємо замість SHADOW V2; старий AppDaemon V1
+і всі його сутності НЕ видаляти. Для handoff лише зупинити його writer/watchdog;
+очищення власник виконає окремо після успіху. V2 спочатку unload/backup,
+не активувати фізичні команди. Не видаляти сторонні helpers/історію.
+
+На aeb9228 candidate 43312563470 PASS, native-production і Python 3.12/3.13
+PASS. Tests 43312563506 FAIL на browser assertion старої adjacency chart+plan:
+новий погоджений layout має chart першою, потім hero/energy, потім plan.
+Замінено перевірку adjacency на строгий порядок chart(first) < hero < plan <
+details; UI не змінено. Тести на пряме доручення власника передано GitHub;
+не повторювати повний локальний suite. Next: перевірити обидва workflows нового
+head, виправляти лише фактичні failures; потім E6/E7 і E8/E9. Production unchanged.

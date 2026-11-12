@@ -188,7 +188,13 @@ def check_compact_overview(page):
     assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
     assert headings==['Факт −6 год → прогноз +24 год','План нагріву','Котел','Камін і циркуляція'], headings
-    assert page.locator('.chart-card + .plan-card').count()==1, 'Heating plan must immediately follow the forecast'
+    assert page.locator('.overview > :first-child.chart-card').count()==1, 'Shared actual/forecast timeline must be first'
+    order=page.locator('.overview > *').evaluate_all('els=>els.map(el=>el.className)')
+    chart=next(i for i,c in enumerate(order) if 'chart-card' in c.split())
+    hero=next(i for i,c in enumerate(order) if 'hero' in c.split())
+    plan=next(i for i,c in enumerate(order) if 'plan-card' in c.split())
+    details=next(i for i,c in enumerate(order) if 'overview-details' in c.split())
+    assert chart < hero < plan < details, order
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
     assert '17,50' in page.locator('.boiler-card').inner_text()
     assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
