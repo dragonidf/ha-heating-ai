@@ -167,3 +167,22 @@ Next GPT: latest main → main push Tests → v0.4.0 asset SHA → Marketplace i
 inactive → private snapshot/continuity → disable V2 + old V1 writer/watchdog →
 activate one native writer → readback/actual KWS/panel/rollback checks.
 Не видаляти old V1/entities. Doc-only checkpoint не змінює tested code.
+
+### 13.11.2026 — v0.4.0 installed through Marketplace, not activated
+
+Immutable v0.4.0 targets tested main 327b2ba0ac8ae65f170d34fb32a49fe48766cc31;
+asset heating_ai_v1_marketplace.zip 528718 bytes, SHA256
+1dff999c294a3c129e3aa6e0caa9a8a3b8b19da6aaa0ce15714447a17c2ee704.
+Owner confirmed previously reading/accepting Marketplace notice; backend explained
+separate MCP-user gate and offered explicit acceptance. Dedicated tool schema
+lacks accept_warning; official HA-MCP backend maps it to marketplace/warning/accept.
+Used that documented one-shot command based on owner confirmation, readback true.
+Added dragonidf/ha-heating-ai integration repo1421772152 and installed v0.4.0;
+readback confirms installed_version v0.4.0. V2 v0.2.3 remains installed/loaded,
+legacy V1 remains active. E8 release+package install DONE; runtime activation
+NOT DONE. Next: load new Python integration (Core restart if required), prepare
+fresh private migration snapshot/check model-energy-history continuity, unload
+V2, disable only legacy heating writer/watchdog, activate native entry, verify
+fresh cycle/KWS/UI/permissions. Preserve legacy files/helpers for owner cleanup.
+Do not claim package install equals native production control. No equipment
+commands or legacy disable have been issued in this install step.
