@@ -177,8 +177,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.source_ids = dict(entry.data.get("source_ids", {}))
         self.boiler_power_mode = entry.data.get("boiler_power_mode", "unconfirmed")
         self._voltage_guard = VoltageGuard()
-        # No arbitrary thresholds, and no UI-provided privilege to actuate.
-        # Defaults remain None until a verified commissioning procedure.
+        # KWS defaults are guard thresholds only; they never grant actuation.
         self.voltage_min_v = entry.options.get("min_voltage_v", 190)
         self.voltage_max_v = entry.options.get("max_voltage_v", 260)
         self.voltage_recovery_seconds = entry.options.get(
