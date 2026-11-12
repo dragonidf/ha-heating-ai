@@ -213,7 +213,8 @@ class HeatingV1NativePanel extends HTMLElement {
     const now = Date.now() / 1000;
     const since = now - 6 * HOUR, until = now + 24 * HOUR;
     const ui = ha.states['sensor.heating_ui'];
-    const ids = ui && ui.attributes && ui.attributes.entities || {};
+    const ids = (ui && ui.attributes && ui.attributes.entities)
+      || (this._native && this._native.entity_map) || {};
     const roomId = ids.room;
     const state = id => id && ha.states[id];
     const roomState = state(roomId);

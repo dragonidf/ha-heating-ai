@@ -94,7 +94,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # or legacy-AppDaemon lifecycle coupling. If provider is unavailable,
         # the independent plan remains BLOCKED_INPUTS instead of inventing it.
         ui = hass.states.get(SOURCE_UI)
-        entities = ui.attributes.get("entities") if ui is not None else None
+        discovered = ui.attributes.get("entities") if ui is not None else None
+        entities = entry.data.get("entity_map") or discovered
         weather_id = entities.get("weather") if isinstance(entities, dict) else None
         store = hass.data.get(WEATHER_ENTITIES)
         provider = (

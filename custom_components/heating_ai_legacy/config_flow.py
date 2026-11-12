@@ -38,6 +38,21 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
                 }),
                 errors={"base": "consent_required"},
             )
+        known_roles = (
+            "room","outside","return","weather","fan","target","lower",
+            "upper","night_target","night_lower","night_upper",
+            "start","end","sleep_start","sleep_end","strategy","mode",
+            "armed","fan_control","fan_mode","fan_speed",
+            "fan_night_limit","fan_intense_speed",
+        )
+        # Persist entity discovery ONCE; HA continues knowing its native
+        # sensors even when the old AppDaemon sensor.heating_ui is removed.
+        entity_map = {
+            role: value for role in known_roles
+            if type(value := mapping.get(role)) is str
+            and len(value) <= 128 and value.count(".") == 1
+            and " " not in value
+        }
         await self.async_set_unique_id("native_v1_shadow")
         self._abort_if_unique_id_configured()
         return self.async_create_entry(
@@ -46,6 +61,7 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
                 "shadow": True,
                 "room": mapping["room"],
                 "outside": mapping["outside"],
+                "entity_map": entity_map,
                 "source_ids": {
                     role: entity_id for role, entity_id in SOURCE_HINTS.items()
                     if self.hass.states.get(entity_id) is not None

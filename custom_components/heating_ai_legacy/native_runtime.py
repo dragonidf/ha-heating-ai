@@ -151,6 +151,8 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             config_entry=entry,
         )
         self.mapping = dict(mapping)
+        self.role_map = dict(entry.data.get("entity_map", {}))
+        self.role_map.update(self.mapping)
         self.source_ids = dict(entry.data.get("source_ids", {}))
         self.model_store = None
         self.model_checkpoint = None
@@ -276,10 +278,15 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Refresh read-only safety before slow math, never from executor."""
-        ui = self.hass.states.get("sensor.heating_ui")
-        source_roles = ui.attributes.get("entities", {}) if ui is not None else {}
-        role_map = dict(source_roles) if isinstance(source_roles, dict) else {}
-        role_map.update(self.mapping)
+        # Config flow preserved V1 role bindings before AppDaemon retirement.
+        # Only old SHADOW entries use live discovery as a compatibility fallback.
+        role_map = dict(self.role_map)
+        if "return" not in role_map:
+            ui = self.hass.states.get("sensor.heating_ui")
+            source_roles = ui.attributes.get("entities", {}) if ui is not None else {}
+            if isinstance(source_roles, dict):
+                role_map.update(source_roles)
+            role_map.update(self.mapping)
         try:
             safety = observe_safety(self.hass, role_map, self.source_ids)
         except Exception:
@@ -359,7 +366,8 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             candidate = planner_snapshot(
-                self.hass, snapshot, self.hourly_weather, self.weather_received_at
+                self.hass, snapshot, self.hourly_weather, self.weather_received_at,
+                role_map=role_map,
             )
         except (ValueError, KeyError, TypeError):
             report["native_plan_status"] = "BLOCKED_INPUTS"

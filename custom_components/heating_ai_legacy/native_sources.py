@@ -123,17 +123,20 @@ def normalize_hourly_weather(items: Any, received_at: float) -> list[dict[str, f
 
 def planner_snapshot(hass: Any, baseline: dict[str, Any],
                      hourly: list[dict[str, float]] | None,
-                     received_at: float | None) -> dict[str, Any]:
+                     received_at: float | None,
+                     *, role_map: dict[str, str] | None = None) -> dict[str, Any]:
     """One bounded source snapshot; fail closed before calling the optimizer."""
     now = datetime.fromisoformat(baseline["at"])
     if now.tzinfo is None:
         raise ValueError("timezone required")
     if hourly is None or received_at is None or now.timestamp()-received_at > MAX_FORECAST_AGE:
         raise ValueError("fresh native hourly weather required")
-    user = _state(hass, UI)
-    mapping = user.attributes.get("entities")
+    mapping = role_map
     if not isinstance(mapping, dict):
-        raise ValueError("legacy V1 entity map missing")
+        user = _state(hass, UI)
+        mapping = user.attributes.get("entities")
+    if not isinstance(mapping, dict):
+        raise ValueError("neither native nor legacy entity map available")
     settings: dict[str, Any] = {}
     for key,role in HELPERS.items():
         row = _state(hass, mapping.get(role))
