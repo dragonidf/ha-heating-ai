@@ -40,6 +40,11 @@ AppDaemon, символьні посилання, окремий терміна�
 - **Донор V2:** `dragonidf/ha-heating-2`, PR #43;
   `packages/control/kernel.py`, HA-native quality/freshness,
   `critical_ledger.py`, `native_api.py`, тестова інфраструктура.
+- **Приватні результати після AppDaemon:** незалежні checkpoint'и
+  SHA-256 для навченої моделі й еквівалентного запасу підлоги, який
+  оновлюється оригінальною `observe_floor` за показниками KWS та обратки.
+  Якщо KWS недоступний, потужність не вигадується; фізичне керування
+  залишається вимкненим.
 - **Без переписування математичного ядра V1:** `heating_model.py`,
   `heating_stability.py`, `heating_environment.py`,
   `heating_outages.py`, `heating_fallback.py`; однакові результати
