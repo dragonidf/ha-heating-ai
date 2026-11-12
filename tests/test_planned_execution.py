@@ -8,7 +8,7 @@ from heating_model import DEFAULT_MODEL
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None,probe_available=True,stored_floor=None,grid_sequence=None,real_planner=False):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None,probe_available=True,stored_floor=None,grid_sequence=None,real_planner=False,mode='Автоматичне керування'):
         app=HeatingClimate()
         self.created_app=app
         app.control_power_prior=reserve_prior
@@ -32,7 +32,7 @@ class PlannedExecutionTests(unittest.TestCase):
             **{'return':22},outside=11,target=22,lower=21.5,upper=22.5,
             night_target=21.5,night_lower=21,night_upper=22,monthly_budget=0,tariff=1.32).get(key,default)
         app.raw=lambda key,attribute=None:dict(start='23:00',end='07:00',sleep_start='23:00',sleep_end='07:00',
-            strategy='Тільки в дозволені години',armed='on',mode='Автоматичне керування',thermostat='heat').get(key)
+            strategy='Тільки в дозволені години',armed='on',mode=mode,thermostat='heat').get(key)
         outage=[None]
         if outage_sequence:
             app.cfg.update(outage_source='sensor.svitlo',outage_emergency='binary_sensor.emergency')
@@ -96,6 +96,12 @@ class PlannedExecutionTests(unittest.TestCase):
         self.assertEqual(self.cycle(grid='off')[0],['off'])
     def test_no_planned_heat_does_not_start(self):
         self.assertEqual(self.cycle(planned=False)[0],['off'])
+    def test_manual_pause_keeps_forecast_advisory_not_executing(self):
+        actions,status=self.cycle(mode='Спостереження')
+        self.assertEqual(actions,['observe'])
+        self.assertEqual(status['state'],'Спостереження')
+        self.assertEqual(self.created_app.memory['plan_execution']['status'],'advisory')
+        self.assertEqual(self.forecast_status['execution_state'],'advisory')
     def test_one_shot_keeps_existing_soft_coast_guard(self):
         self.assertEqual(self.cycle(planned=False,once=True)[0],['off'])
     def test_forecast_diagnostic_is_published_with_tolerated_missing_minutes(self):

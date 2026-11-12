@@ -1573,6 +1573,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         previous_reference=self.memory.get('plan_reference')
         forecast=None
         snapshot=None
+        plan_execution_state=('advisory' if not permitted or self.raw('mode') in ('Спостереження','Вимкнено')
+                              else 'fallback' if self.raw('mode')=='Штатний auto' else 'calculated')
         if forecast_quality and valid:
             forecast,reference=ready if background else stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
                           power_kw=3.0,previous=self.memory.get('plan_reference'))
@@ -1593,7 +1595,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 default=[dict(name='unavailable',available=False,hypothetical=True)])
             snapshot=self.remember_plan_inputs(now,room,floor,outside,fire,usable_weather,settings,forecast,previous_reference)
             self.memory['plan_reference']=reference
-            self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status='calculated')
+            self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status=plan_execution_state)
             panel_forecast=forecast_for_panel(forecast)
             self.publish('sensor.heating_forecast_outlook','Прогноз температури',
                 **forecast_outlook_for_panel(forecast,now,settings))
@@ -1615,7 +1617,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          local_weather_bias=round(weather_bias,2),
                          external_heat=((settings.get('environment') or {}).get('solar') or {}).get('observed_gain',0.),
                          uncertainty='Точність знижена; обережне планування' if environment_quality['degraded'] else 'Оцінка; калібрування триває',
-                         created_at=now.isoformat(),execution_state='calculated',outage_shifted=forecast["outage_shifted"],
+                         created_at=now.isoformat(),execution_state=plan_execution_state,outage_shifted=forecast["outage_shifted"],
                          plan_stable=forecast['plan_stable'],stability_reason=forecast['stability_reason'],
                          outage_preheat=forecast["outage_preheat"],outside_minutes=forecast["outside_minutes"],
                          comfort_shortfall=forecast["comfort_shortfall"],outage_status=forecast["outage_status"],
@@ -1697,7 +1699,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.publish("sensor.heating_coast_peak",round(peak,2) if peak is not None else "unavailable",
                      friendly_name="Клімат — оцінка інерційного піку",unit_of_measurement="°C",
                      device_class="temperature",validated=self.model.get("validated",False))
-        if forecast:self.memory['plan_execution'].update(status='intended',intended_action=action)
+        if forecast:self.memory['plan_execution'].update(
+            status='advisory' if action in ('observe','release') else 'fallback' if action=='fallback' else 'intended',
+            intended_action=action)
         self.publish_control_decision(action,reason,demand,thermostat,**control_attrs,
                      outage_preheat=preheat,outage_shifted=bool(forecast and forecast["outage_shifted"]),
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,
