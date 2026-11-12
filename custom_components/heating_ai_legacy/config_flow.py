@@ -3,14 +3,22 @@ from __future__ import annotations
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.core import callback
+from homeassistant.helpers import selector
 
 from .const import DOMAIN, SOURCE_UI, SOURCE_HINTS
+from .native_voltage import valid_policy
 
 
 class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
     """No side effects: installs a diagnostic native SHADOW beside V1."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return HeatingAIV1OptionsFlow(config_entry)
 
     async def async_step_user(self, user_input=None):
         """Require explicit consent to a non-actuating compatibility probe."""
@@ -76,3 +84,55 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
                 },
             },
         )
+
+
+class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
+    """Configure only the read-only voltage qualification band."""
+
+    def __init__(self, config_entry):
+        self.config_entry = config_entry
+
+    async def async_step_init(self, user_input=None):
+        if user_input is not None:
+            minimum = user_input.get("min_voltage_v")
+            maximum = user_input.get("max_voltage_v")
+            recovery = user_input.get("voltage_recovery_seconds", 180)
+            if not valid_policy(minimum, maximum, recovery):
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=self._schema(user_input),
+                    errors={"base": "invalid_voltage_band"},
+                )
+            return self.async_create_entry(title="", data={
+                "min_voltage_v": minimum,
+                "max_voltage_v": maximum,
+                "voltage_recovery_seconds": recovery,
+            })
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self._schema(self.config_entry.options),
+        )
+
+    @staticmethod
+    def _schema(current):
+        return vol.Schema({
+            vol.Required("min_voltage_v", default=current.get("min_voltage_v")):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=140, max=235, step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                    unit_of_measurement="V",
+                )),
+            vol.Required("max_voltage_v", default=current.get("max_voltage_v")):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=220, max=280, step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                    unit_of_measurement="V",
+                )),
+            vol.Required("voltage_recovery_seconds",
+                         default=current.get("voltage_recovery_seconds", 180)):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=30, max=900, step=30,
+                    mode=selector.NumberSelectorMode.BOX,
+                    unit_of_measurement="s",
+                )),
+        })
