@@ -100,6 +100,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "entry_id": entry.entry_id,
                 "room": entry.data["room"],
                 "entity_map": dict(entry.data.get("entity_map", {})),
+                "source_ids": dict(entry.data.get("source_ids", {})),
             },
             require_admin=True,
         )

@@ -220,6 +220,10 @@ class HeatingV1NativePanel extends HTMLElement {
       ...(config.entity_map || {}),
     };
     const roomId = config.room || ids.room;
+    const sources = {
+      ...(this._native?.source_ids || {}),
+      ...(config.source_ids || {}),
+    };
     const state = id => id && ha.states[id];
     const roomState = state(roomId);
     const current = num(roomState && roomState.state, -20, 65);
@@ -253,12 +257,13 @@ class HeatingV1NativePanel extends HTMLElement {
         }
       }
     }
-    const kwPhases = ['a','b','c'].map(phase =>
-      freshPower(state('sensor.energy_meter_kotel_potuzhnist_' + phase), now)
+    const kwPhases = ['kws_l1','kws_l2','kws_l3'].map((role,index) =>
+      freshPower(state(sources[role] ||
+        'sensor.energy_meter_kotel_potuzhnist_' + ['a','b','c'][index]), now)
     );
     const controller = state('sensor.heating_controller');
     const mode = state(ids.mode);
-    const thermostat = state('climate.kotel');
+    const thermostat = state(sources.thermostat || 'climate.kotel');
     const kv = this.shadowRoot.getElementById.bind(this.shadowRoot);
     kv('room').textContent = degrees(current);
     kv('target').textContent = degrees(num(prediction[0] && prediction[0].target, 10, 35) ??
@@ -274,12 +279,15 @@ class HeatingV1NativePanel extends HTMLElement {
       ? (kwPhases.reduce((a,b) => a+b, 0) / 1000).toFixed(1).replace('.', ',') + ' кВт'
       : 'Немає даних';
     const fire = state('sensor.heating_fireplace');
+    const physicalFire = state(sources.fireplace_temp);
+    const fireTemperature = num(physicalFire && physicalFire.state, -20, 65);
     kv('fire').textContent = fire && fire.state !== 'unavailable' &&
-      fire.state !== 'unknown' ? fire.state : 'Невідомо';
+      fire.state !== 'unknown' ? fire.state
+      : fireTemperature !== null ? degrees(fireTemperature) : 'Невідомо';
     const fan = state(ids.fan);
     kv('fan').textContent = fan && ['on','off'].includes(fan.state)
       ? fan.state === 'on' ? 'Працює' : 'Вимкнена' : 'Невідомо';
-    const grid = state('input_select.indikator_merezhi_stan');
+    const grid = state(sources.grid || 'input_select.indikator_merezhi_stan');
     kv('grid').textContent = grid && grid.state === 'Наявна мережа'
       ? 'Є' : grid && grid.state === 'Відсутня мережа' ? 'Немає' : 'Невідомо';
     kv('mode').textContent = mode || controller
