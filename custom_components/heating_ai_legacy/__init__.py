@@ -22,6 +22,7 @@ from .native_runtime import V1ShadowCoordinator
 from .native_api import register as register_preview_api
 from .native_persistence import bootstrap
 from .native_model import load as load_model_checkpoint
+from .native_floor import load as load_floor_checkpoint
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -36,7 +37,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = V1ShadowCoordinator(
         hass, dict(room=entry.data["room"], outside=entry.data["outside"]), entry
     )
-    await coordinator.async_config_entry_first_refresh()
     # Only private native .storage is created. The old AppDaemon state.json,
     # KWS counters, model, automation ownership and heater are never touched.
     data_directory = hass.config.path(".storage", DOMAIN, entry.entry_id)
@@ -47,14 +47,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         checkpoint = await hass.async_add_executor_job(
             load_model_checkpoint, data_directory
         )
+        floor_checkpoint = await hass.async_add_executor_job(
+            load_floor_checkpoint, data_directory
+        )
     except Exception as exc:
         await coordinator.close()
         raise ConfigEntryNotReady(
             "V1+ private state or safety journal unavailable; no command authority"
         ) from exc
     coordinator.attach_private_state(
-        native_store, ledger, journal, data_directory, checkpoint
+        native_store, ledger, journal, data_directory,
+        checkpoint, floor_checkpoint,
     )
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as exc:
+        await coordinator.close()
+        raise ConfigEntryNotReady(
+            "Native V1 source refresh failed; physical control remains disabled"
+        ) from exc
     assets = Path(__file__).parent / "assets"
     panel = assets / "panel.js"
     if not panel.is_file():

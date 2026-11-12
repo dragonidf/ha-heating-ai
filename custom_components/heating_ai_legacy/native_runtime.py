@@ -25,6 +25,7 @@ from .native_outages import read_calendar
 from .native_safety import observe as observe_safety
 from .native_persistence import observe_room
 from .native_model import remember as save_learned_model
+from .native_floor import advance as advance_floor, remember as save_floor
 from .native_fan_sources import snapshot as fan_snapshot
 
 REQUIRED_COEFFICIENTS = (
@@ -173,6 +174,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.source_ids = dict(entry.data.get("source_ids", {}))
         self.model_store = None
         self.model_checkpoint = None
+        self._floor_state = None
         self._fan_state = None
         self._storage_directory = None
         self.durable_ledger = None
@@ -192,13 +194,15 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_calendar_request = 0.0
 
     def attach_private_state(self, store, ledger, status: dict,
-                             directory=None, checkpoint=None) -> None:
+                             directory=None, checkpoint=None,
+                             floor_observer=None) -> None:
         """Attach state only after checksum and reboot-fence verification."""
         if status.get("fenced") is not True:
             raise ValueError("Refusing unfenced native command journal")
         self.model_store = store
         self._storage_directory = directory
         self.model_checkpoint = checkpoint
+        self._floor_state = floor_observer
         self.durable_ledger = ledger
         self.ledger_summary = {
             "revision": status.get("revision"),
@@ -209,7 +213,8 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _remember_read_only(self, at: float, room: float,
                                   model: dict, model_at: float,
-                                  kws_total_kwh=None, kws_power_w=None) -> None:
+                                  kws_total_kwh=None, kws_power_w=None,
+                                  floor_state=None) -> None:
         try:
             # Execute the one explicitly qualified KWS transaction off-loop.
             await self.hass.async_add_executor_job(
@@ -222,6 +227,10 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.model_checkpoint = await self.hass.async_add_executor_job(
                     save_learned_model, self._storage_directory, model, model_at
                 )
+                if floor_state is not None:
+                    await self.hass.async_add_executor_job(
+                        save_floor, self._storage_directory, floor_state
+                    )
         except Exception:
             # Archive failure must be visible; never repair or overwrite an
             # unknown/corrupted file automatically.
@@ -375,7 +384,11 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
         }
         try:
-            snapshot = sample_v1_inputs(self.hass, self.mapping)
+            snapshot = sample_v1_inputs(
+                self.hass, self.mapping,
+                model_checkpoint=self.model_checkpoint,
+                floor_observer=self._floor_state,
+            )
         except (ValueError, KeyError):
             # The UI still explains why independent sources are missing.
             # Unqualified old readings never become current measurements.
@@ -386,8 +399,35 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 forecast_qualified=False,
                 source="original_v1_thermal_model",
             )
+        # Continue the original V1 slab observer in parallel using genuine
+        # KWS readings. Never invent boiler watts when KWS is unavailable.
+        if (safety.get("return_c") is not None
+            and safety.get("kws_power_w") is not None
+            and type(safety.get("grid")) is bool):
+            try:
+                self._floor_state = advance_floor(
+                    self._floor_state, time.time(),
+                    snapshot["room"], safety["return_c"],
+                    safety["kws_power_w"], safety["grid"],
+                    snapshot["parameters"], safety.get("kws_total_kwh"),
+                    legacy_estimate=(
+                        snapshot["floor"]
+                        if self._floor_state is None and
+                        snapshot["floor_provenance"] == "legacy_floor"
+                        else None
+                    ),
+                )
+                if snapshot["floor_provenance"] == "native_floor_inventory":
+                    snapshot["floor"] = self._floor_state["estimate"]
+            except ValueError:
+                self._storage_fault = "native_floor_inputs_unqualified"
         report = await self.hass.async_add_executor_job(calculate_v1_coast, snapshot)
         report.update(safety_status)
+        report["model_provenance"] = snapshot["model_provenance"]
+        report["floor_provenance"] = snapshot["floor_provenance"]
+        report["native_floor_c"] = (
+            self._floor_state.get("estimate") if self._floor_state else None
+        )
         intent = evaluate_legacy_intent(
             time.time(), self.native_plan, safety_status,
             model_validated=True,  # sample_v1_inputs validated the active source
@@ -407,6 +447,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         snapshot["learned_model_source"], snapshot["learned_model_at"],
                         safety.get("kws_total_kwh"),
                         safety.get("kws_power_w"),
+                        dict(self._floor_state) if self._floor_state else None,
                     ),
                     "heating_ai_v1_record_ha_cache_only",
                 )
