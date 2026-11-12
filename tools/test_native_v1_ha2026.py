@@ -125,8 +125,10 @@ def main() -> None:
                         "floor_air": .0283966, "room_loss": .008192,
                         "floor_decay": .248832, "heat_gain": 1.0368,
                         "fire_gain": .025,
+                        "version": 6,
+                        "validated": "true",
                     }
-                }, age_seconds=150),
+                }, age_seconds=21600),
                 "sensor.heating_forecast": row("21.03", {
                     "plan_id": "synthetic-forecast-ID",
                 }),
@@ -135,6 +137,10 @@ def main() -> None:
             snapshot = sample_v1_inputs(
                 hass, {"room": "sensor.room", "outside": "sensor.outside"}
             )
+            # Learned model is versioned calibration, not a physical
+            # sensor: a six-hour-old unchanged calibration is valid.
+            assert snapshot["parameters"]["heat_gain"] == 1.0368
+            assert snapshot["learned_model_source"]["version"] == 6
             result = calculate_v1_coast(snapshot)
             assert result["mode"] == "COMPATIBILITY_SHADOW"
             assert result["physical_commands_enabled"] is False
