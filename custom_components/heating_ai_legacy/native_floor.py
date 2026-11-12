@@ -47,7 +47,8 @@ def _validate(state: Any) -> dict:
 
 def advance(previous: dict | None, stamp: float, room: float, probe: float,
             power_w: float, grid: bool | None,
-            model: dict, energy_kwh: float | None) -> dict:
+            model: dict, energy_kwh: float | None,
+            *, legacy_estimate: float | None = None) -> dict:
     """Propose next floor inventory; unavailable KWS cannot be coerced to 0."""
     stamp=_numeric(stamp,1,1e12)
     room=_numeric(room,-20,55)
@@ -71,8 +72,14 @@ def advance(previous: dict | None, stamp: float, room: float, probe: float,
         "on" if grid else "off",model,energy_kwh=energy_kwh,
     )
     state=_validate(state)
-    state["estimate"]=_numeric(estimated,-20,90)
-    return state
+    if previous is None and legacy_estimate is not None:
+        # During overlap, inherit the real observer inventory rather than
+        # resetting it to a stagnant return pipe at cutover.
+        state["estimate"]=_numeric(legacy_estimate,-20,90)
+        state["source"]="qualified_legacy_floor_seed"
+    else:
+        state["estimate"]=_numeric(estimated,-20,90)
+    return _validate(state)
 
 
 def load(directory: str | Path) -> dict | None:
