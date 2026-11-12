@@ -186,3 +186,56 @@ V2, disable only legacy heating writer/watchdog, activate native entry, verify
 fresh cycle/KWS/UI/permissions. Preserve legacy files/helpers for owner cleanup.
 Do not claim package install equals native production control. No equipment
 commands or legacy disable have been issued in this install step.
+
+### 13.11.2026 — DEPLOYED: native V1 0.4.0 replaces V2
+
+Runtime entry 01M78Y3WSYWGH6RN1FME6587DP loaded, unique native_v1_controller.
+Marketplace repo1421772152 installed immutable v0.4.0. sensor.heating_ui=0.4.0,
+release_verified=true/runtime=native_v1, fresh native heartbeat across multiple
+cycles, model6 and 4032 samples/coefficient values preserved. Automatic mode and
+armed=on restored; healthy control/storage, Recorder verified_same_state_attributes.
+Current decision waiting per plan; KWS measured ~2W/stage off. This is not a
+new physical relay/HEAT test, and no synthetic voltage/grid was injected.
+
+Private migration: installation4ce529c0e4db4855a07f573ced347aa5; 55729 files,
+383883334 bytes copied and each source/destination checksum verified. Model6,
+original-state and all telemetry/decision archive retained. State SHA256
+50171b02f62db4b9d2571e924879ab85fbdb0f628c76c762b1bd12b0ad8c6e19;
+manifest SHA256 0ef37a1c6ab6a6530fb887b2c1ece968e9be077ad49bdbe0c4669543558dee74.
+Private rollback config/automation/permissions backup at Core
+/config/heating-v1-handoff-20261113.json (File editor /homeassistant/...);
+private native data Core /config/heating_ai_v1/<installation_id>.
+Never upload private data. Full fresh telemetry numerical backtest is not claimed;
+byte preservation plus earlier real saved-reference parity and CI are evidence.
+
+Legacy heating YAML has disable:true and was explicitly stopped through the
+AppDaemon documented admin/app/stop API: YAML edit alone did not stop its live
+callbacks. Terminate logged and old heartbeat ceased before import/activation.
+Shared AppDaemon/Sky Radar remain running. Legacy watchdog off, legacy updater
+left off. V2 entry01M77EWFY07YYBD33TWCNGW3TZ disabled/not_loaded, retained.
+No legacy files/helpers/entities were deleted.
+
+Night fan automation1791057373005 now sends only heating_fan_night_request900:
+its schedule and grid condition are byte-equivalent on readback. Removed its
+parallel direct fan path so native manual hold/STOP owns physical arbitration.
+Original automation config is in private rollback backup. Temporary exporter
+heating_native_migration_once has disable:true and was explicitly stopped;
+File editor enforce_basepath=true, stop succeeded, readback state error/not running.
+
+Energy alias conflict found live: old utility_meter entry
+01M4B9MAVHVBENEW37K7TGV8H7 also wrote sensor.kotel_spozhita_energiia from
+sensor.heating_energy_total. It was disabled/unloaded (not removed/config edited).
+Native still publishes both IDs; readback both633.5573401398849kWh with the same
+native context. Daily/monthly/yearly utility meters remain enabled. Exact inverse:
+re-enable this entry only after stopping native writer if rolling back. A complete
+post-cutover Recorder-rate/statistics study is still a follow-up, not proven PASS.
+
+Panel registered /heating-ai-v1, title Опалення, versioned module hash0b4bf6563865149d.
+Browser/mobile/light-dark/accessibility CI PASS; actual registered panel confirmed
+by get_panels. No screenshot of user's actual phone was obtained.
+
+E8 release/store installation DONE. E9 core single-writer cutover DONE with the
+above evidence limits. Next agent: start from latest main and LIVE state; do not
+repeat migration/enable old writer. Owner will separately delete old V1/unneeded
+entities. First follow-up: compare post-cutover Recorder write rates and energy
+monotonicity over available history; inspect actual installed panel if needed.

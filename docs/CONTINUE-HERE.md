@@ -1,3 +1,16 @@
+> DEPLOYED — 13.11.2026: native V1 0.4.0 ACTIVE in HA, entry
+> 01M78Y3WSYWGH6RN1FME6587DP. Start from latest main + LIVE state.
+> Do NOT repeat migration or re-enable the old writer. Legacy V1 stopped and
+> disabled, watchdog off, V2 disabled/not_loaded, all retained for owner cleanup.
+> Model6/4032 samples and 55729 files (~384MB) preserved with checksums.
+> Automatic mode/armed on; fresh native heartbeat, healthy diagnostics; panel
+> Опалення at /heating-ai-v1. Full details, rollback and evidence limits in the
+> final DEPLOYED work-log entry. Old utility_meter total-alias writer disabled
+> to prevent competing energy updates; daily/monthly/yearly meters retained.
+> Remaining follow-ups: Recorder write-rate/energy monotonicity and actual live
+> panel rendering; no new physical relay test/full raw telemetry replay claimed.
+> Everything below this banner is historical preparation, not the current state.
+
 > АКТУАЛЬНА ТОЧКА — 13.11.2026: PR25 merged у main, commit
 > 327b2ba0ac8ae65f170d34fb32a49fe48766cc31. Починати з latest main,
 > не з робочої гілки. Нижчі згадки draft/старих CI — історичні.
