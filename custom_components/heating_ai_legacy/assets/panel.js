@@ -102,7 +102,7 @@ const stylesheet = [
   '.actual{stroke:#63d3b4;stroke-width:3}.forecast{stroke:#77a8ff;stroke-width:3;stroke-dasharray:8 5}',
   '.native{stroke:#f4a0bf;stroke-width:2.6;stroke-dasharray:10 4}',
   '.target{stroke:#ffbf6b;stroke-width:2;stroke-dasharray:3 6}.lower{stroke:#b18fff;stroke-width:1.5;stroke-dasharray:4 4}',
-  '.heat{fill:#3fb48a;fill-opacity:.15}.outage{fill:#c27e82;fill-opacity:.18}.now{stroke:#dbe3f0;stroke-width:1.5;stroke-dasharray:4 5}',
+  '.heat{fill:#3fb48a;fill-opacity:.15}.heat-native{fill:#f4a0bf;fill-opacity:.11;stroke:#f4a0bf;stroke-opacity:.5;stroke-dasharray:5 5}.outage{fill:#c27e82;fill-opacity:.18}.now{stroke:#dbe3f0;stroke-width:1.5;stroke-dasharray:4 5}',
   '.note,.notice{font-size:12px;color:#aabbd0;line-height:1.6}.note{margin:9px 0 2px}.notice{padding:12px 15px;margin-top:13px}',
   '.error{color:#f2b390}.right{display:flex;flex-direction:column;gap:5px;align-items:flex-end}',
   '@media(max-width:650px){.wrap{padding:12px 9px 36px}.stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.stat{padding:12px}.stat strong{font-size:20px}.chartbox{padding:13px 9px}.key{gap:10px}.brand{font-size:18px}}'
@@ -213,9 +213,13 @@ class HeatingV1NativePanel extends HTMLElement {
     const now = Date.now() / 1000;
     const since = now - 6 * HOUR, until = now + 24 * HOUR;
     const ui = ha.states['sensor.heating_ui'];
-    const ids = (ui && ui.attributes && ui.attributes.entities)
-      || (this._native && this._native.entity_map) || {};
-    const roomId = ids.room;
+    const config=this._panel?.config || {};
+    const ids={
+      ...(ui?.attributes?.entities || {}),
+      ...(this._native?.entity_map || {}),
+      ...(config.entity_map || {}),
+    };
+    const roomId = config.room || ids.room;
     const state = id => id && ha.states[id];
     const roomState = state(roomId);
     const current = num(roomState && roomState.state, -20, 65);
@@ -233,6 +237,7 @@ class HeatingV1NativePanel extends HTMLElement {
     const fallback = fresh ? readPts(attrs.actual_curve, since, now + 60, true) : [];
     const history = this._history.length ? this._history : fallback;
     const windows = fresh && prediction.length > 1 ? segments(attrs.heat_segments, now, until) : [];
+    const nativeWindows = nativeValid ? segments(nativePlan.heat_segments, now, until) : [];
     const outageSchedule = state('sensor.heating_outage_schedule');
     const outages = readOutages(outageSchedule, now, until);
     if (!outages.length && this._native?.outage_preview?.outages) {
@@ -257,10 +262,14 @@ class HeatingV1NativePanel extends HTMLElement {
     const kv = this.shadowRoot.getElementById.bind(this.shadowRoot);
     kv('room').textContent = degrees(current);
     kv('target').textContent = degrees(num(prediction[0] && prediction[0].target, 10, 35) ??
+      num(nativeCurve[0] && nativeCurve[0].target, 10, 35) ??
       num(state(ids.target) && state(ids.target).state, 10, 35));
     kv('boiler').textContent = thermostat ? String(thermostat.state).toUpperCase() : 'Невідомо';
     kv('plan').textContent = fresh && prediction.length > 1
-      ? String(windows.length) + ' вікон' : 'Недоступний';
+      ? String(windows.length) + ' вікон V1'
+      : nativeValid && nativeCurve.length > 1
+      ? String(nativeWindows.length) + ' умовних V1+'
+      : 'Недоступний';
     kv('kws').textContent = kwPhases.every(v => v !== null)
       ? (kwPhases.reduce((a,b) => a+b, 0) / 1000).toFixed(1).replace('.', ',') + ' кВт'
       : 'Немає даних';
@@ -273,21 +282,28 @@ class HeatingV1NativePanel extends HTMLElement {
     const grid = state('input_select.indikator_merezhi_stan');
     kv('grid').textContent = grid && grid.state === 'Наявна мережа'
       ? 'Є' : grid && grid.state === 'Відсутня мережа' ? 'Немає' : 'Невідомо';
-    kv('mode').textContent = 'Режим V1: ' + (mode ? mode.state : 'невідомо') +
-      ' · ' + (controller ? controller.state : 'статус невідомий');
+    kv('mode').textContent = mode || controller
+      ? 'Режим V1: ' + (mode ? mode.state : 'невідомо') +
+        ' · ' + (controller ? controller.state : 'статус невідомий')
+      : 'V1+ SHADOW · керування вимкнене';
     kv('source').textContent = prediction.length > 1
       ? 'Джерело: чинний V1 · ' + time(created) + ' · план ' +
         (attrs.execution_state || 'невідомий') + ' · ' +
         (num(attrs.planned_kwh, 0, 200) === null ? 'енергія невідома'
           : num(attrs.planned_kwh, 0, 200).toFixed(1).replace('.', ',') + ' кВт·год') +
         '. Планові вікна не підтверджують виконання.'
-      : 'Немає актуального розрахунку V1; прогноз не домальовується.';
+      : nativeValid && nativeCurve.length > 1
+      ? 'Незалежний прогноз V1+ · умовний розрахунок без виконання. ' +
+        'Розраховані інтервали не є фізичними командами.'
+      : 'Немає актуального розрахунку; майбутня температура не домальовується.';
     const canvas = this.shadowRoot.querySelector('.chart');
     while (canvas.firstChild) canvas.removeChild(canvas.firstChild);
     const all = history.concat(prediction, nativeCurve);
     if (current !== null) all.push({ at: now, temperature: current });
     const temps = all.map(p => p.temperature).filter(p => p !== null);
-    for (const p of prediction) for (const k of ['target', 'lower']) if (p[k] !== null) temps.push(p[k]);
+    for (const p of prediction.concat(nativeCurve))
+      for (const k of ['target', 'lower'])
+        if (p[k] !== null && p[k] !== undefined) temps.push(p[k]);
     const ymin = temps.length ? Math.floor((Math.min(...temps) - .4) * 2) / 2 : 19;
     const ymax = temps.length ? Math.max(ymin + 1, Math.ceil((Math.max(...temps) + .4) * 2) / 2) : 23;
     const X0 = 63, X1 = 1057, Y0 = 31, Y1 = 314;
@@ -306,13 +322,17 @@ class HeatingV1NativePanel extends HTMLElement {
       x:x(w.a), y:Y0, width:Math.max(0, x(w.b)-x(w.a)),
       height:Y1-Y0, class:'heat'
     });
+    for (const w of nativeWindows) add(canvas, 'rect', {
+      x:x(w.a), y:Y0, width:Math.max(0, x(w.b)-x(w.a)),
+      height:Y1-Y0, class:'heat-native'
+    });
     add(canvas, 'line', { x1:x(now), x2:x(now), y1:Y0, y2:Y1+7, class:'now' });
     add(canvas, 'text', { x:x(now)+7, y:Y0 - 7 }, 'Зараз');
     plot(canvas, history, 'temperature', x, y, 'actual', 90*60);
     plot(canvas, prediction, 'temperature', x, y, 'forecast', 90*60);
     plot(canvas, nativeCurve, 'temperature', x, y, 'native', 90*60);
-    plot(canvas, prediction, 'target', x, y, 'target', 90*60);
-    plot(canvas, prediction, 'lower', x, y, 'lower', 90*60);
+    plot(canvas, prediction.length ? prediction : nativeCurve, 'target', x, y, 'target', 90*60);
+    plot(canvas, prediction.length ? prediction : nativeCurve, 'lower', x, y, 'lower', 90*60);
     if (current !== null && roomState && roomState.last_updated) {
       add(canvas, 'circle', { cx:x(now), cy:y(current), r:4.5, fill:'#63d3b4' });
     }

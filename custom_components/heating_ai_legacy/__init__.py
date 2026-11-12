@@ -96,7 +96,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             sidebar_title="Heating AI V1+",
             sidebar_icon="mdi:chart-line",
             module_url=f"/heating_ai_legacy/assets/panel.js?v={bundle}",
-            config={"entry_id": entry.entry_id},
+            config={
+                "entry_id": entry.entry_id,
+                "room": entry.data["room"],
+                "entity_map": dict(entry.data.get("entity_map", {})),
+            },
             require_admin=True,
         )
         panel_registered = True
