@@ -48,6 +48,20 @@ class BackgroundControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(app.poll_calculation('plan','key',lambda:6))
         self.assertEqual(len(app.submitted),1)
 
+    async def test_timed_out_worker_is_not_duplicated_and_late_result_is_dropped(self):
+        app=self.app()
+        with patch('heating_recovery.time.time',return_value=100.):
+            app.poll_calculation('plan','key',lambda:6)
+        args,kwargs=app.submitted[0]
+        with patch('heating_recovery.time.time',return_value=161.):
+            self.assertIsNone(app.poll_calculation('plan','key',lambda:7))
+        self.assertEqual(len(app.submitted),1)
+        await kwargs['callback']({'result':args[0](*args[1:])})
+        with patch('heating_recovery.time.time',return_value=162.):
+            self.assertIsNone(app.poll_calculation('plan','key',lambda:7))
+        self.assertEqual(len(app.submitted),2)
+        self.assertEqual(app.calculation_stale_results['plan']['job_id'],args[2])
+
 
 class BackgroundTickSafetyTests(unittest.TestCase):
     def app(self):

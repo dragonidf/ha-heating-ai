@@ -83,3 +83,17 @@ class KWSTests(unittest.TestCase):
         self.at+=885;self.row('energiia',50,'kWh');self.tick(a)
         self.at+=15;self.row('energiia',51.5,'kWh');self.tick(a)
         self.assertEqual(a.val('energy'),101.5)
+
+    def test_source_quality_separates_value_time_liveness_unit_and_provenance(self):
+        a=self.app();self.row('potuzhnist_a',3,'kW',age=12)
+        self.assertEqual(self.tick(a),3000)
+        row=a.kws_source_quality['sensor.energy_meter_kotel_potuzhnist_a']
+        self.assertEqual(row['value_reported_at'],self.at-12)
+        self.assertEqual(row['observed_at'],self.at)
+        self.assertEqual(row['unit'],'kW')
+        self.assertEqual(row['quality'],'measured')
+        self.assertTrue(row['online']);self.assertTrue(row['finite'])
+        self.assertFalse(row['raw_ack'])
+        self.row('potuzhnist_a',3,'W')
+        self.assertIsNone(self.tick(a))
+        self.assertEqual(a.kws_source_quality['sensor.energy_meter_kotel_potuzhnist_a']['reason'],'unit_mismatch')

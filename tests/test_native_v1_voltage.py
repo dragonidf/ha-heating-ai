@@ -121,6 +121,14 @@ class VoltageTests(unittest.TestCase):
         self.assertFalse(result["voltage_qualified"])
         self.assertEqual(guard.evaluate(1130.,True,[230.,230.,230.],**kw)["status"],"NORMAL")
 
+    def test_same_loop_timestamp_does_not_reclose_a_recovered_gate(self):
+        guard=self.module.VoltageGuard()
+        guard.evaluate(1000.,True,[230.,230.,230.])
+        self.assertTrue(guard.evaluate(1030.,True,[230.,230.,230.])["voltage_qualified"])
+        repeated=guard.evaluate(1030.,True,[230.,230.,230.])
+        self.assertEqual(repeated["status"],"NORMAL")
+        self.assertTrue(repeated["voltage_qualified"])
+
 
 if __name__=="__main__":
     unittest.main()

@@ -133,21 +133,46 @@ class Hass:
         if domain != "persistent_notification" and data.get("entity_id") not in targets:
             raise PermissionError("Entity outside configured controller scope")
 
-        async def send():
+        async def permitted():
             if not self._running or not self._writer:
                 raise PermissionError("Controller writer is closed")
             guard = getattr(self, "async_command_allowed", None)
             if guard is not None and not guard(domain, action, data):
                 # A voltage change between planning and dispatch must also stop heat.
-                if (domain == "climate" and not
-                        (getattr(self, "voltage_status", None) or {}).get("voltage_qualified", False)):
+                voltage = getattr(self, "voltage_status", None)
+                if (domain == "climate" and voltage is not None
+                        and voltage.get("voltage_qualified") is False):
                     await self.hass.services.async_call("climate", "set_hvac_mode", {
                         "entity_id": self.args["thermostat"], "hvac_mode": "off",
                     }, blocking=True, context=self._context)
                 raise PermissionError("Equipment command blocked by safety interlock")
+
+        # The first pass is memory-only and happens before disk evidence. The
+        # second pass closes changes between PREPARED and the HA service call.
+        asyncio.run_coroutine_threadsafe(permitted(), self.hass.loop).result(30)
+        evidence = None
+        prepare = getattr(self, "prepare_equipment_command", None)
+        if domain in ("climate", "fan") and prepare is not None:
+            evidence = prepare(domain, action, data)
+            getattr(self, "mark_equipment_command_sent")(evidence)
+
+        async def send():
+            await permitted()
             await self.hass.services.async_call(domain, action, data, blocking=True,
                                                context=self._context)
-        return asyncio.run_coroutine_threadsafe(send(), self.hass.loop).result(30)
+            if evidence is not None:
+                evidence["service_completed_at"] = datetime.now(timezone.utc).timestamp()
+            observe = getattr(self, "async_equipment_command_echo", None)
+            return observe(domain, action, data, evidence) if observe is not None else None
+        try:
+            observed = asyncio.run_coroutine_threadsafe(send(), self.hass.loop).result(30)
+        except BaseException:
+            if evidence is not None:
+                getattr(self, "discard_pending_equipment_command", lambda *_: None)(evidence)
+            raise
+        if evidence is not None:
+            getattr(self, "record_equipment_command_echo")(evidence, observed)
+        return None
 
     def listen_state(self, function, entity_id, attribute=None, **kwargs):
         token = uuid4().hex

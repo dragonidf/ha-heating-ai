@@ -77,6 +77,11 @@ class State:
         return dict(entity_id=self.entity_id, state=self.state, attributes=self.attributes,
                     last_updated=self.last_updated.isoformat(), last_changed=self.last_updated.isoformat())
 
+    def replace(self, value, *, context):
+        self.state = str(value)
+        self.context = SimpleNamespace(id=context)
+        self.last_updated = self.last_reported = self.last_updated.replace(microsecond=self.last_updated.microsecond+1)
+
 
 class FakeHA:
     def __init__(self):
@@ -107,6 +112,27 @@ class FakeHA:
         return await asyncio.to_thread(function, *args)
 
 
+class FakeLedger:
+    def __init__(self):
+        self.calls=[]
+
+    def prepare(self, command_id, action, request, **identity):
+        self.calls.append(("PREPARED",command_id,action,request))
+        return {"created":True,"revision":identity["expected_revision"]+1}
+
+    def record_sent(self, command_id, **identity):
+        self.calls.append(("SENT",command_id))
+        return identity["expected_revision"]+1
+
+    def record_ha_echo(self, command_id, **identity):
+        self.calls.append(("HA_ECHO",command_id))
+        return identity["expected_revision"]+1
+
+    def complete_safe_stop(self, command_id, **identity):
+        self.calls.append(("UNFENCED",command_id))
+        return identity["expected_revision"]+1
+
+
 class ProductionTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -123,6 +149,8 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
     def config(self):
         return dict(thermostat="climate.boiler", armed="input_boolean.armed",
                     mode="input_select.mode", allow_actuation=True,
+                    fan="fan.circulation", fan_control="input_boolean.fan_control",
+                    fan_mode="input_select.fan_mode",
                     grid_presence_helper="sensor.grid", voltage_entities=["sensor.l1", "sensor.l2", "sensor.l3"])
 
     def controller(self, component):
@@ -130,6 +158,8 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
         cfg = self.config()
         for key, value in (("climate.boiler", "heat"), ("input_boolean.armed", "on"),
                            ("input_select.mode", "Автоматичне керування"),
+                           ("fan.circulation", "off"), ("input_boolean.fan_control", "on"),
+                           ("input_select.fan_mode", "Авто"),
                            ("sensor.grid", "Наявна мережа"), ("sensor.l1", 230),
                            ("sensor.l2", 230), ("sensor.l3", 230)):
             hass.rows[key] = State(key, value, {"current_temperature": 22, "temperature": 24})
@@ -139,6 +169,8 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
         app.statefile = self.root / "working-state.json"
         app._running = app._writer = True
         app.next_compute = 0
+        app.attach_command_ledger(FakeLedger(),dict(revision=0,owner_id="fixture-owner",
+            boot_id="fixture-boot",owner_epoch=1,fenced=False))
         return hass, app
 
     async def test_voltage_trip_bypasses_minimum_on_and_blocks_auto_dispatch(self):
@@ -210,6 +242,12 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
     async def test_manual_auto_between_setpoint_and_heat_rejects_old_heat_without_overriding_auto(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
+            manual = app.async_manual_snapshot()
+            app.memory.update(native_manual_epoch=1,
+                              native_manual_signature=manual["signature"])
+            app._dispatch_manual_epoch = 1
+            app._dispatch_manual_signature = manual["signature"]
+            app._dispatch_action = "heat"
             with patch.object(component.time, "time", return_value=1000):
                 app.async_voltage_status()
             with patch.object(component.time, "time", return_value=1030):
@@ -230,6 +268,12 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
     async def test_disarmed_dispatch_rejects_positive_setpoint_but_allows_lowering_target(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
+            manual = app.async_manual_snapshot()
+            app.memory.update(native_manual_epoch=1,
+                              native_manual_signature=manual["signature"])
+            app._dispatch_manual_epoch = 1
+            app._dispatch_manual_signature = manual["signature"]
+            app._dispatch_action = "heat"
             with patch.object(component.time, "time", return_value=1000):
                 app.async_voltage_status()
             hass.rows["input_boolean.armed"].state = "off"
@@ -241,6 +285,41 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(app.call_service, "climate/set_temperature",
                                         entity_id="climate.boiler", temperature=20)
                 self.assertEqual(hass.services.async_call.await_count, 1)
+
+    async def test_change_back_to_automatic_still_invalidates_stale_heat_dispatch(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.memory["native_manual_epoch"] = 7
+            app.memory["native_manual_signature"] = app.async_manual_snapshot()["signature"]
+            app._dispatch_manual_epoch = 7
+            app._dispatch_manual_signature = app.async_manual_snapshot()["signature"]
+            app._dispatch_action = "heat"
+            with patch.object(component.time, "time", return_value=1000):
+                app.async_voltage_status()
+            hass.rows["input_select.mode"].replace("Штатний auto", context="manual-auto")
+            hass.rows["input_select.mode"].replace("Автоматичне керування", context="manual-back")
+            with patch.object(component.time, "time", return_value=1030):
+                with self.assertRaises(PermissionError):
+                    await asyncio.to_thread(app.call_service, "climate/set_hvac_mode",
+                                            entity_id="climate.boiler", hvac_mode="heat")
+            hass.services.async_call.assert_not_called()
+
+    async def test_blocked_planner_cannot_send_after_manual_round_trip(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            parent = component.HeatingClimate
+            def stale_plan(action, once):
+                hass.rows["input_select.mode"].replace("Штатний auto", context="manual-auto")
+                hass.rows["input_select.mode"].replace("Автоматичне керування", context="manual-back")
+                app.call_service("climate/set_hvac_mode", entity_id="climate.boiler", hvac_mode="heat")
+            with patch.object(component.time, "time", return_value=1000):
+                app.async_voltage_status()
+            with patch.object(component.time, "time", return_value=1030), \
+                    patch.object(parent, "apply_action", side_effect=stale_plan):
+                with self.assertRaises(PermissionError):
+                    await asyncio.to_thread(app.apply_action, "heat", False)
+            hass.services.async_call.assert_not_called()
+            self.assertGreaterEqual(app.memory["native_manual_epoch"], 1)
 
     async def test_callbacks_are_serial_and_errors_from_services_are_observable(self):
         with package(self.root / "package") as (component, _):
@@ -255,6 +334,68 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             hass.services.async_call.side_effect = RuntimeError("HA refused service")
             with self.assertRaisesRegex(RuntimeError, "HA refused"):
                 await asyncio.to_thread(app.call_service, "persistent_notification/create", message="test")
+
+    async def test_failed_service_cannot_later_borrow_a_manual_state_echo(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            hass.services.async_call.side_effect = RuntimeError("HA refused service")
+            with self.assertRaisesRegex(RuntimeError, "HA refused"):
+                await asyncio.to_thread(app.call_service, "climate/set_hvac_mode",
+                                        entity_id="climate.boiler", hvac_mode="off")
+            self.assertEqual(app.memory["native_command_evidence"]["stage"], "SENT")
+            self.assertFalse(app._pending_command_evidence)
+            hass.rows["climate.boiler"].replace("off", context="manual-user")
+            app.command_echo_changed()
+            self.assertNotIn("HA_ECHO", [call[0] for call in app.command_ledger.calls])
+
+    async def test_equipment_gateway_records_prepared_sent_echo_and_safe_stop(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            await asyncio.to_thread(app.call_service, "climate/set_hvac_mode",
+                                    entity_id="climate.boiler", hvac_mode="off")
+            stages=[call[0] for call in app.command_ledger.calls]
+            self.assertEqual(stages,["PREPARED","SENT","HA_ECHO","UNFENCED"])
+            self.assertEqual(app.command_ledger.calls[0][2],"STOP")
+            self.assertFalse(app.command_ledger_status["fenced"])
+
+    async def test_raw_settings_event_is_not_registered_in_native_production(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            token = await asyncio.to_thread(app.listen_event, app.system_settings_changed,
+                                            "heating_system_settings")
+            self.assertIsNone(token)
+            self.assertFalse(hass.listeners)
+
+    async def test_external_fan_change_between_plan_and_dispatch_is_not_overwritten(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            fan = app.async_fan_snapshot()
+            app._fan_dispatch_signature = fan["permissions"]
+            app._fan_dispatch_device_signature = fan["device"]
+            app._fan_dispatch_epoch = 0
+            hass.rows["fan.circulation"].replace("on", context="external-manual")
+            hass.rows["fan.circulation"].attributes["percentage"] = 72
+            with self.assertRaises(PermissionError):
+                await asyncio.to_thread(app.call_service, "fan/turn_off",
+                                        entity_id="fan.circulation")
+            hass.services.async_call.assert_not_called()
+
+    async def test_persisted_external_fan_hold_clears_only_on_explicit_fan_choice(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.memory["native_fan_device_signature"] = app.async_fan_snapshot()["device"]
+            hass.rows["fan.circulation"].replace("on", context="external-manual")
+            await asyncio.to_thread(app.fan_state_changed)
+            self.assertTrue(app.memory["native_fan_manual_hold"])
+            await asyncio.to_thread(app.fan_permission_changed)
+            self.assertNotIn("native_fan_manual_hold",app.memory)
+            fan = app.async_fan_snapshot()
+            app._fan_dispatch_signature = fan["permissions"]
+            app._fan_dispatch_device_signature = fan["device"]
+            app._fan_dispatch_epoch = app.memory["native_fan_manual_epoch"]
+            await asyncio.to_thread(app.call_service, "fan/turn_off",
+                                    entity_id="fan.circulation")
+            self.assertEqual(hass.services.async_call.await_count,1)
 
     async def test_source_heartbeat_is_not_mistaken_for_native_ownership(self):
         with package(self.root / "package") as (component, _):

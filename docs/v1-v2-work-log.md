@@ -22,13 +22,13 @@ DONE-CODE ≠ DEPLOYED. Частково зроблене не відмічат�
 | ID | Статус | Конкретне завершення / перевірка |
 |---|---|---|
 | E0 | DONE-DOCS | ТЗ, цей реєстр і continuation збережені в робочій гілці PR25; PR body має явно відображати незакриті пункти; checkpoint commit містить лише документацію |
-| E1 | PARTIAL | E1a: final-dispatch live mode/armed guard та manual AUTO між setpoint/mode; 2 failing regressions → PASS. Ще НЕ закрито durable manual epoch, independent memory-only safety та blocked planner scenario |
-| E2 | TODO | Production command evidence PREPARED/SENT/HA_ECHO/UNKNOWN + crash reconciliation/fence, bounded journal, no blind HEAT retry |
-| E3 | TODO | Source timestamps/provenance/finite/unit; preserved KWS zero/20s/energy tests; bounded single-flight/timeout stale drop |
-| E4 | TODO | Versioned admin-only production settings API; CAS/readback і raw-event bypass rejection |
-| E5 | TODO | External fan manual override/STOP + final fan gate; зберегти fireplace/night/backup policy |
-| E6 | TODO | Дім/Історія/Налаштування, перший −6/+24 timeline, manual AUTO/error freshness; mobile/light/dark/browser checks |
-| E7 | TODO | Повна матриця 8/8 з code/test evidence; реальна historical replay/format/energy/model continuity, Recorder write-rate; final make check test та exact-head CI |
+| E1 | DONE-CODE | Durable manual intent epoch + live memory-only final dispatch guard; stale plan rejected навіть після AUTO→назад; blocked-planner regression PASS. Не розгорнуто |
+| E2 | DONE-CODE | PREPARED/SENT/HA_ECHO/UNKNOWN journal, boot fence/owner epoch, bounded confirmed retention, no blind HEAT retry, confirmed climate STOP reconciliation. Не розгорнуто |
+| E3 | DONE-CODE | KWS value/report timestamps, provenance/unit/finite/online quality; zero/20s/hardware energy preserved; 60s bounded single-flight timeout drops stale result. Не розгорнуто |
+| E4 | DONE-CODE | Versioned admin-only websocket settings read/save, CAS revision, durable receipt/readback; native runtime refuses raw settings event. Не розгорнуто |
+| E5 | DONE-CODE | External fan change creates durable manual hold, drops ownership; explicit permission change clears it; live final fan gate rechecks device/epoch/STOP. Не розгорнуто |
+| E6 | PARTIAL | Три вкладки Дім/Історія/Налаштування; перший спільний −6/+24 timeline із факт/прогноз/KWS/outage та touch/mouse/keyboard readout; manual AUTO distinct. 53 JS PASS; real browser/mobile/light/dark check after inactive install remains |
+| E7 | PARTIAL | Targeted safety/model suites and production bundle tests PASS; local full discovery reached 571 tests but Windows sandbox denied Python temp writes (100 errors, one cascading assertion) and lacks jinja2/hypothesis. Exact-head Linux CI, historical replay/continuity and Recorder write-rate remain |
 | E8 | TODO | Merge/release immutable 0.4.0 лише після E1–E7; перевірити artifact SHA, доставку магазину та install неактивним |
 | E9 | TODO | Controlled single-writer handoff, originals/hashes/rollback, actual native cycle/panel/KWS; відновити permissions, cleanup exporter, документувати DEPLOYED |
 
@@ -57,3 +57,26 @@ rejection зберігає emergency OFF. Original release lowering-target seman
 test_native_v1_production.py. `make check test`: 595 Python +50 JS PASS.
 Production не змінено. E1 ще PARTIAL: продовжити
 durable epoch та independent safety, не ставити DONE за цей окремий fix.
+
+### 12.11.2026 — E1–E6 implementation checkpoint before exact-head CI
+
+Завершено code-level safety blocks: durable manual intent epoch; crash-safe
+critical command journal with boot fence and HA echo; voltage repeat timestamp
+fix; KWS source-quality/provenance; planner single-flight timeout; admin-only
+settings API; external fan manual hold and live final gate. Native runtime remains
+inactive, live AppDaemon V1 was not stopped or modified.
+
+UI now opens with one shared actual −6h → forecast +24h timeline and three
+plain tabs. Timeline supports touch, mouse and keyboard inspection and separates
+manual `Штатний auto` from controller error/staleness. Generated embedded UI and
+release hashes were refreshed for 0.4.0.
+
+Evidence: frontend 53/53 PASS; background-control 17/17, KWS 9/9, voltage 9/9,
+production bundle 14/14 and critical-ledger crash/fence/STOP targeted scenarios
+PASS in local targeted runners. Compile/UI/JS/manifest checks PASS. Full Windows
+discovery is not a release verdict: Python-created temp directories become
+unwritable in this host and optional jinja2/hypothesis are absent; it ran 571
+tests with 100 permission/import errors and one dependent assertion. Next:
+commit/push checkpoint, run exact-head Linux CI, fix any genuine CI regression,
+then E7 continuity/replay and inactive Marketplace delivery. No production
+cutover and no release tag yet.

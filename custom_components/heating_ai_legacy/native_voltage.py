@@ -69,7 +69,9 @@ class VoltageGuard:
             )
 
         settings = (minimum_v, maximum_v, recovery_seconds)
-        if self.last_at is not None and now <= self.last_at:
+        # Several commands in one HA event-loop turn may observe the exact same
+        # wall-clock sample. Equality is a repeat observation, not a clock reset.
+        if self.last_at is not None and now < self.last_at:
             self.last_at = now
             self.trip = None
             return blocked("CLOCK_RESET", "voltage_clock_reset")

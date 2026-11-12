@@ -1,7 +1,8 @@
-"""Authenticated read-only native V1+ planner snapshot for the dashboard.
+"""Authenticated native V1 planner and production-settings dashboard API.
 
-No update operation, physical command witness, entity writer, or automation
-target exists in this API. Large forecast arrays are never stored in Recorder.
+Settings writes are administrator-only, versioned and routed through the
+controller's serialized validation/persistence transaction. No physical command
+or automation target exists here. Large forecast arrays are not stored in Recorder.
 """
 from __future__ import annotations
 
@@ -108,4 +109,56 @@ def register(hass):
             "heat_segments": proposal.get("heat_segments", [])[:150],
         })
 
+    @websocket_command({
+        "type": "heating_ai_legacy/settings/read",
+        probatio.Required("entry_id"): str,
+        probatio.Required("version"): [int],
+    })
+    @async_response
+    async def settings_read(hass, connection, msg):
+        if connection.user is None or not connection.user.is_admin:
+            connection.send_error(msg["id"], "forbidden", "Administrator access required")
+            return
+        if msg["version"] != [1, 0]:
+            connection.send_error(msg["id"], "version", "Unsupported settings contract")
+            return
+        runtime = hass.data.get(DOMAIN, {}).get(msg["entry_id"])
+        controller = getattr(runtime, "controller", None)
+        if controller is None:
+            connection.send_error(msg["id"], "unavailable", "Production V1 is not loaded")
+            return
+        snapshot = await hass.async_add_executor_job(controller.native_settings_snapshot)
+        connection.send_result(msg["id"], snapshot)
+
+    @websocket_command({
+        "type": "heating_ai_legacy/settings/save",
+        probatio.Required("entry_id"): str,
+        probatio.Required("version"): [int],
+        probatio.Required("request_id"): str,
+        probatio.Required("revision"): int,
+        probatio.Required("values"): dict,
+    })
+    @async_response
+    async def settings_save(hass, connection, msg):
+        if connection.user is None or not connection.user.is_admin:
+            connection.send_error(msg["id"], "forbidden", "Administrator access required")
+            return
+        if msg["version"] != [1, 0]:
+            connection.send_error(msg["id"], "version", "Unsupported settings contract")
+            return
+        if not 1 <= len(msg["request_id"]) <= 128 or len(msg["values"]) > 64:
+            connection.send_error(msg["id"], "invalid_format", "Invalid settings request")
+            return
+        runtime = hass.data.get(DOMAIN, {}).get(msg["entry_id"])
+        controller = getattr(runtime, "controller", None)
+        if controller is None:
+            connection.send_error(msg["id"], "unavailable", "Production V1 is not loaded")
+            return
+        payload = {key: msg[key] for key in ("request_id", "revision", "values")}
+        await controller._dispatch(controller.apply_native_settings, payload)
+        snapshot = await hass.async_add_executor_job(controller.native_settings_snapshot)
+        connection.send_result(msg["id"], snapshot)
+
     websocket_api.async_register_command(hass, preview)
+    websocket_api.async_register_command(hass, settings_read)
+    websocket_api.async_register_command(hass, settings_save)

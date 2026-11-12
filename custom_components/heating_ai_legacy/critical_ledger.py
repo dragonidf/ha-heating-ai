@@ -73,18 +73,20 @@ class CriticalLedger:
         created = False
         try:
             try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                             | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             except FileExistsError:
                 pass
             else:
                 os.close(fd)
                 created = True
                 # Persist creation of the fixed database name as well as its contents.
-                fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
+                if hasattr(os, 'O_DIRECTORY'):
+                    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
             self._check_files()
             st = self.path.stat()
             self._inode = (st.st_dev, st.st_ino)
@@ -253,6 +255,18 @@ class CriticalLedger:
             if record['stage'] in ('PREPARED', 'SENT') and (not heat_only or record['action'] == 'HEAT'):
                 record['stage'] = 'UNKNOWN'
 
+    @staticmethod
+    def _trim_confirmed(body, keep=128):
+        """Bound confirmed history without ever deleting unresolved evidence."""
+        confirmed = sorted(
+            (record for record in body['commands'].values()
+             if record['stage'] == 'HA_ECHO'),
+            key=lambda record: (record['ha_echo_at'], record['command_id']),
+        )
+        remove = max(0, len(body['commands']) - keep)
+        for record in confirmed[:remove]:
+            body['commands'].pop(record['command_id'])
+
     def prepare(self, command_id, action, request, *, expected_revision, owner_id,
                 boot_id, owner_epoch, at=None):
         _text(command_id)
@@ -285,6 +299,8 @@ class CriticalLedger:
             if body['fenced'] and action == 'HEAT':
                 raise LedgerConflict('HEAT fenced; external reconciliation required')
             if len(body['commands']) >= MAX_RECORDS:
+                self._trim_confirmed(body, MAX_RECORDS - 1)
+            if len(body['commands']) >= MAX_RECORDS:
                 raise LedgerError('Journal full; no eviction or implicit reset')
             if action == 'STOP':
                 self._unknown(body, heat_only=True)
@@ -308,14 +324,15 @@ class CriticalLedger:
             record['stage'] = stage
             record['sent_at' if stage == 'SENT' else 'ha_echo_at'] = at
             self._write(con, revision + 1, body)
+            return revision + 1
 
     def record_sent(self, command_id, *, at, **identity):
         """Service initiation only; not even an HA state echo."""
-        self._record(command_id, 'SENT', at, **identity)
+        return self._record(command_id, 'SENT', at, **identity)
 
     def record_ha_echo(self, command_id, *, at, **identity):
         """Journal an independently qualified HA observation, never hardware ACK."""
-        self._record(command_id, 'HA_ECHO', at, **identity)
+        return self._record(command_id, 'HA_ECHO', at, **identity)
 
     def fence(self, *, expected_revision, owner_id, boot_id, owner_epoch):
         self.reconcile_restart(boot_id, expected_revision=expected_revision,
@@ -328,6 +345,36 @@ class CriticalLedger:
             self._unknown(body, heat_only=False)
             body.update(boot_id=new_boot_id, owner_epoch=owner_epoch + 1, fenced=True)
             self._write(con, revision + 1, body)
+
+    def claim_boot(self, new_boot_id, *, expected_owner_id):
+        """Fence every process start and return the new trusted identity."""
+        _text(new_boot_id)
+        _text(expected_owner_id)
+        with self._transaction() as con:
+            revision, body = self._read(con)
+            if body['owner_id'] != expected_owner_id:
+                raise LedgerConflict('Owner mismatch')
+            self._unknown(body, heat_only=False)
+            body.update(boot_id=new_boot_id, owner_epoch=body['owner_epoch'] + 1,
+                        fenced=True)
+            self._write(con, revision + 1, body)
+            return dict(body, revision=revision + 1)
+
+    def complete_safe_stop(self, command_id, *, expected_revision,
+                           owner_id, boot_id, owner_epoch):
+        """Open the HEAT fence only after a journalled STOP has an HA echo."""
+        with self._transaction() as con:
+            revision, body = self._current(
+                con, expected_revision, owner_id, boot_id, owner_epoch)
+            record = body['commands'].get(command_id)
+            if (record is None or record['action'] != 'STOP'
+                    or record['stage'] != 'HA_ECHO'
+                    or record['request'].get('domain') != 'climate'):
+                raise LedgerConflict('Qualified STOP evidence required')
+            body['fenced'] = False
+            self._trim_confirmed(body)
+            self._write(con, revision + 1, body)
+            return revision + 1
 
     def status(self):
         with self._transaction() as con:

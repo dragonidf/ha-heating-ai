@@ -154,6 +154,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload only the diagnostic sensor; the legacy controller is untouched."""
     if entry.data.get("runtime") == "native_v1":
         await entry.runtime_data.close()
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
         return True
     if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         return False

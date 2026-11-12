@@ -21,22 +21,24 @@ V2 залишається SHADOW без фізичних команд.
 ## Де продовжити
 
 1. Відкрити **draft PR25**: https://github.com/dragonidf/ha-heating-ai/pull/25 .
-2. Отримати свіжий head гілки `feature/v1-marketplace-carrier-20261112`, а не
-   починати від main. Останній функціональний head перед цим документом:
-   `f9e707fdd4e5579114c56bbfa04e56fe5c43d384`;
-   tree `4d9a937328d44f9cd4f4a6799a5acef8d5bd1164`.
+2. Отримати свіжий remote head гілки `feature/v1-marketplace-carrier-20261112`,
+   а не починати від main. Точний checkpoint SHA див. у найновішому записі
+   `v1-v2-work-log.md`; не покладатися на старий `f9e707...`.
 3. Прочитати [ТЗ](v1-v2-modernization-spec.md),
    [реєстр](v1-v2-work-log.md), [матрицю перенесення](v2-transfer-checklist.md)
    та кореневий AGENTS.md. Не повторювати загальний аудит.
-4. **Наступний етап E1 (частково)**: final-dispatch live mode/armed guard вже
-   має регресії; завершити durable intent/owner epoch guard і safety pass, який не
-   чекає serial callback/диска/planner. Теплову математику не переписувати.
+4. **Наступний етап E7 (частково)**: E1–E5 завершені на рівні коду, E6 потребує
+   реального browser/light/dark/mobile огляду. Запустити exact-head Linux CI,
+   відрізнити справжні регресії від відомої локальної Windows заборони на
+   Python temp writes, потім виконати historical replay/continuity і Recorder
+   write-rate. Теплову математику не переписувати.
 5. Після кожного завершеного етапу оновити реєстр і цю точку продовження,
    закомітити та перевірити віддалений SHA. Локальний файл не є checkpoint.
 
 ## Фактичний стан, який не можна плутати з планом
 
-- PR25 **draft, не merged, реліз 0.4.0 ще не встановлений**.
+- PR25 **draft, не merged, реліз 0.4.0 ще не встановлений**. E1–E5 мають
+  DONE-CODE, E6/E7 лишаються PARTIAL; це не дозвіл на release/cutover.
 - Остання підтверджена жива V1: AppDaemon 0.3.23, модель v6. Ці дані є
   історичним зрізом: перед діями перечитати актуальні стани HA.
 - Чинний контролер не вимкнений; новий writer не активований.
@@ -44,6 +46,24 @@ V2 залишається SHADOW без фізичних команд.
   YAML реєстрації exporter не створено. Не видавати це за міграцію.
 - File editor повернуто `enforce_basepath=true` і зупинено.
 - Неповний пакет **не merge/release/install** до закриття E1–E7.
+
+## Найновіший code checkpoint
+
+У робочій гілці реалізовані durable manual epoch/final gate, critical command
+journal PREPARED/SENT/HA_ECHO/UNKNOWN з boot fence, KWS provenance і planner
+timeout, admin-only settings API, fan manual-hold/final gate та новий перший
+факт→прогноз timeline. Деталі й тести — у записі `E1–E6 implementation
+checkpoint` в `v1-v2-work-log.md`.
+
+Локально: 53 JS PASS; targeted background 17, KWS 9, voltage 9, production 14,
+ledger reconciliation PASS. Full discovery на цьому Windows host не є валідним
+release gate: Python temp directories отримують Access denied, а jinja2/hypothesis
+відсутні. Обов'язковий наступний доказ — exact-head Linux CI. Якщо CI падає,
+виправити реальну помилку й додати регресію; не списувати CI на Windows.
+
+Після кожного перевіреного блоку: оновити work-log і цей файл, commit, push,
+звірити remote SHA. Якщо робота переривається — зробити явний WIP checkpoint із
+failing test/next action; не залишати єдиний стан лише в локальному diff.
 
 ## Продовження з іншого акаунта
 
