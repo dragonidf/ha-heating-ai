@@ -122,6 +122,51 @@ class GuardAndPersistenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.model.load(folder)
 
+    def test_hardware_kws_only_energy_and_gap_reconciliation(self):
+        with TemporaryDirectory() as folder:
+            store, _ledger, _status = self.persist.bootstrap(
+                Path(folder)/"private"
+            )
+            # A real cumulative hardware kWh cursor, never kW-time integral.
+            self.persist.observe_room(
+                store,1234567890.,21.3,
+                counter_kwh=100.,boiler_power_w=3000.,
+            )
+            self.assertEqual(store.status()["counter"],100.)
+            self.persist.observe_room(
+                store,1234568790.,21.4,
+                counter_kwh=100.5,boiler_power_w=0.,
+            )
+            self.assertEqual(store.status()["counter"],100.5)
+            self.persist.observe_room(
+                store,1234569690.,21.4,
+                counter_kwh=None,boiler_power_w=None,
+            )
+            self.assertTrue(store.status()["counter_gap"])
+            self.persist.observe_room(
+                store,1234570590.,21.5,
+                counter_kwh=101.5,boiler_power_w=3000.,
+            )
+            recovered=store.status()
+            self.assertEqual(recovered["counter"],101.5)
+            self.assertFalse(recovered["counter_gap"])
+            history=store.history(
+                1234567890.,1234570590.,1234570590.
+            )
+            self.assertAlmostEqual(
+                sum(row["kwh"] for row in history["energy"]),1.5,
+            )
+            self.assertTrue(any(
+                row["category"]=="recovered"
+                for row in history["energy"]
+            ))
+            # A meter reset must not become negative kWh.
+            self.persist.observe_room(
+                store,1234571490.,21.5,
+                counter_kwh=0.,boiler_power_w=0.,
+            )
+            self.assertIsNotNone(store.status()["energy_fault"])
+
     def test_reboots_fence_durable_journal_and_keep_counter_unknown(self):
         with TemporaryDirectory() as folder:
             store,ledger,a = self.persist.bootstrap(Path(folder)/"private")
