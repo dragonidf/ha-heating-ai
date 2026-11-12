@@ -55,14 +55,14 @@ _REL_IMPORT = re.compile(r"(?m)^from [.](heating_(?:environment|outages|model|fa
 
 def as_native_module(original: bytes) -> bytes:
     text = original.decode("utf-8")
-    transformed = _ABS_IMPORT.sub(r"from .\\1 import ", text)
+    transformed = _ABS_IMPORT.sub(r"from .\1 import ", text)
     if "from appdaemon" in transformed or "import appdaemon" in transformed:
         raise ValueError("AppDaemon dependency leaked into native pure engine")
     return transformed.encode("utf-8")
 
 
 def verify_native_module(native: bytes, original: bytes) -> None:
-    restored = _REL_IMPORT.sub(r"from \\1 import ", native.decode("utf-8"))
+    restored = _REL_IMPORT.sub(r"from \1 import ", native.decode("utf-8"))
     if restored.encode("utf-8") != original:
         raise ValueError("Native engine changed V1 computational logic")
 
