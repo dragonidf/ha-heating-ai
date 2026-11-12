@@ -123,7 +123,8 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
     for name in ("__init__.py", "const.py", "config_flow.py",
                  "native_runtime.py", "plan_snapshot.py",
                  "native_planner.py", "native_sources.py", "native_api.py",
-                 "native_safety.py", "native_intent.py", "native_store.py", "native_persistence.py",
+                 "native_safety.py", "native_intent.py", "native_calendar.py",
+                 "native_outages.py", "native_store.py", "native_persistence.py",
                  "native_model.py", "native_fan.py", "native_fan_sources.py",
                  "native_migration.py", "critical_ledger.py", "sensor.py", "strings.json",
                  "assets/panel.js"):

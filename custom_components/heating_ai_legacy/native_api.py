@@ -45,6 +45,8 @@ def register(hass):
                 "physical_commands_enabled": False,
                 "commands_sent": 0, "forecast": [], "heat_segments": [],
                 "entity_map": dict(coordinator.role_map),
+            "outage_preview": coordinator.outage_schedule,
+                "outage_preview": coordinator.outage_schedule,
             })
             return
         # Single immutable observational shape. No private training history,

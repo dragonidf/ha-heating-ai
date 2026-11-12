@@ -21,6 +21,7 @@ from .plan_snapshot import mirror_legacy_plan
 from .native_sources import normalize_hourly_weather, planner_snapshot
 from .native_planner import provisional_plan
 from .native_intent import evaluate as evaluate_legacy_intent
+from .native_outages import read_calendar
 from .native_safety import observe as observe_safety
 from .native_persistence import observe_room
 from .native_model import remember as save_learned_model
@@ -170,6 +171,9 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._requested_snapshot: tuple[Any, ...] | None = None
         self._closed = False
         self._weather_unsubscribe = None
+        self.outage_schedule: dict[str, Any] | None = None
+        self._calendar_job: asyncio.Task[None] | None = None
+        self._last_calendar_request = 0.0
 
     def attach_private_state(self, store, ledger, status: dict,
                              directory=None, checkpoint=None) -> None:
@@ -259,6 +263,18 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 old["native_plan_points"] = len(result.get("forecast", []))
                 self.async_set_updated_data(old)
 
+    async def _refresh_calendar(self) -> None:
+        try:
+            schedule = await read_calendar(
+                self.hass, self.source_ids.get("outage_calendar")
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            schedule = None
+        if not self._closed:
+            self.outage_schedule = schedule
+
     async def close(self) -> None:
         """Release native weather subscription and the one planning task."""
         self._closed = True
@@ -269,6 +285,12 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._plan_job.cancel()
             try:
                 await self._plan_job
+            except asyncio.CancelledError:
+                pass
+        if self._calendar_job is not None and not self._calendar_job.done():
+            self._calendar_job.cancel()
+            try:
+                await self._calendar_job
             except asyncio.CancelledError:
                 pass
         if self._room_archive_job is not None and not self._room_archive_job.done():
@@ -305,6 +327,15 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._fan_state = None
             fan_result = dict(mode="SHADOW_FAN",reason="source_unqualified",
                               physical_commands_enabled=False,commands_sent=0)
+        clock = time.monotonic()
+        if (self._calendar_job is None or self._calendar_job.done()) and (
+            clock - self._last_calendar_request >= 600
+        ):
+            self._last_calendar_request = clock
+            self._calendar_job = self.hass.async_create_task(
+                self._refresh_calendar(),
+                "heating_ai_v1_read_svitlo_calendar",
+            )
         safety_status = {
             "mode": "NATIVE_SHADOW", "physical_commands_enabled": False,
             "source_quality": safety.get("source_quality"),
@@ -368,6 +399,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             candidate = planner_snapshot(
                 self.hass, snapshot, self.hourly_weather, self.weather_received_at,
                 role_map=role_map,
+                calendar_schedule=self.outage_schedule,
             )
         except (ValueError, KeyError, TypeError):
             report["native_plan_status"] = "BLOCKED_INPUTS"

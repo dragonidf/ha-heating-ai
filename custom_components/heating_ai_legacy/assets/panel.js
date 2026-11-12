@@ -233,7 +233,21 @@ class HeatingV1NativePanel extends HTMLElement {
     const fallback = fresh ? readPts(attrs.actual_curve, since, now + 60, true) : [];
     const history = this._history.length ? this._history : fallback;
     const windows = fresh && prediction.length > 1 ? segments(attrs.heat_segments, now, until) : [];
-    const outages = readOutages(state('sensor.heating_outage_schedule'), now, until);
+    const outageSchedule = state('sensor.heating_outage_schedule');
+    const outages = readOutages(outageSchedule, now, until);
+    if (!outages.length && this._native?.outage_preview?.outages) {
+      const nativeOutages = this._native.outage_preview;
+      if (nativeOutages.valid === true &&
+          nativeOutages.coverage_proven === false) {
+        for (const interval of nativeOutages.outages.slice(0, 48)) {
+          const a = num(interval?.start, now - HOUR, until);
+          const b = num(interval?.end, now - HOUR, until);
+          if (a !== null && b !== null && a < b) outages.push({
+            a: Math.max(now, a), b:Math.min(until, b)
+          });
+        }
+      }
+    }
     const kwPhases = ['a','b','c'].map(phase =>
       freshPower(state('sensor.energy_meter_kotel_potuzhnist_' + phase), now)
     );

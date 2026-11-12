@@ -124,7 +124,8 @@ def normalize_hourly_weather(items: Any, received_at: float) -> list[dict[str, f
 def planner_snapshot(hass: Any, baseline: dict[str, Any],
                      hourly: list[dict[str, float]] | None,
                      received_at: float | None,
-                     *, role_map: dict[str, str] | None = None) -> dict[str, Any]:
+                     *, role_map: dict[str, str] | None = None,
+                     calendar_schedule: dict[str, Any] | None = None) -> dict[str, Any]:
     """One bounded source snapshot; fail closed before calling the optimizer."""
     now = datetime.fromisoformat(baseline["at"])
     if now.tzinfo is None:
@@ -144,7 +145,20 @@ def planner_snapshot(hass: Any, baseline: dict[str, Any],
             _number(row.state,10,35) if key in NUMERIC_HELPERS
             else str(row.state)
         )
-    settings["outage_schedule"] = _outage_snapshot(hass, now)
+    # Prefer qualified legacy data while the old V1 is alive; otherwise
+    # use native Svitlo calendar events (partial evidence, never clear grid).
+    try:
+        previous_schedule = _outage_snapshot(hass, now)
+    except (ValueError, TypeError):
+        previous_schedule = dict(
+            mode="unknown", valid=False, outages=[], known_until=None
+        )
+    if previous_schedule.get("valid") is True:
+        settings["outage_schedule"] = previous_schedule
+    elif isinstance(calendar_schedule,dict) and calendar_schedule.get("valid") is True:
+        settings["outage_schedule"] = calendar_schedule
+    else:
+        settings["outage_schedule"] = previous_schedule
     # The fireplace is a live observed source, not a programmable command.
     fireplace = _state(hass, FIRE)
     _fresh(fireplace, 1800, now)

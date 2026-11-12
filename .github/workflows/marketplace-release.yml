@@ -39,6 +39,8 @@ jobs:
         run: python -m unittest discover -s tests -p test_native_v1_migration.py -v
       - name: Legacy V1 decision parity and manual AUTO priority
         run: python -m unittest discover -s tests -p test_native_v1_intent.py -v
+      - name: Calendar 3.1 native outage events are partial evidence
+        run: python -m unittest discover -s tests -p test_native_v1_calendar.py -v
       - name: Build unsigned review artifact, NEVER publish or install
         run: python tools/build_marketplace.py --output heating_ai_v1_marketplace.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
