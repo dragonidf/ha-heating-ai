@@ -2,17 +2,33 @@
 import importlib
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import ModuleType
 import unittest
+import zipfile
+
+from tools.build_marketplace import build
 
 ROOT=Path(__file__).resolve().parents[1]
 PKG="native_v1_intent_fixture"
 
 
 class NativeIntentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.folder=TemporaryDirectory()
+        archive=Path(cls.folder.name)/"native.zip"
+        build(archive)
+        with zipfile.ZipFile(archive) as release:
+            release.extractall(cls.folder.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.folder.cleanup()
+
     def setUp(self):
         fixture=ModuleType(PKG)
-        fixture.__path__=[str(ROOT/"custom_components"/"heating_ai_legacy")]
+        fixture.__path__=[self.folder.name]
         sys.modules[PKG]=fixture
         self.module=importlib.import_module(PKG+".native_intent")
         sys.path.insert(0,str(ROOT/"apps"/"heating_ai"))
