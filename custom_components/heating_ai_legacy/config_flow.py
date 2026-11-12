@@ -4,7 +4,7 @@ from __future__ import annotations
 import voluptuous as vol
 from homeassistant import config_entries
 
-from .const import DOMAIN, SOURCE_UI
+from .const import DOMAIN, SOURCE_UI, SOURCE_HINTS
 
 
 class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -46,5 +46,9 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
                 "shadow": True,
                 "room": mapping["room"],
                 "outside": mapping["outside"],
+                "source_ids": {
+                    role: entity_id for role, entity_id in SOURCE_HINTS.items()
+                    if self.hass.states.get(entity_id) is not None
+                },
             },
         )
