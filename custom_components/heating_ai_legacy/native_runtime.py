@@ -400,6 +400,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass, snapshot, self.hourly_weather, self.weather_received_at,
                 role_map=role_map,
                 calendar_schedule=self.outage_schedule,
+                fireplace_entity=self.source_ids.get("fireplace_temp"),
             )
         except (ValueError, KeyError, TypeError):
             report["native_plan_status"] = "BLOCKED_INPUTS"
