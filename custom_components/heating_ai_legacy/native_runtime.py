@@ -20,6 +20,8 @@ from .native_engine.heating_model import coast
 from .plan_snapshot import mirror_legacy_plan
 from .native_sources import normalize_hourly_weather, planner_snapshot
 from .native_planner import provisional_plan
+from .native_safety import observe as observe_safety
+from .native_persistence import observe_room
 
 REQUIRED_COEFFICIENTS = (
     "floor_air", "room_loss", "floor_decay", "heat_gain", "fire_gain"
@@ -118,6 +120,12 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             config_entry=entry,
         )
         self.mapping = dict(mapping)
+        self.source_ids = dict(entry.data.get("source_ids", {}))
+        self.model_store = None
+        self.durable_ledger = None
+        self.ledger_summary = None
+        self._last_room_archive = 0.0
+        self._room_archive_job = None
         self.hourly_weather: list[dict[str, float]] | None = None
         self.weather_received_at: float | None = None
         self.native_plan: dict[str, Any] | None = None
@@ -126,6 +134,29 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._requested_snapshot: tuple[Any, ...] | None = None
         self._closed = False
         self._weather_unsubscribe = None
+
+    def attach_private_state(self, store, ledger, status: dict) -> None:
+        """Attach state only after checksum and reboot-fence verification."""
+        if status.get("fenced") is not True:
+            raise ValueError("Refusing unfenced native command journal")
+        self.model_store = store
+        self.durable_ledger = ledger
+        self.ledger_summary = {
+            "revision": status.get("revision"),
+            "owner_epoch": status.get("owner_epoch"),
+            "fenced": True,
+            "physical_commands_enabled": False,
+        }
+
+    async def _remember_read_only(self, at: float, room: float) -> None:
+        try:
+            await self.hass.async_add_executor_job(
+                observe_room, self.model_store, at, room
+            )
+        except Exception:
+            # Archive failure must be visible; never repair or overwrite an
+            # unknown/corrupted file automatically.
+            self._storage_fault = "read_only_archive_failed"
 
     def receive_weather(self, items: list[dict[str, Any]] | None) -> None:
         """Read-only HA WeatherEntity callback: receipt is not issue time."""
@@ -191,31 +222,78 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._plan_job
             except asyncio.CancelledError:
                 pass
+        if self._room_archive_job is not None and not self._room_archive_job.done():
+            # A background SQLite write may finish after task cancellation;
+            # wait for its result rather than starting a second writer.
+            await self._room_archive_job
 
     async def _async_update_data(self) -> dict[str, Any]:
+        """Refresh read-only safety before slow math, never from executor."""
+        ui = self.hass.states.get("sensor.heating_ui")
+        source_roles = ui.attributes.get("entities", {}) if ui is not None else {}
+        role_map = dict(source_roles) if isinstance(source_roles, dict) else {}
+        role_map.update(self.mapping)
         try:
-            # HA states must be read on the event-loop thread only.
+            safety = observe_safety(self.hass, role_map, self.source_ids)
+        except Exception:
+            safety = dict(
+                mode="NATIVE_SHADOW", physical_commands_enabled=False,
+                physical_authority=False, source_quality="UNAVAILABLE",
+                source_warnings=["source_monitor_failed"],
+                grid=None, kws_power_w=None, kws_total_kwh=None,
+            )
+        safety_status = {
+            "mode": "NATIVE_SHADOW", "physical_commands_enabled": False,
+            "source_quality": safety.get("source_quality"),
+            "source_warnings": safety.get("source_warnings", []),
+            "manual_observed": safety.get("manual_observed"),
+            "grid_actual": safety.get("grid"),
+            "kws_power_w": safety.get("kws_power_w"),
+            "kws_total_kwh": safety.get("kws_total_kwh"),
+            "legacy_mode": safety.get("legacy_mode"),
+            "thermostat_mode": safety.get("thermostat_mode"),
+            "fan_state": safety.get("fan_state"),
+            "fireplace_state": safety.get("fireplace_state"),
+            "durable_journal": self.ledger_summary,
+            "storage_fault": getattr(self, "_storage_fault", None),
+        }
+        try:
             snapshot = sample_v1_inputs(self.hass, self.mapping)
-        except (ValueError, KeyError) as err:
-            raise UpdateFailed(str(err)) from err
-        # Pure math never blocks the HA event loop.
-        report = await self.hass.async_add_executor_job(
-            calculate_v1_coast, snapshot,
-        )
+        except (ValueError, KeyError):
+            # The UI still explains why independent sources are missing.
+            # Unqualified old readings never become current measurements.
+            return dict(
+                safety_status,
+                native_plan_status="BLOCKED_INPUTS",
+                native_plan_reason="model_or_temperature_stale",
+                forecast_qualified=False,
+                source="original_v1_thermal_model",
+            )
+        report = await self.hass.async_add_executor_job(calculate_v1_coast, snapshot)
+        report.update(safety_status)
+
+        if self.model_store is not None:
+            stamp = time.time()
+            if (stamp - self._last_room_archive >= 900 and
+                    (self._room_archive_job is None or self._room_archive_job.done())):
+                self._last_room_archive = stamp
+                self._room_archive_job = self.hass.async_create_task(
+                    self._remember_read_only(stamp, snapshot["room"]),
+                    "heating_ai_v1_record_ha_cache_only",
+                )
+
         try:
             candidate = planner_snapshot(
-                self.hass, snapshot, self.hourly_weather,
-                self.weather_received_at,
+                self.hass, snapshot, self.hourly_weather, self.weather_received_at
             )
         except (ValueError, KeyError, TypeError):
             report["native_plan_status"] = "BLOCKED_INPUTS"
             report["native_plan_reason"] = "weather_or_source_missing"
             return report
-
         signature = self._planning_key(candidate)
         stamp = time.monotonic()
-        has_running = self._plan_job is not None and not self._plan_job.done()
-        if not has_running and (
+        running = self._plan_job is not None and not self._plan_job.done()
+        if not running and (
             signature != self._requested_snapshot or
             stamp - self._last_plan_start >= 600
         ):
