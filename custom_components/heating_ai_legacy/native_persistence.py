@@ -43,6 +43,31 @@ def bootstrap(directory: str) -> tuple[NativeStore, CriticalLedger, dict]:
     return store, ledger, status
 
 
-def observe_room(store: NativeStore, at: float, room: float) -> None:
-    """Only a HA-cache measurement; no kWh reconstruction or meter reset."""
-    store.observe(at=at, room=room, counter=None, power=None)
+def observe_room(store: NativeStore, at: float, room: float,
+                 *, counter_kwh=None, boiler_power_w=None) -> None:
+    """Persist HA-cache observations, never reinterpret estimated readings.
+
+    A genuine KWS hardware total is the only energy cursor. Missing KWS
+    remains None (a gap), never 0, never a synthetic accumulation from
+    nominal power, and never a duplicate integral.
+    """
+    import math
+
+    if type(at) not in (float, int) or not math.isfinite(at) or at <= 0:
+        raise ValueError("Unqualified observation clock")
+    if type(room) not in (float, int) or not math.isfinite(room) or not -20 <= room <= 55:
+        raise ValueError("Unqualified room sample")
+    if counter_kwh is not None and (
+        type(counter_kwh) not in (float,int) or
+        not math.isfinite(counter_kwh) or not 0 <= counter_kwh <= 1e9
+    ):
+        raise ValueError("Unqualified hardware energy counter")
+    if boiler_power_w is not None and (
+        type(boiler_power_w) not in (float,int) or
+        not math.isfinite(boiler_power_w) or not 0 <= boiler_power_w <= 36000
+    ):
+        raise ValueError("Unqualified KWS active power")
+    store.observe(
+        at=at, room=room, counter=counter_kwh,
+        power=boiler_power_w, counter_at=at,
+    )
