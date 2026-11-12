@@ -28,7 +28,7 @@ def row(state, attributes=None, *, age_seconds=0):
 
 async def lifecycle(readings) -> None:
     """Exercise HA 2026.11 native panel lifecycle without production or writes."""
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import AsyncMock, Mock, patch
     from custom_components import heating_ai_legacy as component
     from custom_components.heating_ai_legacy.native_runtime import V1ShadowCoordinator
 
@@ -41,6 +41,7 @@ async def lifecycle(readings) -> None:
     entry = SimpleNamespace(
         entry_id="synthetic-native-v1",
         domain="heating_ai_legacy",
+        async_on_unload=Mock(),
         data=dict(shadow=True, room="sensor.room", outside="sensor.outside"),
         runtime_data=None,
     )
