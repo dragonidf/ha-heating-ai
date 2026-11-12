@@ -7,6 +7,8 @@ This compatibility adapter is not the final V1+ planner or command gateway.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+import json
 import asyncio
 import math
 import time
@@ -196,7 +198,9 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.native_plan: dict[str, Any] | None = None
         self._plan_job: asyncio.Task[None] | None = None
         self._last_plan_start = 0.0
-        self._requested_snapshot: tuple[Any, ...] | None = None
+        self._requested_snapshot: str | None = None
+        self._latest_input_key: str | None = None
+        self._accepted_plan_key: str | None = None
         self._closed = False
         self._weather_unsubscribe = None
         self.outage_schedule: dict[str, Any] | None = None
@@ -246,9 +250,16 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # unknown/corrupted file automatically.
             self._storage_fault = "read_only_archive_failed"
 
+    def _invalidate_plan(self) -> None:
+        """A previous forecast is never silently executable for new inputs."""
+        self._latest_input_key = None
+        self._accepted_plan_key = None
+        self.native_plan = None
+
     def receive_weather(self, items: list[dict[str, Any]] | None) -> None:
         """Read-only HA WeatherEntity callback: receipt is not issue time."""
         now = time.time()
+        self._invalidate_plan()
         try:
             self.hourly_weather = normalize_hourly_weather(items, now)
             self.weather_received_at = now
@@ -256,25 +267,34 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.hourly_weather = None
             self.weather_received_at = None
 
-    def _planning_key(self, snapshot: dict[str, Any]) -> tuple[Any, ...]:
-        values = snapshot["settings"]
-        return (
-            tuple(sorted(snapshot["model"].items())),
-            round(snapshot["room"] * 4) / 4,
-            round(snapshot["floor"] * 2) / 2,
-            round(snapshot["outside"] * 2) / 2,
-            round(snapshot["fire_delta"] * 2) / 2,
-            tuple((role, str(values[role])) for role in (
-                "target", "lower", "upper", "night_target", "night_lower",
-                "night_upper", "start", "end", "sleep_start", "sleep_end",
-                "strategy",
-            )),
-            snapshot["weather"][-1]["ts"],
-            str(values["outage_schedule"].get("outages", [])),
-        )
+    def _planning_key(self, snapshot: dict[str, Any]) -> str:
+        """Hash bounded meaningful inputs, not only last weather timestamp.
+
+        A revised weather temperature at identical hour ticks, a changed
+        blackout interval, or a new physical boiler setting MUST invalidate
+        the previous native proposal.
+        """
+        vals=snapshot["settings"]
+        reviewed={
+            "thermal_model":snapshot["model"],
+            "room":snapshot["room"],
+            "floor":snapshot["floor"],
+            "outside":snapshot["outside"],
+            "fire":snapshot["fire_delta"],
+            "assumed_kw":snapshot["assumed_kw"],
+            "weather":[(x["ts"],x["temperature"]) for x in snapshot["weather"]],
+            "settings":{key:vals[key] for key in (
+                "target","lower","upper","night_target","night_lower",
+                "night_upper","start","end","sleep_start","sleep_end","strategy",
+            )},
+            "outages":vals.get("outage_schedule"),
+        }
+        payload=json.dumps(reviewed,sort_keys=True,separators=(",",":"),
+                           allow_nan=False).encode()
+        return sha256(payload).hexdigest()
 
     async def _run_plan(
-        self, snapshot: dict[str, Any], signature: tuple[Any, ...]
+        self, snapshot: dict[str, Any], signature: str
     ) -> None:
         """A single isolated executor job; reject results for old input keys."""
         try:
@@ -285,8 +305,10 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             result = dict(status="BLOCKED_INPUTS", reason="calculation_failed",
                           physical_commands_enabled=False,
                           commands_sent=0, proposal_is_command=False)
-        if not self._closed and signature == self._requested_snapshot:
+        if (not self._closed and signature == self._requested_snapshot
+                and signature == self._latest_input_key):
             self.native_plan = result
+            self._accepted_plan_key = signature
             if isinstance(self.data, dict):
                 # Only a compact summary is recorded in HA. The full curve
                 # remains in RAM, until a dedicated authenticated API exists.
@@ -309,6 +331,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             schedule = None
         if not self._closed:
             self.outage_schedule = schedule
+            self._invalidate_plan()
 
     async def close(self) -> None:
         """Release native weather subscription and the one planning task."""
@@ -411,6 +434,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 floor_observer=self._floor_state,
             )
         except (ValueError, KeyError):
+            self._invalidate_plan()
             # The UI still explains why independent sources are missing.
             # Unqualified old readings never become current measurements.
             return dict(
@@ -482,10 +506,15 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 boiler_power_mode=self.boiler_power_mode,
             )
         except (ValueError, KeyError, TypeError):
+            self._invalidate_plan()
             report["native_plan_status"] = "BLOCKED_INPUTS"
             report["native_plan_reason"] = "weather_or_source_missing"
             return report
         signature = self._planning_key(candidate)
+        if signature != self._latest_input_key:
+            self.native_plan = None
+            self._accepted_plan_key = None
+        self._latest_input_key = signature
         stamp = time.monotonic()
         running = self._plan_job is not None and not self._plan_job.done()
         if not running and (
@@ -498,11 +527,11 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._run_plan(candidate, signature),
                 "heating_ai_v1_24h_non_actuating_shadow",
             )
-        plan = self.native_plan or {}
-        report["native_plan_status"] = (
-            plan.get("status", "PLANNING")
-            if signature == self._requested_snapshot else "PLANNING"
+        plan = (
+            self.native_plan or {}
+            if self._accepted_plan_key == signature else {}
         )
+        report["native_plan_status"] = plan.get("status", "PLANNING")
         report["native_plan_quality"] = plan.get("quality")
         report["native_plan_reason"] = plan.get("reason")
         report["native_planned_kwh"] = plan.get("nominal_energy_kwh")

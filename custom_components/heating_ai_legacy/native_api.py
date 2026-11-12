@@ -6,6 +6,7 @@ target exists in this API. Large forecast arrays are never stored in Recorder.
 from __future__ import annotations
 
 import probatio
+import time
 from homeassistant.components import websocket_api
 from homeassistant.components.websocket_api.decorators import (
     async_response, websocket_command,
@@ -39,6 +40,15 @@ def register(hass):
             )
             return
         proposal = coordinator.native_plan
+        published_at = (
+            proposal.get("computed_at") if isinstance(proposal, dict) else None
+        )
+        if (coordinator._closed or
+                coordinator._accepted_plan_key is None or
+                coordinator._accepted_plan_key != coordinator._latest_input_key or
+                not isinstance(published_at, (int,float)) or
+                not 0 <= time.time()-published_at <= 900):
+            proposal = None
         if proposal is None:
             connection.send_result(msg["id"], {
                 "status": "BLOCKED_INPUTS", "reason": "native_plan_not_ready",

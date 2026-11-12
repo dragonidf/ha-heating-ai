@@ -86,6 +86,38 @@ async def lifecycle(readings, directory) -> None:
         assert entry.runtime_data.ledger_summary["fenced"] is True
         assert entry.runtime_data.ledger_summary["physical_commands_enabled"] is False
         assert entry.runtime_data.data["native_plan_status"] == "BLOCKED_INPUTS"
+        native=entry.runtime_data
+        native.native_plan=dict(status="VIRTUAL_CONDITIONAL",computed_at=0)
+        native._latest_input_key="prior"
+        native._accepted_plan_key="prior"
+        native.receive_weather(None)
+        assert native.native_plan is None
+        assert native._accepted_plan_key is None
+        assert native._latest_input_key is None
+        snapshot=dict(
+            model={"floor_air":.03},room=21.5,floor=25.,outside=5.,
+            fire_delta=0.,assumed_kw=6.,
+            weather=[dict(ts=1000.,temperature=4.),
+                     dict(ts=4600.,temperature=5.)],
+            settings=dict(
+                target=22.,lower=21.5,upper=22.5,night_target=21.,
+                night_lower=20.5,night_upper=21.5,start="23:00",
+                end="07:00",sleep_start="23:00",sleep_end="06:30",
+                strategy="Тільки в дозволені години",
+                outage_schedule=dict(valid=False,outages=[]),
+            ),
+        )
+        a=native._planning_key(snapshot)
+        revised=dict(snapshot,weather=[
+            dict(ts=1000.,temperature=4.5),snapshot["weather"][1]
+        ])
+        assert native._planning_key(revised)!=a
+        revised=dict(snapshot,settings=dict(snapshot["settings"],
+            outage_schedule=dict(valid=True,
+                                 outages=[dict(start=6000.,end=7600.)])))
+        assert native._planning_key(revised)!=a
+        assert native._planning_key(dict(snapshot,assumed_kw=9.))!=a
+
         assert not hasattr(hass, "services"), "A device service transport must not be present"
         assert await component.async_unload_entry(hass, entry)
         assert entry.entry_id not in hass.data[component.DOMAIN]
