@@ -62,6 +62,8 @@ async def exercise(directory):
         assert controller.model["version"] == 6
         assert hass.states.get("sensor.heating_ui").attributes["release_verified"] is True
         assert hass.states.get("sensor.heating_ui").attributes["runtime"] == "native_v1"
+        await controller._dispatch(controller.tick,{})
+        assert controller.memory.get("last_successful_tick"), controller.memory.get("control_incident")
         assert not commands, "Manual observation must not actuate equipment at startup"
         hass.states.async_set(cfg["mode"], "Автоматичне керування")
         hass.states.async_set(cfg["armed"], "on")

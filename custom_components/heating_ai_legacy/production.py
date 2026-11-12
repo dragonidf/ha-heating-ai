@@ -229,9 +229,9 @@ async def async_setup_production(hass, entry):
             hass.data[DOMAIN]["production_assets"] = True
         bundle = await hass.async_add_executor_job(lambda: sha256((assets / "full-panel.js").read_bytes()).hexdigest()[:16])
         await panel_custom.async_register_panel(hass, frontend_url_path="heating-ai-v1",
-            webcomponent_name="heating-ai-panel", sidebar_title="Опалення",
+            webcomponent_name=f"heating-ai-v1-{bundle}", sidebar_title="Опалення",
             sidebar_icon="mdi:home-thermometer", require_admin=True,
-            module_url=f"/heating_ai_legacy/full-assets/full-panel.js?v={bundle}", config={})
+            module_url=f"/heating_ai_legacy/full-assets/full-panel-loader.js?v={bundle}", config={})
         runtime.unsubscribers.append(lambda: frontend.async_remove_panel(hass, "heating-ai-v1", warn_if_unknown=False))
         @callback
         def conflict(event):
