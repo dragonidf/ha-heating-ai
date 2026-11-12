@@ -62,6 +62,15 @@ class VoltageTests(unittest.TestCase):
                 self.assertFalse(result["voltage_qualified"])
                 self.assertFalse(result["physical_authority"])
 
+    def test_operator_voltage_band_validation(self):
+        valid=self.module.valid_policy
+        self.assertTrue(valid(207,253,180))
+        self.assertFalse(valid(253,207,180))
+        self.assertFalse(valid(140,144,180))
+        self.assertFalse(valid(True,253,180))
+        self.assertFalse(valid(190,250,29))
+        self.assertFalse(valid(190,250,901))
+
 
 if __name__=="__main__":
     unittest.main()
