@@ -63,6 +63,10 @@ def register(hass):
                 "legacy_decision_preview"
             ),
             "decision_never_executable": True,
+            "voltage_guard_status": (coordinator.data or {}).get(
+                "voltage_guard_status", "LIMITS_UNCONFIGURED"
+            ),
+            "voltage_qualified": False,
             "physical_commands_enabled": False,
             "commands_sent": 0,
             "forecast": proposal.get("forecast", [])[:200],

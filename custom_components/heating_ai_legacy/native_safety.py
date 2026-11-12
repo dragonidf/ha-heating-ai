@@ -13,6 +13,8 @@ MAX_ROOM_AGE = 180
 MAX_RETURN_AGE = 1200
 MAX_GRID_AGE = 120
 MAX_KWS_AGE = 180
+MAX_MAINS_VOLTAGE_AGE = 120
+VOLTAGE_ROLES = ("voltage_l1","voltage_l2","voltage_l3")
 GRID_STATES = {"Наявна мережа": True, "Відсутня мережа": False}
 V1_MANUAL_MODES = {"Штатний auto", "Спостереження", "Вимкнено"}
 
@@ -65,12 +67,17 @@ def observe(hass: Any, mapping: dict[str, str], options: dict[str, str],
     fan = _read(hass, mapping.get("fan"), now, 300)
     kw = [_read(hass, options.get(k), now, MAX_KWS_AGE) for k in KWS_ROLES[:3]]
     energy = _read(hass, options.get("kws_energy"), now, 600)
+    voltages = [
+        _read(hass, options.get(key), now, MAX_MAINS_VOLTAGE_AGE)
+        for key in VOLTAGE_ROLES
+    ]
     reasons: list[str] = []
     room_c = _numerical(room, -20, 55)
     return_c = _numerical(probe, 0, 90)
     outside_c = _numerical(outside, -55, 60)
     phase_w = [_numerical(value, 0, 15000) for value in kw]
     energy_kwh = _numerical(energy, 0, 1e9)
+    phases_v = [_numerical(value, 0, 350) for value in voltages]
     actual_grid = GRID_STATES.get(grid["value"]) if grid["valid"] else None
     physical_mode = str(mode["value"]) if mode["valid"] else None
     manual = physical_mode in V1_MANUAL_MODES
@@ -96,6 +103,8 @@ def observe(hass: Any, mapping: dict[str, str], options: dict[str, str],
         reasons.append("kws_phase_missing_or_stale")
     if energy_kwh is None:
         reasons.append("kws_counter_missing_or_stale")
+    if any(value is None for value in phases_v):
+        reasons.append("mains_voltage_missing_or_stale")
     if legacy["valid"]:
         reasons.append("legacy_controller_active")
     else:
@@ -120,6 +129,11 @@ def observe(hass: Any, mapping: dict[str, str], options: dict[str, str],
         ),
         "kws_phases_w": phase_w,
         "kws_total_kwh": energy_kwh,
+        "voltage_phases_v": phases_v,
+        "voltage_source_quality": (
+            "HA_CACHE_FRESH" if all(x is not None for x in phases_v)
+            else "UNAVAILABLE_OR_STALE"
+        ),
         "thermostat_mode": thermostat["value"] if thermostat["valid"] else None,
         "fireplace_state": fireplace["value"] if fireplace["valid"] else None,
         "fan_state": fan["value"] if fan["valid"] else None,

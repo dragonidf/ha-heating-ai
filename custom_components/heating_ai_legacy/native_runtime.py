@@ -27,6 +27,7 @@ from .native_persistence import observe_room
 from .native_model import remember as save_learned_model
 from .native_floor import advance as advance_floor, remember as save_floor
 from .native_fan_sources import snapshot as fan_snapshot
+from .native_voltage import VoltageGuard
 
 REQUIRED_COEFFICIENTS = (
     "floor_air", "room_loss", "floor_decay", "heat_gain", "fire_gain"
@@ -173,6 +174,14 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.role_map.update(self.mapping)
         self.source_ids = dict(entry.data.get("source_ids", {}))
         self.boiler_power_mode = entry.data.get("boiler_power_mode", "unconfirmed")
+        self._voltage_guard = VoltageGuard()
+        # No arbitrary thresholds, and no UI-provided privilege to actuate.
+        # Defaults remain None until a verified commissioning procedure.
+        self.voltage_min_v = entry.options.get("min_voltage_v")
+        self.voltage_max_v = entry.options.get("max_voltage_v")
+        self.voltage_recovery_seconds = entry.options.get(
+            "voltage_recovery_seconds", 180
+        )
         self.model_store = None
         self.model_checkpoint = None
         self._floor_state = None
@@ -362,8 +371,19 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._refresh_calendar(),
                 "heating_ai_v1_read_svitlo_calendar",
             )
+        voltage = self._voltage_guard.evaluate(
+            time.time(), safety.get("grid"), safety.get("voltage_phases_v"),
+            minimum_v=self.voltage_min_v,
+            maximum_v=self.voltage_max_v,
+            recovery_seconds=self.voltage_recovery_seconds,
+        )
         safety_status = {
-            "mode": "NATIVE_SHADOW", "physical_commands_enabled": False,
+            "mode": "NATIVE_SHADOW",
+            "voltage_guard_status": voltage["status"],
+            "voltage_qualified": voltage["voltage_qualified"],
+            "voltage_recovery_seconds": voltage["sustained_seconds"],
+            "voltage_phases_v": safety.get("voltage_phases_v"),
+            "voltage_source_quality": safety.get("voltage_source_quality"), "physical_commands_enabled": False,
             "source_quality": safety.get("source_quality"),
             "source_warnings": safety.get("source_warnings", []),
             "manual_observed": safety.get("manual_observed"),
