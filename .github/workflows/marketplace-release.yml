@@ -31,6 +31,8 @@ jobs:
         run: node --input-type=module --check < custom_components/heating_ai_legacy/assets/panel.js
       - name: Reproducible native-engine and package tests
         run: PYTHONPATH=apps/heating_ai python -m unittest discover -s tests -p test_marketplace_package.py -v
+      - name: Independent V1 24-hour optimizer fail-closed tests
+        run: python -m unittest discover -s tests -p test_native_v1_planner.py -v
       - name: Build unsigned review artifact, NEVER publish or install
         run: python tools/build_marketplace.py --output heating_ai_v1_marketplace.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

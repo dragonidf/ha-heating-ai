@@ -1,13 +1,14 @@
 """Native V1 planner is a read-only numerical function with bounded sources."""
 from datetime import datetime, timedelta
 from importlib import import_module
+from types import ModuleType
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
 import zipfile
 
-from tools.build_marketplace import build, ROOT
+from tools.build_marketplace import build
 
 
 class NativeV1PlannerTests(unittest.TestCase):
@@ -17,10 +18,14 @@ class NativeV1PlannerTests(unittest.TestCase):
             build(path)
             with zipfile.ZipFile(path) as archive:
                 archive.extractall(directory)
-            sys.path.insert(0, directory)
+            # Read a ZIP-root integration as a synthetic Python package,
+            # without loading Home Assistant or the runtime __init__.py.
+            package = ModuleType("reviewed_heating_v1")
+            package.__path__ = [directory]
+            sys.modules["reviewed_heating_v1"] = package
             try:
-                native = import_module("native_planner")
-                engine = import_module("native_engine.heating_model")
+                native = import_module("reviewed_heating_v1.native_planner")
+                engine = import_module("reviewed_heating_v1.native_engine.heating_model")
                 from zoneinfo import ZoneInfo
                 now = datetime(2026, 10, 9, 4, 30, tzinfo=ZoneInfo("Europe/Kyiv"))
                 snapshot = {
@@ -81,9 +86,8 @@ class NativeV1PlannerTests(unittest.TestCase):
                     native.provisional_plan(malformed)["status"],
                     "BLOCKED_INPUTS")
             finally:
-                sys.path.remove(directory)
                 for name in list(sys.modules):
-                    if name == "native_engine" or name.startswith("native_engine.") or name=="native_planner":
+                    if name == "reviewed_heating_v1" or name.startswith("reviewed_heating_v1."):
                         sys.modules.pop(name, None)
 
 
