@@ -59,6 +59,7 @@ def evaluate(now: float, plan: dict | None,
     mode=sources.get("legacy_mode")
     armed=sources.get("armed") is True
     grid=sources.get("grid_actual")
+    voltage_qualified=sources.get("voltage_qualified") is True
     room=_number(sources.get("room_c"))
     return_temp=_number(sources.get("return_c"))
     kws=_number(sources.get("kws_power_w"))
@@ -71,10 +72,13 @@ def evaluate(now: float, plan: dict | None,
     demand=_planned_demand(now,plan)
     # Passing allow_actuation=True here is strictly a hypothetical input to
     # V1's unchanged pure decide() function. No gateway or service exists.
+    decision_grid=("on" if grid is True and voltage_qualified else
+                   "unknown" if grid is True else
+                   "off" if grid is False else "unknown")
     original=decide(
         mode=mode,armed=armed,allow_actuation=True,
         room=room,probe_ok=return_temp is not None,
-        grid="on" if grid is True else "off" if grid is False else "unknown",
+        grid=decision_grid,
         thermostat_ok=thermostat in ("auto","heat","off"),
         power_ok=kws is not None,model_ready=model_validated is True,
         demand=bool(demand),settings_valid=demand is not None,
@@ -85,6 +89,7 @@ def evaluate(now: float, plan: dict | None,
         proposed_action=original,
         plan_available=demand is not None,
         modeled_heat_demand=demand,
-        reason=("legacy_owner_not_released" if original in ("heat","off")
+        reason=("voltage_not_qualified" if grid is True and not voltage_qualified
+                else "legacy_owner_not_released" if original in ("heat","off")
                 else "manual_or_source_fallback"),
     )
