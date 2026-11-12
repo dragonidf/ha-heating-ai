@@ -22,7 +22,7 @@ KWS_ROLES = ("kws_l1", "kws_l2", "kws_l3", "kws_energy")
 
 
 def _read(hass: Any, entity: str | None, now: float, age_limit: int) -> dict:
-    result = dict(entity_id=entity, valid=False, value=None, age_seconds=None)
+    result = dict(entity_id=entity, valid=False, value=None, age_seconds=None, unit=None)
     if not entity or not isinstance(entity, str):
         return dict(result, reason="not_configured")
     state = hass.states.get(entity)
@@ -35,7 +35,9 @@ def _read(hass: Any, entity: str | None, now: float, age_limit: int) -> dict:
     result["age_seconds"] = round(age, 1)
     if age < -30 or age > age_limit:
         return dict(result, reason="stale")
-    return dict(result, valid=True, value=state.state, reason="ha_cache_fresh")
+    attributes = getattr(state, "attributes", {})
+    unit = attributes.get("unit_of_measurement") if isinstance(attributes, dict) else None
+    return dict(result, valid=True, value=state.state, unit=unit, reason="ha_cache_fresh")
 
 
 def _numerical(row: dict, low: float, high: float) -> float | None:
@@ -46,6 +48,18 @@ def _numerical(row: dict, low: float, high: float) -> float | None:
     except (ValueError, TypeError, OverflowError):
         return None
     return value if isfinite(value) and low <= value <= high else None
+
+
+def _power_w(row: dict) -> float | None:
+    """Convert only declared W/kW sources; never infer units from magnitude."""
+    unit = row.get("unit")
+    maximum = 15 if unit == "kW" else 15000 if unit == "W" else None
+    if maximum is None:
+        return None
+    value = _numerical(row, 0, maximum)
+    if value is None:
+        return None
+    return round(value * 1000, 2) if unit == "kW" else value
 
 
 def observe(hass: Any, mapping: dict[str, str], options: dict[str, str],
@@ -75,8 +89,10 @@ def observe(hass: Any, mapping: dict[str, str], options: dict[str, str],
     room_c = _numerical(room, -20, 55)
     return_c = _numerical(probe, 0, 90)
     outside_c = _numerical(outside, -55, 60)
-    phase_w = [_numerical(value, 0, 15000) for value in kw]
-    energy_kwh = _numerical(energy, 0, 1e9)
+    phase_w = [_power_w(value) for value in kw]
+    energy_kwh = (
+        _numerical(energy, 0, 1e9) if energy.get("unit") == "kWh" else None
+    )
     phases_v = [_numerical(value, 0, 350) for value in voltages]
     actual_grid = GRID_STATES.get(grid["value"]) if grid["valid"] else None
     physical_mode = str(mode["value"]) if mode["valid"] else None

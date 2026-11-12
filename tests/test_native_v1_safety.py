@@ -28,10 +28,11 @@ class GuardAndPersistenceTests(unittest.TestCase):
 
     def states(self, *, manual=True, kws_ok=True):
         now = datetime.now(timezone.utc)
-        def row(value, age=1):
+        def row(value, age=1, unit=None):
+            attributes = {"unit_of_measurement": unit} if unit else {}
             return SimpleNamespace(
                 state=str(value), last_reported=now-timedelta(seconds=age),
-                attributes={},
+                attributes=attributes,
             )
         values = {
             "sensor.room": row(21.3),
@@ -46,8 +47,12 @@ class GuardAndPersistenceTests(unittest.TestCase):
             "fan.circulation": row("off"),
         }
         for i in range(1, 4):
-            values["sensor.kws_"+str(i)] = row(0 if kws_ok else "unavailable")
-        values["sensor.kws_energy"] = row(100.0 if kws_ok else "unavailable")
+            values["sensor.kws_"+str(i)] = row(
+                0 if kws_ok else "unavailable", unit="kW"
+            )
+        values["sensor.kws_energy"] = row(
+            100.0 if kws_ok else "unavailable", unit="kWh"
+        )
         mapping = dict(room="sensor.room", **{
             "return": "sensor.return", "outside": "sensor.outside",
             "mode": "input_select.mode", "armed": "input_boolean.armed",
@@ -71,6 +76,57 @@ class GuardAndPersistenceTests(unittest.TestCase):
         self.assertEqual(result["kws_power_w"], 0)
         self.assertEqual(result["kws_total_kwh"], 100.0)
         self.assertIn("legacy_controller_active", result["source_warnings"])
+
+    def test_kws_kilowatts_convert_to_watts_and_unknown_units_fail_closed(self):
+        hass,mapping,sources = self.states(manual=False)
+        original_get = hass.states.get
+        # Representative values use the HA-declared kW format without copying
+        # private recorder samples into the repository.
+        samples = {"sensor.kws_1": 1.5, "sensor.kws_2": 3.3,
+                   "sensor.kws_3": 1.6}
+        def get(entity_id):
+            if entity_id in samples:
+                previous = original_get(entity_id)
+                return SimpleNamespace(
+                    state=str(samples[entity_id]),
+                    last_reported=previous.last_reported,
+                    attributes={"unit_of_measurement": "kW"},
+                )
+            return original_get(entity_id)
+        hass.states.get = get
+        observed = self.safety.observe(hass,mapping,sources)
+        self.assertEqual(observed["kws_phases_w"],[1500.0,3300.0,1600.0])
+        self.assertEqual(observed["kws_power_w"],6400.0)
+
+        samples["sensor.kws_2"] = 3.344
+        def unknown_unit(entity_id):
+            state = get(entity_id)
+            if entity_id == "sensor.kws_2":
+                return SimpleNamespace(
+                    state=state.state, last_reported=state.last_reported,
+                    attributes={"unit_of_measurement": "MW"},
+                )
+            return state
+        hass.states.get = unknown_unit
+        observed = self.safety.observe(hass,mapping,sources)
+        self.assertIsNone(observed["kws_power_w"])
+        self.assertIn("kws_phase_missing_or_stale", observed["source_warnings"])
+
+    def test_kws_energy_requires_declared_kwh(self):
+        hass,mapping,sources = self.states(manual=False)
+        original_get = hass.states.get
+        def wrong_energy_unit(entity_id):
+            state = original_get(entity_id)
+            if entity_id == "sensor.kws_energy":
+                return SimpleNamespace(
+                    state=state.state, last_reported=state.last_reported,
+                    attributes={"unit_of_measurement": "Wh"},
+                )
+            return state
+        hass.states.get = wrong_energy_unit
+        observed = self.safety.observe(hass,mapping,sources)
+        self.assertIsNone(observed["kws_total_kwh"])
+        self.assertIn("kws_counter_missing_or_stale", observed["source_warnings"])
 
     def test_last_known_voltage_never_proves_live_grid(self):
         hass,mapping,sources = self.states()
