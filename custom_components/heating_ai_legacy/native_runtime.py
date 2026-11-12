@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import MODEL, ENVIRONMENT, FORECAST
 from .native_engine.heating_model import coast
+from .plan_snapshot import mirror_legacy_plan
 
 REQUIRED_COEFFICIENTS = (
     "floor_air", "room_loss", "floor_decay", "heat_gain", "fire_gain"
@@ -67,10 +68,16 @@ def sample_v1_inputs(hass: HomeAssistant, mapping: dict[str, str]) -> dict[str, 
     # expected thermal execution. Preserve these limits even in SHADOW.
     source_plan = hass.states.get(FORECAST)
     plan_id = None
+    plan_attributes = None
     if source_plan and source_plan.state not in ("unknown", "unavailable"):
+        fields = ("created_at", "curve", "actual_curve", "heat_segments",
+                  "planned_kwh", "plan_id", "execution_state")
+        plan_attributes = {key: source_plan.attributes.get(key) for key in fields}
         plan_id = source_plan.attributes.get("plan_id")
     return dict(at=now.isoformat(), parameters=parameters,
-                plan_id=plan_id, **values)
+                plan_id=plan_id,
+                legacy_plan=mirror_legacy_plan(plan_attributes, now.timestamp()),
+                **values)
 
 
 def calculate_v1_coast(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -91,6 +98,7 @@ def calculate_v1_coast(snapshot: dict[str, Any]) -> dict[str, Any]:
         "three_hour_peak_c": maximum,
         "three_hour_end_c": final,
         "source_plan_id": snapshot["plan_id"],
+        "legacy_plan": snapshot["legacy_plan"],
         "computed_at": snapshot["at"],
     }
 

@@ -27,9 +27,18 @@ class NativeV1ShadowStatus(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self):
         # No full forecast arrays, raw YAML, credentials or private state.json
         data = self.coordinator.data
-        return {key: data[key] for key in (
+        plan = data.get("legacy_plan", {})
+        result = {
+            "legacy_plan_status": plan.get("status", "LEGACY_UNAVAILABLE"),
+            "legacy_plan_points": len(plan.get("curve", [])),
+            "legacy_plan_heat_windows": len(plan.get("segments", [])),
+            "legacy_plan_execution": plan.get("source_execution_state"),
+            "legacy_planned_kwh": plan.get("planned_kwh"),
+        }
+        result.update({key: data[key] for key in (
             "physical_commands_enabled", "forecast_qualified",
             "source", "scenario", "room_c", "estimated_floor_c",
             "outside_c", "three_hour_peak_c", "three_hour_end_c",
             "source_plan_id", "computed_at",
-        ) if key in data}
+        ) if key in data})
+        return result
