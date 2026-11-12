@@ -1,3 +1,16 @@
+> АКТУАЛЬНА ТОЧКА — 13.11.2026: PR25 merged у main, commit
+> 327b2ba0ac8ae65f170d34fb32a49fe48766cc31. Починати з latest main,
+> не з робочої гілки. Нижчі згадки draft/старих CI — історичні.
+> PR head 9ee7d096: Tests 43316983165 і candidate 43316983137 PASS,
+> включно Python3.12/3.13, Chromium/WebKit/accessibility і HA2026.11 smoke.
+> Наступне: перевірити push Tests на latest main та автоматичний immutable
+> release v0.4.0 з heating_ai_v1_marketplace.zip; потім Marketplace install.
+> HA ще НЕ оновлено. Новий контролер ставимо замість V2 SHADOW.
+> Перед physical activation потрібні fresh private snapshot/model/energy/archive
+> continuity і single-writer handoff. Старий V1/helpers НЕ видаляти, лише
+> disable його writer/watchdog під час handoff; очищення власник робить окремо.
+> Приватні дані лишаються у HA, shared AppDaemon/Sky Radar не зупиняти.
+
 # Почати тут: модернізація V1 з рішеннями V2
 
 Оновлено: 12.11.2026, Europe/Kyiv. Це точка передачі іншому GPT/Codex.

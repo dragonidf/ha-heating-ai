@@ -150,3 +150,20 @@ native-production PASS; browser FAIL на strict selector .history-readout:
 assertions. UI/control code unchanged. Next: обидва workflows наступного head;
 потім remaining E6/E7, release/store replacement of V2, single-writer handoff.
 Legacy V1/helpers не видаляти. Production unchanged. Тести виконує GitHub.
+
+### 13.11.2026 — all PR checks green, main merged; deployment pending
+
+Functional PR head 9ee7d096ea051db7e176682f8b70618791d6b82c:
+Tests 43316983165 і candidate 43316983137 SUCCESS. Chromium/WebKit,
+accessibility/mobile, Python3.12/3.13, actual HA2026.11 native smoke пройдені.
+PR25 merged squash у main 327b2ba0ac8ae65f170d34fb32a49fe48766cc31.
+E8: merge DONE, release/install PENDING main push CI і release workflow.
+E6: CI browser DONE; actual installed panel check pending. E7: preserved-state
+parity available; full telemetry replay/fresh migration continuity не заявлені
+PASS. E9 NOT STARTED. HA writes/cutover/V2 removal не виконані.
+Live V1 0.3.23 model6 4032 samples, storage healthy; Recorder self-check
+unverified (need retained identical-state decisions), не називати database fault.
+Next GPT: latest main → main push Tests → v0.4.0 asset SHA → Marketplace install
+inactive → private snapshot/continuity → disable V2 + old V1 writer/watchdog →
+activate one native writer → readback/actual KWS/panel/rollback checks.
+Не видаляти old V1/entities. Doc-only checkpoint не змінює tested code.
