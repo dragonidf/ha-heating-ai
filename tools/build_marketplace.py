@@ -92,8 +92,8 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
     # Staged migration: immutable V1 math as a native Python library.
     # Nothing inside this package opens HA connections or sends commands.
     contents["native_engine/__init__.py"] = (
-        b'"""Unmodified V1 numerical model; no AppDaemon or hardware calls."""\\n'
-    ).replace(b"\\\\n", b"\\n")
+        b'"""Original V1 model in an isolated package; no HA commands."""' + bytes([10])
+    )
     for name in PURE_MODULES:
         original = contents[f"legacy_app/{name}"]
         native = as_native_module(original)
