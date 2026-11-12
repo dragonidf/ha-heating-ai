@@ -56,7 +56,11 @@ def _parse_state(raw: bytes) -> dict:
         if not isinstance(row, dict):
             raise ValueError("Original energy bin is invalid")
     energy_last = data.get("energy_last")
-    if energy_last is not None and not _number(energy_last, 0, 1e10):
+    if type(energy_last) is dict:
+        if (not _number(energy_last.get("total"), 0, 1e10)
+                or not _number(energy_last.get("ts"), 0, 1e11)):
+            raise ValueError("Original energy cursor invalid")
+    elif energy_last is not None and not _number(energy_last, 0, 1e10):
         raise ValueError("Original energy cursor invalid")
     return data
 
@@ -65,13 +69,17 @@ def preview(raw: bytes) -> dict:
     """Report exactly what can be preserved without mutating it."""
     state = _parse_state(raw)
     model = state["model"]
+    energy_last = state.get("energy_last")
+    energy_cursor = energy_last.get("total") if type(energy_last) is dict else energy_last
+    energy_cursor_at = energy_last.get("ts") if type(energy_last) is dict else None
     return dict(
         status="DRY_RUN_ONLY",
         sha256=sha256(raw).hexdigest(),
         bytes=len(raw),
         model_version=model["version"],
         model_validated=model["validated"],
-        energy_cursor=state.get("energy_last"),
+        energy_cursor=energy_cursor,
+        energy_cursor_at=energy_cursor_at,
         energy_bin_count=len(state.get("energy_bins") or []),
         weather_points=len(state.get("weather") or []),
         journal_count=len(state.get("journal") or []),

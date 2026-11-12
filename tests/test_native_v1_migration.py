@@ -66,6 +66,16 @@ class MigrationTests(unittest.TestCase):
             self.assertFalse(report["native_physical_commands_enabled"])
             self.assertFalse((source/"v1-original-state.json").exists())
 
+    def test_dict_energy_cursor_accepted_and_malformed_dict_rejected(self):
+        data=json.loads(self.original())
+        data["energy_last"]={"total":133.25,"ts":1762900000.0}
+        report=self.migration.preview(json.dumps(data,allow_nan=False).encode())
+        self.assertEqual(report["energy_cursor"],133.25)
+        self.assertEqual(report["energy_cursor_at"],1762900000.0)
+        data["energy_last"]={"total":"133.25","ts":1762900000.0}
+        with self.assertRaises(ValueError):
+            self.migration.preview(json.dumps(data).encode())
+
     def test_explicit_hash_checked_opaque_backup_and_no_rewrite(self):
         with TemporaryDirectory() as directory:
             dest=Path(directory)/"native"
