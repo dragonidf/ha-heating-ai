@@ -98,7 +98,22 @@ class GuardAndPersistenceTests(unittest.TestCase):
         self.assertEqual(observed["kws_phases_w"],[1500.0,3300.0,1600.0])
         self.assertEqual(observed["kws_power_w"],6400.0)
 
-        samples["sensor.kws_2"] = 3.344
+        watt_samples = {"sensor.kws_1": 1500, "sensor.kws_2": 3300,
+                        "sensor.kws_3": 1600}
+        def watts(entity_id):
+            previous = original_get(entity_id)
+            if entity_id in watt_samples:
+                return SimpleNamespace(
+                    state=str(watt_samples[entity_id]),
+                    last_reported=previous.last_reported,
+                    attributes={"unit_of_measurement": "W"},
+                )
+            return previous
+        hass.states.get = watts
+        observed = self.safety.observe(hass,mapping,sources)
+        self.assertEqual(observed["kws_power_w"],6400.0)
+
+        samples["sensor.kws_2"] = 3.3
         def unknown_unit(entity_id):
             state = get(entity_id)
             if entity_id == "sensor.kws_2":
