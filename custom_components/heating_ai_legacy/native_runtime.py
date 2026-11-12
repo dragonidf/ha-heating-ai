@@ -172,6 +172,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.role_map = dict(entry.data.get("entity_map", {}))
         self.role_map.update(self.mapping)
         self.source_ids = dict(entry.data.get("source_ids", {}))
+        self.boiler_power_mode = entry.data.get("boiler_power_mode", "unconfirmed")
         self.model_store = None
         self.model_checkpoint = None
         self._floor_state = None
@@ -458,6 +459,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 role_map=role_map,
                 calendar_schedule=self.outage_schedule,
                 fireplace_entity=self.source_ids.get("fireplace_temp"),
+                boiler_power_mode=self.boiler_power_mode,
             )
         except (ValueError, KeyError, TypeError):
             report["native_plan_status"] = "BLOCKED_INPUTS"

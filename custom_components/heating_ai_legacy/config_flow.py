@@ -53,6 +53,13 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
             and len(value) <= 128 and value.count(".") == 1
             and " " not in value
         }
+        declared = self.hass.states.get("sensor.heating_power_model")
+        declared_mode = (
+            declared.state
+            if declared is not None and declared.state in (
+                "fixed_3", "fixed_6", "fixed_9"
+            ) else "unconfirmed"
+        )
         await self.async_set_unique_id("native_v1_shadow")
         self._abort_if_unique_id_configured()
         return self.async_create_entry(
@@ -62,6 +69,7 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
                 "room": mapping["room"],
                 "outside": mapping["outside"],
                 "entity_map": entity_map,
+                "boiler_power_mode": declared_mode,
                 "source_ids": {
                     role: entity_id for role, entity_id in SOURCE_HINTS.items()
                     if self.hass.states.get(entity_id) is not None

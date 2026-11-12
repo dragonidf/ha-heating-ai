@@ -121,12 +121,21 @@ def normalize_hourly_weather(items: Any, received_at: float) -> list[dict[str, f
     return records
 
 
+def nominal_kw(mode: str | None) -> float:
+    """Physical knob declaration, not an independent watt measurement."""
+    values = {"fixed_3": 3.0, "fixed_6": 6.0, "fixed_9": 9.0}
+    if mode not in values:
+        raise ValueError("Physical boiler mode unconfirmed")
+    return values[mode]
+
+
 def planner_snapshot(hass: Any, baseline: dict[str, Any],
                      hourly: list[dict[str, float]] | None,
                      received_at: float | None,
                      *, role_map: dict[str, str] | None = None,
                      calendar_schedule: dict[str, Any] | None = None,
-                     fireplace_entity: str | None = None) -> dict[str, Any]:
+                     fireplace_entity: str | None = None,
+                     boiler_power_mode: str | None = None) -> dict[str, Any]:
     """One bounded source snapshot; fail closed before calling the optimizer."""
     now = datetime.fromisoformat(baseline["at"])
     if now.tzinfo is None:
@@ -190,11 +199,13 @@ def planner_snapshot(hass: Any, baseline: dict[str, Any],
         "outside": baseline["outside"],
         "fire_delta": fire_delta,
         "model": dict(baseline["parameters"]),
-        "assumed_kw": 3.0,
+        "assumed_kw": nominal_kw(boiler_power_mode),
         "weather": [dict(row) for row in hourly],
         "settings": settings,
         "source_quality": {
             "weather_issue_time_known": False,
+            "boiler_power_basis": "configured_nominal_not_measured",
+            "physical_boiler_mode": boiler_power_mode,
             "floor_is_derived_heat_storage": True,
             "fireplace_is_provisional": True,
             "solar_and_ventilation_not_reproduced": True,

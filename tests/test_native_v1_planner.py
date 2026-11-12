@@ -77,6 +77,13 @@ class NativeV1PlannerTests(unittest.TestCase):
                     hourlies, now.timestamp()
                 )
                 self.assertEqual(len(converted), 30)
+                for mode, value in (
+                    ("fixed_3", 3.), ("fixed_6", 6.), ("fixed_9", 9.)
+                ):
+                    self.assertEqual(sources.nominal_kw(mode), value)
+                for invalid in (None, "unconfirmed", "auto", "fixed_12"):
+                    with self.assertRaises(ValueError):
+                        sources.nominal_kw(invalid)
                 self.assertEqual(converted[0]["temperature"], 5.0)
                 with self.assertRaises(ValueError):
                     sources.normalize_hourly_weather(
