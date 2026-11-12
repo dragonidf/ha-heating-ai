@@ -27,14 +27,14 @@ V2 залишається SHADOW без фізичних команд.
 3. Прочитати [ТЗ](v1-v2-modernization-spec.md),
    [реєстр](v1-v2-work-log.md), [матрицю перенесення](v2-transfer-checklist.md)
    та кореневий AGENTS.md. Не повторювати загальний аудит.
-4. Взяти latest head PR25. Виправлення synthetic temperature service вже є
-   у aeb9228. Його native-production/Python PASS; browser gate мав застарілу
-   вимогу chart+plan adjacency. Поточний checkpoint перевіряє chart першою та
-   порядок chart < hero < plan < details. Дочекатися обох GitHub workflows;
-   наступні failures брати з job logs. Повні тести виконувати GitHub за прямим
-   дорученням власника. E6/E7 ще PARTIAL; не оголошувати production готовим.
-   Встановлення — замість V2. Старий V1 та його сутності не видаляти: лише
-   disable його writer/watchdog під час handoff, очищення власник зробить окремо.
+4. Взяти latest head PR25. Native production smoke, Python3.12/3.13 і
+   candidate PASS на попередніх heads. Browser gate має stale selectors після
+   нового −6/+24 timeline: виправлено card order, geometry, horizon title та
+   strict selector future room line (now marker теж dashed). Відкрити поточний
+   head workflows; брати наступний failure з job logs, не припускати PASS.
+   Тести виконувати GitHub. E6/E7 PARTIAL; E8/E9 ще не виконано.
+   Новий контролер ставимо замість V2; старий V1 та helpers залишити, лише
+   disable writer/watchdog під час handoff. Подальше очищення робить власник.
 5. Після кожного завершеного етапу оновити реєстр і цю точку продовження,
    закомітити та перевірити віддалений SHA. Локальний файл не є checkpoint.
 

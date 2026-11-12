@@ -130,3 +130,13 @@ chart перед comfort і plan після comfort та gap до поперед
 Очікувана назва 24h horizon відповідає новому −6/+24 timeline. Overflow,
 font sizes, touch targets і height bounds збережені. Next: GitHub exact-head CI;
 E6/E7 ще PARTIAL. Production unchanged.
+
+### 12.11.2026 — browser series selector regression
+
+CI 43315225498: native-production/Python PASS, browser FAIL strict selector:
+shared timeline має два dashed paths (future room curve і now boundary).
+Theme test помилково обирав обидва. Вибір звужено до stroke var(--history-room)
+і dasharray; перевірка однакових кольорів збережена. Це test selector fix,
+не послаблення control/voltage чи renderer. Наступний head CI — обов'язковий.
+Owner target: install instead of V2; legacy V1 and entities retained for separate
+owner cleanup. E6/E7 PARTIAL; E8/E9 not executed. No production writes.
