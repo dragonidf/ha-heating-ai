@@ -529,7 +529,7 @@ def main(engine='chromium'):
             assert page.locator('[data-history-line="outside"]').count()>0
             page.locator('.history-plot').focus();page.locator('.history-plot').press('ArrowLeft')
             page.wait_for_selector('.history-crosshair',state='attached')
-            assert 'Котел:' in page.locator('.history-readout').inner_text() and 'Камін:' in page.locator('.history-readout').inner_text()
+            assert 'Котел:' in page.locator('.history-card .history-readout').inner_text() and 'Камін:' in page.locator('.history-card .history-readout').inner_text()
             page.locator('[data-history-range="24"]').click()
             assert page.locator('[data-series="fireplace"]').count()==1
             assert 'оцінка залишкового тепла' in page.locator('[data-series="fireplace"] title').text_content()
@@ -713,7 +713,7 @@ def main(engine='chromium'):
                 phone.wait_for_selector('.history-plot svg')
                 phone.locator('.history-plot').tap()
                 phone.wait_for_selector('.history-crosshair',state='attached')
-                assert 'Котел:' in phone.locator('.history-readout').inner_text()
+                assert 'Котел:' in phone.locator('.history-card .history-readout').inner_text()
             phone.locator('nav [data-tab="model"]').tap()
             phone.wait_for_selector('[data-comparison-line="forecast"]')
             phone.locator('[data-comparison-days="1"]').tap()

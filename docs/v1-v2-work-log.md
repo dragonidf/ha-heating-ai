@@ -140,3 +140,13 @@ Theme test помилково обирав обидва. Вибір звужен
 не послаблення control/voltage чи renderer. Наступний head CI — обов'язковий.
 Owner target: install instead of V2; legacy V1 and entities retained for separate
 owner cleanup. E6/E7 PARTIAL; E8/E9 not executed. No production writes.
+
+### 13.11.2026 — browser history readout scope
+
+Head 6db1f52: candidate 43316152056 PASS; Tests 43316152088 Python3.12/3.13,
+native-production PASS; browser FAIL на strict selector .history-readout:
+новий overview має два readouts. Keyboard/touch assertions тепер scoped до
+.history-card (саме її .history-plot тест натискає), збережені котел/камін
+assertions. UI/control code unchanged. Next: обидва workflows наступного head;
+потім remaining E6/E7, release/store replacement of V2, single-writer handoff.
+Legacy V1/helpers не видаляти. Production unchanged. Тести виконує GitHub.
