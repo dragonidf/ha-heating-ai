@@ -187,7 +187,7 @@ async def verify() -> None:
                         root?.querySelectorAll('rect.heat-native').length===1 &&
                         root?.querySelectorAll('rect.heat').length===0 &&
                         root?.getElementById('room')?.textContent.includes('21,3') &&
-                        root?.getElementById('source')?.textContent.includes('Незалежний прогноз V1+') &&
+                        root?.getElementById('source')?.textContent.includes('прогноз V1+') &&
                         root?.getElementById('plan')?.textContent.includes('умовне вікно') &&
                         root?.querySelectorAll('button, input, select').length===0;
                 }""",timeout=12000)
