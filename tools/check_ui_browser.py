@@ -636,7 +636,11 @@ def main(engine='chromium'):
                             assert metric.evaluate('el=>el.scrollWidth<=el.clientWidth'), (width,'metric overflow')
                         forecast_box=page.locator('.chart-card').bounding_box()
                         plan_box=page.locator('.plan-card').bounding_box()
-                        assert 0<=plan_box['y']-forecast_box['y']-forecast_box['height']<=16, (width,'plan separated from forecast')
+                        hero_box=page.locator('.hero').bounding_box()
+                        assert forecast_box['y']+forecast_box['height']<=hero_box['y']+1, (width,'timeline must precede comfort')
+                        assert hero_box['y']+hero_box['height']<=plan_box['y']+1, (width,'plan must follow comfort')
+                        gap=page.locator('.plan-card').evaluate('el=>el.getBoundingClientRect().top-el.previousElementSibling.getBoundingClientRect().bottom')
+                        assert 0<=gap<=16, (width,'unexpected gap before plan',gap)
                         if width in (360,390,430):
                             # v0.2.4 was 4493–4550 px on these same synthetic fixtures.
                             assert page.locator('main').bounding_box()['height']<3650, (width,'overview did not become compact')
@@ -766,7 +770,7 @@ def main(engine='chromium'):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.locator('[data-forecast-horizon="24"]').click()
-            assert page.locator('.chart-card h2').inner_text()=='Наступні 24 години'
+            assert page.locator('.chart-card h2').inner_text()=='Факт −6 год → прогноз +24 год'
             for grid in ('off','unknown'):
                 page.evaluate("""grid=>setHeatingScenario({
                     'sensor.heating_grid':{attributes:{raw:grid}},

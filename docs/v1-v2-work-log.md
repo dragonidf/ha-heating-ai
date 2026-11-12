@@ -122,3 +122,11 @@ PASS. Tests 43312563506 FAIL на browser assertion старої adjacency chart
 details; UI не змінено. Тести на пряме доручення власника передано GitHub;
 не повторювати повний локальний suite. Next: перевірити обидва workflows нового
 head, виправляти лише фактичні failures; потім E6/E7 і E8/E9. Production unchanged.
+
+### 12.11.2026 — remaining browser contract alignment
+
+Перевірено решту старих browser assertions: mobile geometry тепер перевіряє
+chart перед comfort і plan після comfort та gap до попередньої картки ≤16px.
+Очікувана назва 24h horizon відповідає новому −6/+24 timeline. Overflow,
+font sizes, touch targets і height bounds збережені. Next: GitHub exact-head CI;
+E6/E7 ще PARTIAL. Production unchanged.
