@@ -1,11 +1,20 @@
-"""Marketplace package remains an inert, byte-identical V1 distribution."""
+"""Prove native Marketplace candidate retains exact V1 thermal algorithms.
+
+These tests are offline, never contact production HA, and cannot actuate
+a thermostat or fan.
+"""
+import hashlib
+import importlib
 import json
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 import zipfile
 
-from tools.build_marketplace import build, EXPECTED, ROOT
+from tools.build_marketplace import (
+    build, EXPECTED, PURE_MODULES, ROOT, verify_native_module,
+)
 
 
 class MarketplaceCarrierTests(unittest.TestCase):
@@ -13,20 +22,67 @@ class MarketplaceCarrierTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 12)
+            self.assertEqual(result["files"], 18)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
-                self.assertEqual(
-                    names, {"__init__.py", "manifest.json",
-                            "legacy_app/release.json",
-                            *(f"legacy_app/{name}" for name in EXPECTED)}
-                )
+                wanted = {
+                    "__init__.py", "manifest.json", "legacy_app/release.json",
+                    "native_engine/__init__.py",
+                    *(f"legacy_app/{name}" for name in EXPECTED),
+                    *(f"native_engine/{name}" for name in PURE_MODULES),
+                }
+                self.assertEqual(names, wanted)
                 recorded = json.loads(archive.read("legacy_app/release.json"))
                 self.assertEqual(recorded["version"], "0.3.23")
                 self.assertEqual(recorded["version"], (ROOT / "VERSION").read_text().strip())
+                for name in EXPECTED:
+                    content = archive.read(f"legacy_app/{name}")
+                    self.assertEqual(hashlib.sha256(content).hexdigest(),
+                                     recorded["module_hashes"][name])
+                for name in PURE_MODULES:
+                    verify_native_module(
+                        archive.read(f"native_engine/{name}"),
+                        archive.read(f"legacy_app/{name}"),
+                    )
                 self.assertNotIn("config.yaml", names)
                 self.assertFalse(any(name.endswith(".yaml") for name in names))
                 self.assertNotIn(b"call_service", archive.read("__init__.py"))
+
+    def test_model_produces_identical_results_in_native_package(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "review.zip"
+            build(path)
+            with zipfile.ZipFile(path) as archive:
+                archive.extractall(directory)
+            v1source = str(ROOT / "apps" / "heating_ai")
+            sys.path.insert(0, directory)
+            sys.path.insert(0, v1source)
+            try:
+                legacy = importlib.import_module("heating_model")
+                native = importlib.import_module("native_engine.heating_model")
+                model = dict(
+                    floor_air=.03, room_loss=.01, floor_decay=.12,
+                    heat_gain=.5, fire_gain=.025,
+                )
+                for room, floor, outside, watts, fire in [
+                    (21.5, 26.0, 4.0, 0.0, 0.0),
+                    (21.8, 27.5, 1.0, 6.0, 0.0),
+                    (22.0, 28.0, -3.0, 0.0, 16.0),
+                ]:
+                    args = (room, floor, outside, watts, fire, model, 1/12)
+                    self.assertEqual(legacy.step(*args), native.step(*args))
+                    coast_args = (room, floor, outside, fire, model, 3)
+                    self.assertEqual(legacy.coast(*coast_args), native.coast(*coast_args))
+                for power in (None, 0, 50, 2999, 3000, 6000, 9000):
+                    for previous in ("off", "3 кВт", "6 кВт", "9 кВт"):
+                        self.assertEqual(legacy.nominal_mode(power, previous),
+                                         native.nominal_mode(power, previous))
+            finally:
+                sys.path.remove(v1source)
+                sys.path.remove(directory)
+                for name in list(sys.modules):
+                    if name == "native_engine" or name.startswith("native_engine."):
+                        sys.modules.pop(name, None)
 
     def test_repeated_archives_have_identical_digest(self):
         with TemporaryDirectory() as directory:
