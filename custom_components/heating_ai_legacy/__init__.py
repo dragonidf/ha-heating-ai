@@ -6,16 +6,18 @@ automations or physical command transport.
 """
 from __future__ import annotations
 
+import asyncio
 from hashlib import sha256
 from pathlib import Path
 
 from homeassistant.components import frontend, panel_custom
 from homeassistant.components.http.server import StaticPathConfig
+from homeassistant.components.weather.const import DATA_COMPONENT as WEATHER_ENTITIES
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN, PLATFORMS
+from .const import DOMAIN, PLATFORMS, SOURCE_UI
 from .native_runtime import V1ShadowCoordinator
 
 
@@ -61,7 +63,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             require_admin=True,
         )
         panel_registered = True
+
+        # Native, read-only hourly forecasts. No service calls, cloud tokens,
+        # or legacy-AppDaemon lifecycle coupling. If provider is unavailable,
+        # the independent plan remains BLOCKED_INPUTS instead of inventing it.
+        ui = hass.states.get(SOURCE_UI)
+        entities = ui.attributes.get("entities") if ui is not None else None
+        weather_id = entities.get("weather") if isinstance(entities, dict) else None
+        store = hass.data.get(WEATHER_ENTITIES)
+        provider = (
+            store.get_entity(weather_id)
+            if store is not None and isinstance(weather_id, str) else None
+        )
+        if provider is not None:
+            try:
+                coordinator._weather_unsubscribe = provider.async_subscribe_forecast(
+                    "hourly", coordinator.receive_weather,
+                )
+                await asyncio.wait_for(
+                    provider.async_update_listeners({"hourly"}), timeout=20,
+                )
+            except (TypeError, ValueError, RuntimeError, asyncio.TimeoutError):
+                coordinator.receive_weather(None)
     except Exception:
+        await coordinator.close()
         if panel_registered:
             frontend.async_remove_panel(
                 hass, "heating-v1-preview", warn_if_unknown=False
@@ -77,4 +102,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         return False
     frontend.async_remove_panel(hass, "heating-v1-preview", warn_if_unknown=False)
+    await entry.runtime_data.close()
     return True
