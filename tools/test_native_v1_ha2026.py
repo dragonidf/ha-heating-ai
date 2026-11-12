@@ -30,7 +30,7 @@ def main() -> None:
         folder = Path(temp)
         archive = folder / "carrier.zip"
         summary = build(archive)
-        assert summary["files"] == 26
+        assert summary["files"] == 27
         target = folder / "isolated" / "custom_components" / "heating_ai_legacy"
         target.mkdir(parents=True)
         with zipfile.ZipFile(archive) as package:

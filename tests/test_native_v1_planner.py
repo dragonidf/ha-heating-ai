@@ -67,6 +67,22 @@ class NativeV1PlannerTests(unittest.TestCase):
                 self.assertGreater(len(result["forecast"]), 24)
                 self.assertEqual(
                     result["reason"], "schedule_coverage_unverified")
+                sources = import_module("reviewed_heating_v1.native_sources")
+                hourlies = [
+                    {"datetime": (now + timedelta(hours=i)).isoformat(),
+                     "temperature": 5.0}
+                    for i in range(-1, 29)
+                ]
+                converted = sources.normalize_hourly_weather(
+                    hourlies, now.timestamp()
+                )
+                self.assertEqual(len(converted), 30)
+                self.assertEqual(converted[0]["temperature"], 5.0)
+                with self.assertRaises(ValueError):
+                    sources.normalize_hourly_weather(
+                        [dict(hourlies[0], temperature=float("nan"))]
+                        + hourlies[1:], now.timestamp()
+                    )
                 no_weather = native.provisional_plan(
                     dict(snapshot, weather=[]))
                 self.assertEqual(no_weather["status"], "BLOCKED_INPUTS")
