@@ -79,6 +79,33 @@ class GuardAndPersistenceTests(unittest.TestCase):
         self.assertIn("kws_phase_missing_or_stale", result["source_warnings"])
         self.assertFalse(result["physical_commands_enabled"])
 
+    def test_fireplace_hysteresis_manual_stop_and_unverified_backup(self):
+        fan = importlib.import_module(PKG + ".native_fan")
+        t=1234567890.
+        initial=fan.project(None,t,5.5,mode="Авто",enabled=True,
+             grid=True,fan_readable=True,standard=38,night_limit=28,
+             intense=65,night_window=False)
+        self.assertTrue(initial.request)
+        self.assertEqual(initial.percent,38)
+        self.assertEqual(initial.source,"fireplace")
+        self.assertFalse(initial.physical_commands_enabled)
+        stopped=fan.project(initial.state,t+60,11.0,mode="Зупинити",
+             enabled=True,grid=True,fan_readable=True,standard=38,
+             night_limit=28,intense=65,night_window=False)
+        self.assertFalse(stopped.request)
+        self.assertIsNone(stopped.percent)
+        blackout=fan.project(initial.state,t+60,11.0,mode="Авто",
+             enabled=True,grid=None,fan_readable=True,standard=38,
+             night_limit=28,intense=65,night_window=False)
+        self.assertTrue(blackout.request)
+        self.assertIsNone(blackout.percent)
+        self.assertEqual(blackout.reason,"fan_supply_unknown")
+        cold=fan.project(initial.state,t+60,2.0,mode="Авто",
+             enabled=True,grid=True,fan_readable=True,standard=38,
+             night_limit=28,intense=65,night_window=False)
+        self.assertFalse(cold.state.burning)
+        self.assertFalse(cold.request)
+
     def test_private_model_sha256_and_reject_downgrade(self):
         with TemporaryDirectory() as folder:
             coeff = dict(floor_air=.03,room_loss=.01,floor_decay=.20,
