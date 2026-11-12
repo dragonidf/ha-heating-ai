@@ -1,12 +1,36 @@
-"""Marketplace carrier for the already-running Heating AI V1 AppDaemon app.
+"""Native V1+ preview built on the original V1 numerical model.
 
-This component intentionally registers no automations, entities, panels, or
-climate/fan services. Installing it must NOT start a second controller.
-Only an explicitly approved one-time migration of the existing AppDaemon
-symlinks makes the separately bundled legacy_app code active.
+This is an observational compatibility milestone, NOT an executable heating
+controller. It deliberately registers no switches, services, scripts,
+automations or physical command transport.
 """
+from __future__ import annotations
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+
+from .const import PLATFORMS
+from .native_runtime import V1ShadowCoordinator
 
 
-async def async_setup(hass, config):
-    """Accept the package without touching the running heating system."""
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Accept the integration without changing existing heating."""
     return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Register only a safe read-only native model parity sensor."""
+    if entry.data.get("shadow") is not True:
+        raise ValueError("V1 native physical commissioning is not implemented")
+    coordinator = V1ShadowCoordinator(
+        hass, dict(room=entry.data["room"], outside=entry.data["outside"])
+    )
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload only the diagnostic sensor; the legacy controller is untouched."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

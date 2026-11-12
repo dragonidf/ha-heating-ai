@@ -109,6 +109,8 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
     manifest = json.loads(root_manifest)
     if manifest.get("domain") != DOMAIN or manifest.get("version") != "1.0.0":
         raise ValueError("Unexpected Marketplace carrier domain/version")
+    if manifest.get("config_flow") is not True:
+        raise ValueError("Native integration must register a config flow")
     if manifest.get("requirements") != []:
         raise ValueError("Carrier must not install Python dependencies in HA")
     hacs = json.loads((ROOT / "hacs.json").read_text(encoding="utf-8"))
@@ -118,9 +120,14 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
             hacs.get("hide_default_branch") is True):
         raise ValueError("Marketplace packaging fields are inconsistent")
     contents["manifest.json"] = nested_manifest
-    contents["__init__.py"] = (CARRIER / "__init__.py").read_bytes()
-    if b"call_service" in contents["__init__.py"] or b"async_call" in contents["__init__.py"]:
-        raise ValueError("Native carrier cannot contain equipment service calls")
+    for name in ("__init__.py", "const.py", "config_flow.py",
+                 "native_runtime.py", "sensor.py", "strings.json"):
+        contents[name] = (CARRIER / name).read_bytes()
+        if name.endswith(".py"):
+            compile(contents[name], name, "exec")
+    # A manually-approved cutover is intentionally impossible in this preview.
+    if b"async_call" in contents["__init__.py"] or b"call_service" in contents["__init__.py"]:
+        raise ValueError("Native preview cannot contain equipment service calls")
     return contents, app_version.encode()
 
 

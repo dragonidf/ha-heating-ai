@@ -22,12 +22,13 @@ class MarketplaceCarrierTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 18)
+            self.assertEqual(result["files"], 23)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 wanted = {
                     "__init__.py", "manifest.json", "legacy_app/release.json",
-                    "native_engine/__init__.py",
+                    "native_engine/__init__.py", "const.py", "config_flow.py",
+                    "native_runtime.py", "sensor.py", "strings.json",
                     *(f"legacy_app/{name}" for name in EXPECTED),
                     *(f"native_engine/{name}" for name in PURE_MODULES),
                 }
