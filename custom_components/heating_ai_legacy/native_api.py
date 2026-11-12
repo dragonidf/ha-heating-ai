@@ -45,7 +45,6 @@ def register(hass):
                 "physical_commands_enabled": False,
                 "commands_sent": 0, "forecast": [], "heat_segments": [],
                 "entity_map": dict(coordinator.role_map),
-            "outage_preview": coordinator.outage_schedule,
                 "outage_preview": coordinator.outage_schedule,
             })
             return
@@ -59,6 +58,7 @@ def register(hass):
             "nominal_energy_kwh": proposal.get("nominal_energy_kwh"),
             "source": "native_v1_optimizer",
             "entity_map": dict(coordinator.role_map),
+            "outage_preview": coordinator.outage_schedule,
             "decision_preview": (coordinator.data or {}).get(
                 "legacy_decision_preview"
             ),
