@@ -17,4 +17,7 @@ SOURCE_HINTS = {
     "kws_l2": "sensor.energy_meter_kotel_potuzhnist_b",
     "kws_l3": "sensor.energy_meter_kotel_potuzhnist_c",
     "kws_energy": "sensor.energy_meter_kotel_energiia",
+    "fireplace_temp": "sensor.t_h_kamin_vitalnia_temperature",
+    "recuperator": "switch.rekuperator_switch_1",
+    "bath": "switch.vitiazhka_vanna_switch_1",
 }

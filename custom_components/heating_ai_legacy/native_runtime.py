@@ -23,6 +23,7 @@ from .native_planner import provisional_plan
 from .native_safety import observe as observe_safety
 from .native_persistence import observe_room
 from .native_model import remember as save_learned_model
+from .native_fan_sources import snapshot as fan_snapshot
 
 REQUIRED_COEFFICIENTS = (
     "floor_air", "room_loss", "floor_decay", "heat_gain", "fire_gain"
@@ -126,6 +127,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.source_ids = dict(entry.data.get("source_ids", {}))
         self.model_store = None
         self.model_checkpoint = None
+        self._fan_state = None
         self._storage_directory = None
         self.durable_ledger = None
         self.ledger_summary = None
@@ -255,6 +257,15 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 source_warnings=["source_monitor_failed"],
                 grid=None, kws_power_w=None, kws_total_kwh=None,
             )
+        try:
+            self._fan_state, fan_result = fan_snapshot(
+                self.hass, role_map, self.source_ids,
+                safety, self._fan_state, time.time()
+            )
+        except Exception:
+            self._fan_state = None
+            fan_result = dict(mode="SHADOW_FAN",reason="source_unqualified",
+                              physical_commands_enabled=False,commands_sent=0)
         safety_status = {
             "mode": "NATIVE_SHADOW", "physical_commands_enabled": False,
             "source_quality": safety.get("source_quality"),
@@ -267,6 +278,7 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "thermostat_mode": safety.get("thermostat_mode"),
             "fan_state": safety.get("fan_state"),
             "fireplace_state": safety.get("fireplace_state"),
+            "fan_preview": fan_result,
             "durable_journal": self.ledger_summary,
             "storage_fault": getattr(self, "_storage_fault", None),
             "cached_model_version": (

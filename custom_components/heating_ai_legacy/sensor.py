@@ -49,6 +49,11 @@ class NativeV1ShadowStatus(CoordinatorEntity, SensorEntity):
             "thermostat_mode": data.get("thermostat_mode"),
             "journal_fenced": (data.get("durable_journal") or {}).get("fenced"),
             "storage_fault": data.get("storage_fault"),
+            "cached_model_version": data.get("cached_model_version"),
+            "fan_preview_reason": (data.get("fan_preview") or {}).get("reason"),
+            "fan_preview_percent": (data.get("fan_preview") or {}).get("proposed_percent"),
+            "recuperator_state": (data.get("fan_preview") or {}).get("recuperator"),
+            "bath_state": (data.get("fan_preview") or {}).get("bathroom"),
         }
         result.update({key: data[key] for key in (
             "physical_commands_enabled", "forecast_qualified",
