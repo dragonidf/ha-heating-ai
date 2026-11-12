@@ -157,7 +157,19 @@ async def verify() -> None:
                 assert "PROVISIONAL_SOURCES" in checks["native_status"]
                 assert checks["controls"] == 0, "Preview must not contain equipment controls"
                 if label=="mobile":
-                    assert checks["has_horizontal_scroll"]
+                    assert not checks["has_horizontal_scroll"], "Full 24h graph should fit mobile"
+                    placement=await page.evaluate("""() => {
+                        const root=document.querySelector('heating-v1-native-preview').shadowRoot;
+                        return {
+                          chart:root.querySelector('.chartbox').getBoundingClientRect().top,
+                          secondary:root.querySelector('.stats.secondary').getBoundingClientRect().top,
+                          viewBox:root.querySelector('.chart').getAttribute('viewBox'),
+                          primaryCount:root.querySelector('.stats:not(.secondary)').children.length,
+                        };
+                    }""")
+                    assert placement["chart"] < placement["secondary"]
+                    assert placement["viewBox"] == "0 0 600 390"
+                    assert placement["primaryCount"] == 2
                 # Native-only lifecycle: old AppDaemon sensors no longer exist.
                 await page.evaluate("""() => {
                     const el=document.querySelector('heating-v1-native-preview');
