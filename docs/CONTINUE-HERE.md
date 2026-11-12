@@ -28,8 +28,8 @@ V2 залишається SHADOW без фізичних команд.
 3. Прочитати [ТЗ](v1-v2-modernization-spec.md),
    [реєстр](v1-v2-work-log.md), [матрицю перенесення](v2-transfer-checklist.md)
    та кореневий AGENTS.md. Не повторювати загальний аудит.
-4. **Наступний етап E1**: регресії ручного AUTO/STOP під час двох послідовних
-   dispatch; final intent/owner epoch guard; короткий safety pass, який не
+4. **Наступний етап E1 (частково)**: final-dispatch live mode/armed guard вже
+   має регресії; завершити durable intent/owner epoch guard і safety pass, який не
    чекає serial callback/диска/planner. Теплову математику не переписувати.
 5. Після кожного завершеного етапу оновити реєстр і цю точку продовження,
    закомітити та перевірити віддалений SHA. Локальний файл не є checkpoint.

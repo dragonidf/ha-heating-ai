@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+from math import isfinite
 from hashlib import sha256
 from pathlib import Path
 import time
@@ -89,7 +90,34 @@ class NativeController(HeatingClimate):
     def async_command_allowed(self, domain, service, data):
         if domain != "climate" or (service == "set_hvac_mode" and data.get("hvac_mode") == "off"):
             return True
-        return self.async_voltage_status()["voltage_qualified"]
+        if not self.async_voltage_status()["voltage_qualified"]:
+            return False
+        # Re-read HA immediately before each dispatch, outside the worker's
+        # cached tick snapshot. A manual choice between setpoint and mode must
+        # invalidate the old positive demand without overwriting that choice.
+        thermostat = self.hass.states.get(self.args["thermostat"])
+        try:
+            current = float(thermostat.attributes["current_temperature"])
+            target = float(data.get("temperature", thermostat.attributes.get("temperature")))
+            positive = not (isfinite(current) and isfinite(target)) or target > current
+        except (ValueError, TypeError, AttributeError, KeyError):
+            positive = True
+        if (service == "set_hvac_mode" and data.get("hvac_mode") == "heat"
+                and getattr(self, "_dispatch_action", None) not in ("off", "observe", "release")):
+            positive = True
+        if not positive:
+            return True  # Original V1 release lowers the target in HEAT mode.
+        armed = self.hass.states.get(self.args["armed"])
+        mode = self.hass.states.get(self.args["mode"])
+        if armed is None or armed.state != "on" or mode is None:
+            return False
+        if mode.state == "Автоматичне керування":
+            return True
+        # An explicitly selected native AUTO keeps its established fallback
+        # target semantics, but an old model HEAT cannot pass this boundary.
+        return (mode.state == "Штатний auto" and
+                getattr(self, "_dispatch_action", None) == "fallback" and
+                (service != "set_hvac_mode" or data.get("hvac_mode") == "auto"))
 
     def voltage_changed(self, *args):
         if getattr(self, "runtime_ready", False):
@@ -162,7 +190,11 @@ class NativeController(HeatingClimate):
     def apply_action(self, action, once):
         if self.apply_voltage_stop():
             return
-        return super().apply_action(action, once)
+        self._dispatch_action = action
+        try:
+            return super().apply_action(action, once)
+        finally:
+            self._dispatch_action = None
 
     def publish(self, entity, state, **attributes):
         if entity in ("sensor.heating_heartbeat", "sensor.heating_ui", "sensor.heating_controller"):

@@ -22,7 +22,7 @@ DONE-CODE ≠ DEPLOYED. Частково зроблене не відмічат�
 | ID | Статус | Конкретне завершення / перевірка |
 |---|---|---|
 | E0 | DONE-DOCS | ТЗ, цей реєстр і continuation збережені в робочій гілці PR25; PR body має явно відображати незакриті пункти; checkpoint commit містить лише документацію |
-| E1 | TODO — NEXT | Regression manual AUTO/STOP між setpoint/mode, durable manual intent/owner epoch; memory-only fast safety незалежно serial/disk; blocked planner scenario |
+| E1 | PARTIAL | E1a: final-dispatch live mode/armed guard та manual AUTO між setpoint/mode; 2 failing regressions → PASS. Ще НЕ закрито durable manual epoch, independent memory-only safety та blocked planner scenario |
 | E2 | TODO | Production command evidence PREPARED/SENT/HA_ECHO/UNKNOWN + crash reconciliation/fence, bounded journal, no blind HEAT retry |
 | E3 | TODO | Source timestamps/provenance/finite/unit; preserved KWS zero/20s/energy tests; bounded single-flight/timeout stale drop |
 | E4 | TODO | Versioned admin-only production settings API; CAS/readback і raw-event bypass rejection |
@@ -45,3 +45,15 @@ DONE-CODE ≠ DEPLOYED. Частково зроблене не відмічат�
 функціональний baseline f9e707fdd4e5579114c56bbfa04e56fe5c43d384, PR25 draft.
 Немає заяви про готовність 8/8 або production. Next: E1. Для deployment іншому
 акаунту потрібен окремий авторизований HA connection, не лише GitHub.
+
+### 12.11.2026 — E1a, final-dispatch manual guard
+
+Checkpoint E0: 7e5d8af7f66d93bceedb21dccc6612b5f2c51d0c, віддалений Git.
+Дві регресії перед fix відтворили пропущений HEAT після ручного AUTO та
+позитивну уставку після disarm. Додано live mode/armed read перед кожною
+командою; manual rejection не відправляє OFF поверх вибраного AUTO, voltage
+rejection зберігає emergency OFF. Original release lowering-target semantics
+та explicit manual fallback збережені. Paths: production.py, native_bridge.py,
+test_native_v1_production.py. `make check test`: 595 Python +50 JS PASS.
+Production не змінено. E1 ще PARTIAL: продовжити
+durable epoch та independent safety, не ставити DONE за цей окремий fix.

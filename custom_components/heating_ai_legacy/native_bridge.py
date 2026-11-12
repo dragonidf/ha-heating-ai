@@ -139,7 +139,8 @@ class Hass:
             guard = getattr(self, "async_command_allowed", None)
             if guard is not None and not guard(domain, action, data):
                 # A voltage change between planning and dispatch must also stop heat.
-                if domain == "climate":
+                if (domain == "climate" and not
+                        (getattr(self, "voltage_status", None) or {}).get("voltage_qualified", False)):
                     await self.hass.services.async_call("climate", "set_hvac_mode", {
                         "entity_id": self.args["thermostat"], "hvac_mode": "off",
                     }, blocking=True, context=self._context)

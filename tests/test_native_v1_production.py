@@ -207,6 +207,41 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             hass.services.async_call.assert_not_called()
             self.assertFalse(app._handles)
 
+    async def test_manual_auto_between_setpoint_and_heat_rejects_old_heat_without_overriding_auto(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            with patch.object(component.time, "time", return_value=1000):
+                app.async_voltage_status()
+            with patch.object(component.time, "time", return_value=1030):
+                self.assertTrue(app.async_voltage_status()["voltage_qualified"])
+            with patch.object(component.time, "time", return_value=1031):
+                await asyncio.to_thread(app.call_service, "climate/set_temperature",
+                                        entity_id="climate.boiler", temperature=24)
+                # User selects native AUTO while the legacy worker still has HEAT.
+                hass.rows["input_select.mode"].state = "Штатний auto"
+                hass.rows["climate.boiler"].state = "auto"
+            with patch.object(component.time, "time", return_value=1032):
+                with self.assertRaises(PermissionError):
+                    await asyncio.to_thread(app.call_service, "climate/set_hvac_mode",
+                                            entity_id="climate.boiler", hvac_mode="heat")
+                self.assertEqual(hass.rows["climate.boiler"].state, "auto")
+                self.assertEqual(hass.services.async_call.await_count, 1)
+
+    async def test_disarmed_dispatch_rejects_positive_setpoint_but_allows_lowering_target(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            with patch.object(component.time, "time", return_value=1000):
+                app.async_voltage_status()
+            hass.rows["input_boolean.armed"].state = "off"
+            with patch.object(component.time, "time", return_value=1030):
+                with self.assertRaises(PermissionError):
+                    await asyncio.to_thread(app.call_service, "climate/set_temperature",
+                                            entity_id="climate.boiler", temperature=24)
+            with patch.object(component.time, "time", return_value=1031):
+                await asyncio.to_thread(app.call_service, "climate/set_temperature",
+                                        entity_id="climate.boiler", temperature=20)
+                self.assertEqual(hass.services.async_call.await_count, 1)
+
     async def test_callbacks_are_serial_and_errors_from_services_are_observable(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
