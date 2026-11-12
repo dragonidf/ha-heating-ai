@@ -97,15 +97,16 @@ const stylesheet = [
   '.chartbox{padding:16px 18px 12px}.heading{font-size:16px;font-weight:700}',
   '.key{display:flex;gap:18px;flex-wrap:wrap;color:#b7c6d9;margin:13px 0 4px;font-size:12px}',
   '.key span:before{content:"";display:inline-block;width:19px;margin:0 6px 3px 0;vertical-align:middle;border-top:3px solid var(--line)}',
-  '.scroll{overflow-x:auto;scrollbar-width:thin}.chart{display:block;width:100%;min-width:750px;aspect-ratio:1080/390}',
+  '.scroll{overflow-x:auto;scrollbar-width:thin}.chart{display:block;width:100%;min-width:0;height:auto;aspect-ratio:auto}',
   '.chart text{fill:#9aadc6;font-size:13px}.gridline{stroke:#34465c;stroke-width:1;stroke-dasharray:3 5}',
   '.actual{stroke:#63d3b4;stroke-width:3}.forecast{stroke:#77a8ff;stroke-width:3;stroke-dasharray:8 5}',
   '.native{stroke:#f4a0bf;stroke-width:2.6;stroke-dasharray:10 4}',
   '.target{stroke:#ffbf6b;stroke-width:2;stroke-dasharray:3 6}.lower{stroke:#b18fff;stroke-width:1.5;stroke-dasharray:4 4}',
   '.heat{fill:#3fb48a;fill-opacity:.15}.heat-native{fill:#f4a0bf;fill-opacity:.11;stroke:#f4a0bf;stroke-opacity:.5;stroke-dasharray:5 5}.outage{fill:#c27e82;fill-opacity:.18}.now{stroke:#dbe3f0;stroke-width:1.5;stroke-dasharray:4 5}',
   '.note,.notice{font-size:12px;color:#aabbd0;line-height:1.6}.note{margin:9px 0 2px}.notice{padding:12px 15px;margin-top:13px}',
+  '.stats.secondary{margin-top:14px;margin-bottom:0}',
   '.error{color:#f2b390}.right{display:flex;flex-direction:column;gap:5px;align-items:flex-end}',
-  '@media(max-width:650px){.wrap{padding:12px 9px 36px}.stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.stat{padding:12px}.stat strong{font-size:20px}.chartbox{padding:13px 9px}.key{gap:10px}.brand{font-size:18px}}'
+  '@media(max-width:650px){.wrap{padding:12px 9px 36px}.stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.stat{padding:12px}.stat strong{font-size:20px}.chartbox{padding:13px 9px}.chart text{font-size:20px}.key{gap:10px}.brand{font-size:18px}}'
 ].join('');
 class HeatingV1NativePanel extends HTMLElement {
   constructor() {
@@ -147,6 +148,14 @@ class HeatingV1NativePanel extends HTMLElement {
       '<section class="notice">Це паралельний перегляд старого прогнозу V1. Він не є ' +
       'незалежним планом V1+ і не керує котлом, вентилятором чи рекуператором. ' +
       'Вручну обраний AUTO не перезапускається з цієї панелі.</section></main>';
+    // The main forecast belongs directly under room and target, not
+    // below eight separate status cards on a narrow phone screen.
+    const primary = this.shadowRoot.querySelector('.stats');
+    const chartSection = this.shadowRoot.querySelector('.chartbox');
+    const secondary = document.createElement('section');
+    secondary.className = 'stats secondary';
+    while (primary.children.length > 2) secondary.appendChild(primary.children[2]);
+    chartSection.after(secondary);
   }
   set hass(value) {
     this._lastHass = value;
@@ -305,6 +314,8 @@ class HeatingV1NativePanel extends HTMLElement {
         'Розраховані інтервали не є фізичними командами.'
       : 'Немає актуального розрахунку; майбутня температура не домальовується.';
     const canvas = this.shadowRoot.querySelector('.chart');
+    const compact = this.getBoundingClientRect().width <= 650;
+    canvas.setAttribute('viewBox', compact ? '0 0 600 390' : '0 0 1080 390');
     while (canvas.firstChild) canvas.removeChild(canvas.firstChild);
     const all = history.concat(prediction, nativeCurve);
     if (current !== null) all.push({ at: now, temperature: current });
@@ -314,7 +325,7 @@ class HeatingV1NativePanel extends HTMLElement {
         if (p[k] !== null && p[k] !== undefined) temps.push(p[k]);
     const ymin = temps.length ? Math.floor((Math.min(...temps) - .4) * 2) / 2 : 19;
     const ymax = temps.length ? Math.max(ymin + 1, Math.ceil((Math.max(...temps) + .4) * 2) / 2) : 23;
-    const X0 = 63, X1 = 1057, Y0 = 31, Y1 = 314;
+    const X0 = compact ? 55 : 63, X1 = compact ? 578 : 1057, Y0 = 31, Y1 = 314;
     const x = t => X0 + (t - since) / (until - since) * (X1 - X0);
     const y = v => Y1 - (v - ymin) / (ymax - ymin) * (Y1 - Y0);
     for (let i=0; i<=4; i++) {
