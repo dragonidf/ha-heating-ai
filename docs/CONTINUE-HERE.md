@@ -27,11 +27,17 @@ V2 залишається SHADOW без фізичних команд.
 3. Прочитати [ТЗ](v1-v2-modernization-spec.md),
    [реєстр](v1-v2-work-log.md), [матрицю перенесення](v2-transfer-checklist.md)
    та кореневий AGENTS.md. Не повторювати загальний аудит.
-4. **Наступний етап E7 (частково)**: E1–E5 завершені на рівні коду, E6 потребує
-   реального browser/light/dark/mobile огляду. Запустити exact-head Linux CI,
-   відрізнити справжні регресії від відомої локальної Windows заборони на
-   Python temp writes, потім виконати historical replay/continuity і Recorder
-   write-rate. Теплову математику не переписувати.
+4. Продовжити з remote head
+   `97bf637d7b7fbaa43c61556fb3794596f4113218`. Candidate workflow
+   [43311679116](https://github.com/dragonidf/ha-heating-ai/actions/runs/43311679116)
+   зелений. Tests run
+   [43311679018](https://github.com/dragonidf/ha-heating-ai/actions/runs/43311679018)
+   ще не release gate: `native-production` падає лише тому, що synthetic HA
+   fixture зареєстрував `climate.set_hvac_mode`, але реальний `apply_action`
+   після нового final guard спочатку викликає незареєстрований у fixture
+   `climate.set_temperature` (`ServiceNotFound`, job `131509066663`). Додати
+   synthetic `set_temperature`, який оновлює атрибут уставки, не послаблювати
+   production gateway, і повторити exact-head Linux CI.
 5. Після кожного завершеного етапу оновити реєстр і цю точку продовження,
    закомітити та перевірити віддалений SHA. Локальний файл не є checkpoint.
 
@@ -55,11 +61,24 @@ timeout, admin-only settings API, fan manual-hold/final gate та новий п�
 факт→прогноз timeline. Деталі й тести — у записі `E1–E6 implementation
 checkpoint` в `v1-v2-work-log.md`.
 
-Локально: 53 JS PASS; targeted background 17, KWS 9, voltage 9, production 14,
-ledger reconciliation PASS. Full discovery на цьому Windows host не є валідним
-release gate: Python temp directories отримують Access denied, а jinja2/hypothesis
-відсутні. Обов'язковий наступний доказ — exact-head Linux CI. Якщо CI падає,
-виправити реальну помилку й додати регресію; не списувати CI на Windows.
+Remote `97bf637...` містить три CI-fixture виправлення після code checkpoint:
+native API smoke очікує три versioned WebSocket methods; production smoke
+використовує справжній durable boot-fenced journal; browser smoke очікує новий
+заголовок −6/+24 timeline. Candidate run 100 зелений. У Tests `make check test`
+на попередньому exact head пройшов на Python 3.12/3.13; останній незакритий
+збій описаний вище і є неповним synthetic service fixture, а не підставою
+дозволяти bare `call_service("heat")`.
+
+Read-only live evidence 12.11: AppDaemon V1 0.3.23 продовжує працювати, heartbeat
+свіжий, automatic/armed, model v6; `sensor.heating_diagnostics` має
+`storage_health=healthy` і `recorder_status=verified_same_state_attributes`.
+У приватній saved-state qualification раніше підтверджено 17,342 energy bins,
+16 cycles, 3,170 actual temperature points і byte-unchanged 48-point reference
+parity. Live Recorder має щонайменше три опубліковані energy-cycle records.
+Двогодинний Recorder baseline без сирих значень: heartbeat ≈240 записів/год,
+controller ≈148/год, diagnostics ≈19/год, energy total ≈1/год. Це baseline для
+порівняння після native cutover, не повний telemetry backtest і не доказ
+фізичного ACK.
 
 Після кожного перевіреного блоку: оновити work-log і цей файл, commit, push,
 звірити remote SHA. Якщо робота переривається — зробити явний WIP checkpoint із

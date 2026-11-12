@@ -28,7 +28,7 @@ DONE-CODE ≠ DEPLOYED. Частково зроблене не відмічат�
 | E4 | DONE-CODE | Versioned admin-only websocket settings read/save, CAS revision, durable receipt/readback; native runtime refuses raw settings event. Не розгорнуто |
 | E5 | DONE-CODE | External fan change creates durable manual hold, drops ownership; explicit permission change clears it; live final fan gate rechecks device/epoch/STOP. Не розгорнуто |
 | E6 | PARTIAL | Три вкладки Дім/Історія/Налаштування; перший спільний −6/+24 timeline із факт/прогноз/KWS/outage та touch/mouse/keyboard readout; manual AUTO distinct. 53 JS PASS; real browser/mobile/light/dark check after inactive install remains |
-| E7 | PARTIAL | Targeted safety/model suites and production bundle tests PASS; local full discovery reached 571 tests but Windows sandbox denied Python temp writes (100 errors, one cascading assertion) and lacks jinja2/hypothesis. Exact-head Linux CI, historical replay/continuity and Recorder write-rate remain |
+| E7 | PARTIAL | Candidate exact-head run 43311679116 PASS; Linux unit/frontend matrix passed on prior head. Saved real-state reference parity: 17,342 bins, 16 cycles, 3,170 actual points, 48 replay points; live Recorder healthy/verified and 2h write baseline captured. Tests 43311679018 still fails synthetic production fixture: missing `climate.set_temperature` registration; not a production-code verdict. Full telemetry backtest and post-cutover comparison remain |
 | E8 | TODO | Merge/release immutable 0.4.0 лише після E1–E7; перевірити artifact SHA, доставку магазину та install неактивним |
 | E9 | TODO | Controlled single-writer handoff, originals/hashes/rollback, actual native cycle/panel/KWS; відновити permissions, cleanup exporter, документувати DEPLOYED |
 
@@ -80,3 +80,30 @@ tests with 100 permission/import errors and one dependent assertion. Next:
 commit/push checkpoint, run exact-head Linux CI, fix any genuine CI regression,
 then E7 continuity/replay and inactive Marketplace delivery. No production
 cutover and no release tag yet.
+
+### 12.11.2026 — GitHub-plugin checkpoint and exact-head CI triage
+
+GitHub is updated through the connected plugin. Remote functional head is
+`97bf637d7b7fbaa43c61556fb3794596f4113218`; its tree was built from verified
+local blob SHAs. Commits after the implementation checkpoint align HA 2026.11
+smokes with the three-method versioned API, attach the real durable command
+journal, update the browser's −6/+24 heading, and route recovered HEAT through
+the controller final guard. Production HA was not changed.
+
+Candidate run 43311679116 is PASS. Tests run 43311679018 is not green yet:
+native-production job 131509066663 reaches the intended guarded
+`apply_action("heat")`, then the synthetic HA raises `ServiceNotFound` because
+`tools/test_production_ha2026.py` registers only `climate.set_hvac_mode` and not
+the `climate.set_temperature` service used by the real V1 action sequence.
+Next agent: add a synthetic temperature handler that updates the thermostat
+target attribute, retain the final intent guard, push via GitHub plugin, and
+wait for both exact-head workflows. Do not merge/release this failing head.
+
+Live read-only E7 baseline: legacy V1 remains 0.3.23, armed/automatic with fresh
+heartbeat and model v6; storage is healthy and Recorder reports
+`verified_same_state_attributes`. Existing private qualification remains
+byte-unchanged saved-reference parity (17,342 energy bins, 16 cycles, 3,170
+actual points, 48 replay points), explicitly not a full telemetry backtest.
+Recorder over two hours returned complete, non-paginated samples at about
+240 heartbeat, 148 controller, 19 diagnostics and 1 energy-total writes/hour.
+Raw telemetry, energy values and configuration were not committed.
