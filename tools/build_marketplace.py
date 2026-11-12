@@ -155,6 +155,7 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
         contents[name] = (CARRIER / name).read_bytes()
         if name.endswith(".py"):
             compile(contents[name], name, "exec")
+    contents["translations/uk.json"] = contents["strings.json"]
     return contents, app_version.encode()
 
 

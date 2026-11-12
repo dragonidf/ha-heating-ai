@@ -34,6 +34,8 @@ async def exercise(directory):
     for role, value in dict(mode="Спостереження", armed="off", room=21.8,
         outside=5, return_=25, fan_control="off", fan_mode="Вимкнено",
         start="23:00:00", end="07:00:00", strategy="Тільки в дозволені години",
+        sleep_start="23:00:00", sleep_end="07:00:00",
+        night_target=21.5, night_lower=21, night_upper=22,
         target=22, lower=21.5, upper=22.5, grid="on", connection="on",
         grid_voltage=230, energy=125, fan="off").items():
         hass.states.async_set(cfg["return" if role == "return_" else role], value)
