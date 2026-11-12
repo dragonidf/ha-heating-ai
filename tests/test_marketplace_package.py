@@ -84,6 +84,47 @@ class MarketplaceCarrierTests(unittest.TestCase):
                     for previous in ("off", "3 кВт", "6 кВт", "9 кВт"):
                         self.assertEqual(legacy.nominal_mode(power, previous),
                                          native.nominal_mode(power, previous))
+                # Full 24h heating optimizer parity, not just a 3h coast.
+                # Fixed synthetic data make this independent of production.
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+                from copy import deepcopy
+                moment = datetime(2026, 10, 9, 4, 30, tzinfo=ZoneInfo("Europe/Kyiv"))
+                base_settings = dict(
+                    start="06:00", end="07:00",
+                    strategy="Тільки в дозволені години",
+                    target=22, lower=21.5, upper=22.5,
+                    night_price=.5, day_price=1,
+                )
+                for scenario in ("ordinary", "scheduled_outage"):
+                    settings = deepcopy(base_settings)
+                    if scenario == "scheduled_outage":
+                        electricity = ["on"] * 48
+                        electricity[12:14] = ["off", "off"]
+                        record = {
+                            "state": "off",
+                            "attributes": {
+                                "updated": moment.isoformat(),
+                                "queue": "3.1",
+                                "region": "kiivska-oblast",
+                                "today_48half": electricity,
+                            },
+                        }
+                        legacy_schedule = importlib.import_module("heating_outages").schedule
+                        settings["outage_schedule"] = legacy_schedule(record, moment)
+                    arguments = (moment, 21.8, 24.0, 10.0, 0.0, model, [],
+                                 settings)
+                    old = legacy.plan(*arguments)
+                    new = native.plan(*arguments[:-1], deepcopy(settings))
+                    for key in (
+                        "curve", "heat_segments", "energy",
+                        "minimum", "maximum", "horizon_hours",
+                        "outage_shifted", "weather_complete",
+                    ):
+                        self.assertEqual(
+                            old.get(key), new.get(key),
+                            (scenario, key),
+                        )
             finally:
                 sys.path.remove(v1source)
                 sys.path.remove(directory)
