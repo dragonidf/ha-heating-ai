@@ -116,6 +116,14 @@ test('home minimum uses the real forecast sensor state rather than an absent att
   for(const method of ['energyComparison','forecastOverview','heatingPlan','boilerOverview','fireplaceOverview','historyChart'])p[method]=()=>'';
   assert.match(p.overview(),/Очікуваний мінімум <strong>21,4 °C/);
 });
+test('home opens with one inspectable actual-to-forecast timeline and three simple tabs',()=>{
+  const now=Date.now()/1000,p=Object.create(HeatingAIPanel.prototype);p.timelineCursor=now;p.forecastExtended=false;p.clientWidth=780;
+  p.shadowRoot={querySelector:()=>null};p.time=()=> '12:00';p.historyData={rows:{room:[{ts:now-1800,state:'21.2'}],boiler_stage:[{ts:now-1200,state:'6 кВт'}]}};
+  const forecast={created_at:new Date(now*1000).toISOString(),horizon_hours:24,curve:[{ts:now,temperature:21.3,lower:20,upper:22},{ts:now+3600,temperature:21.5,lower:20,upper:22}],heat_segments:[{start:now+600,end:now+1200}]};
+  p.attrs=key=>key==='forecast'?forecast:key==='outages'?{outages:[]}:{};p._hass={states:{}};
+  const chart=p.forecastChart();assert.match(chart,/home-timeline/);assert.match(chart,/role="slider"/);assert.match(chart,/Факт кімнати/);assert.match(chart,/Умовний прогноз/);assert.match(chart,/KWS 3·6·9/);assert.match(chart,/Факт: 21,2 °C/);
+  const source=HeatingAIPanel.prototype.render.toString();assert.match(source,/\['overview','Дім'\].*\['model','Історія'\].*\['settings','Налаштування'\]/s);
+});
 test('history graph is the first model content and labels the actual advance lead',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.attrs=()=>({});p.state=()=> 'unavailable';p.entity=()=>null;
   p.temperatureComparison=()=>'<central-comparison />';p.energyComparison=()=>'';p.heatingPlan=()=>'';
@@ -258,6 +266,16 @@ test('a delayed controller acknowledgement still clears the saved draft',async()
   ack={revision:3,last_request_id:request,last_success:'true'};panel.syncSystemSettings();
   assert.deepEqual(panel.systemDraft,{});assert.equal(panel.systemMessage,'Зміни збережено');
 });
+test('native production settings use the versioned authenticated websocket API',async()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);panel.config={entry_id:'native-entry'};
+  panel.systemDraft={boiler_power_mode:'fixed_6'};panel.render=()=>{};panel.shadowRoot={querySelectorAll:()=>[]};
+  panel.attrs=()=>({revision:4});let request;
+  panel._hass={callWS:async payload=>{request=payload;return {last_success:true,persisted_revision:5};}};
+  await panel.saveSystemSettings();clearTimeout(panel.systemTimeout);clearTimeout(panel.systemRetryTimeout);
+  assert.equal(request.type,'heating_ai_legacy/settings/save');assert.deepEqual(request.version,[1,0]);
+  assert.equal(request.entry_id,'native-entry');assert.equal(request.revision,4);
+  assert.deepEqual(request.values,{boiler_power_mode:'fixed_6'});
+});
 test('device bindings use existing HA relay choices with friendly names',()=>{
   const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={};panel._hass={states:{
     'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},
@@ -354,6 +372,11 @@ test('controller health prioritizes fallback error over generic measurement warn
   attrs.forecast.created_at=new Date(Date.now()-600000).toISOString();status=panel.controllerHealth();
   assert.match(status.message,/застарів/);assert.match(status.details,/0 хв/);
   attrs.forecast.created_at=new Date().toISOString();assert.equal(panel.controllerHealth().message,'');
+});
+test('manual thermostat auto is explicit and does not look like a stale controller error',()=>{
+  const panel=Object.create(HeatingAIPanel.prototype),attrs={controller:{quality:true},diagnostics:{control_health:'healthy'},forecast:{created_at:new Date().toISOString()},grid_status:{raw:'on'}};
+  panel.attrs=key=>attrs[key]||{};panel.state=key=>key==='mode'?'Штатний auto':key==='heartbeat'?new Date().toISOString():key==='process'?'on':'off';panel.time=()=> '12:00';panel.boilerActual=()=>({heating:false});
+  assert.equal(panel.overviewDecision(),'Ручний режим AUTO');assert.match(panel.controllerHealth().message,/не надсилає автоматичні команди/);assert.doesNotMatch(panel.controllerHealth().message,/Помилка|застарів/);
 });
 test('a superseded acknowledgement reconciles only actually persisted matching values',async()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={boiler_power_mode:'fixed_6'};p.render=()=>{};

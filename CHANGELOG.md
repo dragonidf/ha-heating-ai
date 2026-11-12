@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 — 2026-11-12
+
+- Package the complete V1 controller as a native Home Assistant Marketplace integration. Preserve the existing thermal planner, KWS counter accounting, comfort settings, manual pause, AUTO/fallback, one-shot, fireplace and fan logic; adapt only platform I/O and module imports. Synchronous callbacks run serially outside the HA event loop and expensive searches retain their immutable-input workers.
+- Import the private V1 model, telemetry and full decision archive without replacing their source. Keep the original state bytes and checksums; store active data outside the Marketplace code directory. Require a disabled legacy app/watchdog and stopped legacy heartbeat before takeover; revoke and close the native writer if a legacy heartbeat reappears.
+- Add an actual voltage interlock: KWS lower limit +6 V and upper limit −5 V, inclusive. With 190/260 V this stops at 196/255 V, requires all phases in 201–250 V for 30 s to recover, then retains permission until an actual trip threshold is crossed. Manual observation stays non-actuating; UI names the phase, measured voltage and reason.
+- Attach the installable ZIP to the immutable release only after the main-branch test workflow, including full native startup against HA 2026.11, succeeds. Preserve private state across subsequent store updates.
+
 ## 0.3.23 — 2026-11-11
 
 - Preserve the hardware energy interval when a repeated value carries a newer report timestamp. Add a regression for a delayed energy increment immediately following a fresh unchanged report; opt-in KWS deployment remains manual.

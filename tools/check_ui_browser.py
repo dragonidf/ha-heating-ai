@@ -68,7 +68,7 @@ def check_theme_and_motion(page):
         for text in colors[1:]:
             a,b=sorted([lum(colors[0]),lum(text)])
             assert (b+.05)/(a+.05)>=4.5, (name,'text contrast')
-        assert page.locator('.forecast-plot path[stroke-dasharray]').evaluate('el=>getComputedStyle(el).stroke')==page.locator('[data-history-line="room"]').first.evaluate('el=>getComputedStyle(el).stroke'), (name,'room series color differs between charts')
+        assert page.locator('.forecast-plot path[stroke="var(--history-room)"][stroke-dasharray]').evaluate('el=>getComputedStyle(el).stroke')==page.locator('[data-history-line="room"]').first.evaluate('el=>getComputedStyle(el).stroke'), (name,'room series color differs between charts')
         for width in (390,1440):
             page.set_viewport_size({'width':width,'height':1000})
             for tab in ('overview','settings','model'):
@@ -187,8 +187,14 @@ def check_compact_overview(page):
     assert page.locator('.overview>.metrics').count()==0, 'Old standalone metrics must be removed'
     assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
-    assert headings==['Наступні 24 години','План нагріву','Котел','Камін і циркуляція'], headings
-    assert page.locator('.chart-card + .plan-card').count()==1, 'Heating plan must immediately follow the forecast'
+    assert headings==['Факт −6 год → прогноз +24 год','План нагріву','Котел','Камін і циркуляція'], headings
+    assert page.locator('.overview > :first-child.chart-card').count()==1, 'Shared actual/forecast timeline must be first'
+    order=page.locator('.overview > *').evaluate_all('els=>els.map(el=>el.className)')
+    chart=next(i for i,c in enumerate(order) if 'chart-card' in c.split())
+    hero=next(i for i,c in enumerate(order) if 'hero' in c.split())
+    plan=next(i for i,c in enumerate(order) if 'plan-card' in c.split())
+    details=next(i for i,c in enumerate(order) if 'overview-details' in c.split())
+    assert chart < hero < plan < details, order
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
     assert '17,50' in page.locator('.boiler-card').inner_text()
     assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
@@ -523,7 +529,7 @@ def main(engine='chromium'):
             assert page.locator('[data-history-line="outside"]').count()>0
             page.locator('.history-plot').focus();page.locator('.history-plot').press('ArrowLeft')
             page.wait_for_selector('.history-crosshair',state='attached')
-            assert 'Котел:' in page.locator('.history-readout').inner_text() and 'Камін:' in page.locator('.history-readout').inner_text()
+            assert 'Котел:' in page.locator('.history-card .history-readout').inner_text() and 'Камін:' in page.locator('.history-card .history-readout').inner_text()
             page.locator('[data-history-range="24"]').click()
             assert page.locator('[data-series="fireplace"]').count()==1
             assert 'оцінка залишкового тепла' in page.locator('[data-series="fireplace"] title').text_content()
@@ -630,7 +636,11 @@ def main(engine='chromium'):
                             assert metric.evaluate('el=>el.scrollWidth<=el.clientWidth'), (width,'metric overflow')
                         forecast_box=page.locator('.chart-card').bounding_box()
                         plan_box=page.locator('.plan-card').bounding_box()
-                        assert 0<=plan_box['y']-forecast_box['y']-forecast_box['height']<=16, (width,'plan separated from forecast')
+                        hero_box=page.locator('.hero').bounding_box()
+                        assert forecast_box['y']+forecast_box['height']<=hero_box['y']+1, (width,'timeline must precede comfort')
+                        assert hero_box['y']+hero_box['height']<=plan_box['y']+1, (width,'plan must follow comfort')
+                        gap=page.locator('.plan-card').evaluate('el=>el.getBoundingClientRect().top-el.previousElementSibling.getBoundingClientRect().bottom')
+                        assert 0<=gap<=16, (width,'unexpected gap before plan',gap)
                         if width in (360,390,430):
                             # v0.2.4 was 4493–4550 px on these same synthetic fixtures.
                             assert page.locator('main').bounding_box()['height']<3650, (width,'overview did not become compact')
@@ -703,7 +713,7 @@ def main(engine='chromium'):
                 phone.wait_for_selector('.history-plot svg')
                 phone.locator('.history-plot').tap()
                 phone.wait_for_selector('.history-crosshair',state='attached')
-                assert 'Котел:' in phone.locator('.history-readout').inner_text()
+                assert 'Котел:' in phone.locator('.history-card .history-readout').inner_text()
             phone.locator('nav [data-tab="model"]').tap()
             phone.wait_for_selector('[data-comparison-line="forecast"]')
             phone.locator('[data-comparison-days="1"]').tap()
@@ -760,7 +770,7 @@ def main(engine='chromium'):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.locator('[data-forecast-horizon="24"]').click()
-            assert page.locator('.chart-card h2').inner_text()=='Наступні 24 години'
+            assert page.locator('.chart-card h2').inner_text()=='Факт −6 год → прогноз +24 год'
             for grid in ('off','unknown'):
                 page.evaluate("""grid=>setHeatingScenario({
                     'sensor.heating_grid':{attributes:{raw:grid}},

@@ -1130,8 +1130,25 @@ class HeatingClimate(HeatingRecovery,Hass):
         entity='sensor.energy_meter_kotel_'+suffix
         row=self.get_state(entity,attribute='all') or {}
         value=number(row.get('state'));attrs=row.get('attributes') or {}
-        if value is None or value<0 or attrs.get('unit_of_measurement')!=unit:return None
-        if not self.fresh(entity,max_age):return None
+        reported=row.get('last_reported') or row.get('last_updated')
+        try:
+            report_at=datetime.fromisoformat(reported.replace('Z','+00:00')).timestamp()
+            age=time.time()-report_at
+        except (AttributeError,ValueError,TypeError):
+            report_at=None;age=None
+        fresh=age is not None and -5<=age<=max_age
+        reason=(None if value is not None and value>=0 and attrs.get('unit_of_measurement')==unit and fresh else
+                'invalid_value' if value is None or value<0 else
+                'unit_mismatch' if attrs.get('unit_of_measurement')!=unit else 'stale_or_missing_timestamp')
+        quality=getattr(self,'kws_source_quality',{})
+        quality[entity]=dict(value=value,value_reported_at=report_at,
+            observed_at=time.time(),age_seconds=age,unit=attrs.get('unit_of_measurement'),expected_unit=unit,
+            online=row.get('state') not in (None,'unknown','unavailable'),finite=value is not None,
+            quality='measured' if reason is None else 'unknown',reason=reason,
+            provenance='ha_last_reported' if row.get('last_reported') else 'ha_last_updated' if reported else 'unknown',
+            raw_ack=False)
+        self.kws_source_quality=quality
+        if reason is not None:return None
         return value
 
     def update_kws_power(self):
@@ -1150,10 +1167,14 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.power_quality='unknown' if power is None else 'estimated' if supported_zero else 'measured'
         self.power_source='unavailable' if power is None else 'fallback_kws_zero' if supported_zero else 'kws_phases'
         self.power_confirmation_pending=False
-        self.power_observation=dict(at=stamp,watts=power,quality=self.power_quality,policy='kws',phases_kw=phases)
+        sources={key:value for key,value in getattr(self,'kws_source_quality',{}).items()
+                 if 'potuzhnist_' in key or 'napruga_' in key}
+        self.power_observation=dict(at=stamp,watts=power,quality=self.power_quality,policy='kws',
+            phases_kw=phases,source_quality=sources,provenance='three_local_kws_phase_channels')
         self.publish('sensor.heating_power_confirmed',power,unit_of_measurement='W',device_class='power',state_class='measurement',
             power_source=self.power_source,power_quality=self.power_quality,measurement_basis='kws_phases',
-            independent=True,zero_voltage_supported=supported_zero,timestamp=self.now().isoformat())
+            independent=True,zero_voltage_supported=supported_zero,source_quality=sources,
+            provenance='three_local_kws_phase_channels',timestamp=self.now().isoformat())
         self.update_kws_energy(stamp)
         return power
 
@@ -1190,7 +1211,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         total=counter['origin_kwh']+counter['measured_kwh']
         self.publish('sensor.heating_energy_total',total,unit_of_measurement='kWh',device_class='energy',state_class='total_increasing',
             basis='kws_counter_delta',origin_kwh=counter['origin_kwh'],measured_since_switch_kwh=counter['measured_kwh'],
-            started_at=counter['started_at'],reset_count=counter.get('reset_count',0),origin_quality='legacy_mixed')
+            started_at=counter['started_at'],reset_count=counter.get('reset_count',0),origin_quality='legacy_mixed',
+            value_reported_at=at,observed_at=stamp,provenance='single_local_kws_hardware_total',
+            source_quality=(getattr(self,'kws_source_quality',{}).get('sensor.energy_meter_kotel_energiia')))
         self.publish('sensor.kotel_spozhita_energiia',total,unit_of_measurement='kWh',device_class='energy',state_class='total_increasing')
 
     def kws_stage_update(self,power):
@@ -1573,6 +1596,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         previous_reference=self.memory.get('plan_reference')
         forecast=None
         snapshot=None
+        plan_execution_state=('advisory' if not permitted or self.raw('mode') in ('Спостереження','Вимкнено')
+                              else 'fallback' if self.raw('mode')=='Штатний auto' else 'calculated')
         if forecast_quality and valid:
             forecast,reference=ready if background else stable_plan(now,room,floor,outside,fire,self.model,usable_weather,settings,
                           power_kw=3.0,previous=self.memory.get('plan_reference'))
@@ -1593,7 +1618,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 default=[dict(name='unavailable',available=False,hypothetical=True)])
             snapshot=self.remember_plan_inputs(now,room,floor,outside,fire,usable_weather,settings,forecast,previous_reference)
             self.memory['plan_reference']=reference
-            self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status='calculated')
+            self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status=plan_execution_state)
             panel_forecast=forecast_for_panel(forecast)
             self.publish('sensor.heating_forecast_outlook','Прогноз температури',
                 **forecast_outlook_for_panel(forecast,now,settings))
@@ -1615,7 +1640,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          local_weather_bias=round(weather_bias,2),
                          external_heat=((settings.get('environment') or {}).get('solar') or {}).get('observed_gain',0.),
                          uncertainty='Точність знижена; обережне планування' if environment_quality['degraded'] else 'Оцінка; калібрування триває',
-                         created_at=now.isoformat(),execution_state='calculated',outage_shifted=forecast["outage_shifted"],
+                         created_at=now.isoformat(),execution_state=plan_execution_state,outage_shifted=forecast["outage_shifted"],
                          plan_stable=forecast['plan_stable'],stability_reason=forecast['stability_reason'],
                          outage_preheat=forecast["outage_preheat"],outside_minutes=forecast["outside_minutes"],
                          comfort_shortfall=forecast["comfort_shortfall"],outage_status=forecast["outage_status"],
@@ -1697,7 +1722,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.publish("sensor.heating_coast_peak",round(peak,2) if peak is not None else "unavailable",
                      friendly_name="Клімат — оцінка інерційного піку",unit_of_measurement="°C",
                      device_class="temperature",validated=self.model.get("validated",False))
-        if forecast:self.memory['plan_execution'].update(status='intended',intended_action=action)
+        if forecast:self.memory['plan_execution'].update(
+            status='advisory' if action in ('observe','release') else 'fallback' if action=='fallback' else 'intended',
+            intended_action=action)
         self.publish_control_decision(action,reason,demand,thermostat,**control_attrs,
                      outage_preheat=preheat,outage_shifted=bool(forecast and forecast["outage_shifted"]),
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,

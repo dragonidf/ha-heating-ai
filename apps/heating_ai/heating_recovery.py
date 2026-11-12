@@ -19,6 +19,8 @@ from heating_model import number,in_window,heating_cycle,step,held_action,comfor
 from heating_outages import schedule,blocked
 from heating_fallback import estimated_power
 
+CALCULATION_TIMEOUT_SECONDS=60
+
 def wire_values(value):
     if isinstance(value,dict):return {k:wire_values(v) for k,v in value.items()}
     if isinstance(value,list):return [wire_values(v) for v in value]
@@ -295,9 +297,19 @@ class HeatingRecovery:
             job=self.calculation_jobs.get(kind)
             if job:
                 done=job.get('completed')
-                if not done:return None
+                if not done:
+                    age=max(0.,time.time()-job['at'])
+                    if age>=CALCULATION_TIMEOUT_SECONDS:
+                        job.setdefault('timed_out_at',time.time())
+                        self.calculation_timeouts=getattr(self,'calculation_timeouts',{})
+                        self.calculation_timeouts[kind]=dict(job_id=job['id'],age_seconds=age)
+                    return None
                 del self.calculation_jobs[kind]
-                if job['key']==key:
+                if job.get('timed_out_at'):
+                    self.calculation_stale_results=getattr(self,'calculation_stale_results',{})
+                    self.calculation_stale_results[kind]=dict(
+                        job_id=job['id'],completed_at=time.time(),seconds=done.get('seconds'))
+                elif job['key']==key:
                     if done.get('error'):raise RuntimeError(done['error'])
                     self.calculation_durations=getattr(self,'calculation_durations',{})
                     self.calculation_durations[kind]=done['seconds']
