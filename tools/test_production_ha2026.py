@@ -103,8 +103,10 @@ async def exercise(directory):
         controller.async_voltage_status()
         controller.voltage_guard.stable_since = time.time()-31
         assert controller.async_voltage_status()["voltage_qualified"]
-        await asyncio.to_thread(controller.call_service,"climate/set_hvac_mode",
-                                entity_id=cfg["thermostat"],hvac_mode="heat")
+        # A positive command must be dispatched by the controller with a live
+        # manual-intent token; a bare call_service("heat") is intentionally
+        # rejected by the final gateway.
+        await controller._dispatch(controller.apply_action,"heat",False)
         assert commands[-1]["hvac_mode"] == "heat"
     finally:
         await controller.async_close()
