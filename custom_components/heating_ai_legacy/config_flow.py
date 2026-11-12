@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import voluptuous as vol
+from pathlib import Path
+from uuid import uuid4
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers import selector
@@ -21,6 +23,84 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
         return HeatingAIV1OptionsFlow(config_entry)
 
     async def async_step_user(self, user_input=None):
+        return self.async_show_menu(step_id="user", menu_options=["prepared", "migrate", "preview"])
+
+    async def async_step_prepared(self, user_input=None):
+        """Select a private snapshot prepared on the shared HA mount."""
+        from .production_migration import load_installation
+        if self._async_current_entries():
+            return self.async_abort(reason="single_instance_allowed")
+        import re
+        base = Path(self.hass.config.path("heating_ai_v1"))
+        def discover():
+            found = {}
+            if base.is_dir():
+                for root in base.iterdir():
+                    if not re.fullmatch(r"[a-f0-9]{32}", root.name):
+                        continue
+                    try:
+                        _, report = load_installation(root)
+                    except (OSError, ValueError, KeyError):
+                        continue
+                    found[root.name] = report
+            return found
+        prepared = await self.hass.async_add_executor_job(discover)
+        if not prepared:
+            return self.async_abort(reason="prepared_snapshot_missing")
+        if user_input is not None and user_input.get("installation_id") in prepared:
+            self._installation_id = user_input["installation_id"]
+            self._import_report = prepared[self._installation_id]
+            return await self.async_step_activate()
+        return self.async_show_form(step_id="prepared", data_schema=vol.Schema({
+            vol.Required("installation_id"): selector.SelectSelector(selector.SelectSelectorConfig(
+                options=[{"value":identity,"label":f"Модель {report['model_version']} · {report['files']} файлів"}
+                         for identity, report in prepared.items()]))}))
+
+    async def async_step_migrate(self, user_input=None):
+        """Import the complete private V1 data bundle through HA's upload API."""
+        if self._async_current_entries():
+            return self.async_abort(reason="single_instance_allowed")
+        errors = {}
+        if user_input is not None:
+            from homeassistant.components.file_upload import process_uploaded_file
+            from .production_migration import install_bundle
+            self._installation_id = uuid4().hex
+            target = Path(self.hass.config.path("heating_ai_v1", self._installation_id))
+            def migrate():
+                with process_uploaded_file(self.hass, user_input["bundle"]) as path:
+                    return install_bundle(path.read_bytes(), target)
+            try:
+                self._import_report = await self.hass.async_add_executor_job(migrate)
+            except (OSError, ValueError, KeyError):
+                errors["base"] = "invalid_migration_bundle"
+            else:
+                return await self.async_step_activate()
+        return self.async_show_form(step_id="migrate", errors=errors,
+            data_schema=vol.Schema({vol.Required("bundle"): selector.FileSelector(
+                selector.FileSelectorConfig(accept=".zip,application/zip"))}))
+
+    async def async_step_activate(self, user_input=None):
+        from .production import source_writer_active
+        errors = {}
+        if user_input is not None:
+            if user_input.get("legacy_stopped") is not True:
+                errors["base"] = "legacy_still_active"
+            elif source_writer_active(self.hass):
+                errors["base"] = "legacy_still_active"
+            else:
+                await self.async_set_unique_id("native_v1_controller")
+                self._abort_if_unique_id_configured()
+                return self.async_create_entry(title="Heating AI · Опалення", data={
+                    "runtime": "native_v1", "installation_id": self._installation_id,
+                    "grid_presence_helper": SOURCE_HINTS["grid"],
+                    "voltage_entities": [SOURCE_HINTS[f"voltage_l{i}"] for i in (1,2,3)],
+                })
+        return self.async_show_form(step_id="activate", errors=errors,
+            description_placeholders={"model": str(self._import_report["model_version"]),
+                                      "files": str(self._import_report["files"])},
+            data_schema=vol.Schema({vol.Required("legacy_stopped", default=False): bool}))
+
+    async def async_step_preview(self, user_input=None):
         """Require explicit consent to a non-actuating compatibility probe."""
         if self._async_current_entries():
             return self.async_abort(reason="single_instance_allowed")
@@ -90,7 +170,7 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
     """Configure only the read-only voltage qualification band."""
 
     def __init__(self, config_entry):
-        self.config_entry = config_entry
+        self._entry = config_entry
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:
@@ -110,7 +190,7 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
             })
         return self.async_show_form(
             step_id="init",
-            data_schema=self._schema(self.config_entry.options),
+            data_schema=self._schema(self._entry.options),
         )
 
     @staticmethod

@@ -1,5 +1,5 @@
 {
-  "name": "Heating AI V1 — AppDaemon delivery",
+  "name": "Heating AI",
   "homeassistant": "2026.11.0",
   "zip_release": true,
   "filename": "heating_ai_v1_marketplace.zip",

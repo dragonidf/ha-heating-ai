@@ -104,6 +104,14 @@ class VoltageTests(unittest.TestCase):
         self.assertEqual(result["trip_low_v"],196.)
         self.assertFalse(result["physical_commands_enabled"])
 
+    def test_recovered_guard_holds_until_actual_trip_not_recovery_edge(self):
+        guard=self.module.VoltageGuard()
+        guard.evaluate(1000.,True,[230.,230.,230.])
+        self.assertTrue(guard.evaluate(1030.,True,[230.,230.,230.])["voltage_qualified"])
+        self.assertTrue(guard.evaluate(1040.,True,[197.,254.,230.])["voltage_qualified"])
+        self.assertFalse(guard.evaluate(1050.,True,[196.,254.,230.])["voltage_qualified"])
+        self.assertFalse(guard.evaluate(1060.,True,[197.,230.,230.])["voltage_qualified"])
+
     def test_long_sampling_gap_restarts_continuous_recovery_timer(self):
         guard=self.module.VoltageGuard()
         kw=dict(minimum_v=190.,maximum_v=260.,recovery_seconds=30.)

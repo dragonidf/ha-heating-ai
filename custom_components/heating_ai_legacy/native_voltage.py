@@ -36,6 +36,7 @@ class VoltageGuard:
         self.last_at: float | None = None
         self.policy: tuple | None = None
         self.trip: str | None = None
+        self.qualified = False
 
     def evaluate(
         self, now: float, grid: bool | None, phases_v: list[Any],
@@ -47,6 +48,7 @@ class VoltageGuard:
 
         def blocked(status, reason_code, **details):
             self.stable_since = None
+            self.qualified = False
             minimum_ok = type(minimum_v) in (int, float) and isfinite(minimum_v)
             maximum_ok = type(maximum_v) in (int, float) and isfinite(maximum_v)
             return dict(
@@ -73,11 +75,13 @@ class VoltageGuard:
             return blocked("CLOCK_RESET", "voltage_clock_reset")
         if self.last_at is not None and now - self.last_at > MAX_SAMPLE_GAP_S:
             self.stable_since = None
+            self.qualified = False
         self.last_at = now
         if settings != self.policy:
             self.policy = settings
             self.stable_since = None
             self.trip = None
+            self.qualified = False
         if grid is not True:
             self.trip = None
             return blocked("GRID_OFF_OR_UNKNOWN", "grid_not_confirmed")
@@ -117,7 +121,7 @@ class VoltageGuard:
             i for i, value in enumerate(phases_v, 1)
             if not recovery_low <= value <= recovery_high
         ]
-        if outside_recovery:
+        if outside_recovery and not self.qualified:
             self.stable_since = None
             names = [f"L{i}" for i in outside_recovery]
             return blocked(
@@ -130,7 +134,8 @@ class VoltageGuard:
         if self.stable_since is None:
             self.stable_since = now
         duration = max(0., now - self.stable_since)
-        qualified = duration >= recovery_seconds
+        qualified = self.qualified or duration >= recovery_seconds
+        self.qualified = qualified
         if qualified:
             self.trip = None
         return dict(

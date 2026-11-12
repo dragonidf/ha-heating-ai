@@ -37,6 +37,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Register only a safe read-only native model parity sensor."""
+    if entry.data.get("runtime") == "native_v1":
+        from .production import async_setup_production
+        return await async_setup_production(hass, entry)
     if entry.data.get("shadow") is not True:
         raise ValueError("V1 native physical commissioning is not implemented")
     coordinator = V1ShadowCoordinator(
@@ -149,6 +152,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload only the diagnostic sensor; the legacy controller is untouched."""
+    if entry.data.get("runtime") == "native_v1":
+        await entry.runtime_data.close()
+        return True
     if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         return False
     frontend.async_remove_panel(hass, "heating-v1-preview", warn_if_unknown=False)

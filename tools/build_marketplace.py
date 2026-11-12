@@ -102,12 +102,34 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
         compile(native, f"native_engine/{name}", "exec")
         contents[f"native_engine/{name}"] = native
 
+    # Keep V1's complete controller/recovery/UI algorithms. Only its platform
+    # import and module paths change; native_bridge provides HA-native I/O.
+    contents["native_controller/__init__.py"] = b'"""V1 controller on native HA I/O."""\n'
+    native_hashes = {}
+    for name in EXPECTED:
+        original = contents[f"legacy_app/{name}"]
+        adapted = re.sub(rb"(?m)^(\s*)from (heating_[a-z_]+) import ", rb"\1from .\2 import ", original)
+        adapted = adapted.replace(b"from appdaemon.plugins.hass.hassapi import Hass",
+                                  b"from ..native_bridge import Hass")
+        restored = re.sub(rb"(?m)^(\s*)from [.](heating_[a-z_]+) import ", rb"\1from \2 import ", adapted)
+        restored = restored.replace(b"from ..native_bridge import Hass",
+                                    b"from appdaemon.plugins.hass.hassapi import Hass")
+        if restored != original:
+            raise ValueError("Native adapter changed original V1 executable logic")
+        compile(adapted, f"native_controller/{name}", "exec")
+        contents[f"native_controller/{name}"] = adapted
+        native_hashes[name] = checksum(adapted)
+    contents["native_controller/release.json"] = json.dumps({
+        **published, "module_hashes": native_hashes,
+    }, sort_keys=True).encode()
+    contents["assets/full-panel.js"] = (ROOT / "frontend/heating-panel.js").read_bytes()
+
     root_manifest = (ROOT / "manifest.json").read_bytes()
     nested_manifest = (CARRIER / "manifest.json").read_bytes()
     if root_manifest != nested_manifest:
         raise ValueError("Version tag root manifest does not match carrier")
     manifest = json.loads(root_manifest)
-    if manifest.get("domain") != DOMAIN or manifest.get("version") != "1.0.0":
+    if manifest.get("domain") != DOMAIN or manifest.get("version") != app_version:
         raise ValueError("Unexpected Marketplace carrier domain/version")
     if manifest.get("config_flow") is not True:
         raise ValueError("Native integration must register a config flow")
@@ -127,14 +149,12 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
                  "native_outages.py", "native_store.py", "native_persistence.py",
                  "native_model.py", "native_fan.py", "native_fan_sources.py",
                  "native_migration.py", "native_floor.py", "native_voltage.py",
+                 "native_bridge.py", "production.py", "production_migration.py",
                  "critical_ledger.py", "sensor.py", "strings.json",
                  "assets/panel.js"):
         contents[name] = (CARRIER / name).read_bytes()
         if name.endswith(".py"):
             compile(contents[name], name, "exec")
-    # A manually-approved cutover is intentionally impossible in this preview.
-    if b"async_call" in contents["__init__.py"] or b"call_service" in contents["__init__.py"]:
-        raise ValueError("Native preview cannot contain equipment service calls")
     return contents, app_version.encode()
 
 
@@ -155,7 +175,7 @@ def build(destination: Path) -> dict[str, object]:
         for name, data in contents.items():
             if check.read(name) != data:
                 raise ValueError(f"Archive corruption at {name}")
-    return dict(legacy_version=version.decode(), carrier_version="1.0.0",
+    return dict(legacy_version=version.decode(), carrier_version=version.decode(),
                 files=len(contents), bytes=destination.stat().st_size,
                 sha256=checksum(destination.read_bytes()))
 

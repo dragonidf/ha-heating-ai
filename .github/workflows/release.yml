@@ -30,6 +30,7 @@ jobs:
           version=$(cat VERSION)
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           tag="v$version"
+          python tools/build_marketplace.py --output heating_ai_v1_marketplace.zip
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --target "$TESTED_SHA" --title "$tag" --notes-file CHANGELOG.md
+            gh release create "$tag" heating_ai_v1_marketplace.zip --target "$TESTED_SHA" --title "$tag" --notes-file CHANGELOG.md
           fi
