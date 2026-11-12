@@ -30,7 +30,7 @@ def main() -> None:
         folder = Path(temp)
         archive = folder / "carrier.zip"
         summary = build(archive)
-        assert summary["files"] == 23
+        assert summary["files"] == 25
         target = folder / "isolated" / "custom_components" / "heating_ai_legacy"
         target.mkdir(parents=True)
         with zipfile.ZipFile(archive) as package:
@@ -72,8 +72,32 @@ def main() -> None:
             assert result["physical_commands_enabled"] is False
             assert result["forecast_qualified"] is False
             assert result["source_plan_id"] == "synthetic-forecast-ID"
+            assert result["legacy_plan"]["status"] == "LEGACY_UNAVAILABLE"
             assert isinstance(result["three_hour_end_c"], float)
             assert result["scenario"] == "three_hour_coast_without_heating_or_fire"
+            from custom_components.heating_ai_legacy.plan_snapshot import mirror_legacy_plan
+            timestamp = datetime.now(timezone.utc).timestamp()
+            candidate = mirror_legacy_plan({
+                "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                "execution_state": "advisory",
+                "plan_id": "synthetic-plan",
+                "planned_kwh": 3.5,
+                "curve": [
+                    {"ts": timestamp + 600, "temperature": 21.3, "target": 21.5},
+                    {"ts": timestamp + 1200, "temperature": 21.4, "target": 21.5},
+                ],
+                "heat_segments": [
+                    {"start": timestamp + 600, "end": timestamp + 1200, "power_kw": 6},
+                ],
+            }, timestamp)
+            assert candidate["status"] == "LEGACY_MIRROR"
+            assert len(candidate["curve"]) == 2 and len(candidate["segments"]) == 1
+            assert candidate["execution_verified"] is False
+            old = mirror_legacy_plan({
+                "created_at": datetime.fromtimestamp(timestamp - 86400, timezone.utc).isoformat(),
+                "curve": candidate["curve"],
+            }, timestamp)
+            assert old["status"] == "LEGACY_UNAVAILABLE"
 
             stale = dict(readings)
             stale["sensor.room"] = row("21.3", age_seconds=3600)

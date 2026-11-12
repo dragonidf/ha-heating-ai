@@ -134,7 +134,9 @@ class HeatingV1NativePanel extends HTMLElement {
       const values = Array.isArray(series) && Array.isArray(series[0]) ? series[0] : [];
       const parsed = [];
       for (const item of values.slice(-2000)) {
-        const at = Date.parse(item.lu || item.last_updated || item.last_changed || '') / 1000;
+        const rawTime = item.lu ?? item.last_updated ?? item.last_changed;
+        const at = typeof rawTime === 'number' ? rawTime
+          : Date.parse(rawTime || '') / 1000;
         const value = num(item.s ?? item.state, -20, 65);
         if (Number.isFinite(at) && value !== null && at >= now - 6 * HOUR && at <= now + 60)
           parsed.push({ at, temperature: value });

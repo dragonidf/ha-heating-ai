@@ -22,13 +22,14 @@ class MarketplaceCarrierTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 23)
+            self.assertEqual(result["files"], 25)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 wanted = {
                     "__init__.py", "manifest.json", "legacy_app/release.json",
                     "native_engine/__init__.py", "const.py", "config_flow.py",
-                    "native_runtime.py", "sensor.py", "strings.json",
+                    "native_runtime.py", "plan_snapshot.py", "sensor.py",
+                    "strings.json", "assets/panel.js",
                     *(f"legacy_app/{name}" for name in EXPECTED),
                     *(f"native_engine/{name}" for name in PURE_MODULES),
                 }
@@ -48,6 +49,11 @@ class MarketplaceCarrierTests(unittest.TestCase):
                 self.assertNotIn("config.yaml", names)
                 self.assertFalse(any(name.endswith(".yaml") for name in names))
                 self.assertNotIn(b"call_service", archive.read("__init__.py"))
+                panel = archive.read("assets/panel.js")
+                self.assertIn("Температура".encode("utf-8"), panel)
+                self.assertIn(b"callApi", panel)
+                self.assertNotIn(b"callService", panel)
+                self.assertNotIn(b"physical_commands_enabled: true", panel)
 
     def test_model_produces_identical_results_in_native_package(self):
         with TemporaryDirectory() as directory:

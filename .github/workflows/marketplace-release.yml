@@ -24,6 +24,11 @@ jobs:
           python-version: '3.12'
       - name: Verify the existing nine V1 module fingerprints
         run: python tools/build_ui.py --check
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Read-only native panel ES module syntax
+        run: node --input-type=module --check < custom_components/heating_ai_legacy/assets/panel.js
       - name: Reproducible native-engine and package tests
         run: PYTHONPATH=apps/heating_ai python -m unittest discover -s tests -p test_marketplace_package.py -v
       - name: Build unsigned review artifact, NEVER publish or install

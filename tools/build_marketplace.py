@@ -121,7 +121,8 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
         raise ValueError("Marketplace packaging fields are inconsistent")
     contents["manifest.json"] = nested_manifest
     for name in ("__init__.py", "const.py", "config_flow.py",
-                 "native_runtime.py", "sensor.py", "strings.json"):
+                 "native_runtime.py", "plan_snapshot.py",
+                 "sensor.py", "strings.json", "assets/panel.js"):
         contents[name] = (CARRIER / name).read_bytes()
         if name.endswith(".py"):
             compile(contents[name], name, "exec")
