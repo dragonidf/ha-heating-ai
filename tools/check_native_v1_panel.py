@@ -154,7 +154,8 @@ async def verify() -> None:
                 assert checks["n_forecast"]>=1 and checks["n_native"]>=1
                 assert checks["n_history"]>=1
                 assert "Штатний auto" in checks["mode"]
-                assert "PROVISIONAL_SOURCES" in checks["native_status"]
+                assert "V1+" in checks["native_status"]
+                assert "PROVISIONAL_SOURCES" not in checks["native_status"]
                 assert checks["controls"] == 0, "Preview must not contain equipment controls"
                 if label=="mobile":
                     assert not checks["has_horizontal_scroll"], "Full 24h graph should fit mobile"
@@ -187,7 +188,7 @@ async def verify() -> None:
                         root?.querySelectorAll('rect.heat').length===0 &&
                         root?.getElementById('room')?.textContent.includes('21,3') &&
                         root?.getElementById('source')?.textContent.includes('Незалежний прогноз V1+') &&
-                        root?.getElementById('plan')?.textContent.includes('умовних V1+') &&
+                        root?.getElementById('plan')?.textContent.includes('умовне вікно') &&
                         root?.querySelectorAll('button, input, select').length===0;
                 }""",timeout=12000)
                 out=ROOT/("native-v1-preview-"+label+".png")

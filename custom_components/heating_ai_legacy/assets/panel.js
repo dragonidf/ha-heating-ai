@@ -124,30 +124,29 @@ class HeatingV1NativePanel extends HTMLElement {
     this.shadowRoot.innerHTML =
       '<style>' + stylesheet + '</style>' +
       '<main class="wrap"><header class="top"><div><div class="brand">Heating AI V1+</div>' +
-      '<div class="minor">Температура, 24-годинний план V1 і фактичні виміри</div></div>' +
+      '<div class="minor">Температура та план на 24 години</div></div>' +
       '<div class="right"><span class="tag">SHADOW · БЕЗ КОМАНД</span><small class="minor" id="mode"></small></div></header>' +
       '<section class="stats"><div class="stat"><label>Кімната</label><strong id="room">—</strong></div>' +
       '<div class="stat"><label>Ціль</label><strong id="target">—</strong></div>' +
       '<div class="stat"><label>Котел</label><strong id="boiler">—</strong></div>' +
-      '<div class="stat"><label>План V1</label><strong id="plan">—</strong></div>' +
+      '<div class="stat"><label>План нагріву</label><strong id="plan">—</strong></div>' +
       '<div class="stat"><label>KWS · фактично</label><strong id="kws">—</strong></div>' +
       '<div class="stat"><label>Камін</label><strong id="fire">—</strong></div>' +
       '<div class="stat"><label>Циркуляція</label><strong id="fan">—</strong></div>' +
       '<div class="stat"><label>Мережа</label><strong id="grid">—</strong></div></section>' +
       '<section class="chartbox"><div class="heading">Температура · план і факт</div>' +
       '<div class="key"><span style="--line:#63d3b4">Факт HA</span>' +
-      '<span style="--line:#77a8ff">Прогноз V1</span><span style="--line:#f4a0bf">V1+ умовний</span>' +
+      '<span class="legend-legacy" style="--line:#77a8ff">Прогноз V1</span><span class="legend-native" style="--line:#f4a0bf">V1+ умовний</span>' +
       '<span style="--line:#ffbf6b">Ціль</span>' +
       '<span style="--line:#b18fff">Нижня межа</span>' +
-      '<span style="--line:#3fb48a">План нагріву</span>' +
+      '<span class="legend-legacy" style="--line:#3fb48a">Нагрів V1</span><span class="legend-native" style="--line:#f4a0bf">Умовний нагрів</span>' +
       '<span style="--line:#c27e82">Відключення 3.1</span></div>' +
       '<div class="scroll"><svg class="chart" viewBox="0 0 1080 390" role="img" ' +
       'aria-label="Фактична температура, розрахована температура, ціль і вікна нагріву">' +
       '</svg></div><p class="note" id="source"></p>' +
       '<p class="note" id="native-status"></p></section>' +
-      '<section class="notice">Це паралельний перегляд старого прогнозу V1. Він не є ' +
-      'незалежним планом V1+ і не керує котлом, вентилятором чи рекуператором. ' +
-      'Вручну обраний AUTO не перезапускається з цієї панелі.</section></main>';
+      '<section class="notice">V1+ поки працює лише в режимі спостереження. ' +
+      'Команди котлу, каміну та вентиляції вимкнені.</section></main>';
     // The main forecast belongs directly under room and target, not
     // below eight separate status cards on a narrow phone screen.
     const primary = this.shadowRoot.querySelector('.stats');
@@ -279,10 +278,13 @@ class HeatingV1NativePanel extends HTMLElement {
       num(nativeCurve[0] && nativeCurve[0].target, 10, 35) ??
       num(state(ids.target) && state(ids.target).state, 10, 35));
     kv('boiler').textContent = thermostat ? String(thermostat.state).toUpperCase() : 'Невідомо';
+    const n = nativeWindows.length;
+    const nativeWindowLabel = n + ' ' + (n === 1 ? 'умовне вікно'
+      : n >= 2 && n <= 4 ? 'умовні вікна' : 'умовних вікон');
     kv('plan').textContent = fresh && prediction.length > 1
       ? String(windows.length) + ' вікон V1'
       : nativeValid && nativeCurve.length > 1
-      ? String(nativeWindows.length) + ' умовних V1+'
+      ? nativeWindowLabel
       : 'Недоступний';
     kv('kws').textContent = kwPhases.every(v => v !== null)
       ? (kwPhases.reduce((a,b) => a+b, 0) / 1000).toFixed(1).replace('.', ',') + ' кВт'
@@ -299,10 +301,9 @@ class HeatingV1NativePanel extends HTMLElement {
     const grid = state(sources.grid || 'input_select.indikator_merezhi_stan');
     kv('grid').textContent = grid && grid.state === 'Наявна мережа'
       ? 'Є' : grid && grid.state === 'Відсутня мережа' ? 'Немає' : 'Невідомо';
-    kv('mode').textContent = mode || controller
-      ? 'Режим V1: ' + (mode ? mode.state : 'невідомо') +
-        ' · ' + (controller ? controller.state : 'статус невідомий')
-      : 'V1+ SHADOW · керування вимкнене';
+    kv('mode').textContent = mode
+      ? 'Режим: ' + mode.state + (controller ? ' · ' + controller.state : '')
+      : 'V1+ · спостереження';
     kv('source').textContent = prediction.length > 1
       ? 'Джерело: чинний V1 · ' + time(created) + ' · план ' +
         (attrs.execution_state || 'невідомий') + ' · ' +
@@ -310,9 +311,8 @@ class HeatingV1NativePanel extends HTMLElement {
           : num(attrs.planned_kwh, 0, 200).toFixed(1).replace('.', ',') + ' кВт·год') +
         '. Планові вікна не підтверджують виконання.'
       : nativeValid && nativeCurve.length > 1
-      ? 'Незалежний прогноз V1+ · умовний розрахунок без виконання. ' +
-        'Розраховані інтервали не є фізичними командами.'
-      : 'Немає актуального розрахунку; майбутня температура не домальовується.';
+      ? 'Самостійний прогноз V1+; розраховані нагріви не є командами котлу.'
+      : 'Поки немає актуального прогнозу — показано лише вимірювання.';
     const canvas = this.shadowRoot.querySelector('.chart');
     const compact = this.getBoundingClientRect().width <= 650;
     canvas.setAttribute('viewBox', compact ? '0 0 600 390' : '0 0 1080 390');
@@ -363,9 +363,12 @@ class HeatingV1NativePanel extends HTMLElement {
     add(canvas, 'text',{x:X1,y:Y1+55,'text-anchor':'end'},'+24 год · план');
     const nativeStatus = this.shadowRoot.getElementById('native-status');
     nativeStatus.textContent = nativeValid
-      ? 'Окремий розрахунок V1+ · ' + nativePlan.quality +
-        ' · ' + nativeCurve.length + ' точок. Умовний сценарій, команди заборонені.'
-      : 'Окремий розрахунок V1+: очікує перевірених джерел; не підміняється планом V1.';
+      ? (prediction.length > 1 ? 'V1+: незалежний умовний прогноз для порівняння.' : '')
+      : 'V1+: очікує актуальних даних для прогнозу.';
+    this.shadowRoot.querySelectorAll('.legend-legacy').forEach(
+      item => item.hidden = prediction.length < 2);
+    this.shadowRoot.querySelectorAll('.legend-native').forEach(
+      item => item.hidden = nativeCurve.length < 2);
     if (typeof roomId === 'string') void this.recorder(ha,roomId,now);
     void this.nativeSnapshot(ha,now);
   }
