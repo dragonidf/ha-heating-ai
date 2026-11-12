@@ -37,6 +37,33 @@ const readPts = (items, lo, hi, historical) => {
   }
   return result;
 };
+const readOutages = (entity, now, end) => {
+  if (!entity || !entity.attributes) return [];
+  const attrs = entity.attributes;
+  const updated = Date.parse(entity.last_reported || entity.last_updated || '') / 1000;
+  if (attrs.valid !== true || attrs.source_fresh !== true ||
+      !Number.isFinite(updated) || now - updated > 1800 || now - updated < -60) return [];
+  const events = attrs.outages;
+  if (!Array.isArray(events) || events.length > 100) return [];
+  const parseTime = value => {
+    if (typeof value === 'string' && value.includes('T')) {
+      const t = Date.parse(value) / 1000;
+      return Number.isFinite(t) ? t : null;
+    }
+    return num(value, now - HOUR, end);
+  };
+  return events.slice(0, 48).flatMap(e => {
+    const a = parseTime(e?.start), b = parseTime(e?.end);
+    return a !== null && b !== null && b > Math.max(a, now) &&
+      a < end ? [{ a:Math.max(a, now), b:Math.min(b, end) }] : [];
+  });
+};
+const freshPower = (entity, now) => {
+  if (!entity) return null;
+  const stamp = Date.parse(entity.last_reported || entity.last_updated || '') / 1000;
+  return Number.isFinite(stamp) && stamp <= now + 30 && now - stamp < 180
+    ? num(entity.state, 0, 15000) : null;
+};
 const segments = (items, now, end) => {
   if (!Array.isArray(items)) return [];
   return items.slice(0, 50).flatMap(i => {
@@ -75,7 +102,7 @@ const stylesheet = [
   '.actual{stroke:#63d3b4;stroke-width:3}.forecast{stroke:#77a8ff;stroke-width:3;stroke-dasharray:8 5}',
   '.native{stroke:#f4a0bf;stroke-width:2.6;stroke-dasharray:10 4}',
   '.target{stroke:#ffbf6b;stroke-width:2;stroke-dasharray:3 6}.lower{stroke:#b18fff;stroke-width:1.5;stroke-dasharray:4 4}',
-  '.heat{fill:#3fb48a;fill-opacity:.15}.now{stroke:#dbe3f0;stroke-width:1.5;stroke-dasharray:4 5}',
+  '.heat{fill:#3fb48a;fill-opacity:.15}.outage{fill:#c27e82;fill-opacity:.18}.now{stroke:#dbe3f0;stroke-width:1.5;stroke-dasharray:4 5}',
   '.note,.notice{font-size:12px;color:#aabbd0;line-height:1.6}.note{margin:9px 0 2px}.notice{padding:12px 15px;margin-top:13px}',
   '.error{color:#f2b390}.right{display:flex;flex-direction:column;gap:5px;align-items:flex-end}',
   '@media(max-width:650px){.wrap{padding:12px 9px 36px}.stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.stat{padding:12px}.stat strong{font-size:20px}.chartbox{padding:13px 9px}.key{gap:10px}.brand{font-size:18px}}'
@@ -101,13 +128,18 @@ class HeatingV1NativePanel extends HTMLElement {
       '<section class="stats"><div class="stat"><label>Кімната</label><strong id="room">—</strong></div>' +
       '<div class="stat"><label>Ціль</label><strong id="target">—</strong></div>' +
       '<div class="stat"><label>Котел</label><strong id="boiler">—</strong></div>' +
-      '<div class="stat"><label>План V1</label><strong id="plan">—</strong></div></section>' +
+      '<div class="stat"><label>План V1</label><strong id="plan">—</strong></div>' +
+      '<div class="stat"><label>KWS · фактично</label><strong id="kws">—</strong></div>' +
+      '<div class="stat"><label>Камін</label><strong id="fire">—</strong></div>' +
+      '<div class="stat"><label>Циркуляція</label><strong id="fan">—</strong></div>' +
+      '<div class="stat"><label>Мережа</label><strong id="grid">—</strong></div></section>' +
       '<section class="chartbox"><div class="heading">Температура · план і факт</div>' +
       '<div class="key"><span style="--line:#63d3b4">Факт HA</span>' +
       '<span style="--line:#77a8ff">Прогноз V1</span><span style="--line:#f4a0bf">V1+ умовний</span>' +
       '<span style="--line:#ffbf6b">Ціль</span>' +
       '<span style="--line:#b18fff">Нижня межа</span>' +
-      '<span style="--line:#3fb48a">Можливий нагрів</span></div>' +
+      '<span style="--line:#3fb48a">План нагріву</span>' +
+      '<span style="--line:#c27e82">Відключення 3.1</span></div>' +
       '<div class="scroll"><svg class="chart" viewBox="0 0 1080 390" role="img" ' +
       'aria-label="Фактична температура, розрахована температура, ціль і вікна нагріву">' +
       '</svg></div><p class="note" id="source"></p>' +
@@ -200,6 +232,10 @@ class HeatingV1NativePanel extends HTMLElement {
     const fallback = fresh ? readPts(attrs.actual_curve, since, now + 60, true) : [];
     const history = this._history.length ? this._history : fallback;
     const windows = fresh && prediction.length > 1 ? segments(attrs.heat_segments, now, until) : [];
+    const outages = readOutages(state('sensor.heating_outage_schedule'), now, until);
+    const kwPhases = ['a','b','c'].map(phase =>
+      freshPower(state('sensor.energy_meter_kotel_potuzhnist_' + phase), now)
+    );
     const controller = state('sensor.heating_controller');
     const mode = state(ids.mode);
     const thermostat = state('climate.kotel');
@@ -210,6 +246,18 @@ class HeatingV1NativePanel extends HTMLElement {
     kv('boiler').textContent = thermostat ? String(thermostat.state).toUpperCase() : 'Невідомо';
     kv('plan').textContent = fresh && prediction.length > 1
       ? String(windows.length) + ' вікон' : 'Недоступний';
+    kv('kws').textContent = kwPhases.every(v => v !== null)
+      ? (kwPhases.reduce((a,b) => a+b, 0) / 1000).toFixed(1).replace('.', ',') + ' кВт'
+      : 'Немає даних';
+    const fire = state('sensor.heating_fireplace');
+    kv('fire').textContent = fire && fire.state !== 'unavailable' &&
+      fire.state !== 'unknown' ? fire.state : 'Невідомо';
+    const fan = state(ids.fan);
+    kv('fan').textContent = fan && ['on','off'].includes(fan.state)
+      ? fan.state === 'on' ? 'Працює' : 'Вимкнена' : 'Невідомо';
+    const grid = state('input_select.indikator_merezhi_stan');
+    kv('grid').textContent = grid && grid.state === 'Наявна мережа'
+      ? 'Є' : grid && grid.state === 'Відсутня мережа' ? 'Немає' : 'Невідомо';
     kv('mode').textContent = 'Режим V1: ' + (mode ? mode.state : 'невідомо') +
       ' · ' + (controller ? controller.state : 'статус невідомий');
     kv('source').textContent = prediction.length > 1
@@ -235,6 +283,10 @@ class HeatingV1NativePanel extends HTMLElement {
       add(canvas, 'line', { x1:X0, x2:X1, y1:y(t), y2:y(t), class:'gridline' });
       add(canvas, 'text', { x:X0 - 7, y:y(t)+4, 'text-anchor':'end' }, t.toFixed(1));
     }
+    for (const o of outages) add(canvas, 'rect', {
+      x:x(o.a), y:Y0, width:Math.max(0, x(o.b)-x(o.a)),
+      height:Y1-Y0, class:'outage'
+    });
     for (const w of windows) add(canvas, 'rect', {
       x:x(w.a), y:Y0, width:Math.max(0, x(w.b)-x(w.a)),
       height:Y1-Y0, class:'heat'
