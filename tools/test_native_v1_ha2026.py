@@ -42,6 +42,7 @@ async def lifecycle(readings, directory) -> None:
         entry_id="synthetic-native-v1",
         domain="heating_ai_legacy",
         async_on_unload=Mock(),
+        add_update_listener=Mock(return_value=lambda: None),
         data=dict(shadow=True, room="sensor.room", outside="sensor.outside"),
         options={},
         runtime_data=None,
