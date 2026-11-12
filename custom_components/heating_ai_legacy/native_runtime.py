@@ -31,6 +31,8 @@ REQUIRED_COEFFICIENTS = (
 
 
 def _number(value: Any, low: float, high: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a temperature or model coefficient")
     try:
         result = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -60,7 +62,15 @@ def sample_v1_inputs(hass: HomeAssistant, mapping: dict[str, str]) -> dict[str, 
     rows: dict[str, Any] = {}
     for role, entity_id in entity_ids.items():
         row = hass.states.get(entity_id)
-        _age(row, now, 900 if role in ("model", "floor") else 300)
+        if role == "model":
+            # Coefficients are versioned calibration metadata, not a
+            # physical sensor that must report each 15-minute window.
+            # Reject missing/corrupt calibration, but not an unchanged
+            # approved version whose HA timestamp is old.
+            if row is None or row.state in ("unknown","unavailable",""):
+                raise ValueError("trained V1 model unavailable")
+        else:
+            _age(row, now, 900 if role == "floor" else 300)
         rows[role] = row
     values["room"] = _number(rows["room"].state, -20, 55)
     values["outside"] = _number(rows["outside"].state, -55, 60)
@@ -68,6 +78,22 @@ def sample_v1_inputs(hass: HomeAssistant, mapping: dict[str, str]) -> dict[str, 
     attrs = rows["model"].attributes.get("parameters")
     if not isinstance(attrs, dict):
         raise ValueError("V1 thermal coefficients not available")
+    if (
+        attrs.get("validated") not in (True, "true", "True")
+        or type(attrs.get("version")) is not int
+        or attrs["version"] < 0
+    ):
+        raise ValueError("unvalidated or unversioned V1 model")
+    model_timestamp = (
+        getattr(rows["model"], "last_reported", None)
+        or getattr(rows["model"], "last_updated", None)
+    )
+    if (
+        not isinstance(model_timestamp, datetime)
+        or model_timestamp.tzinfo is None
+        or model_timestamp > now + timedelta(seconds=60)
+    ):
+        raise ValueError("trained V1 model provenance invalid")
     parameters = {
         key: _number(attrs.get(key), -10, 10)
         for key in REQUIRED_COEFFICIENTS
@@ -86,7 +112,7 @@ def sample_v1_inputs(hass: HomeAssistant, mapping: dict[str, str]) -> dict[str, 
                 plan_id=plan_id,
                 legacy_plan=mirror_legacy_plan(plan_attributes, now.timestamp()),
                 learned_model_source=dict(attrs),
-                learned_model_at=rows["model"].last_reported.timestamp(),
+                learned_model_at=model_timestamp.timestamp(),
                 **values)
 
 
