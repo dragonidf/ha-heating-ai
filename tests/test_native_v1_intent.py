@@ -45,6 +45,7 @@ class NativeIntentTests(unittest.TestCase):
                  grid=True, armed=True, end=200.):
         safety=dict(
             legacy_mode=mode,armed=armed,grid_actual=grid,
+            voltage_qualified=grid is True,
             room_c=21.7,return_c=28.,kws_power_w=kws,
             thermostat_mode="auto",
         )
@@ -86,6 +87,16 @@ class NativeIntentTests(unittest.TestCase):
         r=self.module.evaluate(110.,plan,safety,model_validated=True)
         self.assertEqual(r["proposed_action"],"off")
         self.assertFalse(r["physical_commands_enabled"])
+
+    def test_unqualified_voltage_blocks_heat_even_with_confirmed_grid(self):
+        safety,plan=self.scenario()
+        for value in (False,None):
+            safety["voltage_qualified"]=value
+            result=self.module.evaluate(110.,plan,safety,model_validated=True)
+            self.assertEqual(result["proposed_action"],"off")
+            self.assertEqual(result["reason"],"voltage_not_qualified")
+            self.assertFalse(result["physical_commands_enabled"])
+            self.assertEqual(result["commands_sent"],0)
 
     def test_missing_or_malformed_plan_not_treated_as_demand(self):
         safety,plan=self.scenario()
