@@ -96,7 +96,7 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             minimum = user_input.get("min_voltage_v")
             maximum = user_input.get("max_voltage_v")
-            recovery = user_input.get("voltage_recovery_seconds", 180)
+            recovery = user_input.get("voltage_recovery_seconds", 30)
             if not valid_policy(minimum, maximum, recovery):
                 return self.async_show_form(
                     step_id="init",
@@ -116,20 +116,20 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
     @staticmethod
     def _schema(current):
         return vol.Schema({
-            vol.Required("min_voltage_v", default=current.get("min_voltage_v")):
+            vol.Required("min_voltage_v", default=current.get("min_voltage_v", 190)):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=140, max=235, step=1,
                     mode=selector.NumberSelectorMode.BOX,
                     unit_of_measurement="V",
                 )),
-            vol.Required("max_voltage_v", default=current.get("max_voltage_v")):
+            vol.Required("max_voltage_v", default=current.get("max_voltage_v", 260)):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=220, max=280, step=1,
                     mode=selector.NumberSelectorMode.BOX,
                     unit_of_measurement="V",
                 )),
             vol.Required("voltage_recovery_seconds",
-                         default=current.get("voltage_recovery_seconds", 180)):
+                         default=current.get("voltage_recovery_seconds", 30)):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=30, max=900, step=30,
                     mode=selector.NumberSelectorMode.BOX,

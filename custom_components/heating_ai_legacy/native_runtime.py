@@ -179,10 +179,10 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._voltage_guard = VoltageGuard()
         # No arbitrary thresholds, and no UI-provided privilege to actuate.
         # Defaults remain None until a verified commissioning procedure.
-        self.voltage_min_v = entry.options.get("min_voltage_v")
-        self.voltage_max_v = entry.options.get("max_voltage_v")
+        self.voltage_min_v = entry.options.get("min_voltage_v", 190)
+        self.voltage_max_v = entry.options.get("max_voltage_v", 260)
         self.voltage_recovery_seconds = entry.options.get(
-            "voltage_recovery_seconds", 180
+            "voltage_recovery_seconds", 30
         )
         self.model_store = None
         self.model_checkpoint = None
@@ -403,9 +403,19 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         safety_status = {
             "mode": "NATIVE_SHADOW",
             "voltage_guard_status": voltage["status"],
+            "voltage_guard_reason_code": voltage["reason_code"],
+            "voltage_guard_reason": voltage["reason"],
             "voltage_qualified": voltage["voltage_qualified"],
             "voltage_recovery_seconds": voltage["sustained_seconds"],
+            "voltage_recovery_required_seconds": self.voltage_recovery_seconds,
+            "voltage_min_v": voltage["minimum_v"],
+            "voltage_max_v": voltage["maximum_v"],
+            "voltage_trip_low_v": voltage["trip_low_v"],
+            "voltage_trip_high_v": voltage["trip_high_v"],
+            "voltage_recovery_low_v": voltage["recovery_low_v"],
+            "voltage_recovery_high_v": voltage["recovery_high_v"],
             "voltage_phases_v": safety.get("voltage_phases_v"),
+            "voltage_affected_phases": voltage["affected_phases"],
             "voltage_source_quality": safety.get("voltage_source_quality"), "physical_commands_enabled": False,
             "source_quality": safety.get("source_quality"),
             "source_warnings": safety.get("source_warnings", []),

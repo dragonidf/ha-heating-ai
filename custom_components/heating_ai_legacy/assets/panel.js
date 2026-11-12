@@ -145,6 +145,7 @@ class HeatingV1NativePanel extends HTMLElement {
       'aria-label="Фактична температура, розрахована температура, ціль і вікна нагріву">' +
       '</svg></div><p class="note" id="source"></p>' +
       '<p class="note" id="native-status"></p></section>' +
+      '<section class="notice" id="voltage-notice" aria-live="polite" hidden></section>' +
       '<section class="notice">V1+ поки працює лише в режимі спостереження. ' +
       'Команди котлу, каміну та вентиляції вимкнені.</section></main>';
     // The main forecast belongs directly under room and target, not
@@ -365,6 +366,24 @@ class HeatingV1NativePanel extends HTMLElement {
     nativeStatus.textContent = nativeValid
       ? (prediction.length > 1 ? 'V1+: незалежний умовний прогноз для порівняння.' : '')
       : 'V1+: очікує актуальних даних для прогнозу.';
+    const voltageNotice = this.shadowRoot.getElementById('voltage-notice');
+    if (this._native && typeof this._native.voltage_guard_reason === 'string') {
+      const status = this._native.voltage_guard_status;
+      const reason = this._native.voltage_guard_reason;
+      const recovery = `Дозвіл повернеться після показів ${this._native.voltage_recovery_low_v}–${this._native.voltage_recovery_high_v} В на всіх фазах протягом ${this._native.voltage_recovery_required_seconds} с.`;
+      const shadow = ' SHADOW: це прогноз блокування; команда котлу не надсилалась.';
+      voltageNotice.hidden = false;
+      voltageNotice.textContent = status === 'LOW_VOLTAGE' || status === 'HIGH_VOLTAGE'
+        ? `Причина заборони нагріву: ${reason}. ${recovery}${shadow}`
+        : status === 'RECOVERY_HYSTERESIS' || status === 'RECOVERING'
+          ? `Нагрів поки заблокований: ${reason}. ${recovery}${shadow}`
+          : status === 'NORMAL'
+            ? `Напруга нормалізована: ${reason}. Умовний дозвіл на нагрів відновлено.${shadow}`
+            : `Нагрів не кваліфіковано: ${reason}.${shadow}`;
+    } else {
+      voltageNotice.hidden = true;
+      voltageNotice.textContent = '';
+    }
     this.shadowRoot.querySelectorAll('.legend-legacy').forEach(
       item => item.hidden = prediction.length < 2);
     this.shadowRoot.querySelectorAll('.legend-native').forEach(

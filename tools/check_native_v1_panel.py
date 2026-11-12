@@ -113,6 +113,11 @@ async def verify() -> None:
                               computed_at:now,
                               physical_commands_enabled:false,
                               commands_sent:0,
+                              voltage_guard_status:'LOW_VOLTAGE',
+                              voltage_guard_reason:'Низька напруга L2: 196 В; межа KWS 190 В, раннє вимкнення ≤196 В',
+                              voltage_recovery_low_v:201,
+                              voltage_recovery_high_v:250,
+                              voltage_recovery_required_seconds:30,
                               forecast:native,
                               heat_segments:[
                                 {start:now+900,end:now+5400,power_kw:3.0}
@@ -144,6 +149,7 @@ async def verify() -> None:
                             n_history:root.querySelectorAll('path.actual').length,
                             mode:root.getElementById('mode').textContent,
                             native_status:root.getElementById('native-status').textContent,
+                            voltage_reason:root.getElementById('voltage-notice').textContent,
                             stats,
                             controls:root.querySelectorAll('button, select, input').length,
                             has_horizontal_scroll:root.querySelector('.chart').getBoundingClientRect().width >
@@ -156,6 +162,9 @@ async def verify() -> None:
                 assert "Штатний auto" in checks["mode"]
                 assert "V1+" in checks["native_status"]
                 assert "PROVISIONAL_SOURCES" not in checks["native_status"]
+                assert "Причина заборони нагріву" in checks["voltage_reason"]
+                assert "L2: 196 В" in checks["voltage_reason"]
+                assert "команда котлу не надсилалась" in checks["voltage_reason"]
                 assert checks["controls"] == 0, "Preview must not contain equipment controls"
                 if label=="mobile":
                     assert not checks["has_horizontal_scroll"], "Full 24h graph should fit mobile"

@@ -25,6 +25,11 @@ from .native_model import load as load_model_checkpoint
 from .native_floor import load as load_floor_checkpoint
 
 
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the guard after its operator-set KWS limits change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Accept the integration without changing existing heating."""
     return True
@@ -75,6 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     entry.runtime_data = coordinator
     state = hass.data.setdefault(DOMAIN, {})
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     forwarded = False
     panel_registered = False
     try:

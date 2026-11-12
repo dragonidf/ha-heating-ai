@@ -49,6 +49,31 @@ def register(hass):
                 not isinstance(published_at, (int,float)) or
                 not 0 <= time.time()-published_at <= 900):
             proposal = None
+        data = coordinator.data or {}
+        voltage = {
+            "voltage_guard_status": data.get(
+                "voltage_guard_status", "LIMITS_UNCONFIGURED"
+            ),
+            "voltage_guard_reason_code": data.get(
+                "voltage_guard_reason_code", "voltage_preview_unavailable"
+            ),
+            "voltage_guard_reason": data.get(
+                "voltage_guard_reason", "Немає актуальних даних про напругу"
+            ),
+            "voltage_qualified": data.get("voltage_qualified") is True,
+            "voltage_phases_v": data.get("voltage_phases_v"),
+            "voltage_affected_phases": data.get("voltage_affected_phases", []),
+            "voltage_min_v": data.get("voltage_min_v", 190),
+            "voltage_max_v": data.get("voltage_max_v", 260),
+            "voltage_trip_low_v": data.get("voltage_trip_low_v", 196),
+            "voltage_trip_high_v": data.get("voltage_trip_high_v", 255),
+            "voltage_recovery_low_v": data.get("voltage_recovery_low_v", 201),
+            "voltage_recovery_high_v": data.get("voltage_recovery_high_v", 250),
+            "voltage_recovery_seconds": data.get("voltage_recovery_seconds", 0),
+            "voltage_recovery_required_seconds": data.get(
+                "voltage_recovery_required_seconds", 30
+            ),
+        }
         if proposal is None:
             connection.send_result(msg["id"], {
                 "status": "BLOCKED_INPUTS", "reason": "native_plan_not_ready",
@@ -57,6 +82,7 @@ def register(hass):
                 "entity_map": dict(coordinator.role_map),
                 "source_ids": dict(coordinator.source_ids),
                 "outage_preview": coordinator.outage_schedule,
+                **voltage,
             })
             return
         # Single immutable observational shape. No private training history,
@@ -75,10 +101,7 @@ def register(hass):
                 "legacy_decision_preview"
             ),
             "decision_never_executable": True,
-            "voltage_guard_status": (coordinator.data or {}).get(
-                "voltage_guard_status", "LIMITS_UNCONFIGURED"
-            ),
-            "voltage_qualified": False,
+            **voltage,
             "physical_commands_enabled": False,
             "commands_sent": 0,
             "forecast": proposal.get("forecast", [])[:200],
