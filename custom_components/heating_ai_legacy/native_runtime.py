@@ -7,7 +7,9 @@ This compatibility adapter is not the final V1+ planner or command gateway.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import asyncio
 import math
+import time
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -16,6 +18,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import MODEL, ENVIRONMENT, FORECAST
 from .native_engine.heating_model import coast
 from .plan_snapshot import mirror_legacy_plan
+from .native_sources import normalize_hourly_weather, planner_snapshot
+from .native_planner import provisional_plan
 
 REQUIRED_COEFFICIENTS = (
     "floor_air", "room_loss", "floor_decay", "heat_gain", "fire_gain"
@@ -113,6 +117,79 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(seconds=60),
         )
         self.mapping = dict(mapping)
+        self.hourly_weather: list[dict[str, float]] | None = None
+        self.weather_received_at: float | None = None
+        self.native_plan: dict[str, Any] | None = None
+        self._plan_job: asyncio.Task[None] | None = None
+        self._last_plan_start = 0.0
+        self._requested_snapshot: tuple[Any, ...] | None = None
+        self._closed = False
+        self._weather_unsubscribe = None
+
+    def receive_weather(self, items: list[dict[str, Any]] | None) -> None:
+        """Read-only HA WeatherEntity callback: receipt is not issue time."""
+        now = time.time()
+        try:
+            self.hourly_weather = normalize_hourly_weather(items, now)
+            self.weather_received_at = now
+        except (TypeError, ValueError, OverflowError):
+            self.hourly_weather = None
+            self.weather_received_at = None
+
+    def _planning_key(self, snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        values = snapshot["settings"]
+        return (
+            tuple(sorted(snapshot["model"].items())),
+            round(snapshot["room"] * 4) / 4,
+            round(snapshot["floor"] * 2) / 2,
+            round(snapshot["outside"] * 2) / 2,
+            round(snapshot["fire_delta"] * 2) / 2,
+            tuple((role, str(values[role])) for role in (
+                "target", "lower", "upper", "night_target", "night_lower",
+                "night_upper", "start", "end", "sleep_start", "sleep_end",
+                "strategy",
+            )),
+            snapshot["weather"][-1]["ts"],
+            str(values["outage_schedule"].get("outages", [])),
+        )
+
+    async def _run_plan(
+        self, snapshot: dict[str, Any], signature: tuple[Any, ...]
+    ) -> None:
+        """A single isolated executor job; reject results for old input keys."""
+        try:
+            result = await self.hass.async_add_executor_job(
+                provisional_plan, snapshot
+            )
+        except Exception:
+            result = dict(status="BLOCKED_INPUTS", reason="calculation_failed",
+                          physical_commands_enabled=False,
+                          commands_sent=0, proposal_is_command=False)
+        if not self._closed and signature == self._requested_snapshot:
+            self.native_plan = result
+            if isinstance(self.data, dict):
+                # Only a compact summary is recorded in HA. The full curve
+                # remains in RAM, until a dedicated authenticated API exists.
+                old = dict(self.data)
+                old["native_plan_status"] = result.get("status", "BLOCKED_INPUTS")
+                old["native_plan_quality"] = result.get("quality")
+                old["native_plan_reason"] = result.get("reason")
+                old["native_planned_kwh"] = result.get("nominal_energy_kwh")
+                old["native_plan_points"] = len(result.get("forecast", []))
+                self.async_set_updated_data(old)
+
+    async def close(self) -> None:
+        """Release native weather subscription and the one planning task."""
+        self._closed = True
+        if self._weather_unsubscribe is not None:
+            self._weather_unsubscribe()
+            self._weather_unsubscribe = None
+        if self._plan_job is not None and not self._plan_job.done():
+            self._plan_job.cancel()
+            try:
+                await self._plan_job
+            except asyncio.CancelledError:
+                pass
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
@@ -121,6 +198,39 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (ValueError, KeyError) as err:
             raise UpdateFailed(str(err)) from err
         # Pure math never blocks the HA event loop.
-        return await self.hass.async_add_executor_job(
+        report = await self.hass.async_add_executor_job(
             calculate_v1_coast, snapshot,
         )
+        try:
+            candidate = planner_snapshot(
+                self.hass, snapshot, self.hourly_weather,
+                self.weather_received_at,
+            )
+        except (ValueError, KeyError, TypeError):
+            report["native_plan_status"] = "BLOCKED_INPUTS"
+            report["native_plan_reason"] = "weather_or_source_missing"
+            return report
+
+        signature = self._planning_key(candidate)
+        stamp = time.monotonic()
+        has_running = self._plan_job is not None and not self._plan_job.done()
+        if not has_running and (
+            signature != self._requested_snapshot or
+            stamp - self._last_plan_start >= 600
+        ):
+            self._last_plan_start = stamp
+            self._requested_snapshot = signature
+            self._plan_job = self.hass.async_create_task(
+                self._run_plan(candidate, signature),
+                "heating_ai_v1_24h_non_actuating_shadow",
+            )
+        plan = self.native_plan or {}
+        report["native_plan_status"] = (
+            plan.get("status", "PLANNING")
+            if signature == self._requested_snapshot else "PLANNING"
+        )
+        report["native_plan_quality"] = plan.get("quality")
+        report["native_plan_reason"] = plan.get("reason")
+        report["native_planned_kwh"] = plan.get("nominal_energy_kwh")
+        report["native_plan_points"] = len(plan.get("forecast", []))
+        return report
