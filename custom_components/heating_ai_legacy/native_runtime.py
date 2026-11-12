@@ -20,6 +20,7 @@ from .native_engine.heating_model import coast
 from .plan_snapshot import mirror_legacy_plan
 from .native_sources import normalize_hourly_weather, planner_snapshot
 from .native_planner import provisional_plan
+from .native_intent import evaluate as evaluate_legacy_intent
 from .native_safety import observe as observe_safety
 from .native_persistence import observe_room
 from .native_model import remember as save_learned_model
@@ -303,6 +304,9 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "source_warnings": safety.get("source_warnings", []),
             "manual_observed": safety.get("manual_observed"),
             "grid_actual": safety.get("grid"),
+            "room_c": safety.get("room_c"),
+            "return_c": safety.get("return_c"),
+            "armed": safety.get("armed"),
             "kws_power_w": safety.get("kws_power_w"),
             "kws_total_kwh": safety.get("kws_total_kwh"),
             "legacy_mode": safety.get("legacy_mode"),
@@ -330,6 +334,13 @@ class V1ShadowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         report = await self.hass.async_add_executor_job(calculate_v1_coast, snapshot)
         report.update(safety_status)
+        intent = evaluate_legacy_intent(
+            time.time(), self.native_plan, safety_status,
+            model_validated=True,  # sample_v1_inputs validated the active source
+        )
+        report["legacy_decision_preview"] = intent.get("proposed_action")
+        report["legacy_decision_preview_status"] = intent.get("status")
+        report["legacy_decision_never_executable"] = True
 
         if self.model_store is not None:
             stamp = time.time()

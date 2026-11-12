@@ -33,7 +33,7 @@ class NativeIntentTests(unittest.TestCase):
             thermostat_mode="auto",
         )
         schedule=dict(
-            status="VIRTUAL_CONDITIONAL",
+            status="VIRTUAL_CONDITIONAL", computed_at=105.,
             heat_segments=[dict(start=100.,end=end,power_kw=3.)]
         )
         return safety,schedule
@@ -86,6 +86,11 @@ class NativeIntentTests(unittest.TestCase):
         self.assertEqual(
             self.module.evaluate(210.,plan,safety,model_validated=True)["proposed_action"],
             "off",
+        )
+        plan["computed_at"]=-10000.
+        self.assertEqual(
+            self.module.evaluate(210.,plan,safety,model_validated=True)["proposed_action"],
+            "fallback",
         )
 
 

@@ -55,6 +55,10 @@ def register(hass):
             "computed_at": proposal.get("computed_at"),
             "nominal_energy_kwh": proposal.get("nominal_energy_kwh"),
             "source": "native_v1_optimizer",
+            "decision_preview": (coordinator.data or {}).get(
+                "legacy_decision_preview"
+            ),
+            "decision_never_executable": True,
             "physical_commands_enabled": False,
             "commands_sent": 0,
             "forecast": proposal.get("forecast", [])[:200],

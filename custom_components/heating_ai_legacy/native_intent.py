@@ -21,6 +21,9 @@ def _number(value: Any) -> float | None:
 def _planned_demand(now: float, plan: dict[str, Any] | None) -> bool | None:
     if not isinstance(plan,dict) or plan.get("status") != "VIRTUAL_CONDITIONAL":
         return None
+    computed=_number(plan.get("computed_at"))
+    if computed is None or not 0 <= now-computed <= 900:
+        return None
     rows = plan.get("heat_segments")
     if not isinstance(rows,list) or len(rows)>150:
         return None
