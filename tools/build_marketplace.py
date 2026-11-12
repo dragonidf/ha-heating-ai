@@ -123,7 +123,9 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
     for name in ("__init__.py", "const.py", "config_flow.py",
                  "native_runtime.py", "plan_snapshot.py",
                  "native_planner.py", "native_sources.py", "native_api.py",
-                 "sensor.py", "strings.json", "assets/panel.js"):
+                 "native_safety.py", "native_store.py", "native_persistence.py",
+                 "critical_ledger.py", "sensor.py", "strings.json",
+                 "assets/panel.js"):
         contents[name] = (CARRIER / name).read_bytes()
         if name.endswith(".py"):
             compile(contents[name], name, "exec")

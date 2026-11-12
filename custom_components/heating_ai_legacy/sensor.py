@@ -39,6 +39,16 @@ class NativeV1ShadowStatus(CoordinatorEntity, SensorEntity):
             "native_plan_reason": data.get("native_plan_reason"),
             "native_plan_points": data.get("native_plan_points", 0),
             "native_planned_kwh": data.get("native_planned_kwh"),
+            "source_quality": data.get("source_quality", "UNAVAILABLE"),
+            "source_warnings": ",".join(data.get("source_warnings", [])[:12]),
+            "manual_observed": data.get("manual_observed"),
+            "grid_actual": data.get("grid_actual"),
+            "kws_power_w": data.get("kws_power_w"),
+            "kws_total_kwh": data.get("kws_total_kwh"),
+            "legacy_mode": data.get("legacy_mode"),
+            "thermostat_mode": data.get("thermostat_mode"),
+            "journal_fenced": (data.get("durable_journal") or {}).get("fenced"),
+            "storage_fault": data.get("storage_fault"),
         }
         result.update({key: data[key] for key in (
             "physical_commands_enabled", "forecast_qualified",

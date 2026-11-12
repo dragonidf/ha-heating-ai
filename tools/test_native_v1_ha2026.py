@@ -26,7 +26,7 @@ def row(state, attributes=None, *, age_seconds=0):
 
 
 
-async def lifecycle(readings) -> None:
+async def lifecycle(readings, directory) -> None:
     """Exercise HA 2026.11 native panel lifecycle without production or writes."""
     from unittest.mock import AsyncMock, Mock, patch
     from custom_components import heating_ai_legacy as component
@@ -58,6 +58,9 @@ async def lifecycle(readings) -> None:
         data={},
         states=SimpleNamespace(get=source.get),
         http=SimpleNamespace(async_register_static_paths=AsyncMock()),
+        config=SimpleNamespace(path=lambda *parts: str(
+            Path(directory).joinpath(*parts)
+        )),
         config_entries=config,
         async_add_executor_job=executor,
         async_create_task=lambda coro, name=None: asyncio.create_task(coro, name=name),
@@ -79,6 +82,8 @@ async def lifecycle(readings) -> None:
         assert api.call_count == 1
         assert hass.data[component.DOMAIN][entry.entry_id] is entry.runtime_data
         assert entry.runtime_data.data["physical_commands_enabled"] is False
+        assert entry.runtime_data.ledger_summary["fenced"] is True
+        assert entry.runtime_data.ledger_summary["physical_commands_enabled"] is False
         assert entry.runtime_data.data["native_plan_status"] == "BLOCKED_INPUTS"
         assert not hasattr(hass, "services"), "A device service transport must not be present"
         assert await component.async_unload_entry(hass, entry)
@@ -93,7 +98,7 @@ def main() -> None:
         folder = Path(temp)
         archive = folder / "carrier.zip"
         summary = build(archive)
-        assert summary["files"] == 28
+        assert summary["files"] == 32
         target = folder / "isolated" / "custom_components" / "heating_ai_legacy"
         target.mkdir(parents=True)
         with zipfile.ZipFile(archive) as package:
@@ -138,7 +143,7 @@ def main() -> None:
             assert result["legacy_plan"]["status"] == "LEGACY_UNAVAILABLE"
             assert isinstance(result["three_hour_end_c"], float)
             assert result["scenario"] == "three_hour_coast_without_heating_or_fire"
-            asyncio.run(lifecycle(readings))
+            asyncio.run(lifecycle(readings, folder / "private-shadow"))
             from custom_components.heating_ai_legacy.plan_snapshot import mirror_legacy_plan
             timestamp = datetime.now(timezone.utc).timestamp()
             candidate = mirror_legacy_plan({
