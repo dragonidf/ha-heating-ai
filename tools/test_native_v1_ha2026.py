@@ -25,6 +25,67 @@ def row(state, attributes=None, *, age_seconds=0):
     )
 
 
+
+async def lifecycle(readings) -> None:
+    """Exercise HA 2026.11 native panel lifecycle without production or writes."""
+    from unittest.mock import AsyncMock, patch
+    from custom_components import heating_ai_legacy as component
+    from custom_components.heating_ai_legacy.native_runtime import V1ShadowCoordinator
+
+    async def first_refresh(self):
+        self.data = await self._async_update_data()
+
+    async def executor(func, *args):
+        return func(*args)
+
+    entry = SimpleNamespace(
+        entry_id="synthetic-native-v1",
+        data=dict(shadow=True, room="sensor.room", outside="sensor.outside"),
+        runtime_data=None,
+    )
+    source = dict(readings)
+    source["sensor.heating_ui"] = row("0.3.23", {
+        "entities": {"room": "sensor.room", "outside": "sensor.outside",
+                     "weather": "weather.synthetic"}
+    })
+    config = SimpleNamespace(
+        async_forward_entry_setups=AsyncMock(),
+        async_unload_platforms=AsyncMock(return_value=True),
+    )
+    hass = SimpleNamespace(
+        data={},
+        states=SimpleNamespace(get=source.get),
+        http=SimpleNamespace(async_register_static_paths=AsyncMock()),
+        config_entries=config,
+        async_add_executor_job=executor,
+        async_create_task=lambda coro, name=None: asyncio.create_task(coro, name=name),
+    )
+    with (
+        patch.object(V1ShadowCoordinator, "async_config_entry_first_refresh", first_refresh),
+        patch.object(component.panel_custom, "async_register_panel", new_callable=AsyncMock) as panel,
+        patch.object(component.frontend, "async_remove_panel") as removed,
+        patch("custom_components.heating_ai_legacy.native_api.websocket_api.async_register_command") as api,
+    ):
+        assert await component.async_setup_entry(hass, entry)
+        assert panel.await_count == 1
+        args = panel.await_args.kwargs
+        assert args["frontend_url_path"] == "heating-v1-preview"
+        assert args["module_url"].startswith("/heating_ai_legacy/assets/panel.js?v=")
+        assert args["webcomponent_name"] == "heating-v1-native-" + args["module_url"].split("=")[-1]
+        assert args["config"]["entry_id"] == entry.entry_id
+        assert args["require_admin"] is True
+        assert api.call_count == 1
+        assert hass.data[component.DOMAIN][entry.entry_id] is entry.runtime_data
+        assert entry.runtime_data.data["physical_commands_enabled"] is False
+        assert entry.runtime_data.data["native_plan_status"] == "BLOCKED_INPUTS"
+        assert not hasattr(hass, "services"), "A device service transport must not be present"
+        assert await component.async_unload_entry(hass, entry)
+        assert entry.entry_id not in hass.data[component.DOMAIN]
+        assert removed.call_count == 1
+        assert config.async_unload_platforms.await_count == 1
+
+
+
 def main() -> None:
     with TemporaryDirectory() as temp:
         folder = Path(temp)
@@ -75,6 +136,7 @@ def main() -> None:
             assert result["legacy_plan"]["status"] == "LEGACY_UNAVAILABLE"
             assert isinstance(result["three_hour_end_c"], float)
             assert result["scenario"] == "three_hour_coast_without_heating_or_fire"
+            asyncio.run(lifecycle(readings))
             from custom_components.heating_ai_legacy.plan_snapshot import mirror_legacy_plan
             timestamp = datetime.now(timezone.utc).timestamp()
             candidate = mirror_legacy_plan({
