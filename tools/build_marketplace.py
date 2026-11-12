@@ -31,6 +31,40 @@ EXPECTED = (
 RELEASE = "release.json"
 ZIP_NAME = "heating_ai_v1_marketplace.zip"
 
+# These five original V1 modules are independent of AppDaemon Hass.
+# Copy their algorithms identically, changing only top-level absolute
+# imports into explicit package-relative imports; all executable logic is
+# preserved byte-for-byte and regression-checked against the V1 source.
+PURE_MODULES = (
+    "heating_environment.py",
+    "heating_outages.py",
+    "heating_model.py",
+    "heating_fallback.py",
+    "heating_stability.py",
+)
+RELATIVE_IMPORTS = (
+    "heating_environment", "heating_outages", "heating_model",
+    "heating_fallback", "heating_stability",
+)
+
+
+def as_native_module(original: bytes) -> bytes:
+    text = original.decode("utf-8")
+    for module in RELATIVE_IMPORTS:
+        text = text.replace(f"from {module} import ", f"from .{module} import ")
+    if "from appdaemon" in text or "import appdaemon" in text:
+        raise ValueError("AppDaemon dependency leaked into native pure engine")
+    return text.encode("utf-8")
+
+
+def verify_native_module(native: bytes, original: bytes) -> None:
+    restored = native.decode("utf-8")
+    for module in RELATIVE_IMPORTS:
+        restored = restored.replace(f"from .{module} import ", f"from {module} import ")
+    if restored.encode("utf-8") != original:
+        raise ValueError("Native engine changed V1 computational logic")
+
+
 
 def checksum(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -54,6 +88,18 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
             raise ValueError(f"Module checksum mismatch: {name}")
         contents[f"legacy_app/{name}"] = data
     contents[f"legacy_app/{RELEASE}"] = (SOURCE / RELEASE).read_bytes()
+
+    # Staged migration: immutable V1 math as a native Python library.
+    # Nothing inside this package opens HA connections or sends commands.
+    contents["native_engine/__init__.py"] = (
+        b'"""Unmodified V1 numerical model; no AppDaemon or hardware calls."""\\n'
+    ).replace(b"\\\\n", b"\\n")
+    for name in PURE_MODULES:
+        original = contents[f"legacy_app/{name}"]
+        native = as_native_module(original)
+        verify_native_module(native, original)
+        compile(native, f"native_engine/{name}", "exec")
+        contents[f"native_engine/{name}"] = native
 
     root_manifest = (ROOT / "manifest.json").read_bytes()
     nested_manifest = (CARRIER / "manifest.json").read_bytes()
