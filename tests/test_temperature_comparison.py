@@ -146,8 +146,8 @@ class TemperatureComparisonTests(unittest.TestCase):
         app.history_timeout(dict(request_id='slow'))
         self.assertFalse(app.history_loading)
         self.assertIsNone(app.history_loading_id)
-        self.assertEqual(published[0]['comparison']['error_code'],'history_timeout')
-        self.assertIn('вчасно',published[0]['comparison']['error'])
+        self.assertEqual(app.history_comparison['error_code'],'history_timeout')
+        self.assertIn('вчасно',app.history_comparison['error'])
         app.plan_history_loaded(dict(result=dict(request_id='slow',start=self.start,end=self.end,actual=[],cycles=[])))
         self.assertEqual(len(pages),1)
 
