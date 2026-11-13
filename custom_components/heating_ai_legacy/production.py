@@ -339,6 +339,9 @@ class NativeController(HeatingClimate):
             return
         if not self.command_ledger_status.get("fenced"):
             return
+        if getattr(self.command_ledger, "_fence_recovery_seen", False):
+            return
+        self.command_ledger._fence_recovery_seen = True
         if (self.raw("mode") != "Автоматичне керування"
                 or self._fence_recovery_attempted
                 or self.memory.get("fence_recovery_attempted")):
