@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 — 2026-11-13
+
+- Exclude notifications and missing entity targets from physical command echo checks, fixing recurring NoneType.lower exceptions and unintended temporary AUTO incidents.
+- Allow short HA state I/O closures directly on the HA loop for asynchronous Recorder verification; keep synchronous controller computations in the executor.
+- Add regressions for both production tracebacks; preserve model, private history, thermal decisions and energy accounting.
+
 ## 0.4.0 — 2026-11-12
 
 - Package the complete V1 controller as a native Home Assistant Marketplace integration. Preserve the existing thermal planner, KWS counter accounting, comfort settings, manual pause, AUTO/fallback, one-shot, fireplace and fan logic; adapt only platform I/O and module imports. Synchronous callbacks run serially outside the HA event loop and expensive searches retain their immutable-input workers.

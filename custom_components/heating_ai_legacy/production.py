@@ -238,6 +238,10 @@ class NativeController(HeatingClimate):
 
     @callback
     def async_equipment_command_echo(self, domain, service, data, evidence=None):
+        # Notifications have notification_id, not an equipment entity. They
+        # cannot supply physical command evidence or enter HA StateMachine.get.
+        if domain not in ("climate", "fan") or not isinstance(data.get("entity_id"), str):
+            return {"matched": False, "observed_at": time.time()}
         state = self.hass.states.get(data.get("entity_id"))
         matched = False
         # A completed blocking service may confirm an idempotent command even

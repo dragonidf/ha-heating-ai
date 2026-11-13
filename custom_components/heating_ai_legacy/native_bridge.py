@@ -38,7 +38,10 @@ class Hass:
 
     def _on_loop(self, function, *args):
         if threading.get_ident() == self._loop_thread:
-            raise RuntimeError("Synchronous controller callback ran on HA loop")
+            # Async Recorder callbacks already run here. Execute only the
+            # supplied short HA I/O closure directly; never reschedule and wait
+            # on the same loop. Normal synchronous V1 callbacks stay off-loop.
+            return function(*args)
         return run_callback_threadsafe(self.hass.loop, function, *args).result(30)
 
     async def _dispatch(self, function, *args):

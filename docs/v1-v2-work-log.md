@@ -239,3 +239,23 @@ above evidence limits. Next agent: start from latest main and LIVE state; do not
 repeat migration/enable old writer. Owner will separately delete old V1/unneeded
 entities. First follow-up: compare post-cutover Recorder write rates and energy
 monotonicity over available history; inspect actual installed panel if needed.
+
+### 13.11.2026 — 0.4.1 production traceback fix pending CI/deployment
+
+Live native0.4.0 repeatedly reports AttributeError NoneType.lower. Confirmed
+traceback: native_bridge.call_service invokes async_equipment_command_echo for
+persistent_notification/dismiss without entity_id; HA StateMachine.get(None)
+throws. Restrict echo lookup to climate/fan with a string entity target; retain
+all equipment echo/ledger checks. Separate Recorder coroutine traceback calls
+synchronous state closure on HA loop; _on_loop now executes that short closure
+directly when already on the HA thread, avoiding a throw/deadlock.
+
+Two focused production-method regressions FAIL before fix, PASS after. Original
+eight executable V1 sources remain byte-identical; only native adapter/bridge,
+release versions and regenerated frontend/version hashes changed. Version0.4.1.
+User delegated full testing to GitHub. Next: main exact-head Tests/release,
+Marketplace update repo1421772152 to v0.4.1, load new Python code via necessary
+Core restart (not full AppDaemon), verify fresh successful cycles, error counts
+stop increasing, actual control quality and temporary fallback clearance. Preserve
+native private model/history and manual intent; do not blindly force HEAT.
+Legacy V1/V2 stay disabled. Production has NOT received0.4.1 at this checkpoint.
