@@ -30,4 +30,5 @@
 - 2026-11-13 — fence recovery реалізовано та випущено у v0.4.9 без polling і повного reboot.
 - 2026-11-13 — v0.4.10 додав людськомовне розрізнення warning/error для проблем контролера.
 - 2026-11-13 — PR #34 об’єднав два малих P0: heartbeat/writer health контракт і bounded power telemetry Recorder publications.
-- 2026-11-13 — PR #34 пройшов Python 3.12/3.13, browser responsive/accessibility та native HA 2026.11; підготовлено реліз v0.4.11.
+- 2026-11-13 — PR #35 об’єднав heartbeat/writer health і bounded power telemetry, пройшов GitHub CI та випустив v0.4.11; HACS встановив v0.4.11.
+- 2026-11-13 — live entry reload виявив mixed-module setup_error через кеш Python після оновлення custom integration. Повний Core restart не виконано через обмеження безпеки; поточний запис не завантажений, heartbeat off. Це P0-блокер для наступного bundled fix: activation без reboot або явно погоджений одноразовий restart.
