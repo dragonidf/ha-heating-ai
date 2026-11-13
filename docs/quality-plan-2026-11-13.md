@@ -32,3 +32,7 @@
 - 2026-11-13 — PR #34 об’єднав два малих P0: heartbeat/writer health контракт і bounded power telemetry Recorder publications.
 - 2026-11-13 — PR #35 об’єднав heartbeat/writer health і bounded power telemetry, пройшов GitHub CI та випустив v0.4.11; HACS встановив v0.4.11.
 - 2026-11-13 — live entry reload виявив mixed-module setup_error через кеш Python після оновлення custom integration. Повний Core restart не виконано через обмеження безпеки; поточний запис не завантажений, heartbeat off. Це P0-блокер для наступного bundled fix: activation без reboot або явно погоджений одноразовий restart.
+
+- 2026-11-13 — після ручного перезапуску власником v0.4.11 фактично завантажена: heartbeat свіжий, writer owned, нових setup-помилок немає; поточний plan safety-blocked лише через `grid_not_confirmed`.
+- 2026-11-13 — live QA відтворив повільну історію: після 5 секунд сторінка лишалась у loading з 0/168 год. Причина — повний scan `telemetry.jsonl`; також старі записи не містили стан каміна.
+- 2026-11-13 — підготовлено bundled v0.4.12: bounded telemetry tail, fireplace telemetry/markers, зрозуміліший loading/legend, тести виконуються GitHub.
