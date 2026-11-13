@@ -22,7 +22,7 @@ class MarketplaceCarrierTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 58)
+            self.assertEqual(result["files"], 59)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 wanted = {
@@ -32,7 +32,7 @@ class MarketplaceCarrierTests(unittest.TestCase):
                     "native_outages.py",
                     "native_store.py", "native_persistence.py", "native_model.py", "native_fan.py", "native_fan_sources.py",
                     "native_migration.py", "native_floor.py", "native_voltage.py",
-                    "native_bridge.py", "production.py", "production_migration.py",
+                    "native_bridge.py", "calculation_worker.py", "production.py", "production_migration.py",
                     "native_controller/__init__.py", "native_controller/release.json",
                     "assets/full-panel.js", "assets/full-panel-loader.js",
                     "critical_ledger.py", "sensor.py",
