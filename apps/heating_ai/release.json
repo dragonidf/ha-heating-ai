@@ -1,4 +1,6 @@
 {
-  "module_hashes": {},
+  "module_hashes": {
+    "heating_ui_assets.py": "ce6f26375015e5ef91b364a2c24003b78634fa7c14f00e78986112fd7b73e03b"
+  },
   "version": "0.4.10"
 }
