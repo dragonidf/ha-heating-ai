@@ -99,9 +99,17 @@ async def exercise(directory):
         async def collect(payload):
             worker_result.update(payload["result"])
             finished.set()
-        controller.submit_to_executor(controller.calculate_snapshot, "plan", "spawn-smoke",
-                                      stable_plan, (), {}, callback=collect)
-        await asyncio.wait_for(finished.wait(), 30)
+        # Real HA's package loader does not require /config on sys.path.
+        # Remove the fixture's import shortcut before spawning, reproducing it.
+        component_root = str(Path(sys.modules["custom_components.heating_ai_legacy"].__file__).resolve().parents[2])
+        saved_path = list(sys.path)
+        sys.path[:] = [p for p in sys.path if p != component_root]
+        try:
+            controller.submit_to_executor(controller.calculate_snapshot, "plan", "spawn-smoke",
+                                          stable_plan, (), {}, callback=collect)
+            await asyncio.wait_for(finished.wait(), 30)
+        finally:
+            sys.path[:] = saved_path
         assert worker_result["id"] == "spawn-smoke" and worker_result.get("error")
         await controller._dispatch(controller.tick,{})
         assert controller.memory.get("last_successful_tick"), controller.memory.get("control_incident")

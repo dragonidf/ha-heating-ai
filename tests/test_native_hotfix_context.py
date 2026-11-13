@@ -37,6 +37,15 @@ class NativeContextRegressions(unittest.TestCase):
         run = method('native_bridge.py', 'Hass', '_on_loop')
         self.assertEqual(run(app, lambda value: value + 1, 41), 42)
 
+    def test_confirmed_notification_recovery_retains_old_incident_history(self):
+        error = dict(active=True, count=863, signature="AttributeError: 'NoneType' object has no attribute 'lower'")
+        app = SimpleNamespace(memory={"diagnostic_errors": {"fallback_command": error}})
+        echo = method('production.py', 'NativeController', 'async_equipment_command_echo')
+        result = echo(app, 'persistent_notification', 'dismiss', {'notification_id': 'heating_control_fault'})
+        self.assertFalse(result['matched'])
+        self.assertFalse(error['active'])
+        self.assertEqual(error['count'], 863)
+
 
 if __name__ == '__main__':
     unittest.main()

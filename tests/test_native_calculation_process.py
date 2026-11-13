@@ -6,6 +6,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import shutil
+import site
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -32,8 +33,12 @@ class CalculationProcessTest(unittest.TestCase):
             sys.path.insert(0, directory)
             try:
                 worker = importlib.import_module("worker_fixture.calculation_worker")
+                # Reproduce HA's custom package loader: imported in parent,
+                # absent from the spawned interpreter's ordinary search path.
+                sys.path.remove(directory)
                 async def exercise():
-                    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as pool:
+                    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"),
+                                             initializer=site.addsitedir, initargs=(directory,)) as pool:
                         loop = asyncio.get_running_loop()
                         future = loop.run_in_executor(pool, worker.calculate, "power_advice", "job-1", [21, 25], {"prior": 3})
                         ticks = 0
@@ -52,7 +57,8 @@ class CalculationProcessTest(unittest.TestCase):
                         self.assertGreaterEqual(result["seconds"], 0)
                 asyncio.run(exercise())
             finally:
-                sys.path.remove(directory)
+                if directory in sys.path:
+                    sys.path.remove(directory)
                 for name in list(sys.modules):
                     if name == "worker_fixture" or name.startswith("worker_fixture."):
                         del sys.modules[name]

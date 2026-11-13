@@ -241,6 +241,13 @@ class NativeController(HeatingClimate):
         # Notifications have notification_id, not an equipment entity. They
         # cannot supply physical command evidence or enter HA StateMachine.get.
         if domain not in ("climate", "fan") or not isinstance(data.get("entity_id"), str):
+            if (domain == "persistent_notification" and service == "dismiss"
+                    and data.get("notification_id") == "heating_control_fault"):
+                error = ((getattr(self, "memory", {}) or {}).get("diagnostic_errors") or {}).get("fallback_command")
+                if error and error.get("signature") == "AttributeError: 'NoneType' object has no attribute 'lower'":
+                    # This hook runs only after the blocking dismiss succeeded.
+                    # Retain the incident/count; resolve its obsolete active flag.
+                    error.update(active=False, recovered_at=time.time())
             return {"matched": False, "observed_at": time.time()}
         state = self.hass.states.get(data.get("entity_id"))
         matched = False

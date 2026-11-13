@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.3 — 2026-11-13
+
+- Initialize spawn workers with the installed custom-component root; submit process startup outside HA's event loop.
+- Reproduce HA's package-loader isolation in both process and real-HA regressions.
+- Resolve the retained notification fault only after a successful fault-notification dismissal; retain its history/count.
+
+
 ## 0.4.2 — 2026-11-13
 
 - Run pure plan and power-advice calculations in spawn workers, outside HA's Python GIL. Preserve V1 numerical algorithms, input validation, job IDs and command boundaries.

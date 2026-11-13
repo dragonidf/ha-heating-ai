@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 import inspect
 import logging
 import multiprocessing
+from pathlib import Path
+import site
 import threading
 from uuid import uuid4
 
@@ -263,11 +265,16 @@ class Hass:
                     # CPU-bound Python threads share HA's GIL. Use spawn,
                     # never fork a running HA process, and pass only pure data.
                     self._calculation_pool = ProcessPoolExecutor(
-                        max_workers=2, mp_context=multiprocessing.get_context("spawn"))
+                        max_workers=2, mp_context=multiprocessing.get_context("spawn"),
+                        # HA loads custom_components via its package loader;
+                        # /config need not be on a spawned interpreter's path.
+                        initializer=site.addsitedir,
+                        initargs=(str(Path(__file__).resolve().parents[2]),))
                 kind, job_id, _algorithm, inputs, options = args
                 try:
-                    result = await self.hass.loop.run_in_executor(
-                        self._calculation_pool, calculate, kind, job_id, inputs, options)
+                    future = await self.hass.async_add_executor_job(
+                        self._calculation_pool.submit, calculate, kind, job_id, inputs, options)
+                    result = await asyncio.wrap_future(future)
                 except Exception as exc:
                     if not self._running:
                         return
