@@ -353,6 +353,7 @@ class NativeController(HeatingClimate):
             self.mark_equipment_command_sent(evidence)
             self.call_service("climate/set_hvac_mode",
                               entity_id=self.cfg["thermostat"], hvac_mode="off")
+            evidence["service_completed_at"] = time.time()
             observed = self._on_loop(
                 self.async_equipment_command_echo,
                 evidence["domain"], evidence["service"],
