@@ -303,7 +303,11 @@ class CriticalLedger:
             if len(body['commands']) >= MAX_RECORDS:
                 raise LedgerError('Journal full; no eviction or implicit reset')
             if action == 'STOP':
-                self._unknown(body, heat_only=True)
+                # A safe STOP is the only command allowed to supersede an
+                # unresolved reservation. Preserve every prior record as
+                # UNKNOWN evidence, keep the fence closed, and let the
+                # independently echoed STOP open it through complete_safe_stop.
+                self._unknown(body, heat_only=False)
                 body['fenced'] = True
             elif any(r['stage'] in ('PREPARED', 'SENT') for r in body['commands'].values()):
                 raise LedgerConflict('Outstanding reservation')
