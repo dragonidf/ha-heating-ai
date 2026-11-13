@@ -187,7 +187,7 @@ def check_compact_overview(page):
     assert page.locator('.overview>.metrics').count()==0, 'Old standalone metrics must be removed'
     assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
-    assert headings==['Факт −6 год → прогноз +24 год','План нагріву','Котел','Камін і циркуляція'], headings
+    assert headings==['Прогноз на 24 год','План нагріву','Котел','Камін і циркуляція'], headings
     assert page.locator('.overview > :first-child.chart-card').count()==1, 'Shared actual/forecast timeline must be first'
     order=page.locator('.overview > *').evaluate_all('els=>els.map(el=>el.className)')
     chart=next(i for i,c in enumerate(order) if 'chart-card' in c.split())
@@ -259,11 +259,11 @@ def check_compact_overview(page):
         'sensor.heating_forecast':{attributes:{schedule_complete:false,weather_complete:true,outage_mode:'normal'}},
         'sensor.heating_outage_schedule':{attributes:{mode:'normal',warning:null,emergency:false,outages:[]}}})""")
     assert page.locator('[data-controller-health]:not(.hidden)').count()==0, 'Normal mode must not warn about absent schedule'
-    assert page.locator('[data-forecast-metric="schedule"] strong').inner_text()=='Не очікуються'
+    assert page.locator('[data-forecast-metric="schedule"]').count()==0
     page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true}},
         'sensor.heating_outage_schedule':{attributes:{mode:'normal',assumed_available:true,warning:null,emergency:false}}})""")
     assert page.locator('[data-controller-health]:not(.hidden)').count()==0
-    assert page.locator('[data-forecast-metric="schedule"] strong').inner_text()=='Доступна'
+    assert page.locator('[data-forecast-metric="schedule"]').count()==0
     page.evaluate("""setHeatingScenario({
         'sensor.heating_forecast':{attributes:{schedule_complete:true,weather_complete:true,outage_mode:'normal'}},
         'sensor.heating_outage_schedule':{attributes:{mode:'unknown',warning:'Графік недоступний'}}})""")
@@ -531,8 +531,8 @@ def main(engine='chromium'):
             page.wait_for_selector('.history-crosshair',state='attached')
             assert 'Котел:' in page.locator('.history-card .history-readout').inner_text() and 'Камін:' in page.locator('.history-card .history-readout').inner_text()
             page.locator('[data-history-range="24"]').click()
-            assert page.locator('[data-series="fireplace"]').count()==1
-            assert 'оцінка залишкового тепла' in page.locator('[data-series="fireplace"] title').text_content()
+            assert page.locator('.forecast-plot [data-series="fireplace"]').count()==0
+            assert 'Камін' not in page.locator('.chart-card .legend').inner_text()
             assert page.locator('.fireplace-card').count()==1, 'Fireplace must have a visible overview card'
             assert page.locator('.fireplace-card').bounding_box()['y']>page.locator('.plan-card').bounding_box()['y'], 'Source details should follow the main forecast and plan'
             page.evaluate('''() => {
@@ -770,7 +770,7 @@ def main(engine='chromium'):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.locator('[data-forecast-horizon="24"]').click()
-            assert page.locator('.chart-card h2').inner_text()=='Факт −6 год → прогноз +24 год'
+            assert page.locator('.chart-card h2').inner_text()=='Прогноз на 24 год'
             for grid in ('off','unknown'):
                 page.evaluate("""grid=>setHeatingScenario({
                     'sensor.heating_grid':{attributes:{raw:grid}},

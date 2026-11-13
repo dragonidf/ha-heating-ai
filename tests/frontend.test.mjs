@@ -116,12 +116,12 @@ test('home minimum uses the real forecast sensor state rather than an absent att
   for(const method of ['energyComparison','forecastOverview','heatingPlan','boilerOverview','fireplaceOverview','historyChart'])p[method]=()=>'';
   assert.match(p.overview(),/Очікуваний мінімум <strong>21,4 °C/);
 });
-test('home opens with one inspectable actual-to-forecast timeline and three simple tabs',()=>{
+test('home opens with a forecast-only timeline and three simple tabs',()=>{
   const now=Date.now()/1000,p=Object.create(HeatingAIPanel.prototype);p.timelineCursor=now;p.forecastExtended=false;p.clientWidth=780;
   p.shadowRoot={querySelector:()=>null};p.time=()=> '12:00';p.historyData={rows:{room:[{ts:now-1800,state:'21.2'}],boiler_stage:[{ts:now-1200,state:'6 кВт'}]}};
   const forecast={created_at:new Date(now*1000).toISOString(),horizon_hours:24,curve:[{ts:now,temperature:21.3,lower:20,upper:22},{ts:now+3600,temperature:21.5,lower:20,upper:22}],heat_segments:[{start:now+600,end:now+1200}]};
   p.attrs=key=>key==='forecast'?forecast:key==='outages'?{outages:[]}:{};p._hass={states:{}};
-  const chart=p.forecastChart();assert.match(chart,/home-timeline/);assert.match(chart,/role="slider"/);assert.match(chart,/Факт кімнати/);assert.match(chart,/Умовний прогноз/);assert.match(chart,/KWS 3·6·9/);assert.match(chart,/Факт: 21,2 °C/);
+  const chart=p.forecastChart();assert.match(chart,/home-timeline/);assert.match(chart,/role="slider"/);assert.doesNotMatch(chart,/Факт кімнати|KWS 3·6·9|Факт: 21,2 °C/);assert.match(chart,/Прогноз температури/);assert.match(chart,/План нагріву/);assert.match(chart,/Прогноз: 21,3 °C/);
   const source=HeatingAIPanel.prototype.render.toString();assert.match(source,/\['overview','Дім'\].*\['model','Історія'\].*\['settings','Налаштування'\]/s);
 });
 test('history graph is the first model content and labels the actual advance lead',()=>{
