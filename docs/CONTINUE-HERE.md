@@ -9,9 +9,10 @@
 P0 ledger fence recovery реалізовано в draft PR #31: bounded STOP виконується
 вже наявним 15-секундним control tick лише для fenced ledger; повторні ticks не
 дублюють команду, новий polling/таймер і зміни HA не додаються. Регресійний тест
-додано. GitHub Actions для нового head ще не дали нового запуску; локальний
-Windows runner не має Python, тому CI залишається обов'язковою перевіркою.
-Не встановлювати цей коміт у production до проходження CI та окремого погодження.
+додано. GitHub Actions для head `efe99e5504edb3cb225bdfbba648d153a97abce3`
+пройшли: Python 3.12/3.13, `make check test`, bounded measurements,
+browser responsive/accessibility і `native-production` — PASS.
+Не встановлювати цей коміт у production без окремого погодження.
 
 ## Мета та авторизація
 
