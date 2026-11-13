@@ -1536,6 +1536,37 @@ class DecisionJournal:
             raise ValueError('Snapshot checksum mismatch')
         return json.loads(raw)
 
+    def _recent_telemetry_lines(self,path,minimum_ts):
+        """Read only the append-only telemetry tail needed for a history window."""
+        rows=[];position=None;carry=b'';stop=False;chunk_size=1024*1024;max_bytes=128*1024*1024;read_bytes=0
+        with path.open('rb') as stream:
+            position=stream.seek(0,2)
+            while position>0 and read_bytes<max_bytes and not stop:
+                start=max(0,position-chunk_size)
+                stream.seek(start)
+                block=stream.read(position-start)+carry
+                read_bytes+=position-start;position=start
+                parts=block.splitlines()
+                carry=parts.pop(0) if start>0 and parts else b''
+                for raw in reversed(parts):
+                    try:
+                        row=json.loads(raw)
+                        timestamp=number(row.get('ts'))
+                    except (ValueError,TypeError,AttributeError):
+                        continue
+                    if timestamp is not None and timestamp<minimum_ts:
+                        stop=True
+                        break
+                    rows.append(raw.decode('utf-8'))
+            if not stop and carry:
+                try:
+                    row=json.loads(carry)
+                    timestamp=number(row.get('ts'))
+                    if timestamp is None or timestamp>=minimum_ts:rows.append(carry.decode('utf-8'))
+                except (ValueError,TypeError,AttributeError):
+                    pass
+        yield from reversed(rows)
+
     def temperature_comparison(self,start,end,stored=None):
         """Read original issued snapshots and observations; never run a thermal model.
 
@@ -1561,8 +1592,7 @@ class DecisionJournal:
         # Telemetry persists actual control temperatures even on days with no heat.
         telemetry=self.directory.parent/'telemetry.jsonl'
         if telemetry.exists():
-            with telemetry.open() as stream:
-                for line in stream:
+            for line in self._recent_telemetry_lines(telemetry,start-1200):
                     try:
                         row=json.loads(line)
                         observe(row.get('ts'),row.get('room'),row.get('room_valid',row.get('quality')) in (True,'true','on'))
@@ -1592,6 +1622,9 @@ class DecisionJournal:
                     if (before.get('power_quality')=='measured' and before.get('power_estimated') not in (True,'true')
                             and number(before.get('power')) is not None and before['power']>=1.5):
                         mark('actual_heat',a,ts)
+                    fireplace_phase=before.get('fire_phase')
+                    if before.get('fire_active') in (True,'true','on') or fireplace_phase in ('Розпалювання','Горить','Інтенсивно горить','Згасає'):
+                        mark('fireplace_heat',a,ts)
                     if before.get('grid') not in ('on','off') or before.get('power_quality') in ('unknown','contradictory'):
                         mark('unknown',a,ts)
                 else:mark('unknown',a,ts)
