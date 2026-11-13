@@ -58,3 +58,15 @@
 
 
 - 2026-11-13 — PR #39 merged as v0.5.0 (main 68c72c900def6d2a0f5470a11e7913086dc38960). Main Tests #686 / run 43518494857 and release #687 / run 43519221592 passed, including responsive/accessibility and native HA 2026.11. Marketplace ZIP published. Live HA installation and restart remain owner-controlled and unperformed.
+
+
+## Контрольна точка релізу v0.5.0 — 13.11.2026
+
+- PR #39 merged у main: `68c72c900def6d2a0f5470a11e7913086dc38960`.
+- Main Tests: run `43518494857` (#686), green; Python 3.12/3.13, browser/responsive/accessibility та native HA 2026.11 пройдені.
+- Release tested version: run `43519221592` (#687), green.
+- GitHub release: [v0.5.0](https://github.com/dragonidf/ha-heating-ai/releases/tag/v0.5.0).
+- Marketplace asset: `heating_ai_v1_marketplace.zip`, 535,978 bytes, SHA-256 `befd79a8674c2508268fa28480fa8f3aa65e1d909425a4a2eb6ef8057fc4b5aa`.
+- History watchdog, timeout/error path, stale-callback guard і responsive UI audit: **DONE**.
+- Live HA install/restart/acceptance: **PENDING OWNER**. У межах цього релізу HA не змінювався й не перезапускався.
+
