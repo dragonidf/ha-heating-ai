@@ -48,6 +48,17 @@ class TemperatureComparisonTests(unittest.TestCase):
         self.assertTrue(all(c['started_at']-c['forecast']['at']>=12*3600 for c in result['cycles']))
         self.assertEqual(self.journal.temperature_comparison(self.start,self.end),result)
 
+    def test_history_reads_only_recent_telemetry_tail_and_preserves_fireplace_marker(self):
+        path=Path(self.temp.name) / 'telemetry.jsonl'
+        rows=[dict(ts=self.start-86400,room=18.,room_valid=True),
+              dict(ts=self.start+300,room=21.,room_valid=True,grid='on',power_quality='measured',power_estimated=False,power=0.,fire_active=True),
+              dict(ts=self.start+600,room=21.2,room_valid=True,grid='on',power_quality='measured',power_estimated=False,power=0.,fire_active=True)]
+        path.write_text(''.join(json.dumps(row)+'\\n' for row in rows))
+        tail=list(self.journal._recent_telemetry_lines(path,self.start-1200))
+        self.assertEqual([json.loads(line)['ts'] for line in tail],[self.start+300,self.start+600])
+        result=self.journal.temperature_comparison(self.start,self.end)
+        self.assertTrue(any(marker['kind']=='fireplace_heat' for marker in result['markers']))
+
     def test_actual_exists_without_any_advance_forecast_or_heat_cycle(self):
         self.actual=[dict(ts=self.start+300,room=22.4,quality=True),dict(ts=self.start+600,room=22.5,quality=False)]
         self.write_actual()
