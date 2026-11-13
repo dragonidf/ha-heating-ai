@@ -170,3 +170,14 @@ class FinalDispatchGuardTests(unittest.TestCase):
         app=self.app(23);app.values['armed']='off';app.attrs['current_temperature']=None
         self.run_action(app,'fallback')
         self.assertFalse(any(c[0]=='climate/set_hvac_mode' and c[1].get('hvac_mode')=='auto' for c in app.calls))
+
+class HealthContractTests(unittest.TestCase):
+    def test_health_exposes_fresh_heartbeat_and_writer_state(self):
+        app=HeatingClimate();app.at=datetime(2026,10,12,19,10,tzinfo=ZoneInfo('Europe/Kiev'));app.now=lambda:app.at
+        app.memory={'last_successful_tick':app.at.isoformat(),'owned':True}
+        published={};app.publish=lambda entity,state,**attrs:published.update({entity:dict(state=state,**attrs)})
+        app.publish_diagnostic_health()
+        self.assertEqual(published['sensor.heating_diagnostics']['heartbeat_state'],'fresh')
+        self.assertEqual(published['sensor.heating_diagnostics']['writer_state'],'owned')
+        self.assertEqual(published['sensor.heating_diagnostics']['heartbeat_age_seconds'],0.)
+
