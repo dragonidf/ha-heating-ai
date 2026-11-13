@@ -49,7 +49,8 @@ class NativeController(HeatingClimate):
         self.command_ledger = None
         self.command_ledger_status = None
         self._command_sequence = 0
-        self._pending_command_evidence = {}\n        self._fence_recovery_attempted = False
+        self._pending_command_evidence = {}
+        self._fence_recovery_attempted = False
 
     def attach_command_ledger(self, ledger, status):
         self.command_ledger = ledger
