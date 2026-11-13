@@ -51,6 +51,25 @@ class PowerProvenanceTests(unittest.TestCase):
             power,attrs=self.run_power(app);self.assertEqual(power,watts)
             self.assertEqual(attrs['power_quality'],'measured')
 
+
+    def test_repeated_telemetry_is_bounded_but_material_state_change_is_published(self):
+        app=self.app()
+        with patch('heating_climate.time.time',return_value=1000.):
+            app.publish_power_measurement(3000.,power_source='balance',power_quality='measured',primary_failed=False,
+                requested_heating=False,confirmation_pending=False,inferred_demand=None,stale_sources=[],power_fault='off',
+                measurement_basis='meter_balance',power_without_request=True)
+        first=app.published['sensor.heating_power_confirmed']
+        with patch('heating_climate.time.time',return_value=1005.):
+            self.assertFalse(app.publish_power_measurement(3000.,power_source='balance',power_quality='measured',primary_failed=False,
+                requested_heating=False,confirmation_pending=False,inferred_demand=None,stale_sources=[],power_fault='off',
+                measurement_basis='meter_balance',power_without_request=True))
+        self.assertEqual(app.published['sensor.heating_power_confirmed'],first)
+        with patch('heating_climate.time.time',return_value=1006.):
+            self.assertTrue(app.publish_power_measurement(None,power_source='unavailable',power_quality='unknown',primary_failed=True,
+                requested_heating=False,confirmation_pending=False,inferred_demand=None,stale_sources=['total'],power_fault='off',
+                measurement_basis='meter_balance',power_without_request=False))
+        self.assertIsNone(app.published['sensor.heating_power_confirmed']['state'])
+
     def test_legacy_config_and_missing_timestamps_do_not_crash(self):
         app=self.app();app.cfg.pop('power_balance_sources');self.assertEqual(self.run_power(app)[0],3000.)
         app=HeatingClimate();app.get_state=lambda *a,**kw:dict(state='1',last_updated=None)
