@@ -879,7 +879,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         row['grid']=self.grid_state()
         row['fire_valid']=self.memory.get('fire_phase')!='Датчик недоступний'
         row['fire_phase']=self.memory.get('fire_phase','Неактивний')
-        row['fire_active']=bool(self.memory.get('fire_active',False))
+        row['fire_active']=bool((self.memory.get('fire_circulation') or {}).get('active',False))
         row['ventilation']=self.ventilation_sample(stamp)
         record=self.raw('room',attribute='all') if self.cfg.get('room') else None
         if isinstance(record,dict):
