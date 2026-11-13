@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.5 — 2026-11-13
+
+- Simplify the home forecast chart and retain the extended forecast horizon when available.
+
+
 ## 0.4.4 — 2026-11-13
 
 - Carry V1's existing blackout-preheat exception through replay using exact authorised intervals tied to the unchanged published outage schedule. Arbitrary day heating and outage overlap remain blocked.
