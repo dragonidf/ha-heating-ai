@@ -19,7 +19,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,learn_power_modes,power_profile,outdoor_at)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
-from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference
+from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions
 from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
@@ -659,7 +659,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
             return None
         fresh=replay(now,room,floor,outside,fire,self.model,weather,settings,reference['segments'],
-                     reference['split'],3.,reserve_checked=True)
+                     reference['split'],3.,reserve_checked=True,window_extensions=approved_extensions(settings,reference))
         if fresh is None:
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
             return None

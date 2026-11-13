@@ -299,7 +299,10 @@ class HeatingRecovery:
                 done=job.get('completed')
                 if not done:
                     age=max(0.,time.time()-job['at'])
-                    if age>=CALCULATION_TIMEOUT_SECONDS:
+                    # Advice evaluates all three physical power scenarios;
+                    # it is read-only and can take longer than one plan.
+                    timeout=180 if kind=='power_advice' else CALCULATION_TIMEOUT_SECONDS
+                    if age>=timeout:
                         job.setdefault('timed_out_at',time.time())
                         self.calculation_timeouts=getattr(self,'calculation_timeouts',{})
                         self.calculation_timeouts[kind]=dict(job_id=job['id'],age_seconds=age)

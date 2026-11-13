@@ -24,6 +24,15 @@ def policy(settings):
             'search_policy_version':SEARCH_POLICY_VERSION}
 
 
+def approved_extensions(settings, proposal):
+    data=settings.get('outage_schedule') or {}
+    outages=[dict(start=o['start'],end=o['end']) for o in data.get('outages',[])]
+    if (not data.get('valid') or data.get('mode')!='scheduled' or
+            not outages or outages!=proposal.get('extension_outages')):
+        return []
+    return proposal.get('approved_window_extensions') or []
+
+
 def reference(now, room, floor, outside, fire, model, weather, settings, result):
     return dict(at=now.timestamp(),room=room,floor=floor,outside=outside,fire=fire,
                 model=dict(model),policy=policy(settings),weather=list(weather),
@@ -35,7 +44,10 @@ def reference(now, room, floor, outside, fire, model, weather, settings, result)
                 split=result.get('split_comfort_applied',False),
                 minimum=result['minimum'],maximum=result['maximum'],
                 profile=settings.get('modulation_profile'),curve=list(result.get('_calculation_curve',result['curve'])),
-                environment=settings.get('environment',{}))
+                environment=settings.get('environment',{}),
+                approved_window_extensions=result.get('approved_window_extensions',[]),
+                extension_outages=result.get('extension_outages',[]),
+                outage_shifted=result.get('outage_shifted',False),outage_preheat=result.get('outage_preheat',False))
 
 def expected(previous,stamp,key,initial):
     points=[(previous['at'],previous[initial])]+[(p['ts'],p[key])
@@ -46,7 +58,7 @@ def expected(previous,stamp,key,initial):
     return points[-1][1]
 
 
-def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False,context_override=None):
+def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False,context_override=None,window_extensions=()):
     """Integrate at <=5 min, splitting at exact session and forecast boundaries."""
     start=now.timestamp(); public_finish=start+86400
     context=context_override or reserve_context(now,settings,model)
@@ -61,6 +73,8 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         return None
     data=availability(settings.get('outage_schedule') or {},start,finish)
     outages=data.get('outages',[]) if data.get('valid') else []
+    def extension(a,b):
+        return any(a>=lo and b<=hi for lo,hi in window_extensions)
     segments=[dict(s,start=max(start,s['start']),end=min(finish,s['end']))
               for s in segments if s['end']>start and s['start']<finish]
     for s in segments:
@@ -68,7 +82,8 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         b=datetime.fromtimestamp(s['end']-.001,now.tzinfo)
         if (blocked(s['start'],s['end'],outages) or
             settings['strategy']=='Тільки в дозволені години' and
-            not (in_window(a,settings['start'],settings['end']) and
+            not (extension(s['start'],s['end']) or
+                 in_window(a,settings['start'],settings['end']) and
                  in_window(b,settings['start'],settings['end']))):
             return None
     boundaries={s[k] for s in segments for k in ('start','end')}
@@ -100,7 +115,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 hi=safe_upper(hi,zone,settings)
                 if actuator:
                     permitted=(not blocked(t,u,outages) and (settings['strategy']!='Тільки в дозволені години' or
-                        in_window(tm,settings['start'],settings['end']) and
+                        extension(t,u) or in_window(tm,settings['start'],settings['end']) and
                         in_window(datetime.fromtimestamp(u-.001,now.tzinfo),settings['start'],settings['end'])))
                     stop=not permitted or r>=hi or actuator.get('safety_stop') and t<start+300
                     wanted='heat' if active and not stop else 'off'
@@ -126,7 +141,8 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         rows.append(dict(ts=b,temperature=round(r,2),return_=round(f,2),
                          target=wanted,lower=lo,upper=hi,comfort_zone=zone,
                          **{'return':round(f,2)},heat=bool(heats),kwh=round(used,4),
-                         heat_segments=heats,outside_minutes=0.,_fine=fine,
+                         heat_segments=heats,outside_minutes=sum((s['end']-s['start'])/60 for s in heats
+                             if not in_window(datetime.fromtimestamp(s['start'],now.tzinfo),settings['start'],settings['end'])),_fine=fine,
                          schedule_known=schedule_covered(data,a,b),
                          weather_known=bool(weather and max(x['ts'] for x in weather)+3600>=b)))
     if not priority and not morning_runs_valid(rows,now,settings.get('morning_min_minutes',30),
@@ -163,7 +179,9 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 conditional_heat_minutes=round(sum((s['end']-s['start'])/60 for s in all_segments if s['conditional']),1),
                 schedule_complete=schedule_covered(data,start,finish),
                 outage_mode=data.get('mode','scheduled' if data.get('valid') else 'unknown'),
-                outage_shifted=False,outage_preheat=False,outside_minutes=0.,
+                outage_shifted=False,outage_preheat=False,outside_minutes=sum(r['outside_minutes'] for r in rows),
+                approved_window_extensions=[list(pair) for pair in window_extensions],
+                extension_outages=[dict(start=o['start'],end=o['end']) for o in outages] if window_extensions else [],
                 outage_status=data.get('reason','Графік не підключений'),
                 comfort_shortfall=any(r['temperature']<r['lower'] for r in rows),heat_segments=all_segments,
                 schedule_updated=data.get('updated'),plan_stable=True,_calculation_curve=calculation_rows)
@@ -198,7 +216,8 @@ def stress_scenarios(now,room,floor,outside,fire,model,weather,settings,nominal,
             cases.append(('blackout_'+format(minutes,'g'),dict(settings,outage_schedule=outage,morning_min_minutes=0),trimmed,outside,weather))
     for name,scenario,requests,out,weather_rows in cases:
         result=replay(now,room,floor,out,fire,model,weather_rows,scenario,requests,
-                      nominal.get('split_comfort_applied',False),power_kw,reserve_checked=True,context_override=context)
+                      nominal.get('split_comfort_applied',False),power_kw,reserve_checked=True,context_override=context,
+                      window_extensions=approved_extensions(settings,nominal))
         rows.append(dict(name=name,hypothetical=True,scope='frozen_plan_without_replanning',
             assessment_until=(context or {}).get('assessment_until',now.timestamp()+86400),
             available=result is not None,energy=result.get('energy') if result else None,
@@ -234,7 +253,8 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
             key=search_input_key(now,room,floor,outside,fire,model,weather,settings)
             checked=previous.get('search_check_key')==key
             result=replay(now,room,floor,outside,fire,model,weather,settings,
-                          previous['segments'],previous['split'],power_kw,reserve_checked=checked)
+                          previous['segments'],previous['split'],power_kw,reserve_checked=checked,
+                          window_extensions=approved_extensions(settings,previous))
             budget=settings.get('cycle_energy_budget') or {}
             if result and budget:
                 remaining=sum(s.get('kwh',0.)*max(0.,min(s['end'],budget['end'])-max(s['start'],budget['start']))/
@@ -244,6 +264,8 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
                 reserve=result.get('morning_reserve',{})
                 improved=None
                 result.update(previous.get('search',{}))
+                for name in ('outage_shifted','outage_preheat'):
+                    result[name]=previous.get(name,False)
                 if settings.get('split_comfort') and 'night_target' in settings and reserve.get('deficit_degree_hours',0)>.00001 and not checked:
                     alternative=optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
                     other=alternative.get('morning_reserve',{}).get('deficit_degree_hours',0)

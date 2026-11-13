@@ -883,6 +883,11 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
             segment["conditional"] = not schedule_covered(data,segment['start'],segment['end'])
             if segment["conditional"]:
                 conditional_minutes += (segment["end"]-segment["start"])/60
+    # Preserve the exact exception intervals already authorised by V1's
+    # blackout search. Replay must not invent or broaden these intervals.
+    result['approved_window_extensions'] = [list(pair) for pair in extensions] if (
+        data.get('mode') == 'scheduled' and any(r['outside_minutes'] > 0 for r in result['curve'])) else []
+    result['extension_outages'] = [dict(start=o['start'],end=o['end']) for o in outages] if result['approved_window_extensions'] else []
     result.update(schedule_known_until=schedule_until, **coverage,
                   conditional_heat_minutes=round(conditional_minutes,1),
                   schedule_complete=schedule_covered(data,now.timestamp(),now.timestamp()+86400),

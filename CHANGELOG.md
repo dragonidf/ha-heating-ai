@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.4 — 2026-11-13
+
+- Carry V1's existing blackout-preheat exception through replay using exact authorised intervals tied to the unchanged published outage schedule. Arbitrary day heating and outage overlap remain blocked.
+- Preserve preheat evidence in references and stress replays, preventing endless recomputation of a valid V1 plan.
+- Allow180s for read-only three-mode power advice; retain60s for one plan.
+
+
 ## 0.4.3 — 2026-11-13
 
 - Initialize spawn workers with the installed custom-component root; submit process startup outside HA's event loop.
