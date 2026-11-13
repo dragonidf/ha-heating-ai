@@ -338,9 +338,11 @@ class NativeController(HeatingClimate):
         if not self.command_ledger_status.get("fenced"):
             return
         if (self.raw("mode") != "Автоматичне керування"
-                or self._fence_recovery_attempted):
+                or self._fence_recovery_attempted
+                or self.memory.get("fence_recovery_attempted")):
             return
         self._fence_recovery_attempted = True
+        self.memory["fence_recovery_attempted"] = True
         manual = self._remember_manual_snapshot()
         self._dispatch_manual_signature = manual["signature"]
         self._dispatch_manual_epoch = self.memory["native_manual_epoch"]
