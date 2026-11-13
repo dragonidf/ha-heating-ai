@@ -68,7 +68,9 @@ class NativeController(HeatingClimate):
         echo is unavailable.
         """
         try:
-            self._reconcile_writer_fence()
+            if not self.memory.get("fence_recovery_tick_seen"):
+                self.memory["fence_recovery_tick_seen"] = True
+                self._reconcile_writer_fence()
         except Exception as exc:
             self.log("Ledger fence recovery deferred: %s", str(exc), level="WARNING")
         return super().tick(kwargs, **extra)
