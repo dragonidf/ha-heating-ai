@@ -1,3 +1,9 @@
+# 0.4.12 — 2026-11-13
+
+- History comparison reads only the requested telemetry tail instead of scanning the full archive, keeping the existing 31-day limit and background execution.
+- Persist fireplace phase/activity in telemetry and show a compact, human-readable fireplace lane in the history chart alongside planned and actual boiler heat.
+- Clarify history loading status and bundle the UI/data improvements without new polling or a full HA Core restart.
+
 # 0.4.11 — 2026-11-13
 
 - Expose explicit heartbeat freshness and single-writer state in diagnostics.
