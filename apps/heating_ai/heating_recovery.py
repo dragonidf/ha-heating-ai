@@ -1537,32 +1537,20 @@ class DecisionJournal:
         return json.loads(raw)
 
     def _recent_telemetry_lines(self,path,minimum_ts):
-        """Read only the append-only telemetry tail needed for a history window."""
-        rows=[];chunk_size=1024*1024;max_bytes=128*1024*1024;read_bytes=0;stop=False
+        """Read only the bounded append-only telemetry tail needed for a history window."""
+        max_bytes=128*1024*1024;rows=[];stop=False
+        size=path.stat().st_size
         with path.open('rb') as stream:
-            stream.seek(0,2);position=stream.tell();carry=b''
-            while position>0 and read_bytes<max_bytes and not stop:
-                start=max(0,position-chunk_size)
-                stream.seek(start)
-                block=stream.read(position-start)+carry
-                read_bytes+=position-start;position=start
-                parts=block.split(b'\n')
-                carry=parts.pop(0) if start>0 and parts else b''
-                for raw in reversed(parts):
-                    if not raw:continue
-                    try:
-                        row=json.loads(raw);timestamp=number(row.get('ts'))
-                    except (ValueError,TypeError,AttributeError):
-                        continue
-                    if timestamp is not None and timestamp<minimum_ts:
-                        stop=True;break
-                    rows.append(raw.decode('utf-8'))
-            if not stop and carry:
-                try:
-                    row=json.loads(carry);timestamp=number(row.get('ts'))
-                    if timestamp is None or timestamp>=minimum_ts:rows.append(carry.decode('utf-8'))
-                except (ValueError,TypeError,AttributeError):
-                    pass
+            stream.seek(max(0,size-max_bytes))
+            data=stream.read(min(size,max_bytes))
+        for raw in reversed(data.splitlines()):
+            try:
+                row=json.loads(raw);timestamp=number(row.get('ts'))
+            except (ValueError,TypeError,AttributeError):
+                continue
+            if timestamp is not None and timestamp<minimum_ts:
+                stop=True;break
+            if timestamp is not None:rows.append(raw.decode('utf-8'))
         yield from reversed(rows)
 
     def temperature_comparison(self,start,end,stored=None):
