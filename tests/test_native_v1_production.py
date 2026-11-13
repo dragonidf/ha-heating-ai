@@ -358,6 +358,20 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.command_ledger.calls[0][2],"STOP")
             self.assertFalse(app.command_ledger_status["fenced"])
 
+    async def test_fenced_recovery_runs_once_from_existing_control_tick(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.command_ledger_status.update(fenced=True, revision=7)
+            with patch.object(component.HeatingClimate, "tick") as parent_tick:
+                await asyncio.to_thread(app.tick)
+                await asyncio.to_thread(app.tick)
+            self.assertEqual(parent_tick.call_count, 2)
+            self.assertEqual(
+                [call[0] for call in app.command_ledger.calls],
+                ["PREPARED", "SENT", "HA_ECHO", "UNFENCED"],
+            )
+            self.assertFalse(app.command_ledger_status["fenced"])
+
     async def test_raw_settings_event_is_not_registered_in_native_production(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
@@ -474,3 +488,4 @@ class BundleTests(unittest.TestCase):
                 (path/"private/original-state.json").write_text("{}")
                 with self.assertRaises(ValueError):
                     migration.load_installation(path/"private")
+
