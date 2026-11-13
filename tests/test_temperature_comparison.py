@@ -137,4 +137,19 @@ class TemperatureComparisonTests(unittest.TestCase):
         self.assertIsNone(app.history_queued)
 
 
+    def test_history_timeout_publishes_bounded_human_error_and_ignores_late_result(self):
+        app=HeatingRecovery();app.memory={};app.history_loading=True
+        app.history_loading_id='slow';app.history_loading_start=self.start;app.history_loading_end=self.end
+        app.history_compact=True;published=[];pages=[]
+        app.publish_plan_history=lambda **kw:published.append(kw)
+        app.publish=lambda *args,**kw:pages.append((args,kw))
+        app.history_timeout(dict(request_id='slow'))
+        self.assertFalse(app.history_loading)
+        self.assertIsNone(app.history_loading_id)
+        self.assertEqual(app.history_comparison['error_code'],'history_timeout')
+        self.assertIn('вчасно',app.history_comparison['error'])
+        app.plan_history_loaded(dict(result=dict(request_id='slow',start=self.start,end=self.end,actual=[],cycles=[])))
+        self.assertEqual(len(pages),1)
+
+
 if __name__=='__main__':unittest.main()

@@ -1,3 +1,9 @@
+# 0.5.0 — 2026-11-13
+
+- Bound history comparison requests with a one-shot server watchdog and a human-readable timeout result; late executor callbacks are ignored safely.
+- Add a clear 25-second UI retry/error state, reduce recurring panel re-render work, and compact fireplace/circulation cards into a responsive two-column mobile layout.
+- Preserve existing control structure, safety guards, history ranges, markers and no-new-polling behavior.
+
 # 0.4.13 — 2026-11-13
 
 - Reduce the bounded telemetry tail used by interactive history comparisons to 16 MiB, keeping the graph responsive on large archives without adding polling or HA load.
