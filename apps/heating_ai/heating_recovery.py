@@ -1538,7 +1538,7 @@ class DecisionJournal:
 
     def _recent_telemetry_lines(self,path,minimum_ts):
         """Read only the bounded append-only telemetry tail needed for a history window."""
-        max_bytes=128*1024*1024;rows=[];stop=False
+        max_bytes=16*1024*1024;rows=[];stop=False
         size=path.stat().st_size
         with path.open('rb') as stream:
             stream.seek(max(0,size-max_bytes))
