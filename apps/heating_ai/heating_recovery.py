@@ -1132,7 +1132,7 @@ class HeatingRecovery:
                          **wire_values(comparison_page(comparison_items(result),0,request_id,
                                                        uuid4().hex,result['start'],result['end'],
                                                        compact=getattr(self,'history_compact',False))))
-            self.publish_plan_history(request_id=request_id,comparison=result)
+            self.publish_plan_history(request_id=request_id)
             self.history_loading_id=None
 
     def _plan_history_loaded(self,kwargs=None,**extra):
