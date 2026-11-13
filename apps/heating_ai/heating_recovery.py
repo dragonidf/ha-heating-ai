@@ -1536,6 +1536,23 @@ class DecisionJournal:
             raise ValueError('Snapshot checksum mismatch')
         return json.loads(raw)
 
+    def _recent_telemetry_lines(self,path,minimum_ts):
+        """Read only the bounded append-only telemetry tail needed for a history window."""
+        max_bytes=128*1024*1024;rows=[];stop=False
+        size=path.stat().st_size
+        with path.open('rb') as stream:
+            stream.seek(max(0,size-max_bytes))
+            data=stream.read(min(size,max_bytes))
+        for raw in reversed(data.splitlines()):
+            try:
+                row=json.loads(raw);timestamp=number(row.get('ts'))
+            except (ValueError,TypeError,AttributeError):
+                continue
+            if timestamp is not None and timestamp<minimum_ts:
+                stop=True;break
+            if timestamp is not None:rows.append(raw.decode('utf-8'))
+        yield from reversed(rows)
+
     def temperature_comparison(self,start,end,stored=None):
         """Read original issued snapshots and observations; never run a thermal model.
 
@@ -1561,8 +1578,7 @@ class DecisionJournal:
         # Telemetry persists actual control temperatures even on days with no heat.
         telemetry=self.directory.parent/'telemetry.jsonl'
         if telemetry.exists():
-            with telemetry.open() as stream:
-                for line in stream:
+            for line in self._recent_telemetry_lines(telemetry,start-1200):
                     try:
                         row=json.loads(line)
                         observe(row.get('ts'),row.get('room'),row.get('room_valid',row.get('quality')) in (True,'true','on'))
@@ -1592,6 +1608,9 @@ class DecisionJournal:
                     if (before.get('power_quality')=='measured' and before.get('power_estimated') not in (True,'true')
                             and number(before.get('power')) is not None and before['power']>=1.5):
                         mark('actual_heat',a,ts)
+                    fireplace_phase=before.get('fire_phase')
+                    if before.get('fire_active') in (True,'true','on') or fireplace_phase in ('Розпалювання','Горить','Інтенсивно горить','Згасає'):
+                        mark('fireplace_heat',a,ts)
                     if before.get('grid') not in ('on','off') or before.get('power_quality') in ('unknown','contradictory'):
                         mark('unknown',a,ts)
                 else:mark('unknown',a,ts)
