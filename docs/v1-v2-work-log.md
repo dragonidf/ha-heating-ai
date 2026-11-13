@@ -259,3 +259,12 @@ Core restart (not full AppDaemon), verify fresh successful cycles, error counts
 stop increasing, actual control quality and temporary fallback clearance. Preserve
 native private model/history and manual intent; do not blindly force HEAT.
 Legacy V1/V2 stay disabled. Production has NOT received0.4.1 at this checkpoint.
+
+
+## 2026-11-13 — 0.4.1 production hotfix and sidebar recovery
+
+> HOTFIX DEPLOYED — 13.11.2026 07:59 Europe/Kyiv: native V1 0.4.1 installed via Marketplace; entry 01M78Y3WSYWGH6RN1FME6587DP loaded. GitHub Tests 43373239994 and release 43373784188 PASS, code 401dd2cb355250987c8b6b6f99db1a62bf9200ff. Notification echo now rejects missing/non-equipment entity targets; Recorder callbacks can use short HA-loop I/O closures. Original thermal modules unchanged.
+> Live native heartbeat 07:58:42, control_health healthy, control_error null, armed on, actuation permitted on. Panel Опалення registered at /heating-ai-v1, asset 69b61be5e3e45937. Old fallback_command diagnostic is historical (count 863, last occurrence before update); do not clear audit history or treat it as a fresh exception.
+> Core restart exposed AppDaemon bug: disable API fails AppConfig.update; cached old app restarted on HASS reconnect and native conflict safety removed its panel. Old app stopped again (terminated); original config retained as /app_configs/a0d7b954_appdaemon/apps/heating_climate.yaml.disabled, no active heating_climate.yaml. AppDaemon production_mode set false to restore config scanning. IMPORTANT: cached terminated object still exists in current AppDaemon process; verify no reactivation on next reconnect, do not claim reconnect-proof removal until cache is cleared. No shared AppDaemon restart performed.
+> File editor enforce_basepath restored true and stopped. Models/history/energy retained. Do not repeat data migration. Continue with fresh live state if any conflict recurs.
+
