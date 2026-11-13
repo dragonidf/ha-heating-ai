@@ -38,6 +38,7 @@ class AsyncHistoryDispatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_result_publication_uses_the_immutable_snapshot(self):
         app=HeatingRecovery();snapshot={'__energy_cycles':{}};app.history_read_snapshot=snapshot
+        app.history_loading=True;app.history_loading_id='reader'
         published=[];app.publish_plan_history=lambda **kwargs:published.append(kwargs)
         await app.plan_history_result({'result':{'request_id':'reader'}})
         self.assertIs(published[0]['source'],snapshot)

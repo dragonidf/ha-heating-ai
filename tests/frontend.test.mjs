@@ -227,6 +227,14 @@ test('the comparison can load by REST when no websocket acknowledgement reaches 
   try{await p.loadComparison();await p.readComparison(p.comparisonPending);assert.equal(p.comparisonData.actual.length,1);assert.equal(p.comparisonPending,null);}
   finally{clearTimeout(p.comparisonTimeout);clearTimeout(p.comparisonPoll);}
 });
+test('comparison deadline is 25 seconds and exposes a retry instead of infinite loading',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.comparisonPending='slow';p.render=()=>{};
+  let callback,delay;const previous=globalThis.setTimeout;
+  globalThis.setTimeout=(fn,ms)=>{callback=fn;delay=ms;return 1;};
+  try{p.comparisonDeadline('slow');assert.equal(delay,25000);callback();}
+  finally{globalThis.setTimeout=previous;clearTimeout(p.comparisonTimeout);}
+  assert.equal(p.comparisonPending,null);assert.match(p.comparisonError,/Натисніть оновлення/);
+});
 test('matching shared comparison data redraws even if HA reuses its hass object',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.comparisonStart=100;p.comparisonEnd=1000;
   p.comparisonPending='this-client';p.comparisonCache=new Map();p.nativeCards=new Map();p.toggleAttribute=()=>{};

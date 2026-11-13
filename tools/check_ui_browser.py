@@ -226,6 +226,10 @@ def check_compact_overview(page):
             assert (red>green and blue>green) if phase in ('Горить','Інтенсивно горить') else (red>green>blue), (phase,'wrong tint')
         if page.viewport_size['width']<=430:
             assert page.locator('.fireplace-card').bounding_box()['height']<225, (phase,'fireplace too tall')
+            columns=page.locator('.fireplace-grid').evaluate("el=>getComputedStyle(el).gridTemplateColumns.split(' ').filter(Boolean)")
+            assert len(columns)==2, (phase,'fireplace blocks must stay in two columns')
+            blocks=page.locator('.fireplace-grid>div').evaluate_all('els=>els.map(el=>{const r=el.getBoundingClientRect();return [r.width,r.height]})')
+            assert all(.8<=width/height<=1.25 for width,height in blocks), (phase,'fireplace blocks must stay compact and square-ish',blocks)
             assert page.locator('.fan-actual').evaluate('el=>el.scrollWidth<=el.clientWidth')
         if page.viewport_size['width']==360:
             page.locator('.fireplace-card').screenshot(path=str(ARTIFACTS/f'heating-fireplace-{phase}-360.png'))

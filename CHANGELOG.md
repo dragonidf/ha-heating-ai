@@ -1,8 +1,9 @@
 # 0.5.0 — 2026-11-13
 
-- Bound history comparison requests with a one-shot server watchdog and a human-readable timeout result; late executor callbacks are ignored safely.
-- Add a clear 25-second UI retry/error state, reduce recurring panel re-render work, and compact fireplace/circulation cards into a responsive two-column mobile layout.
-- Preserve existing control structure, safety guards, history ranges, markers and no-new-polling behavior.
+- Bound every interactive history request with a one-shot 20-second server watchdog and a 25-second panel deadline. A stalled archive read now returns a human Ukrainian error and retry path instead of leaving the History tab loading forever; no recurring polling or extra Home Assistant load is added.
+- Ignore late executor callbacks by exact request identity and immediately start the newest queued request after a timeout. Preserve immutable range/result checks, 31-day bounds, paged Recorder-safe transport, private history evidence and read-only behavior.
+- Keep fireplace temperature and circulation as compact, square-ish two-column cards on narrow screens. Extend Python, frontend and Chromium/WebKit responsive regressions for timeout publication, stale callbacks, retry text and mobile layout.
+- Bundle the complete nine-module AppDaemon release with regenerated UI source and SHA-256 manifest. Production Home Assistant was not changed while preparing this release; live acceptance remains a manual backup → HACS update → Home Assistant restart → History verification step.
 
 # 0.4.13 — 2026-11-13
 

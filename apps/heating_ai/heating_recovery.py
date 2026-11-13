@@ -20,6 +20,7 @@ from heating_outages import schedule,blocked
 from heating_fallback import estimated_power
 
 CALCULATION_TIMEOUT_SECONDS=60
+HISTORY_TIMEOUT_SECONDS=20
 
 def wire_values(value):
     if isinstance(value,dict):return {k:wire_values(v) for k,v in value.items()}
@@ -85,7 +86,7 @@ def comparison_items(result):
         items.append(dict(kind='energy',value={k:v for k,v in cycle.items() if k!='plan_reviews'}))
         items.extend(dict(kind='review',value=dict(review,cycle_id=cycle['cycle_id'])) for review in cycle.get('plan_reviews',[]))
     if result.get('error') or result.get('warnings'):
-        items.append(dict(kind='status',value={k:result[k] for k in ('error','warnings') if k in result}))
+        items.append(dict(kind='status',value={k:result[k] for k in ('error','error_code','warnings') if k in result}))
     return items
 
 HISTORY_COLUMNS=(('ts','temperature','lower','upper'),('ts','temperature','lower','upper','target','heat_segments'))
@@ -1030,7 +1031,7 @@ class HeatingRecovery:
             if value is False:return 'false'
             return '0' if isinstance(value,(int,float)) and value==0 else value
         comparison=getattr(self,'history_comparison',None)
-        summary=({k:comparison.get(k) for k in ('start','end','warnings','error')} if comparison else None)
+        summary=({k:comparison.get(k) for k in ('start','end','warnings','error','error_code')} if comparison else None)
         if summary is not None:summary.update(actual_count=len(comparison.get('actual',[])),cycle_count=len(comparison.get('cycles',[])))
         if summary is not None and getattr(self,'history_protocol',1)!=2:
             summary.update(actual=[],cycles=[],requires_panel_reload=True,
@@ -1089,7 +1090,7 @@ class HeatingRecovery:
             # One bounded watchdog prevents a lost executor callback from
             # leaving the UI in an infinite loading state. It never polls HA.
             if hasattr(self,'run_in'):
-                self.history_timeout_handle=self.run_in(self.history_timeout,45,
+                self.history_timeout_handle=self.run_in(self.history_timeout,HISTORY_TIMEOUT_SECONDS,
                     request_id=data['request_id'])
             self.submit_to_executor(self.load_temperature_comparison,start,end,history,data['request_id'],
                                     callback=self.plan_history_result)
@@ -1134,13 +1135,15 @@ class HeatingRecovery:
                                                        compact=getattr(self,'history_compact',False))))
             self.publish_plan_history(request_id=request_id)
             self.history_loading_id=None
+            self.history_timeout_handle=None
+            queued=getattr(self,'history_queued',None);self.history_queued=None
+            if queued:self.plan_history_requested('heating_plan_history',queued)
 
     def _plan_history_loaded(self,kwargs=None,**extra):
         result=(kwargs or extra).get('result')
         request_id=result.get('request_id') if isinstance(result,dict) else None
-        if getattr(self,'history_timed_out_request',None)==request_id:
-            return
-        if getattr(self,'history_loading_id',None) not in (None,request_id):
+        if (getattr(self,'history_timed_out_request',None)==request_id or
+                request_id!=getattr(self,'history_loading_id',None)):
             return
         self.history_loading=False
         self.history_loading_id=None
@@ -1148,6 +1151,7 @@ class HeatingRecovery:
         if handle is not None and hasattr(self,'cancel_timer'):
             try:self.cancel_timer(handle)
             except (AttributeError,TypeError):pass
+        self.history_timeout_handle=None
         if isinstance(result,dict):
             self.history_comparison=result
             if getattr(self,'history_protocol',1)==2 and 'start' in result and 'end' in result:
