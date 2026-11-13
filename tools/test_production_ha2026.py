@@ -90,6 +90,19 @@ async def exercise(directory):
         assert controller.model["version"] == 6
         assert hass.states.get("sensor.heating_ui").attributes["release_verified"] is True
         assert hass.states.get("sensor.heating_ui").attributes["runtime"] == "native_v1"
+        # Exercise the packaged spawn import under real HA, not only a stub.
+        # Invalid numerical inputs must return the normal job-error protocol
+        # without blocking HA or sending any physical service call.
+        from custom_components.heating_ai_legacy.native_controller.heating_stability import stable_plan
+        finished = asyncio.Event()
+        worker_result = {}
+        async def collect(payload):
+            worker_result.update(payload["result"])
+            finished.set()
+        controller.submit_to_executor(controller.calculate_snapshot, "plan", "spawn-smoke",
+                                      stable_plan, (), {}, callback=collect)
+        await asyncio.wait_for(finished.wait(), 30)
+        assert worker_result["id"] == "spawn-smoke" and worker_result.get("error")
         await controller._dispatch(controller.tick,{})
         assert controller.memory.get("last_successful_tick"), controller.memory.get("control_incident")
         assert not commands, "Manual observation must not actuate equipment at startup"
@@ -138,3 +151,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
