@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.8 — 2026-11-13
+
+- Recover a fenced durable command ledger with one bounded STOP from the existing control tick after a runtime command failure. Avoid duplicate recovery commands and avoid adding polling or HA restart requirements.
+
+
 ## 0.4.5 — 2026-11-13
 
 - Simplify the home forecast chart and retain the extended forecast horizon when available.
