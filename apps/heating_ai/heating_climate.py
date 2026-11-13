@@ -320,6 +320,23 @@ class HeatingClimate(HeatingRecovery,Hass):
         except (TypeError,ValueError):pass
         self.set_state(entity,state=state,attributes=attributes,replace=True)
         self.cache_published_state(entity,state,attributes)
+    def publish_power_measurement(self,state,**attributes):
+        """Publish power telemetry at most once per minute unless its meaning changes."""
+        now=time.time()
+        stable_keys=('confirmation_pending','power_source','primary_failed','requested_heating',
+                     'inferred_demand','power_quality','stale_sources','power_fault',
+                     'measurement_basis','power_without_request')
+        stable_state=state
+        if isinstance(state,(int,float)) and not isinstance(state,bool):
+            stable_state=round(float(state)/100)*100
+        signature=[stable_state,{key:deepcopy(attributes.get(key)) for key in stable_keys}]
+        previous=getattr(self,'_power_publication',None)
+        if previous and previous.get('signature')==signature and now-previous.get('at',0)<60:
+            return False
+        attributes['timestamp']=self.now().isoformat()
+        self.publish('sensor.heating_power_confirmed',state,**attributes)
+        self._power_publication=dict(signature=signature,at=now)
+        return True
     def journal(self,reason,kind="decision"):
         records=self.memory.setdefault("journal",[])
         if records and records[-1]["reason"]==reason and records[-1]["kind"]==kind:
@@ -1287,7 +1304,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                             'contradictory' if grid_off and power>=1500 else 'measured')
         if self.cfg.get('power_measurement_policy')=='audited' and assessment['quality']=='contradictory':self.power_quality='contradictory'
         if grid_off and power==0:self.power_quality='estimated'
-        self.publish("sensor.heating_power_confirmed",self.current_power_w,confirmation_pending=pending,
+        self.publish_power_measurement(self.current_power_w,confirmation_pending=pending,
                      friendly_name="Котел — підтверджена потужність ТЕНів",
                      unit_of_measurement="W",device_class="power",state_class="measurement",
                      measurement_version=3,threshold_w=self.power_estimator.threshold,confirmation_seconds=10,
@@ -1300,8 +1317,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      power_without_request=power is not None and power>=1500 and not requested,
                      uncertainty='Несвіжі складові балансу' if stale else 'Помилка або невідомий стан вимірювачів' if fault!='off' else None,
                      control_reserve=self.control_power_bounds,assumed_control_w=self.control_power_prior,
-                     fallback_raw_w=raw if source.startswith("fallback") else None,
-                     timestamp=self.now().isoformat())
+                     fallback_raw_w=raw if source.startswith("fallback") else None)
         self.run_diagnostic('power_observation',self.observe_power_quality,stamp,primary,power,grid_off)
         return power
     def stage_update(self,power):
