@@ -55,3 +55,6 @@
 | P1 | Покращити український UI помилки графіка та кнопку повтору | користувач розуміє проблему, стан і наступну дію |
 | P1 | Rate-limit diagnostics та відокремити historical ledger warnings | повтори агреговані, поточна проблема видима |
 | P2 | Перевірити single-writer V1/V2 і завершити live acceptance | немає другого publisher, усі періоди/маркери перевірені на HA |
+
+
+- 2026-11-13 — PR #39 merged as v0.5.0 (main 68c72c900def6d2a0f5470a11e7913086dc38960). Main Tests #686 / run 43518494857 and release #687 / run 43519221592 passed, including responsive/accessibility and native HA 2026.11. Marketplace ZIP published. Live HA installation and restart remain owner-controlled and unperformed.
