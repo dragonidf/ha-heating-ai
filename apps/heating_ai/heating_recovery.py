@@ -1081,9 +1081,16 @@ class HeatingRecovery:
                 self.history_queued=dict(data);return
             self.history_loading=True
             self.history_compact=data.get('compact') is True
-            self.history_loading_id=data['request_id'];self.history_protocol=data.get('protocol',1)
+            self.history_loading_id=data['request_id'];self.history_loading_start=start
+            self.history_loading_end=end;self.history_timed_out_request=None
+            self.history_protocol=data.get('protocol',1)
             history=copy.deepcopy(getattr(self,'history_read_snapshot',None) or self.memory.get('temperature_history') or {})
             if '__energy_cycles' not in history:history['__energy_cycles']=copy.deepcopy(self.memory.get('cycle_energy') or {})
+            # One bounded watchdog prevents a lost executor callback from
+            # leaving the UI in an infinite loading state. It never polls HA.
+            if hasattr(self,'run_in'):
+                self.history_timeout_handle=self.run_in(self.history_timeout,45,
+                    request_id=data['request_id'])
             self.submit_to_executor(self.load_temperature_comparison,start,end,history,data['request_id'],
                                     callback=self.plan_history_result)
             return
@@ -1109,9 +1116,38 @@ class HeatingRecovery:
         with getattr(self,'history_request_lock',RLock()):
             self._plan_history_loaded(kwargs,**extra)
 
+    def history_timeout(self,kwargs=None,**extra):
+        request_id=(kwargs or extra).get('request_id')
+        with getattr(self,'history_request_lock',RLock()):
+            if not getattr(self,'history_loading',False) or request_id!=getattr(self,'history_loading_id',None):
+                return
+            self.history_loading=False
+            self.history_timed_out_request=request_id
+            result=dict(start=self.history_loading_start,end=self.history_loading_end,
+                        actual=[],cycles=[],markers=[],energy_cycles=[],
+                        error='Історія не відповіла вчасно. Повторіть завантаження.',
+                        error_code='history_timeout',request_id=request_id)
+            self.history_comparison=result
+            self.publish('sensor.heating_history_page','Історія · сторінка',
+                         **wire_values(comparison_page(comparison_items(result),0,request_id,
+                                                       uuid4().hex,result['start'],result['end'],
+                                                       compact=getattr(self,'history_compact',False))))
+            self.publish_plan_history(request_id=request_id,comparison=result)
+            self.history_loading_id=None
+
     def _plan_history_loaded(self,kwargs=None,**extra):
         result=(kwargs or extra).get('result')
+        request_id=result.get('request_id') if isinstance(result,dict) else None
+        if getattr(self,'history_timed_out_request',None)==request_id:
+            return
+        if getattr(self,'history_loading_id',None) not in (None,request_id):
+            return
         self.history_loading=False
+        self.history_loading_id=None
+        handle=getattr(self,'history_timeout_handle',None)
+        if handle is not None and hasattr(self,'cancel_timer'):
+            try:self.cancel_timer(handle)
+            except (AttributeError,TypeError):pass
         if isinstance(result,dict):
             self.history_comparison=result
             if getattr(self,'history_protocol',1)==2 and 'start' in result and 'end' in result:
