@@ -50,6 +50,7 @@ class NativeController(HeatingClimate):
         self.command_ledger_status = None
         self._command_sequence = 0
         self._pending_command_evidence = {}
+        self._fence_recovery_attempted = False
 
     def attach_command_ledger(self, ledger, status):
         self.command_ledger = ledger
@@ -58,6 +59,19 @@ class NativeController(HeatingClimate):
     def update_in_progress(self):
         # Marketplace unload/reload revokes this bridge before replacing code.
         return False
+
+    def tick(self, kwargs=None, **extra):
+        """Retry one fenced STOP from the existing 15-second control tick.
+
+        This is deliberately a one-shot per continuous fence: it adds no
+        polling loop and cannot emit repeated STOP commands while a service or
+        echo is unavailable.
+        """
+        try:
+            self._reconcile_writer_fence()
+        except Exception as exc:
+            self.log("Ledger fence recovery deferred: %s", str(exc), level="WARNING")
+        return super().tick(kwargs, **extra)
 
     def listen_event(self, function, event_name, **kwargs):
         # Production settings are accepted only through the authenticated
@@ -319,10 +333,15 @@ class NativeController(HeatingClimate):
                 self.record_equipment_command_echo(evidence, observed)
 
     def _reconcile_writer_fence(self):
-        if (self.command_ledger_status is None
-                or not self.command_ledger_status.get("fenced")
-                or self.raw("mode") != "Автоматичне керування"):
+        if self.command_ledger_status is None:
             return
+        if not self.command_ledger_status.get("fenced"):
+            self._fence_recovery_attempted = False
+            return
+        if (self.raw("mode") != "Автоматичне керування"
+                or self._fence_recovery_attempted):
+            return
+        self._fence_recovery_attempted = True
         manual = self._remember_manual_snapshot()
         self._dispatch_manual_signature = manual["signature"]
         self._dispatch_manual_epoch = self.memory["native_manual_epoch"]
