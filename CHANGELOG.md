@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.9 — 2026-11-13
+
+- Journal the bounded fenced STOP recovery through PREPARED/SENT/HA_ECHO before clearing the durable fence; preserve the existing 15-second tick and no-restart policy.
+
+
 ## 0.4.8 — 2026-11-13
 
 - Recover a fenced durable command ledger with one bounded STOP from the existing control tick after a runtime command failure. Avoid duplicate recovery commands and avoid adding polling or HA restart requirements.
