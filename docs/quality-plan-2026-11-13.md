@@ -15,7 +15,7 @@
 
 | Пріоритет | Робота | Статус | Критерій готовності |
 |---|---|---|---|
-| P0 | Відновлення ledger fence без reboot | IMPLEMENTED — CI PENDING | Один bounded STOP через наявний tick, HA echo відкриває fence; повторні ticks не дублюють команду |
+| P0 | Відновлення ledger fence без reboot | DONE — GitHub CI PASS | Один bounded STOP через наявний tick, HA echo відкриває fence; повторні ticks не дублюють команду |
 | P0 | Контракт heartbeat/health | TODO | heartbeat відображає фактичну свіжість control tick і стан writer |
 | P0 | Зменшення Recorder flood `power_balance` | TODO | Дедуп/мінімальний інтервал без втрати аварійних переходів |
 | P1 | Класифікація та rate-limit діагностики | TODO | Повторювані однакові помилки не створюють лавину записів |
@@ -40,6 +40,7 @@
 - 2026-11-13 — план зафіксовано цим файлом; P0 fence recovery взято в роботу.
 - 2026-11-13 — додано регресійний тест і bounded recovery у наявний 15-секундний tick;
   новий polling/таймер не створюється, повторний STOP у межах одного fence не надсилається.
-- 2026-11-13 — локальний Windows runner не має Python, тому остаточна перевірка
-  має виконатися GitHub Actions після push; результат не позначається PASS до CI.
+- 2026-11-13 — GitHub Actions для head `efe99e5504edb3cb225bdfbba648d153a97abce3`:
+  Python 3.12, Python 3.13 і `native-production` PASS; `make check test`, bounded
+  measurements та browser responsive/accessibility перевірки пройдено.
 
