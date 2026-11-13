@@ -46,6 +46,8 @@ def package(directory):
         "homeassistant": module("homeassistant"),
         "homeassistant.core": module("homeassistant.core", callback=lambda fn: fn,
             Context=lambda: SimpleNamespace(id="native-fixture-context")),
+        "homeassistant.const": module("homeassistant.const",
+            EVENT_HOMEASSISTANT_STOP="homeassistant_stop"),
         "homeassistant.components": module("homeassistant.components",
             frontend=SimpleNamespace(async_remove_panel=Mock()),
             panel_custom=SimpleNamespace(async_register_panel=AsyncMock())),
@@ -474,3 +476,36 @@ class BundleTests(unittest.TestCase):
                 (path/"private/original-state.json").write_text("{}")
                 with self.assertRaises(ValueError):
                     migration.load_installation(path/"private")
+
+
+    async def test_runtime_close_is_idempotent_and_releases_lease_once(self):
+        with package(self.root / "package") as (component, _):
+            controller = SimpleNamespace(async_close=AsyncMock())
+            lease = Mock()
+            runtime = component.ProductionRuntime(controller, lease)
+            await runtime.close()
+            await runtime.close()
+            controller.async_close.assert_awaited_once()
+            lease.close.assert_called_once()
+            self.assertTrue(runtime._closed)
+
+    async def test_close_cancels_launched_jobs_and_rejects_late_launch(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            started = asyncio.Event()
+            finished = asyncio.Event()
+
+            async def job():
+                started.set()
+                try:
+                    await asyncio.sleep(60)
+                finally:
+                    finished.set()
+
+            task = app._launch(job())
+            await started.wait()
+            await app.async_close()
+            self.assertTrue(task.done())
+            self.assertTrue(finished.is_set())
+            late = app._launch(asyncio.sleep(0))
+            self.assertIsNone(late)
