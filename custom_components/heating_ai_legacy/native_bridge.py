@@ -26,6 +26,36 @@ from .calculation_worker import calculate
 
 _LOGGER = logging.getLogger(__name__)
 
+_POOL_CLOSE_TIMEOUT = 15
+_SERIAL_CLOSE_TIMEOUT = 5
+
+
+def _terminate_process_pool(pool):
+    if hasattr(pool, "terminate_workers"):
+        pool.terminate_workers()
+    else:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+async def _close_process_pool(hass, pool):
+    try:
+        await asyncio.wait_for(
+            hass.async_add_executor_job(_terminate_process_pool, pool),
+            _POOL_CLOSE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        killer = getattr(pool, "kill_workers", None)
+        if killer is None:
+            _LOGGER.error("Heating AI calculation pool did not stop within timeout")
+            return
+        try:
+            await asyncio.wait_for(
+                hass.async_add_executor_job(killer), _SERIAL_CLOSE_TIMEOUT
+            )
+        except (asyncio.TimeoutError, RuntimeError) as exc:
+            _LOGGER.error("Heating AI calculation pool could not be killed: %s", exc)
+
+
 
 class Hass:
     """The small I/O surface used by V1; no AppDaemon dependency."""
@@ -40,6 +70,10 @@ class Hass:
         self._jobs = set()
         self._published = set()
         self._calculation_pool = None
+        self._pool_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._closing = False
+        self._closed = False
         self._context = Context()
         self._loop_thread = threading.get_ident()
 
@@ -61,6 +95,9 @@ class Hass:
                 await self.hass.async_add_executor_job(function, *args)
 
     def _launch(self, coro):
+        if self._closing or not self._running:
+            coro.close()
+            return None
         task = self.hass.async_create_task(coro, "Heating AI V1 callback")
         self._jobs.add(task)
         task.add_done_callback(self._jobs.discard)
@@ -76,22 +113,41 @@ class Hass:
             raise
 
     async def async_close(self):
-        self._writer = False
-        self._running = False
-        if self._calculation_pool is not None:
-            pool, self._calculation_pool = self._calculation_pool, None
-            # HA 2026.11 uses Python 3.14. Older supported test runtimes
-            # finish already-running pure jobs but cancel queued work.
-            if hasattr(pool, "terminate_workers"):
-                pool.terminate_workers()
-            else:
-                pool.shutdown(wait=False, cancel_futures=True)
-        for cancel in tuple(self._handles.values()):
-            cancel()
-        self._handles.clear()
-        async with self._serial:
-            await self.hass.async_add_executor_job(self.terminate)
-        # Executor jobs may finish later, but cannot publish or dispatch commands.
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            self._writer = False
+            self._running = False
+
+            for cancel in tuple(self._handles.values()):
+                cancel()
+            self._handles.clear()
+
+            current = asyncio.current_task()
+            jobs = tuple(job for job in self._jobs if job is not current)
+            for job in jobs:
+                job.cancel()
+            if jobs:
+                await asyncio.gather(*jobs, return_exceptions=True)
+
+            async with self._pool_lock:
+                pool, self._calculation_pool = self._calculation_pool, None
+            if pool is not None:
+                await _close_process_pool(self.hass, pool)
+
+            acquired = False
+            try:
+                await asyncio.wait_for(self._serial.acquire(), _SERIAL_CLOSE_TIMEOUT)
+                acquired = True
+                await self.hass.async_add_executor_job(self.terminate)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Heating AI serial shutdown wait timed out")
+                await self.hass.async_add_executor_job(self.terminate)
+            finally:
+                if acquired:
+                    self._serial.release()
+            self._closed = True
 
     def datetime(self):
         return datetime.now(timezone.utc)
@@ -261,19 +317,23 @@ class Hass:
             if not self._running:
                 return
             if function == getattr(self, "calculate_snapshot", None) and args and args[0] in ("plan", "power_advice"):
-                if self._calculation_pool is None:
-                    # CPU-bound Python threads share HA's GIL. Use spawn,
-                    # never fork a running HA process, and pass only pure data.
-                    self._calculation_pool = ProcessPoolExecutor(
-                        max_workers=2, mp_context=multiprocessing.get_context("spawn"),
-                        # HA loads custom_components via its package loader;
-                        # /config need not be on a spawned interpreter's path.
-                        initializer=site.addsitedir,
-                        initargs=(str(Path(__file__).resolve().parents[2]),))
                 kind, job_id, _algorithm, inputs, options = args
                 try:
-                    future = await self.hass.async_add_executor_job(
-                        self._calculation_pool.submit, calculate, kind, job_id, inputs, options)
+                    async with self._pool_lock:
+                        if self._closing or not self._running:
+                            return
+                        if self._calculation_pool is None:
+                            # CPU-bound Python threads share HA's GIL. Use spawn,
+                            # never fork a running HA process, and pass only pure data.
+                            self._calculation_pool = ProcessPoolExecutor(
+                                max_workers=2, mp_context=multiprocessing.get_context("spawn"),
+                                # HA loads custom_components via its package loader;
+                                # /config need not be on a spawned interpreter's path.
+                                initializer=site.addsitedir,
+                                initargs=(str(Path(__file__).resolve().parents[2]),))
+                        pool = self._calculation_pool
+                        future = await self.hass.async_add_executor_job(
+                            pool.submit, calculate, kind, job_id, inputs, options)
                     result = await asyncio.wrap_future(future)
                 except Exception as exc:
                     if not self._running:
