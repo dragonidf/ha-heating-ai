@@ -124,7 +124,7 @@ class NativeController(HeatingClimate):
         for entity in self.args["voltage_entities"]:
             self.listen_state(self.voltage_changed, entity, attribute="all")
         self.listen_state(self.voltage_changed, self.args["grid_presence_helper"])
-        self._reconcile_writer_fence()
+        # Recovery is attempted from the existing periodic control tick only.
 
     @callback
     def async_manual_snapshot(self):
