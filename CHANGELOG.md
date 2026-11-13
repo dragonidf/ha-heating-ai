@@ -1,3 +1,8 @@
+# 0.4.10 — 2026-11-13
+
+- Show controller problems in human language with clear warning/error highlighting, explain the affected sensor and safe fallback, and hide internal ledger exception names from the main status banner.
+- Keep the existing safe control behavior and update only the panel presentation.
+
 # Changelog
 
 ## 0.4.9 — 2026-11-13
