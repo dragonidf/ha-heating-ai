@@ -6,10 +6,12 @@ separate immutable-input worker; HA's event loop never runs the optimiser.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
 import inspect
 import logging
+import multiprocessing
 import threading
 from uuid import uuid4
 
@@ -17,6 +19,8 @@ from homeassistant.core import Context, callback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.template import Template
 from homeassistant.util.async_ import run_callback_threadsafe
+
+from .calculation_worker import calculate
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +37,7 @@ class Hass:
         self._handles = {}
         self._jobs = set()
         self._published = set()
+        self._calculation_pool = None
         self._context = Context()
         self._loop_thread = threading.get_ident()
 
@@ -71,6 +76,14 @@ class Hass:
     async def async_close(self):
         self._writer = False
         self._running = False
+        if self._calculation_pool is not None:
+            pool, self._calculation_pool = self._calculation_pool, None
+            # HA 2026.11 uses Python 3.14. Older supported test runtimes
+            # finish already-running pure jobs but cancel queued work.
+            if hasattr(pool, "terminate_workers"):
+                pool.terminate_workers()
+            else:
+                pool.shutdown(wait=False, cancel_futures=True)
         for cancel in tuple(self._handles.values()):
             cancel()
         self._handles.clear()
@@ -243,7 +256,24 @@ class Hass:
 
     def submit_to_executor(self, function, *args, callback=None, **kwargs):
         async def run():
-            result = await self.hass.async_add_executor_job(function, *args)
+            if not self._running:
+                return
+            if function == getattr(self, "calculate_snapshot", None) and args and args[0] in ("plan", "power_advice"):
+                if self._calculation_pool is None:
+                    # CPU-bound Python threads share HA's GIL. Use spawn,
+                    # never fork a running HA process, and pass only pure data.
+                    self._calculation_pool = ProcessPoolExecutor(
+                        max_workers=2, mp_context=multiprocessing.get_context("spawn"))
+                kind, job_id, _algorithm, inputs, options = args
+                try:
+                    result = await self.hass.loop.run_in_executor(
+                        self._calculation_pool, calculate, kind, job_id, inputs, options)
+                except Exception as exc:
+                    if not self._running:
+                        return
+                    result = dict(kind=kind, id=job_id, error=str(exc), seconds=0.)
+            else:
+                result = await self.hass.async_add_executor_job(function, *args)
             if self._running and callback is not None:
                 await self._dispatch(callback, dict(kwargs, result=result))
         self.hass.loop.call_soon_threadsafe(lambda: self._launch(run()))

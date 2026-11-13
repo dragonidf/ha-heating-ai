@@ -149,7 +149,7 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
                  "native_outages.py", "native_store.py", "native_persistence.py",
                  "native_model.py", "native_fan.py", "native_fan_sources.py",
                  "native_migration.py", "native_floor.py", "native_voltage.py",
-                 "native_bridge.py", "production.py", "production_migration.py",
+                 "native_bridge.py", "calculation_worker.py", "production.py", "production_migration.py",
                  "critical_ledger.py", "sensor.py", "strings.json",
                  "assets/panel.js", "assets/full-panel-loader.js"):
         contents[name] = (CARRIER / name).read_bytes()
@@ -186,3 +186,4 @@ if __name__ == "__main__":
     ap.add_argument("--output", default=ZIP_NAME)
     args = ap.parse_args()
     print(json.dumps(build(Path(args.output)), indent=2))
+

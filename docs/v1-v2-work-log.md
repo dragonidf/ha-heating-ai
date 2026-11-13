@@ -268,3 +268,8 @@ Legacy V1/V2 stay disabled. Production has NOT received0.4.1 at this checkpoint.
 > Core restart exposed AppDaemon bug: disable API fails AppConfig.update; cached old app restarted on HASS reconnect and native conflict safety removed its panel. Old app stopped again (terminated); original config retained as /app_configs/a0d7b954_appdaemon/apps/heating_climate.yaml.disabled, no active heating_climate.yaml. AppDaemon production_mode set false to restore config scanning. IMPORTANT: cached terminated object still exists in current AppDaemon process; verify no reactivation on next reconnect, do not claim reconnect-proof removal until cache is cleared. No shared AppDaemon restart performed.
 > File editor enforce_basepath restored true and stopped. Models/history/energy retained. Do not repeat data migration. Continue with fresh live state if any conflict recurs.
 
+
+
+## 2026-11-13 — 0.4.2 performance repair pending CI/deployment
+
+A/B measured Core CPU25.98–27.22% with native controller, 1.52% after unload. Native entry temporarily disabled; boiler confirmed stock AUTO/target20.5, automatic/armed helpers retained. Pure numerical plan/advice now use2 spawn processes outside HA GIL; original V1 algorithms/command checks unchanged. Local spawn/error regression PASS. Private historical direct/process replay identical energy27kWh, minimum20.58C,56heat segments, runtime5.06/5.60s. NEXT: GitHubCI/release, Marketplace0.4.2, load new code, re-enable native; verify fresh accepted forecast/heat segments, CPU and sidebar. Old AppDaemon cache remains a reconnect risk (disabled file retained); fix lifecycle before restart, retain old data. No new physical relay test claimed.

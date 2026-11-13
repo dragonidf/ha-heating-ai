@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2 — 2026-11-13
+
+- Run pure plan and power-advice calculations in spawn workers, outside HA's Python GIL. Preserve V1 numerical algorithms, input validation, job IDs and command boundaries.
+- Stop worker processes when the native controller unloads; add a real spawn/serialization/error regression.
+
+
 ## 0.4.1 — 2026-11-13
 
 - Exclude notifications and missing entity targets from physical command echo checks, fixing recurring NoneType.lower exceptions and unintended temporary AUTO incidents.
