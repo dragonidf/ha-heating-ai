@@ -1538,30 +1538,28 @@ class DecisionJournal:
 
     def _recent_telemetry_lines(self,path,minimum_ts):
         """Read only the append-only telemetry tail needed for a history window."""
-        rows=[];position=None;carry=b'';stop=False;chunk_size=1024*1024;max_bytes=128*1024*1024;read_bytes=0
+        rows=[];chunk_size=1024*1024;max_bytes=128*1024*1024;read_bytes=0;stop=False
         with path.open('rb') as stream:
-            position=stream.seek(0,2)
+            stream.seek(0,2);position=stream.tell();carry=b''
             while position>0 and read_bytes<max_bytes and not stop:
                 start=max(0,position-chunk_size)
                 stream.seek(start)
                 block=stream.read(position-start)+carry
                 read_bytes+=position-start;position=start
-                parts=block.splitlines()
+                parts=block.split(b'\\n')
                 carry=parts.pop(0) if start>0 and parts else b''
                 for raw in reversed(parts):
+                    if not raw:continue
                     try:
-                        row=json.loads(raw)
-                        timestamp=number(row.get('ts'))
+                        row=json.loads(raw);timestamp=number(row.get('ts'))
                     except (ValueError,TypeError,AttributeError):
                         continue
                     if timestamp is not None and timestamp<minimum_ts:
-                        stop=True
-                        break
+                        stop=True;break
                     rows.append(raw.decode('utf-8'))
             if not stop and carry:
                 try:
-                    row=json.loads(carry)
-                    timestamp=number(row.get('ts'))
+                    row=json.loads(carry);timestamp=number(row.get('ts'))
                     if timestamp is None or timestamp>=minimum_ts:rows.append(carry.decode('utf-8'))
                 except (ValueError,TypeError,AttributeError):
                     pass
