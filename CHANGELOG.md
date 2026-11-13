@@ -1,3 +1,9 @@
+# 0.4.11 — 2026-11-13
+
+- Expose explicit heartbeat freshness and single-writer state in diagnostics.
+- Bound unchanged power telemetry publications to reduce Recorder load while preserving material transitions immediately.
+- Bundle the next quality-plan P0 improvements without adding polling or requiring a full HA Core restart.
+
 # 0.4.10 — 2026-11-13
 
 - Show controller problems in human language with clear warning/error highlighting, explain the affected sensor and safe fallback, and hide internal ledger exception names from the main status banner.
