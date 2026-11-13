@@ -31,6 +31,7 @@ def build(check=False):
     target = ROOT/'apps/heating_ai/heating_ui_assets.py'
     if check:
         if not target.exists() or target.read_text() != content:
+            print("DEBUG ui target_match=False expected_digest="+digest+" target_exists="+str(target.exists()))
             raise SystemExit('Run python tools/build_ui.py and commit the generated assets')
     else:
         target.write_text(content)
@@ -39,6 +40,7 @@ def build(check=False):
     release=target.parent/'release.json'
     if check:
         if not release.exists() or release.read_text()!=manifest:
+            print("DEBUG release target_match=False expected_manifest="+manifest)
             raise SystemExit('Run python tools/build_ui.py to refresh the nine-module release manifest')
     else:
         release.write_text(manifest)
