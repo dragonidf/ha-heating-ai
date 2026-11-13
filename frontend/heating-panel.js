@@ -1638,7 +1638,7 @@ h1,h2{min-width:0;overflow-wrap:anywhere}button,input,select,textarea{font-famil
 @container(max-width:600px){
   .overview .fireplace-card{padding:10px 12px}
   .fireplace-card .fire-details{margin-top:0}
-  .fireplace-card .fire-details summary{min-height:28px}
+  .fireplace-card .fire-details summary{min-height:44px}
 }
 `;
 if(!customElements.get('heating-ai-panel'))customElements.define('heating-ai-panel',HeatingAIPanel);
