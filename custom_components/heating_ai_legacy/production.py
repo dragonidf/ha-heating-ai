@@ -13,6 +13,7 @@ from uuid import uuid4
 from homeassistant.components import frontend, panel_custom
 from homeassistant.components.http.server import StaticPathConfig
 from homeassistant.components.weather.const import DATA_COMPONENT as WEATHER_ENTITIES
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
 
@@ -516,15 +517,21 @@ class ProductionRuntime:
         self.controller = controller
         self.lease = lease
         self.unsubscribers = []
+        self._close_lock = asyncio.Lock()
+        self._closed = False
 
     async def close(self):
-        for unsubscribe in self.unsubscribers:
-            unsubscribe()
-        self.unsubscribers.clear()
-        try:
-            await self.controller.async_close()
-        finally:
-            self.lease.close()
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            for unsubscribe in tuple(self.unsubscribers):
+                unsubscribe()
+            self.unsubscribers.clear()
+            try:
+                await self.controller.async_close()
+            finally:
+                self.lease.close()
 
 
 async def async_setup_production(hass, entry):
@@ -573,6 +580,13 @@ async def async_setup_production(hass, entry):
     controller = NativeController(hass, cfg)
     controller.attach_command_ledger(ledger, ledger_status)
     runtime = ProductionRuntime(controller, lease)
+
+    async def stop_runtime(_event):
+        await runtime.close()
+
+    runtime.unsubscribers.append(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_runtime)
+    )
     try:
         assets = Path(__file__).parent / "assets"
         state = hass.data.setdefault(DOMAIN, {})
