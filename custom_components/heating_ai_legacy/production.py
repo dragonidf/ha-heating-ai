@@ -346,9 +346,24 @@ class NativeController(HeatingClimate):
         self._dispatch_manual_signature = manual["signature"]
         self._dispatch_manual_epoch = self.memory["native_manual_epoch"]
         self._dispatch_action = "off"
+        evidence = None
         try:
+            evidence = self.prepare_equipment_command(
+                "climate", "set_hvac_mode",
+                {"entity_id": self.cfg["thermostat"], "hvac_mode": "off"})
+            self.mark_equipment_command_sent(evidence)
             self.call_service("climate/set_hvac_mode",
                               entity_id=self.cfg["thermostat"], hvac_mode="off")
+            observed = self._on_loop(
+                self.async_equipment_command_echo,
+                evidence["domain"], evidence["service"],
+                evidence["data"], evidence)
+            if observed.get("matched"):
+                self.record_equipment_command_echo(evidence, observed)
+        except Exception:
+            if evidence is not None:
+                self._pending_command_evidence.pop(evidence["command_id"], None)
+            raise
         finally:
             self._dispatch_action = None
             self._dispatch_manual_signature = None
