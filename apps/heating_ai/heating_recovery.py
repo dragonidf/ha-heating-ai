@@ -1546,7 +1546,7 @@ class DecisionJournal:
                 stream.seek(start)
                 block=stream.read(position-start)+carry
                 read_bytes+=position-start;position=start
-                parts=block.split(b'\\n')
+                parts=block.split(b'\n')
                 carry=parts.pop(0) if start>0 and parts else b''
                 for raw in reversed(parts):
                     if not raw:continue
