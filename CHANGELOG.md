@@ -1,3 +1,7 @@
+# 0.4.13 — 2026-11-13
+
+- Reduce the bounded telemetry tail used by interactive history comparisons to 16 MiB, keeping the graph responsive on large archives without adding polling or HA load.
+
 # 0.4.12 — 2026-11-13
 
 - History comparison reads only the requested telemetry tail instead of scanning the full archive, keeping the existing 31-day limit and background execution.
