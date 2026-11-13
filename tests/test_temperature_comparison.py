@@ -53,7 +53,7 @@ class TemperatureComparisonTests(unittest.TestCase):
         rows=[dict(ts=self.start-86400,room=18.,room_valid=True),
               dict(ts=self.start+300,room=21.,room_valid=True,grid='on',power_quality='measured',power_estimated=False,power=0.,fire_active=True),
               dict(ts=self.start+600,room=21.2,room_valid=True,grid='on',power_quality='measured',power_estimated=False,power=0.,fire_active=True)]
-        path.write_text(''.join(json.dumps(row)+'\\n' for row in rows))
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
         tail=list(self.journal._recent_telemetry_lines(path,self.start-1200))
         self.assertEqual([json.loads(line)['ts'] for line in tail],[self.start+300,self.start+600])
         result=self.journal.temperature_comparison(self.start,self.end)
