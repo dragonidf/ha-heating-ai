@@ -181,7 +181,7 @@ export class HeatingAIPanel extends HTMLElement {
     };
     document.addEventListener('visibilitychange',this.comparisonResume);
     window.addEventListener('online',this.comparisonResume);
-    this.timer=setInterval(()=>this.render(),30000); this.render();
+    this.timer=setInterval(()=>this.render(),60000); this.render();
   }
   disconnectedCallback() {
     clearInterval(this.timer);this.resizeObserver?.disconnect();
@@ -711,9 +711,9 @@ export class HeatingAIPanel extends HTMLElement {
     const coverage=forecasts.reduce((sum,f)=>sum+f.points.slice(1).reduce((n,p,i)=>{
       const previous=f.points[i];return n+(Number(p.ts)-Number(previous.ts)<=3600?Math.max(0,Math.min(Number(p.ts),f.finish)-Math.max(Number(previous.ts),start,Number(f.cycle.started_at))):0);
     },0),0);
-    const status=this.comparisonError||data?.error||(this.comparisonPending?'Читаємо архів температури… Це може зайняти кілька секунд.':!actual.length?'Фактичних вимірів за цей період немає.':!forecastPaths?'Завчасних прогнозів за цей період не збережено. Показано фактичну температуру.':'');
+    const status=this.comparisonError||data?.error||(this.comparisonPending?'Читаємо збережені дані… Якщо відповідь не надійде за 25 секунд, з’явиться кнопка повтору.':!actual.length?'Фактичних вимірів за цей період немає.':!forecastPaths?'Завчасних прогнозів за цей період не збережено. Показано фактичну температуру.':'');
     const sources=`<details class="comparison-sources"><summary>Джерела прогнозу · ${cycles.filter(c=>c.forecast).length} з ${cycles.length} циклів</summary><p class="muted note">Пунктир — незмінний прогноз, виданий щонайменше за 12 годин до контрольного початку вікна або підтвердженого нагріву. Фактичну давність наведено нижче. Нові перерахунки його не замінюють. Пропуски не відновлено заднім числом.</p>${cycles.map(c=>`<p class="comparison-source"><strong>${h(this.time(Number(c.started_at),true))}</strong><span>${c.forecast?`Прогноз від ${h(this.time(Number(c.forecast.at),true))} · за ${fmt((Number(c.started_at)-Number(c.forecast.at))/3600,2)} год${c.forecast.source==='archive'?' · оригінал з архіву':''}`:'Завчасний прогноз не збережено'}</span></p>`).join('')}${data?.warnings?.length?'<p class="warn note">Частина архіву недоступна. Відсутні ділянки залишено порожніми.</p>':''}</details>`;
-    return this.section('Прогноз і фактична температура',controls+svg+`<div class="comparison-legend"><span>┄ Завчасний прогноз · від 12 год</span><span>━ Фактична температура</span><span>··· Межі комфорту</span><span>Смужки: план / котел / камін · тло: мережа / прогалини</span></div><p class="comparison-readout muted" aria-live="polite">${h(readout)}</p>${status?`<p class="comparison-status muted" role="status">${h(status)}</p>`:''}${data&&coverage<(end-start)-300?`<p class="comparison-coverage muted">Збережений прогноз: ${fmt(coverage/3600,1)} з ${fmt((end-start)/3600,0)} год. Решта — без завчасних даних.</p>`:''}${missing?`<p class="muted note">Без завчасного прогнозу: ${missing} циклів.</p>`:''}`+sources,'comparison-card');
+    return this.section('Прогноз і фактична температура',controls+svg+`<div class="comparison-legend"><span>┄ Завчасний прогноз · від 12 год</span><span>━ Фактична температура</span><span>··· Межі комфорту</span><span>Смужки: план / котел / камін · тло: мережа / прогалини</span></div><p class="comparison-readout muted" aria-live="polite">${h(readout)}</p>${status?`<p class="comparison-status ${this.comparisonError||data?.error?'warn':''}" role="status">${h(status)}</p>`:''}${data&&coverage<(end-start)-300?`<p class="comparison-coverage muted">Збережений прогноз: ${fmt(coverage/3600,1)} з ${fmt((end-start)/3600,0)} год. Решта — без завчасних даних.</p>`:''}${missing?`<p class="muted note">Без завчасного прогнозу: ${missing} циклів.</p>`:''}`+sources,'comparison-card');
   }
   overview() {
     const c=this.attrs('controller'),budget=numeric(this.state('monthly_budget')),used=numeric(this.state(this.attrs('system_settings').values?.power_accounting_method==='inlet'?'energy_accounted_monthly':'energy_monthly'));
@@ -1177,6 +1177,10 @@ section[id]{scroll-margin-top:16px}
 .metric strong{font-size:1.4375rem}
 .mode{display:none}
 }
+.fireplace-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:10px}
+.fire-block,.circulation-block{min-width:0;min-height:0;aspect-ratio:1/1;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;overflow:hidden}
+.fire-block .fire-temperature,.circulation-block .fan-actual{overflow-wrap:anywhere}
+@container(max-width:600px){.fireplace-grid{gap:8px}.fire-block,.circulation-block{padding:12px}.fire-block .eyebrow,.circulation-block .eyebrow{font-size:.6875rem}.fire-block .fire-temperature,.circulation-block .fan-actual{font-size:1rem}.fire-details{margin-top:8px}}
 @container(max-width:600px){main{padding:8px 12px}
 header{padding:8px 2px 18px;gap:10px}
 .brand strong{font-size:1.25rem}
