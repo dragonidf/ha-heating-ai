@@ -3,6 +3,16 @@
 Оновлено: 12.11.2026, Europe/Kyiv. Це точка передачі іншому GPT/Codex.
 Повний контекст чату не потрібний. Не трактуйте зелені тести як готовий production.
 
+## Актуальний checkpoint 13.11.2026
+
+Поточний план і статус виконання: [quality-plan-2026-11-13.md](quality-plan-2026-11-13.md).
+P0 ledger fence recovery реалізовано в draft PR #31: bounded STOP виконується
+вже наявним 15-секундним control tick лише для fenced ledger; повторні ticks не
+дублюють команду, новий polling/таймер і зміни HA не додаються. Регресійний тест
+додано. GitHub Actions для нового head ще не дали нового запуску; локальний
+Windows runner не має Python, тому CI залишається обов'язковою перевіркою.
+Не встановлювати цей коміт у production до проходження CI та окремого погодження.
+
 ## Мета та авторизація
 
 Власник доручив завершити модернізацію **робочого V1**, перенести погоджені
@@ -27,14 +37,17 @@ V2 залишається SHADOW без фізичних команд.
 3. Прочитати [ТЗ](v1-v2-modernization-spec.md),
    [реєстр](v1-v2-work-log.md), [матрицю перенесення](v2-transfer-checklist.md)
    та кореневий AGENTS.md. Не повторювати загальний аудит.
-4. Взяти latest head PR25. Native production smoke, Python3.12/3.13 і
-   candidate PASS на попередніх heads. Browser gate має stale selectors після
-   нового −6/+24 timeline: виправлено card order, geometry, horizon title та
-   strict selector future room line (now marker теж dashed). Відкрити поточний
-   head workflows; брати наступний failure з job logs, не припускати PASS.
-   Тести виконувати GitHub. E6/E7 PARTIAL; E8/E9 ще не виконано.
-   Новий контролер ставимо замість V2; старий V1 та helpers залишити, лише
-   disable writer/watchdog під час handoff. Подальше очищення робить власник.
+4. Продовжити з remote head
+   `97bf637d7b7fbaa43c61556fb3794596f4113218`. Candidate workflow
+   [43311679116](https://github.com/dragonidf/ha-heating-ai/actions/runs/43311679116)
+   зелений. Tests run
+   [43311679018](https://github.com/dragonidf/ha-heating-ai/actions/runs/43311679018)
+   ще не release gate: `native-production` падає лише тому, що synthetic HA
+   fixture зареєстрував `climate.set_hvac_mode`, але реальний `apply_action`
+   після нового final guard спочатку викликає незареєстрований у fixture
+   `climate.set_temperature` (`ServiceNotFound`, job `131509066663`). Додати
+   synthetic `set_temperature`, який оновлює атрибут уставки, не послаблювати
+   production gateway, і повторити exact-head Linux CI.
 5. Після кожного завершеного етапу оновити реєстр і цю точку продовження,
    закомітити та перевірити віддалений SHA. Локальний файл не є checkpoint.
 
@@ -128,3 +141,4 @@ I/O bridge для незмінної математики V1; це **відхи�
 а не вже доведена parity. Не приховувати його. До release довести збереження
 повної поведінки, незалежний safety, один writer, rollback і доставку магазину;
 якщо доказів немає, не називати кандидат готовим.
+
