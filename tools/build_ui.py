@@ -31,7 +31,9 @@ def build(check=False):
     target = ROOT/'apps/heating_ai/heating_ui_assets.py'
     if check:
         if not target.exists() or target.read_text() != content:
-            print("DEBUG ui target_match=False expected_digest="+digest+" target_exists="+str(target.exists()))
+            actual=target.read_text() if target.exists() else ''
+            diff=next((i for i,(a,b) in enumerate(zip(actual,content)) if a!=b),min(len(actual),len(content)))
+            print("DEBUG ui target_match=False expected_digest="+digest+" lengths="+str((len(content),len(actual)))+" diff="+str(diff)+" expected="+repr(content[diff:diff+80])+" actual="+repr(actual[diff:diff+80]))
             raise SystemExit('Run python tools/build_ui.py and commit the generated assets')
     else:
         target.write_text(content)
