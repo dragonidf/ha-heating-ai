@@ -335,6 +335,14 @@ class HeatingRecovery:
         archive=journal.health() if journal and hasattr(journal,'health') else {}
         storage=self.memory.get('state_load_error') or getattr(journal,'error',None)
         control='fallback' if fallback else 'error' if incident.get('active') else 'healthy' if self.memory.get('last_successful_tick') else 'starting'
+        last_tick=self.memory.get('last_successful_tick')
+        try:
+            heartbeat_age=max(0.,self.now().timestamp()-datetime.fromisoformat(last_tick.replace('Z','+00:00')).timestamp()) if last_tick else None
+        except (AttributeError,TypeError,ValueError):
+            heartbeat_age=None
+        heartbeat_state=('fresh' if heartbeat_age is not None and heartbeat_age<=45 and control in ('healthy','fallback') else
+                         'stale' if heartbeat_age is not None else 'starting')
+        writer_state=('fallback' if fallback else 'owned' if self.memory.get('owned',False) else 'standby')
         state=('Помилка контролера' if control=='error' else 'Тимчасовий auto' if fallback else
                'Помилка збереження' if storage else 'Діагностика обмежена' if active or recent else 'Журнал доступний')
         self.publish('sensor.heating_diagnostics',state,storage_health='degraded' if storage else 'warning' if archive.get('pressure') else 'healthy',archive_health=archive,
@@ -342,7 +350,9 @@ class HeatingRecovery:
             journal_max_bytes=getattr(getattr(self,'decision_journal',None),'max_bytes',None),
             storage_degraded=bool(storage),validation_health='degraded' if active or recent else 'healthy',control_health=control,
             diagnostic_errors=active,validation_rejections=self.memory.get('forecast_validation_rejections',{}),
-            last_successful_tick=self.memory.get('last_successful_tick'),incident_id=incident.get('incident_id'),
+            last_successful_tick=last_tick,heartbeat_state=heartbeat_state,
+            heartbeat_age_seconds=round(heartbeat_age,1) if heartbeat_age is not None else None,
+            writer_state=writer_state,incident_id=incident.get('incident_id'),
             control_error=incident.get('signature') if incident.get('active') else None,
             recorder_status=self.memory.get('decision_recorder_status','pending'),
             plan_execution=self.memory.get('plan_execution'),applied_plan=self.memory.get('applied_plan'),
