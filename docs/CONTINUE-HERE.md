@@ -175,3 +175,56 @@ I/O bridge для незмінної математики V1; це **відхи�
 а не вже доведена parity. Не приховувати його. До release довести збереження
 повної поведінки, незалежний safety, один writer, rollback і доставку магазину;
 якщо доказів немає, не називати кандидат готовим.
+
+
+---
+
+# CLOUD WORK HANDOFF — 13.11.2026
+
+Цей розділ є актуальною точкою передачі для продовження роботи в cloud Work. Попередні історичні блоки вище не скасовують цей checkpoint.
+
+## Мета
+
+Довести один великий реліз Heating AI v0.5.0 до готовності в GitHub/Marketplace. Не змінювати Home Assistant, не встановлювати реліз і не перезапускати HA в межах цієї задачі: власник спочатку зробить backup, встановить v0.5.0 з Marketplace/HACS і сам перезапустить HA.
+
+## Точка коду
+
+- Репозиторій: dragonidf/ha-heating-ai
+- Робоча гілка: release/v0.5.0-history-ui
+- Pull request: https://github.com/dragonidf/ha-heating-ai/pull/39
+- PR-голова на момент передачі: 4e6dbf82ddff844fe9149d91b4c197ef782f49b3
+- Цільова версія: 0.5.0
+- Останній live-реліз у HA: 0.4.13; його не змінювати.
+
+## Уже зроблено у PR #39
+
+- Серверний one-shot watchdog для history comparison: 45 секунд, без polling і без додаткового навантаження на HA.
+- Людська українська помилка history_timeout з безпечним завершенням loading-state.
+- Ігнорування запізнілих executor callbacks після timeout.
+- UI deadline 25 секунд із зрозумілим повідомленням і повтором.
+- Загальний UI re-render зменшений до 60 секунд.
+- Картки fireplace/circulation на вузькому екрані — компактна двоколонкова квадратна сітка.
+- Версія, manifest, CHANGELOG і generated UI asset синхронізовані на 0.5.0.
+- Додано regression test для timeout/stale callback.
+- HA не змінювався і не перезапускався.
+
+## Що потрібно зробити далі
+
+1. Перевірити найновіший GitHub Actions run після commit 4e6dbf8; брати тільки актуальний run/commit, не старі merge-запуски. Якщо є failure — отримати job log, виправити лише в PR #39, оновити generated asset/manifest через tools/build_ui.py, повторити GitHub CI.
+2. Дочекатися зеленого повного Tests workflow (Python 3.12, 3.13, native HA 2026.11, browser/responsive/accessibility де передбачено).
+3. Лише після green checks merge PR #39 у main.
+4. Перевірити main CI та автоматичну публікацію Marketplace/release v0.5.0, включно tag і heating_ai_v1_marketplace.zip.
+5. Після merge оновити цей checkpoint і docs/quality-plan-2026-11-13.md: зафіксувати PR/merge SHA, CI run IDs, release URL; позначити history watchdog і UI audit як DONE, а live acceptance/install як PENDING OWNER.
+6. Перевірити, що в Git немає незгенерованого asset/manifest diff. Не виконувати жодних HA write/service/reload/restart дій.
+
+## Критерії готовності
+
+- PR #39 merged.
+- v0.5.0 існує як GitHub release/tag у Marketplace з повним пакетом.
+- Повний GitHub CI green на точному release commit.
+- Документація містить фактичні SHA/run IDs і короткий rollback/install checklist.
+- У фінальному повідомленні власнику чітко сказано: backup → install v0.5.0 → один HA restart → перевірити history/error UI та компактні картки. Не стверджувати production verification до цього ручного кроку.
+
+## Коротка команда для нового GPT
+
+> Продовжуй dragonidf/ha-heating-ai з розділу CLOUD WORK HANDOFF — 13.11.2026 у docs/CONTINUE-HERE.md: перевір актуальний CI PR #39 для v0.5.0, виправ failures у GitHub, доведи green checks, merge, перевір Marketplace release і онови checkpoint. HA не змінюй і не перезапускай.
