@@ -1,3 +1,9 @@
+# 0.5.1 — 2026-11-14
+
+- Make equipment command echo reconciliation idempotent when the blocking
+  service path and HA state listener confirm the same command concurrently.
+  Prevent duplicate `HA_ECHO` ledger conflicts and the resulting HEAT fence.
+
 # 0.5.0 — 2026-11-13
 
 - Bound history comparison requests with a one-shot server watchdog and a human-readable timeout result; late executor callbacks are ignored safely.

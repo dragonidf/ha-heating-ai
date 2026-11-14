@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 import time
 import re
+import threading
 from uuid import uuid4
 
 from homeassistant.components import frontend, panel_custom
@@ -50,6 +51,8 @@ class NativeController(HeatingClimate):
         self.command_ledger_status = None
         self._command_sequence = 0
         self._pending_command_evidence = {}
+        self._echo_lock = threading.Lock()
+        self._echoed_command_ids = set()
         self._fence_recovery_attempted = False
 
     def attach_command_ledger(self, ledger, status):
@@ -313,18 +316,26 @@ class NativeController(HeatingClimate):
     def record_equipment_command_echo(self, evidence, observed):
         if not observed or not observed.get("matched"):
             return False
-        revision = self.command_ledger.record_ha_echo(
-            evidence["command_id"],
-            at=max(observed["observed_at"], evidence["sent_at"] + 1e-6),
-            **self._ledger_identity())
-        self.command_ledger_status["revision"] = revision
-        self.memory["native_command_evidence"].update(
-            stage="HA_ECHO", ha_echo_at=observed["observed_at"])
-        if evidence["action"] == "STOP" and evidence["domain"] == "climate":
-            revision = self.command_ledger.complete_safe_stop(
-                evidence["command_id"], **self._ledger_identity())
-            self.command_ledger_status.update(revision=revision, fenced=False)
-        self._pending_command_evidence.pop(evidence["command_id"], None)
+        command_id = evidence["command_id"]
+        # The blocking service path and the HA state listener can confirm the
+        # same command concurrently.  A second HA_ECHO is a ledger conflict,
+        # not a new equipment transition.
+        with self._echo_lock:
+            if command_id in self._echoed_command_ids:
+                return True
+            revision = self.command_ledger.record_ha_echo(
+                command_id,
+                at=max(observed["observed_at"], evidence["sent_at"] + 1e-6),
+                **self._ledger_identity())
+            self._echoed_command_ids.add(command_id)
+            self.command_ledger_status["revision"] = revision
+            self.memory["native_command_evidence"].update(
+                stage="HA_ECHO", ha_echo_at=observed["observed_at"])
+            if evidence["action"] == "STOP" and evidence["domain"] == "climate":
+                revision = self.command_ledger.complete_safe_stop(
+                    command_id, **self._ledger_identity())
+                self.command_ledger_status.update(revision=revision, fenced=False)
+            self._pending_command_evidence.pop(command_id, None)
         return True
 
     def command_echo_changed(self, *args):
