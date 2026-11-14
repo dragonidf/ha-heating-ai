@@ -1,3 +1,11 @@
+# 0.5.6 — 2026-11-14
+
+- Deliver the modular Modern UI/UX redesign for Overview, History and Settings.
+- Preserve the complete 0.5.5 controller backend, safety gates, command ledger,
+  planner and Offline Plan Recovery behavior without new polling or Recorder load.
+- Add responsive Chromium/WebKit coverage, accessibility checks and final visual
+  regression protection for compact mobile and desktop heat-source cards.
+
 # 0.5.5
 
 - Serialize thermostat setpoint/mode stages until durable command echo; repeated control ticks wait without duplicate reservations.
