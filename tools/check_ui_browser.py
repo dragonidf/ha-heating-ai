@@ -779,12 +779,13 @@ def main(engine='chromium'):
                     curve:Array.from({length:72},(_,i)=>[Date.now()/1000+(i+1)*1800,21.2,20.5,22,21]),heat_segments:[]}}
             })""")
             page.locator('[data-forecast-horizon="extended"]').click()
-            assert '36,0 год' in page.locator('.chart-card h2').inner_text()
+            assert '36,0 годин' in page.locator('.forecast-plot svg').get_attribute('aria-label')
             for width in (320,390,1440):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.locator('[data-forecast-horizon="24"]').click()
-            assert page.locator('.chart-card h2').inner_text()=='Прогноз на 24 год'
+            assert page.locator('.chart-card h2').inner_text()=='Прогноз'
+            assert page.locator('[data-forecast-horizon="24"]').get_attribute('aria-pressed')=='true'
             for grid in ('off','unknown'):
                 page.evaluate("""grid=>setHeatingScenario({
                     'sensor.heating_grid':{attributes:{raw:grid}},
