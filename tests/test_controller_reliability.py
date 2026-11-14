@@ -127,43 +127,44 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(app.call_service, 'climate/set_hvac_mode', entity_id='climate.boiler', hvac_mode='off')
             self.assertTrue(ledger.status()['fenced'])
 
-    async def test_L04_idempotent_off_requires_fresh_entity_readback(self):
-        for refreshed in (True, False):
-            with self.subTest(refreshed=refreshed), TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+    async def test_L04_idempotent_off_requires_independent_safe_readback(self):
+        for verified in (True, False):
+            with self.subTest(verified=verified), TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
                 hass, app = self.controller(component)
                 ledger = self.attach_real(component, app, folder)
                 app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
+                app.cfg['power_accounting_method'] = 'kws'
                 row = hass.rows['climate.boiler']
                 row.state = 'off'
-                async def readback(domain, service, data, **kwargs):
-                    if domain == 'homeassistant' and service == 'update_entity' and refreshed:
-                        row.last_reported = row.last_updated = datetime.now(timezone.utc)
-                        row.context = kwargs['context']
-                hass.services.async_call.side_effect = readback
-                with patch.object(component.time, 'time', return_value=2000):
+                app.async_independent_stop_seen = Mock(return_value=verified)
+                hass.services.async_call.side_effect = lambda *a, **k: None
+                with patch.object(component.time, 'time', return_value=2000), \
+                        patch.object(component.asyncio, 'sleep', new_callable=__import__('unittest').mock.AsyncMock):
                     await asyncio.to_thread(app._reconcile_writer_fence)
-                self.assertEqual([c.args[:2] for c in hass.services.async_call.await_args_list],
-                                 [('climate','set_hvac_mode'), ('homeassistant','update_entity')])
-                self.assertEqual(ledger.status()['fenced'], not refreshed)
-                if refreshed:
+                self.assertEqual(hass.services.async_call.await_count, 1)
+                self.assertEqual(ledger.status()['fenced'], not verified)
+                if verified:
                     self.assertEqual(app.memory['ledger_recovery']['state'], 'reconciliation_verified')
 
-    async def test_L04_readback_wrong_mode_never_unfences(self):
+    async def test_L04_kws_safe_stop_requires_new_voltages_and_zero_all_phases(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
-            ledger = self.attach_real(component, app, folder)
-            app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
-            row = hass.rows['climate.boiler']
-            row.state = 'off'
-            async def readback(domain, service, data, **kwargs):
-                if domain == 'homeassistant' and service == 'update_entity':
-                    row.state = 'heat'
-                    row.last_reported = row.last_updated = datetime.now(timezone.utc)
-                    row.context = kwargs['context']
-            hass.services.async_call.side_effect = readback
-            with patch.object(component.time, 'time', return_value=2000):
-                await asyncio.to_thread(app._reconcile_writer_fence)
-            self.assertTrue(ledger.status()['fenced'])
+            app.cfg['power_accounting_method'] = 'kws'
+            hass.rows['climate.boiler'].state = 'off'
+            for phase in 'abc':
+                hass.rows['sensor.energy_meter_kotel_napruga_'+phase] = State('v'+phase, 230, at=2002)
+                hass.rows['sensor.energy_meter_kotel_potuzhnist_'+phase] = State('p'+phase, 0, at=1000)
+            with patch.object(component.time, 'time', return_value=2004), \
+                    patch.object(app, 'async_kws_status', return_value={'ready':True}):
+                self.assertTrue(app.async_independent_stop_seen(2000))
+                hass.rows['sensor.energy_meter_kotel_potuzhnist_b'].state='3.0'
+                self.assertFalse(app.async_independent_stop_seen(2000))
+                hass.rows['sensor.energy_meter_kotel_potuzhnist_b'].state='0'
+                hass.rows['sensor.energy_meter_kotel_napruga_c'].last_reported=datetime.fromtimestamp(1999,timezone.utc)
+                self.assertFalse(app.async_independent_stop_seen(2000))
+                hass.rows['sensor.energy_meter_kotel_napruga_c'].last_reported=datetime.fromtimestamp(2002,timezone.utc)
+                hass.rows['climate.boiler'].state='heat'
+                self.assertFalse(app.async_independent_stop_seen(2000))
 
     async def test_clean_target_lowering_does_not_create_a_spurious_fence(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
