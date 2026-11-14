@@ -113,6 +113,14 @@ class NativeController(HeatingClimate):
                 self.memory.pop(key, None)
             self.memory["native_runtime_initialized"] = True
         self._remember_manual_snapshot()
+        # A fence is durable safety state, but the one-shot recovery guard is
+        # runtime state. Reset only the guard on each fresh native runtime so
+        # a fence created by an older process can be reconciled once after
+        # restart. The ledger itself remains authoritative and the recovery
+        # still requires automatic mode before issuing the safe STOP.
+        self.memory.pop("fence_recovery_tick_seen", None)
+        self.memory.pop("fence_recovery_attempted", None)
+        self._fence_recovery_attempted = False
         self.memory["command_generation"] = self.memory.get("command_generation", 0)+1
         self.save()
         for entity in (self.args["armed"], self.args["mode"]):
