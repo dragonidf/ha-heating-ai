@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import fcntl
 from math import isfinite
 from hashlib import sha256
@@ -19,12 +20,14 @@ from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .native_controller.heating_climate import HeatingClimate
+from .native_controller.heating_model import comfort_at
 from .native_controller.heating_ui import system_fields
 from .native_controller.heating_recovery import wire_values
 from .native_voltage import VoltageGuard
 from .production_migration import load_installation
 from .const import DOMAIN, SOURCE_HINTS
-from .critical_ledger import CriticalLedger, FILENAME
+from .critical_ledger import CriticalLedger, LedgerConflict, FILENAME
+from .kws_readiness import KWSReadiness
 
 
 def source_writer_active(hass, now=None):
@@ -49,10 +52,13 @@ class NativeController(HeatingClimate):
         self.voltage_status = None
         self.command_ledger = None
         self.command_ledger_status = None
+        self.kws_readiness = KWSReadiness()
         self._command_sequence = 0
         self._pending_command_evidence = {}
         self._echo_lock = threading.Lock()
         self._echoed_command_ids = set()
+        self._recovery_attempts = 0
+        self._recovery_next_at = 0
         self._fence_recovery_attempted = False
 
     def attach_command_ledger(self, ledger, status):
@@ -64,18 +70,20 @@ class NativeController(HeatingClimate):
         return False
 
     def tick(self, kwargs=None, **extra):
-        """Retry one fenced STOP from the existing 15-second control tick.
-
-        This is deliberately a one-shot per continuous fence: it adds no
-        polling loop and cannot emit repeated STOP commands while a service or
-        echo is unavailable.
-        """
+        """Recover on the existing tick; never create another polling task."""
         try:
-            if not self.memory.get("fence_recovery_tick_seen"):
-                self.memory["fence_recovery_tick_seen"] = True
-                self._reconcile_writer_fence()
+            equipment = self._on_loop(self.async_kws_status)
+            signature = (equipment["reason"], equipment.get("kws_fault"),
+                         (self.voltage_status or {}).get("status"))
+            if signature != getattr(self, "_equipment_signature", None):
+                journal = getattr(self, "decision_journal", None)
+                if journal:
+                    journal.append(dict(event="equipment_transition", before=getattr(self, "_equipment_signature", None),
+                        after=signature, voltage=self.voltage_status, equipment=equipment), stamp=time.time())
+                self._equipment_signature = signature
+            self._reconcile_writer_fence()
         except Exception as exc:
-            self.log("Ledger fence recovery deferred: %s", str(exc), level="WARNING")
+            self.record_failure("ledger_recovery", exc)
         return super().tick(kwargs, **extra)
 
     def listen_event(self, function, event_name, **kwargs):
@@ -249,6 +257,9 @@ class NativeController(HeatingClimate):
         result = self.command_ledger.prepare(command_id, action, request,
                                              **self._ledger_identity())
         self.command_ledger_status["revision"] = result["revision"]
+        if action == "STOP":
+            self.command_ledger_status["fenced"] = result.get("fenced", True)
+            self._pending_command_evidence.clear()
         evidence = dict(command_id=command_id, action=action, domain=domain,
                         service=service, data=dict(data))
         self._pending_command_evidence[command_id] = evidence
@@ -291,6 +302,9 @@ class NativeController(HeatingClimate):
                 return {"matched": False, "observed_at": time.time()}
         if state is not None and domain == "climate" and service == "set_hvac_mode":
             matched = state.state == data.get("hvac_mode")
+            if matched and data.get("hvac_mode") == "off" and evidence is not None:
+                # Service return alone cannot reconcile a pre-existing OFF display.
+                matched = state.last_reported.timestamp() >= evidence.get("sent_at", float("inf"))
             if matched and data.get("hvac_mode") == "heat" \
                     and ((evidence or {}).get("action") == "STOP"):
                 try:
@@ -320,6 +334,8 @@ class NativeController(HeatingClimate):
         # Durable SENT stays unresolved for restart reconciliation; it must not
         # later be mistaken for a manual state change that happens to match.
         self._pending_command_evidence.pop(evidence["command_id"], None)
+        self.command_ledger.fence(**self._ledger_identity())
+        self.command_ledger_status = self.command_ledger.status()
 
     def record_equipment_command_echo(self, evidence, observed):
         if not observed or not observed.get("matched"):
@@ -331,18 +347,35 @@ class NativeController(HeatingClimate):
         with self._echo_lock:
             if command_id in self._echoed_command_ids:
                 return True
-            revision = self.command_ledger.record_ha_echo(
-                command_id,
-                at=max(observed["observed_at"], evidence["sent_at"] + 1e-6),
-                **self._ledger_identity())
+            if command_id not in self._pending_command_evidence:
+                return False  # Superseded/failed evidence cannot borrow a later echo.
+            try:
+                revision = self.command_ledger.record_ha_echo(
+                    command_id,
+                    at=max(observed["observed_at"], evidence["sent_at"] + 1e-6),
+                    **self._ledger_identity())
+            except LedgerConflict as exc:
+                self._pending_command_evidence.pop(command_id, None)
+                self.record_failure("ledger_echo", exc)
+                return False
+            if len(self._echoed_command_ids) >= 256:
+                self._echoed_command_ids.clear()
             self._echoed_command_ids.add(command_id)
             self.command_ledger_status["revision"] = revision
             self.memory["native_command_evidence"].update(
                 stage="HA_ECHO", ha_echo_at=observed["observed_at"])
-            if evidence["action"] == "STOP" and evidence["domain"] == "climate":
+            if (evidence["action"] == "STOP" and evidence["domain"] == "climate"
+                    and evidence["service"] == "set_hvac_mode"
+                    and evidence["data"].get("hvac_mode") == "off"):
                 revision = self.command_ledger.complete_safe_stop(
                     command_id, **self._ledger_identity())
                 self.command_ledger_status.update(revision=revision, fenced=False)
+                self.memory["ledger_recovery"] = dict(state="reconciliation_verified", at=time.time())
+                self.next_compute = 0
+                for stage in ("ledger_recovery", "ledger_echo", "equipment_stop", "fallback_command"):
+                    error = (self.memory.get("diagnostic_errors") or {}).get(stage)
+                    if error and (stage != "fallback_command" or error.get("signature", "").startswith("LedgerConflict:")):
+                        error.update(active=False, recovered_at=time.time())
             self._pending_command_evidence.pop(command_id, None)
         return True
 
@@ -356,41 +389,63 @@ class NativeController(HeatingClimate):
     def _reconcile_writer_fence(self):
         if self.command_ledger_status is None:
             return
+        if self._pending_command_evidence:
+            expired = [e for e in self._pending_command_evidence.values()
+                       if time.time() - e.get("sent_at", time.time()) >= 30]
+            if expired:
+                self.command_ledger.fence(**self._ledger_identity())
+                self.command_ledger_status = self.command_ledger.status()
+                self._pending_command_evidence.clear()
         if not self.command_ledger_status.get("fenced"):
+            self._recovery_attempts = 0
+            self._recovery_next_at = 0
             return
-        if getattr(self.command_ledger, "_fence_recovery_seen", False):
+        now = time.time()
+        active = self._equipment_service_task
+        if active is not None and not active.done():
+            self.memory["ledger_recovery"] = dict(state="reconciliation_waiting", reason="service_in_flight")
             return
-        self.command_ledger._fence_recovery_seen = True
+        online = self.raw("thermostat") not in (None, "unknown", "unavailable")
+        if not online:
+            self._recovery_was_offline = True
+            self.memory["ledger_recovery"] = dict(state="reconciliation_waiting", reason="thermostat_unavailable")
+            return
+        if getattr(self, "_recovery_was_offline", False):
+            self._recovery_attempts = 0
+            self._recovery_next_at = 0
+            self._recovery_was_offline = False
+        if self._recovery_attempts >= 8:
+            self.memory["ledger_recovery"] = dict(state="heat_fenced", reason="manual_reconciliation_required", attempts=8)
+            return
+        if now < self._recovery_next_at:
+            return
         if (self.raw("mode") != "Автоматичне керування"
-                or self._fence_recovery_attempted
-                or self.memory.get("fence_recovery_attempted")):
+                or self.raw("armed") != "on" or not self.cfg.get("allow_actuation")):
+            self.memory["ledger_recovery"] = dict(state="heat_fenced", reason="manual_authority")
             return
-        self._fence_recovery_attempted = True
-        self.memory["fence_recovery_attempted"] = True
         manual = self._remember_manual_snapshot()
         self._dispatch_manual_signature = manual["signature"]
         self._dispatch_manual_epoch = self.memory["native_manual_epoch"]
         self._dispatch_action = "off"
-        evidence = None
+        self._recovery_inflight = True
+        # The legacy manual-change listener must expect our reconciliation OFF.
+        self.command_pending_until = now+20
+        self.memory.update(expected_mode="off", expected_setpoint=self.val("thermostat", attribute="temperature"),
+                           last_command="off", command_at=now,
+                           command_generation=self.memory.get("command_generation", 0)+1)
+        self._recovery_attempts += 1
+        self._recovery_next_at = now + min(300, 30 * 2 ** min(self._recovery_attempts-1, 4))
+        self.memory["ledger_recovery"] = dict(state="safe_stop_required",
+            last_attempt=now, attempts=self._recovery_attempts, next_attempt=self._recovery_next_at)
         try:
-            evidence = self.prepare_equipment_command(
-                "climate", "set_hvac_mode",
-                {"entity_id": self.cfg["thermostat"], "hvac_mode": "off"})
-            self.mark_equipment_command_sent(evidence)
+            # call_service owns PREPARED/SENT/echo. A second reservation here
+            # used to supersede that very STOP and invalidate its callback.
             self.call_service("climate/set_hvac_mode",
                               entity_id=self.cfg["thermostat"], hvac_mode="off")
-            evidence["service_completed_at"] = time.time()
-            observed = self._on_loop(
-                self.async_equipment_command_echo,
-                evidence["domain"], evidence["service"],
-                evidence["data"], evidence)
-            if observed.get("matched"):
-                self.record_equipment_command_echo(evidence, observed)
-        except Exception:
-            if evidence is not None:
-                self._pending_command_evidence.pop(evidence["command_id"], None)
-            raise
+            if self.command_ledger_status.get("fenced"):
+                self.memory["ledger_recovery"]["state"] = "reconciliation_waiting"
         finally:
+            self._recovery_inflight = False
             self._dispatch_action = None
             self._dispatch_manual_signature = None
             self._dispatch_manual_epoch = None
@@ -420,6 +475,53 @@ class NativeController(HeatingClimate):
         return self.voltage_status
 
     @callback
+    def async_kws_status(self):
+        if self.cfg.get("power_accounting_method") != "kws":
+            return dict(ready=True, reason="not_configured")
+        now = time.time()
+        def row(entity):
+            state = self.hass.states.get(entity)
+            if state is None:
+                return {}
+            value = state.state
+            try:
+                value = float(value)
+            except (ValueError, TypeError):
+                pass
+            return dict(value=value, at=state.last_reported.timestamp(),
+                        **({"fault_code": state.attributes["fault_code"]}
+                           if "fault_code" in state.attributes else {}))
+        grid = row(self.cfg["grid"])
+        connection = row(self.cfg["connection"])
+        deye_voltage = row(self.cfg["grid_voltage"])
+        # Binary statuses may legitimately stay unchanged. A live voltage
+        # report from this inverter proves link liveness, not their change time.
+        deye_fresh = (deye_voltage.get("at") is not None
+                      and -5 <= now-deye_voltage["at"] <= 90)
+        physical = ("on" if deye_fresh and connection.get("value") == "on"
+                    and grid.get("value") == "on" and
+                    isinstance(deye_voltage.get("value"), (int, float)) and
+                    deye_voltage["value"] >= 150 else
+                    "off" if deye_fresh and connection.get("value") == "on" and
+                    grid.get("value") == "off" and isinstance(deye_voltage.get("value"), (int, float))
+                    and deye_voltage["value"] < 50 else "unknown")
+        rows = {"status": row(self.cfg.get("kws_status", "sensor.energy_meter_kotel_status")),
+                "relay": row(self.cfg.get("kws_relay", "switch.energy_meter_kotel")),
+                "fault": row(self.cfg.get("kws_fault", "binary_sensor.energy_meter_kotel_problema"))}
+        rows.update({p: row("sensor.energy_meter_kotel_napruga_"+p) for p in "abc"})
+        epochs = []
+        for entity in (self.cfg["grid"], self.cfg["grid_presence_helper"]):
+            state = self.hass.states.get(entity)
+            changed = getattr(state, "last_changed", None)
+            if state is not None and state.state in ("on", "Наявна мережа") and changed is not None:
+                epochs.append(changed.timestamp())
+        grid_epoch = max(epochs) if len(epochs) == 2 else None
+        self.equipment_status = self.kws_readiness.evaluate(now, physical,
+            self.async_voltage_status()["voltage_qualified"], rows,
+            reset_delay=self.cfg.get("kws_reset_delay", 120), grid_epoch=grid_epoch)
+        return self.equipment_status
+
+    @callback
     def async_command_allowed(self, domain, service, data):
         if domain == "fan":
             fan = self.async_fan_snapshot()
@@ -432,7 +534,13 @@ class NativeController(HeatingClimate):
             if fan["control"] != "on":
                 return False
             return service == "turn_off" or fan["mode"] != "Зупинити"
-        if domain != "climate" or (service == "set_hvac_mode" and data.get("hvac_mode") == "off"):
+        if domain != "climate":
+            return True
+        if service == "set_hvac_mode" and data.get("hvac_mode") == "off":
+            if getattr(self, "_recovery_inflight", False):
+                manual = self.async_manual_snapshot()
+                return (manual["signature"] == self._dispatch_manual_signature
+                        and manual["armed"] == "on" and manual["mode"] == "Автоматичне керування")
             return True
         if not self.async_voltage_status()["voltage_qualified"]:
             return False
@@ -446,11 +554,36 @@ class NativeController(HeatingClimate):
             positive = not (isfinite(current) and isfinite(target)) or target > current
         except (ValueError, TypeError, AttributeError, KeyError):
             positive = True
-        if (service == "set_hvac_mode" and data.get("hvac_mode") == "heat"
+        if (service == "set_hvac_mode" and data.get("hvac_mode") in ("heat", "auto")
                 and getattr(self, "_dispatch_action", None) not in ("off", "observe", "release")):
             positive = True
         if not positive:
             return True  # Original V1 release lowers the target in HEAT mode.
+        if (self.command_ledger_status or {}).get("fenced", True):
+            return False
+        if not self.async_kws_status()["ready"]:
+            return False
+        if self.cfg.get("power_accounting_method") == "kws":
+            now = time.time()
+            for role, attribute, age in (("return", None, self.cfg.get("return_max_age", 1200)), ("thermostat", "current_temperature", 5400)):
+                state = self.hass.states.get(self.args.get(role))
+                try:
+                    value = float(state.state if attribute is None else state.attributes.get(attribute))
+                    plausible = 0 < value < 65 if role == "return" else 5 < value < 40
+                    if not isfinite(value) or not plausible or not -5 <= now-state.last_reported.timestamp() <= age:
+                        return False
+                except (ValueError, TypeError, AttributeError):
+                    return False
+            room = self.hass.states.get(self.args.get("room"))
+            try:
+                room_ok = (5 < float(room.state) < 40 and
+                    -5 <= now-room.last_reported.timestamp() <= self.cfg.get("room_max_age", 14400))
+            except (ValueError, TypeError, AttributeError):
+                room_ok = False
+            quality = getattr(self, "temperature_quality", {})
+            bias_at = self.memory.get("thermostat_bias_at", 0)
+            if not room_ok and not (quality.get("backup_usable") and 0 <= now-bias_at <= 86400):
+                return False
         manual = self.async_manual_snapshot()
         if (getattr(self, "_dispatch_manual_signature", None) != manual["signature"]
                 or getattr(self, "_dispatch_manual_epoch", None) !=
@@ -537,6 +670,29 @@ class NativeController(HeatingClimate):
     def apply_action(self, action, once):
         if self.apply_voltage_stop():
             return
+        equipment = self._on_loop(self.async_kws_status)
+        fenced = (self.command_ledger_status or {}).get("fenced", True)
+        automatic_fence = (fenced and self.raw("mode") == "Автоматичне керування" and self.raw("armed") == "on")
+        if automatic_fence or action in ("heat", "fallback") and (fenced or not equipment["ready"]):
+            reason = "Журнал команд: очікується підтверджене вимкнення" if fenced else equipment.get("reason_text", equipment["reason"])
+            self.publish("sensor.heating_controller", "Нагрів заблоковано",
+                         reason=reason, control_state="blocked", equipment_readiness=equipment,
+                         ledger_recovery=self.memory.get("ledger_recovery"),
+                         comfort_available=False)
+            if equipment.get("diagnosis_overdue") and not getattr(self, "_kws_notified", False):
+                self._kws_notified = True
+                self.notify_once("KWS не готовий до нагріву: "+reason)
+            if not fenced and not equipment["ready"] and self.raw("thermostat") not in (None, "unknown", "unavailable", "off"):
+                try:
+                    self.call_service("climate/set_hvac_mode", entity_id=self.cfg["thermostat"], hvac_mode="off")
+                except Exception as exc:
+                    self.record_failure("equipment_stop", exc)
+            self._track_comfort_lock(reason)
+            return
+        self._kws_notified = False
+        lock = self.memory.get("comfort_lock")
+        if lock and lock.get("active"):
+            lock.update(active=False, recovered_at=time.time())
         manual = self._remember_manual_snapshot()
         self._dispatch_manual_signature = manual["signature"]
         self._dispatch_manual_epoch = self.memory["native_manual_epoch"]
@@ -547,6 +703,55 @@ class NativeController(HeatingClimate):
             self._dispatch_action = None
             self._dispatch_manual_signature = None
             self._dispatch_manual_epoch = None
+
+    def _track_comfort_lock(self, reason):
+        room = self.source_temperature()[0]
+        if room is None or room >= self.val("lower", 21.5):
+            return
+        now = time.time()
+        lock = self.memory.get("comfort_lock")
+        if not lock or not lock.get("active"):
+            lock = dict(active=True, since=now, reason=reason, notified=False)
+            self.memory["comfort_lock"] = lock
+        if now-lock["since"] >= 900 and not lock["notified"]:
+            lock["notified"] = True
+            self.notify_once("У кімнаті холодніше допустимого; безпечне резервне опалення недоступне: "+reason)
+
+    def fallback_target(self, current, attrs):
+        target = super().fallback_target(current, attrs)
+        room, _, _, thermostat = self.source_temperature()
+        now = time.time()
+        bias = self.memory.get("thermostat_bias")
+        bias_at = self.memory.get("thermostat_bias_at")
+        quality = getattr(self, "temperature_quality", {})
+        settings = {key: self.val(key, default) for key, default in
+                    (("target", 22), ("lower", 21.5), ("upper", 22.5))}
+        if self.cfg.get("night_target"):
+            settings.update({key: self.val(key) for key in ("night_target", "night_lower", "night_upper")})
+            settings.update(sleep_start=self.raw("sleep_start"), sleep_end=self.raw("sleep_end"))
+        comfort, lower, upper, _ = comfort_at(self.now(), settings)
+        valid = (self.cfg.get("fallback_bias_enabled") is True
+                 and self.raw("mode") == "Автоматичне керування"
+                 and quality.get("primary_status") == "normal"
+                 and quality.get("thermostat_age_seconds", 1e9) <= 300
+                 and all(isinstance(v, (int, float)) and isfinite(v)
+                         for v in (room, thermostat, bias, bias_at, lower, upper, comfort))
+                 and 0 <= now-bias_at <= 86400 and abs(bias) <= 2
+                 and abs(thermostat-room-bias) <= .3
+                 and room < lower-.1 and target >= (current or 0)
+                 and not (self.command_ledger_status or {}).get("fenced", True))
+        if valid:
+            step = float(attrs.get("target_temp_step") or .5)
+            ceiling = min(float(attrs.get("max_temp") or 35), upper+bias)
+            corrected = min(comfort+bias, ceiling)
+            target = max(float(attrs.get("min_temp") or 5),
+                         min(round(corrected/step)*step, int(ceiling/step)*step))
+        unavailable = (isinstance(room, (int, float)) and isinstance(thermostat, (int, float))
+                       and isinstance(lower, (int, float)) and room < lower and target <= thermostat)
+        self.memory["fallback_comfort"] = dict(available=not unavailable, bias_applied=bool(valid))
+        if unavailable:
+            self._track_comfort_lock("Резервний auto не запитує нагрів через різницю показів датчиків")
+        return target
 
     def fan_tick(self, grid, fire_active):
         fan = self._remember_fan_snapshot()
@@ -561,8 +766,31 @@ class NativeController(HeatingClimate):
             self._fan_dispatch_epoch = None
 
     def publish(self, entity, state, **attributes):
+        if entity == "sensor.heating_diagnostics":
+            now = time.time()
+            observation = getattr(self, "power_observation", {})
+            last_tick = self.memory.get("last_successful_tick")
+            try:
+                last_tick = datetime.fromisoformat(last_tick).timestamp() if isinstance(last_tick, str) else float(last_tick or 0)
+            except (TypeError, ValueError):
+                last_tick = 0
+            attributes["reliability"] = dict(
+                computation_alive=0 <= now-last_tick < 45,
+                equipment=getattr(self, "equipment_status", {"ready": False, "reason": "not_verified"}),
+                command_authorized=bool(self._writer and self.memory.get("native_manual_signature")
+                    and self.raw("armed") == "on" and self.raw("mode") == "Автоматичне керування"
+                    and not (self.command_ledger_status or {}).get("fenced", True)),
+                physical_heating_confirmed=bool(observation.get("quality") == "measured"
+                    and 0 <= now-observation.get("at", 0) <= 180 and
+                    (observation.get("watts") or 0) >= 500),
+                ledger_recovery=self.memory.get("ledger_recovery"))
         if entity in ("sensor.heating_heartbeat", "sensor.heating_ui", "sensor.heating_controller"):
             attributes["runtime"] = "native_v1"
+        if entity == "sensor.heating_controller" and attributes.get("control_state") == "fallback":
+            comfort = self.memory.get("fallback_comfort", {})
+            attributes["comfort_available"] = comfort.get("available", False)
+            if comfort.get("available") is False:
+                attributes["reason"] = "Резервний auto не запитує нагрів через різницю показів датчиків"
         hold = getattr(self, "memory", {}).get("voltage_hold")
         if entity == "sensor.heating_controller" and hold:
             state = "Захист напруги"

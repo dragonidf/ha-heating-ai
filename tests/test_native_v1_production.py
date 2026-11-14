@@ -100,7 +100,11 @@ class FakeHA:
 
     async def service(self, domain, service, data, **kwargs):
         if domain == "climate" and service == "set_hvac_mode":
-            self.rows[data["entity_id"]].state = data["hvac_mode"]
+            import time
+            row = self.rows[data["entity_id"]]
+            row.state = data["hvac_mode"]
+            row.context = kwargs.get("context", row.context)
+            row.last_updated = row.last_reported = datetime.fromtimestamp(time.time(), timezone.utc)
 
     def listen(self, ids, callback):
         pair = (ids, callback)
@@ -129,6 +133,14 @@ class FakeLedger:
     def record_ha_echo(self, command_id, **identity):
         self.calls.append(("HA_ECHO",command_id))
         return identity["expected_revision"]+1
+
+    def fence(self, **identity):
+        self.identity = dict(revision=identity['expected_revision']+1,
+            owner_id=identity['owner_id'], boot_id=identity['boot_id'],
+            owner_epoch=identity['owner_epoch']+1, fenced=True)
+
+    def status(self):
+        return self.identity
 
     def complete_safe_stop(self, command_id, **identity):
         self.calls.append(("UNFENCED",command_id))
@@ -369,6 +381,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             app.mark_equipment_command_sent(evidence)
             evidence["service_completed_at"] = 1001
             hass.rows["climate.boiler"].state = "off"
+            hass.rows["climate.boiler"].last_reported = datetime.fromtimestamp(evidence["sent_at"]+1, timezone.utc)
             observed = app.async_equipment_command_echo(
                 "climate", "set_hvac_mode", evidence["data"], evidence)
             self.assertTrue(app.record_equipment_command_echo(evidence, observed))
@@ -441,6 +454,39 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(component.source_writer_active(hass, 1020))
 
 
+    async def test_runtime_close_is_idempotent_and_releases_lease_once(self):
+        with package(self.root / "package") as (component, _):
+            controller = SimpleNamespace(async_close=AsyncMock())
+            lease = Mock()
+            runtime = component.ProductionRuntime(controller, lease)
+            await runtime.close()
+            await runtime.close()
+            controller.async_close.assert_awaited_once()
+            lease.close.assert_called_once()
+            self.assertTrue(runtime._closed)
+
+    async def test_close_cancels_launched_jobs_and_rejects_late_launch(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            started = asyncio.Event()
+            finished = asyncio.Event()
+
+            async def job():
+                started.set()
+                try:
+                    await asyncio.sleep(60)
+                finally:
+                    finished.set()
+
+            task = app._launch(job())
+            await started.wait()
+            await app.async_close()
+            self.assertTrue(task.done())
+            self.assertTrue(finished.is_set())
+            late = app._launch(asyncio.sleep(0))
+            self.assertIsNone(late)
+
+
 class BundleTests(unittest.TestCase):
     def test_shared_mount_export_requires_stopped_app_and_preserves_all_history(self):
         with TemporaryDirectory() as directory:
@@ -508,36 +554,3 @@ class BundleTests(unittest.TestCase):
                 (path/"private/original-state.json").write_text("{}")
                 with self.assertRaises(ValueError):
                     migration.load_installation(path/"private")
-
-
-    async def test_runtime_close_is_idempotent_and_releases_lease_once(self):
-        with package(self.root / "package") as (component, _):
-            controller = SimpleNamespace(async_close=AsyncMock())
-            lease = Mock()
-            runtime = component.ProductionRuntime(controller, lease)
-            await runtime.close()
-            await runtime.close()
-            controller.async_close.assert_awaited_once()
-            lease.close.assert_called_once()
-            self.assertTrue(runtime._closed)
-
-    async def test_close_cancels_launched_jobs_and_rejects_late_launch(self):
-        with package(self.root / "package") as (component, _):
-            hass, app = self.controller(component)
-            started = asyncio.Event()
-            finished = asyncio.Event()
-
-            async def job():
-                started.set()
-                try:
-                    await asyncio.sleep(60)
-                finally:
-                    finished.set()
-
-            task = app._launch(job())
-            await started.wait()
-            await app.async_close()
-            self.assertTrue(task.done())
-            self.assertTrue(finished.is_set())
-            late = app._launch(asyncio.sleep(0))
-            self.assertIsNone(late)

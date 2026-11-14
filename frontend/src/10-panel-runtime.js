@@ -1,10 +1,11 @@
 export class HeatingAIPanel extends HTMLElement {
   constructor() {
     super(); this.attachShadow({mode:'open'}); this.tab='overview'; this.config={}; this.nativeCards=new Map(); this.nativeConfigs=new Map(); this.pending=new Set();
-    this.historyRange=24;this.historyVisible=new Set(['room','return']);this.historyEpoch=0;this.timelineCursor=null;
+    this.historyRange=24;this.historyVisible=new Set(['room','return']);this.historyEpoch=0;this.timelineCursor=null;this.settingsQuery='';
     this.comparisonDays=7;this.comparisonCache=new Map();this.systemDraft={};this.systemHelp=null;this.systemPending=null;
     this.shadowRoot.addEventListener('click',e=>this.clicked(e));
     this.shadowRoot.addEventListener('change',e=>this.changed(e));
+    this.shadowRoot.addEventListener('input',e=>this.inputted(e));
     this.shadowRoot.addEventListener('focusout',()=>setTimeout(()=>this.render(),0));
     this.shadowRoot.addEventListener('cancel',e=>{if(e.target.matches('.system-dialog')){e.preventDefault();this.closeSystemHelp();}},true);
     for(const event of ['pointerdown','pointermove','pointerleave','keydown'])this.shadowRoot.addEventListener(event,e=>this.inspectHistory(e),event==='pointerleave');
@@ -348,6 +349,10 @@ export class HeatingAIPanel extends HTMLElement {
     }
     el.blur();this.render();
   }
+  inputted(e) {
+    if(!e.target.hasAttribute('data-settings-search'))return;
+    this.settingsQuery=e.target.value;this.render();
+  }
   async call(key,service,data) {
     const id=this.id(key), entity=this.hass.states[id];
     if(!entity||['unknown','unavailable'].includes(entity.state)||this.pending.has(id))return;
@@ -359,5 +364,4 @@ export class HeatingAIPanel extends HTMLElement {
     catch(error) {this.error=`Не вдалося зберегти: ${error.message || 'помилка Home Assistant'}`;}
     finally{this.pending.delete(id);this.render();}
   }
-
 

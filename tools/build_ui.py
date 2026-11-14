@@ -17,21 +17,21 @@ JS_SOURCES = (
 
 
 def write_text(path, content):
-    path.write_text(content, newline='\n')
+    path.write_text(content, encoding='utf-8', newline='\n')
 
 
 def bundle_frontend():
     """Build one dependency-free panel asset from maintainable UI sources."""
-    javascript = ''.join(path.read_text() for path in JS_SOURCES)
-    styles = (SOURCE_DIR/'styles.css').read_text()
-    register = (SOURCE_DIR/'30-register.js').read_text()
+    javascript = ''.join(path.read_text(encoding='utf-8') for path in JS_SOURCES)
+    styles = (SOURCE_DIR/'styles.css').read_text(encoding='utf-8')
+    register = (SOURCE_DIR/'30-register.js').read_text(encoding='utf-8')
     return javascript + 'const styles=`\n' + styles + '`;\n' + register
 
 
 def build(check=False):
-    version = (ROOT/'VERSION').read_text().strip()
+    version = (ROOT/'VERSION').read_text(encoding='utf-8').strip()
     core_path = JS_SOURCES[0]
-    core = core_path.read_text()
+    core = core_path.read_text(encoding='utf-8')
     sys.path.insert(0,str(ROOT/'apps/heating_ai'))
     from heating_ui import system_fields
     from heating_model import DEFAULT_MODEL
@@ -46,7 +46,7 @@ def build(check=False):
     source = bundle_frontend()
     panel = FRONTEND/'heating-panel.js'
     if check:
-        if not panel.exists() or panel.read_text() != source:
+        if not panel.exists() or panel.read_text(encoding='utf-8') != source:
             raise SystemExit('Run python tools/build_ui.py to refresh the bundled frontend')
     else:
         write_text(panel, source)
@@ -57,7 +57,7 @@ def build(check=False):
                f'VERSION = {version!r}\nDIGEST = {digest!r}\nSOURCE = {source!r}\n')
     target = ROOT/'apps/heating_ai/heating_ui_assets.py'
     if check:
-        if not target.exists() or target.read_text() != content:
+        if not target.exists() or target.read_text(encoding='utf-8') != content:
             raise SystemExit('Run python tools/build_ui.py and commit the generated assets')
     else:
         write_text(target, content)
@@ -65,7 +65,7 @@ def build(check=False):
     manifest=json.dumps(dict(version=version,module_hashes=modules),sort_keys=True,indent=2)+'\n'
     release=target.parent/'release.json'
     if check:
-        if not release.exists() or release.read_text()!=manifest:
+        if not release.exists() or release.read_text(encoding='utf-8')!=manifest:
             raise SystemExit('Run python tools/build_ui.py to refresh the nine-module release manifest')
     else:
         write_text(release, manifest)
