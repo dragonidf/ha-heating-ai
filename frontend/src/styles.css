@@ -772,3 +772,6 @@ main .overview .hero button,main .overview .heat-sources button,main .overview .
 
 .monthly-inline{flex-wrap:wrap}.compact-history .history-tools h2{min-width:0;overflow-wrap:anywhere}
 @container(max-width:15rem){.compact-history .history-tools{flex-wrap:wrap}.compact-history .history-tools h2{flex-basis:100%;max-width:none}.history-legend{grid-template-columns:1fr}.history-series{justify-content:space-between}.history-series>button{flex:none}}
+.table-value{min-height:44px;padding:2px 0;border:0;border-radius:0;font-size:inherit;line-height:1.3;color:inherit;text-align:left}.table-scroll td:has(.table-value){padding:0 6px}
+.compact-history .history-tools h2{max-width:100px;overflow-wrap:normal}
+@container(max-width:360px){.compact-history .history-tools{flex-wrap:wrap}.compact-history .history-tools h2{flex-basis:100%;max-width:none}}

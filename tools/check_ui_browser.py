@@ -239,7 +239,9 @@ def check_compact_overview(page):
     assert 'Тло — комфортний діапазон' not in page.locator('.chart-card').inner_text()
     assert 'Час майбутнього горіння невідомий' not in page.locator('.chart-card').inner_text()
     page.locator('.forecast-help summary').click()
-    assert 'Час майбутнього горіння невідомий' in page.locator('.chart-card').inner_text()
+    page.locator('.forecast-help>summary').click()
+    assert 'Час майбутнього горіння невідомий' in page.locator('.forecast-help').inner_text()
+    page.locator('.forecast-help>summary').click()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), 'Forecast help overflow'
     page.locator('.forecast-help summary').click()
     for missing in (0,42,59,60):

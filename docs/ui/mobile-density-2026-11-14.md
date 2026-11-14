@@ -34,8 +34,9 @@ Use their density and progressive-disclosure principles, not their branding.
 
 Only UI sources, generated JS/Python UI bundle/fingerprints, UI tests and docs.
 No backend algorithms, command gateway, journal, protection, energy accounting,
-settings schema, WebSocket API or polling/subscriptions are changed. Version
-metadata stays 0.5.6 for this review; release numbering follows design approval.
+settings schema, WebSocket API or polling/subscriptions are changed. Candidate 0.5.7 changes release-version metadata only; all backend Python code
+except the generated UI resource stays byte-identical to 0.5.6. No release is
+published or installed before the owner reviews this candidate.
 
 Local full `make check test` and CI cover existing backend checks as regression
 protection. Browser checks cover 320–1440px, 100/125/200% text, 44px controls,

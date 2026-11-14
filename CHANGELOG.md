@@ -1,3 +1,10 @@
+# 0.5.7
+
+- Compact smartphone overview with daily actual/planned energy, on-demand heating plan and two adjacent heat-source cards.
+- Restore the residual-fireplace forecast lane; reduce chart/history height and move monthly energy into an inline summary.
+- Open source readings in Home Assistant more-info; keep critical failures visible while comfort detail stays under boiler details.
+- UI-only update: preserve the 0.5.6 backend, including 0.5.5 reservation sequencing, journal and safety protections.
+
 # 0.5.6 — 2026-11-14
 
 - Deliver the modular Modern UI/UX redesign for Overview, History and Settings.
