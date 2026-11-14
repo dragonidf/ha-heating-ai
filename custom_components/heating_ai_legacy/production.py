@@ -372,9 +372,9 @@ class NativeController(HeatingClimate):
                 self.command_ledger_status.update(revision=revision, fenced=False)
                 self.memory["ledger_recovery"] = dict(state="reconciliation_verified", at=time.time())
                 self.next_compute = 0
-                for stage in ("ledger_recovery", "ledger_echo", "equipment_stop"):
+                for stage in ("ledger_recovery", "ledger_echo", "equipment_stop", "fallback_command"):
                     error = (self.memory.get("diagnostic_errors") or {}).get(stage)
-                    if error:
+                    if error and (stage != "fallback_command" or error.get("signature", "").startswith("LedgerConflict:")):
                         error.update(active=False, recovered_at=time.time())
             self._pending_command_evidence.pop(command_id, None)
         return True
@@ -428,6 +428,11 @@ class NativeController(HeatingClimate):
         self._dispatch_manual_epoch = self.memory["native_manual_epoch"]
         self._dispatch_action = "off"
         self._recovery_inflight = True
+        # The legacy manual-change listener must expect our reconciliation OFF.
+        self.command_pending_until = now+20
+        self.memory.update(expected_mode="off", expected_setpoint=self.val("thermostat", attribute="temperature"),
+                           last_command="off", command_at=now,
+                           command_generation=self.memory.get("command_generation", 0)+1)
         self._recovery_attempts += 1
         self._recovery_next_at = now + min(300, 30 * 2 ** min(self._recovery_attempts-1, 4))
         self.memory["ledger_recovery"] = dict(state="safe_stop_required",
@@ -667,7 +672,8 @@ class NativeController(HeatingClimate):
             return
         equipment = self._on_loop(self.async_kws_status)
         fenced = (self.command_ledger_status or {}).get("fenced", True)
-        if action in ("heat", "fallback") and (fenced or not equipment["ready"]):
+        automatic_fence = (fenced and self.raw("mode") == "Автоматичне керування" and self.raw("armed") == "on")
+        if automatic_fence or action in ("heat", "fallback") and (fenced or not equipment["ready"]):
             reason = "Журнал команд: очікується підтверджене вимкнення" if fenced else equipment.get("reason_text", equipment["reason"])
             self.publish("sensor.heating_controller", "Нагрів заблоковано",
                          reason=reason, control_state="blocked", equipment_readiness=equipment,

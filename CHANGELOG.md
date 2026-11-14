@@ -1,3 +1,10 @@
+# 0.5.4 — 2026-11-14
+
+- Mark reconciliation OFF as a controller-owned expected command, preventing its echo from selecting Observation as a false manual override.
+- Hold ordinary automatic actions while the journal is fenced so a normal low-target OFF cannot supersede a pending verified-OFF recovery command.
+- Resolve retained ledger-related fallback diagnostics only after verified reconciliation; preserve incident counts and manual thermostat priority.
+- Preserve the existing UI, safety gates, command journal schema, KWS readiness and energy origins. Version metadata only in frontend.
+
 # 0.5.3 — 2026-11-14
 
 - Recover durable HEAT fences using one journalled STOP, fresh OFF evidence and bounded retries; retain SQLite schema v1 and all unresolved evidence.
