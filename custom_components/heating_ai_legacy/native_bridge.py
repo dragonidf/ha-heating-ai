@@ -256,6 +256,9 @@ class Hass:
         # The first pass is memory-only and happens before disk evidence. The
         # second pass closes changes between PREPARED and the HA service call.
         asyncio.run_coroutine_threadsafe(permitted(), self.hass.loop).result(30)
+        pending = getattr(self, "equipment_command_pending", None)
+        if pending is not None and pending(domain, action, data):
+            return False  # Deferred, not sent: the caller must not advance stages.
         evidence = None
         prepare = getattr(self, "prepare_equipment_command", None)
         if domain == "climate" and prepare is not None:
@@ -275,7 +278,13 @@ class Hass:
             if evidence is not None:
                 evidence["service_completed_at"] = datetime.now(timezone.utc).timestamp()
             observe = getattr(self, "async_equipment_command_echo", None)
-            return observe(domain, action, data, evidence) if observe is not None else None
+            try:
+                return observe(domain, action, data, evidence) if observe is not None else None
+            finally:
+                if evidence is not None:
+                    # Only this immediate observation may borrow service return.
+                    # Delayed echoes must prove the controller's own context.
+                    evidence.pop("service_completed_at", None)
         sent = asyncio.run_coroutine_threadsafe(send(), self.hass.loop)
         try:
             observed = sent.result(30)

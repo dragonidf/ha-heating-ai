@@ -113,3 +113,12 @@ See `release-0.5.3-handoff.md`: final review closed restored-config and reload-e
 KWS defects, full local suite is now 654 Python + 53 JS, and 0.5.3 metadata/package
 is prepared. Original audit branch and UI PR #44 remain unchanged. Installation
 and integration reload still require explicit operator approval.
+
+## P0 follow-up: Outstanding reservation / 0.5.5
+
+PR #46 was merged at 9874743 but does not cover unfenced pending setpoint
+reservations. Reproduced the production set_hvac_mode conflict on that main;
+fixed stage deferral, duplicate dispatch and PREPARED expiry in a separate
+worktree/PR. See [evidence, validation and deployment boundary](outstanding-reservation-0.5.5.md).
+659 Python + 53 JS full local checks and 28 final targeted checks passed.
+No production writes; actual recovery still requires approved installation.
