@@ -73,6 +73,12 @@ def main():
             page.locator('nav [data-tab="overview"]').click()
             page.evaluate("document.body.style.cssText+=';--ha-card-background:#fff;--primary-text-color:#202628;--secondary-text-color:#526069;--primary-color:#087e67;background:#f4f6f6';panel.hass={...panel.hass,themes:{darkMode:false}}")
             page.screenshot(path=str(ARTIFACTS/'heating-mobile-overview-light-390.png'),full_page=True)
+            page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{weather_complete:true,morning_reserve:{comfort_deficit:{coverage_complete:true,first_comfort_violation_at:Date.now()/1000+3600,first_violation_temperature:20.8,first_violation_lower:21.0,first_violation_shortfall:.2}}}}})""")
+            assert not page.locator('[data-controller-health]').is_visible(), 'Comfort detail belongs under boiler details'
+            page.locator('.power-advice>summary').click()
+            assert 'нижче мінімуму' in page.locator('.power-advice').inner_text()
+            page.evaluate("setHeatingScenario({'sensor.heating_diagnostics':{attributes:{control_health:'error',control_error:'LedgerConflict: Outstanding reservation'}}})")
+            assert page.locator('[data-controller-health][role="alert"]').is_visible(), 'Critical controller failures must remain visible'
             assert not errors,errors
             browser.close()
     finally:

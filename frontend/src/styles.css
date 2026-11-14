@@ -757,3 +757,18 @@ main{max-width:1120px;margin:auto}
 main .overview .hero button,main .overview .heat-sources button,main .overview .heat-sources summary{min-height:44px}
 .history-placeholder{min-height:238px}
 .heat-sources:has(details[open]){align-items:start}
+.header-live{min-height:44px;padding:0 2px;border:0;font-size:inherit;color:inherit}.hero-status .comfort-bounds{white-space:normal}
+
+/* One accessibility invariant supersedes legacy component-specific heights. */
+.overview button,.overview summary{min-height:44px!important}
+.brand strong{white-space:nowrap}.forecast-help .icon{width:20px;height:20px}
+.heat-sources .card-heading{min-height:44px;align-items:center;gap:4px}.heat-sources .card-heading h2{flex:none;font-size:.875rem}
+.heat-sources .card-heading .source-state{max-width:70%;text-align:right;line-height:1.3}
+.heat-sources .fire-phase{max-width:72%;gap:3px;justify-content:flex-end;min-width:0;white-space:normal}.heat-sources .fire-phase svg{width:18px;height:18px;flex:none}.heat-sources .fire-phase strong{font-size:.6875rem;font-weight:500;overflow-wrap:anywhere;text-align:right;min-width:0}
+.heat-sources .fire-temperature small{display:inline}.history-series{gap:3px}.history-series .history-value small{display:none}
+@container(max-width:360px){.brand-icon{display:none}.brand{gap:0}}
+
+.compact-history .history-tools{gap:4px}.compact-history .history-tools h2{font-size:.8125rem;line-height:1.25;max-width:84px;margin:0;flex:1}.compact-history .history-ranges{gap:0;flex:none}.compact-history .history-ranges button{padding:4px 3px;font-size:.625rem;min-width:44px}.compact-history .history-refresh{flex:none;width:44px;padding:8px}.monthly-inline>.text-button{margin-right:auto;color:var(--green)}
+
+.monthly-inline{flex-wrap:wrap}.compact-history .history-tools h2{min-width:0;overflow-wrap:anywhere}
+@container(max-width:15rem){.compact-history .history-tools{flex-wrap:wrap}.compact-history .history-tools h2{flex-basis:100%;max-width:none}.history-legend{grid-template-columns:1fr}.history-series{justify-content:space-between}.history-series>button{flex:none}}

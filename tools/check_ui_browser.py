@@ -631,7 +631,7 @@ def main(engine='chromium'):
                         assert all(r['x']>=bounds['x']-1 and r['right']<=bounds['x']+bounds['width']+1 for r in labels), (width,'clipped chart labels')
                         history=page.locator('.history-plot svg')
                         page.wait_for_function("Math.abs(panel.shadowRoot.querySelector('.history-plot svg').getBoundingClientRect().width-panel.shadowRoot.querySelector('.history-plot svg').viewBox.baseVal.width)<=1")
-                        assert 225<=history.bounding_box()['height']<=250, (width,'history too short')
+                        assert 215<=history.bounding_box()['height']<=235, (width,'history too short')
                         assert history.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5, (width,'unreadable history labels')
                         assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2
                         assert page.locator('.forecast-stats').count()==0
@@ -822,7 +822,7 @@ def main(engine='chromium'):
                 'sensor.heating_power_model':{state:'fixed_9',attributes:{equipment_version:20}},
                 'sensor.heating_forecast':{attributes:{equipment_version:19}}
             })""")
-            assert 'Режим' in page.locator('.source-modes').inner_text()
+            assert 'Обрано' in page.locator('.source-modes').inner_text()
             assert '9 кВт' in page.locator('.source-modes').inner_text()
             assert 'оновленим профілем' in page.locator('.plan-card').inner_text()
             assert page.locator('.plan-card .session').count()==0

@@ -428,6 +428,11 @@ test('deficit warning uses concrete limits and labels the horizon without stale 
       first_violation_temperature:20.8,first_violation_lower:21.,first_violation_shortfall:.2,outside_visible_horizon:true}}}};
   p.attrs=k=>data[k]||{};p.state=k=>k==='heartbeat'?new Date().toISOString():'';
   assert.match(p.controllerHealth().message,/20,80 °C/);assert.match(p.controllerHealth().message,/поза видимими/);
+  assert.equal(p.controllerHealth().comfortWarning,p.controllerHealth().message);
+  data.diagnostics={control_health:'error',control_error:'LedgerConflict: Outstanding reservation'};
+  assert.equal(p.controllerHealth().comfortWarning,'');
+  assert.match(p.controllerHealth().message,/Безпечне керування/);
+  delete data.diagnostics;
   data.forecast.created_at=new Date(Date.now()-600000).toISOString();
   assert.match(p.controllerHealth().message,/застарів/);assert.doesNotMatch(p.controllerHealth().message,/20,80/);
 });
