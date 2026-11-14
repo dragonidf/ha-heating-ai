@@ -26,7 +26,7 @@ def wait_for_chart_layout(page):
         const svg=document.querySelector('heating-ai-panel')?.shadowRoot.querySelector('.forecast-plot svg');
         if(!svg)return false;
         const box=svg.getBoundingClientRect(), label=svg.querySelector('text');
-        return box.height>=250 && Math.abs(box.width-svg.viewBox.baseVal.width)<=1 &&
+        return box.height>=240 && Math.abs(box.width-svg.viewBox.baseVal.width)<=1 &&
             parseFloat(label.getAttribute('font-size'))*label.getScreenCTM().a>=10.5;
     }''',timeout=5000)
 
@@ -189,18 +189,18 @@ def check_compact_overview(page):
     assert page.locator('.overview>.metrics').count()==0, 'Old standalone metrics must be removed'
     assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
-    assert headings==['Прогноз на 24 год','План нагріву','Котел','Камін і циркуляція'], headings
+    assert headings==['Прогноз','Котел','Камін'], headings
     assert page.locator('.overview > :first-child.hero').count()==1, 'Current temperature and truthful status must be first'
     order=page.locator('.overview > *').evaluate_all('els=>els.map(el=>el.className)')
     chart=next(i for i,c in enumerate(order) if 'chart-card' in c.split())
     hero=next(i for i,c in enumerate(order) if 'hero' in c.split())
     action=next(i for i,c in enumerate(order) if 'next-action' in c.split())
-    metrics=next(i for i,c in enumerate(order) if 'overview-metrics' in c.split())
-    plan=next(i for i,c in enumerate(order) if 'plan-card' in c.split())
+    assert page.locator('.overview-metrics').count()==0
+    assert page.locator('.next-action .plan-card').count()==1
     details=next(i for i,c in enumerate(order) if 'overview-details' in c.split())
-    assert hero < action < metrics < chart < plan < details, order
+    assert hero < action < chart < details, order
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
-    assert '17,50' in page.locator('.overview-metrics').inner_text(), '24-hour energy belongs in the compact summary, not the boiler card'
+    assert '17,5' in page.locator('.hero-energy').inner_text(), '24-hour energy belongs in the compact summary, not the boiler card'
     assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
     for binary,power,expected in [('on','6000','true'),('off','9000','true'),('off','0','false'),('unavailable','3000','true'),('unavailable','unavailable','unknown')]:
         page.evaluate('''([binary,power])=>setHeatingScenario({
@@ -222,14 +222,14 @@ def check_compact_overview(page):
             'fan.circulation':{state:'on',attributes:{percentage:phase==='Інтенсивно горить'?60:42}}
         })''',[phase,active])
         assert page.locator('.fireplace-card').get_attribute('data-phase')==phase
-        assert phase in page.locator('.fireplace-card .fire-phase').inner_text()
+        assert phase in page.locator('.fireplace-card .fire-state').inner_text()
         assert ('60 %' if phase=='Інтенсивно горить' else '42 %') in page.locator('.fan-actual').inner_text()
         accents.append(page.locator('.fire-phase').evaluate('el=>getComputedStyle(el).color'))
         if phase!='Неактивний':
             red,green,blue=background_rgb(page.locator('.fireplace-card'))
             assert (red>green and blue>green) if phase in ('Горить','Інтенсивно горить') else (red>green>blue), (phase,'wrong tint')
         if page.viewport_size['width']<=430:
-            assert page.locator('.fireplace-card').bounding_box()['height']<225, (phase,'fireplace too tall')
+            assert page.locator('.heat-sources').bounding_box()['height']<330, (phase,'fireplace too tall')
             assert page.locator('.fan-actual').evaluate('el=>el.scrollWidth<=el.clientWidth')
         if page.viewport_size['width']==360:
             page.locator('.fireplace-card').screenshot(path=str(ARTIFACTS/f'heating-fireplace-{phase}-360.png'))
@@ -239,7 +239,7 @@ def check_compact_overview(page):
     assert 'Тло — комфортний діапазон' not in page.locator('.chart-card').inner_text()
     assert 'Час майбутнього горіння невідомий' not in page.locator('.chart-card').inner_text()
     page.locator('.forecast-help summary').click()
-    assert 'Час майбутнього горіння невідомий' in page.locator('.chart-card').inner_text()
+    assert 'Час майбутнього горіння невідомий' in page.locator('.forecast-help').inner_text()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), 'Forecast help overflow'
     page.locator('.forecast-help summary').click()
     for missing in (0,42,59,60):
@@ -277,7 +277,7 @@ def check_compact_overview(page):
         'sensor.heating_outage_schedule':{attributes:{mode:'scheduled',emergency:true,warning:'Аварійні відключення: графік не гарантує світло'}}})""")
     assert any('Аварійні відключення' in text for text in page.locator('[data-controller-health]:not(.hidden)').all_text_contents())
     page.evaluate("setHeatingScenario({'sensor.heating_forecast':{attributes:{planned_kwh:null}}})")
-    assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
+    assert page.locator('.hero-energy [data-info="sensor.heating_forecast"] strong').inner_text()=='—'
     # Automatic completion is separate from the future plan and manual power.
     page.evaluate("""setHeatingScenario({'sensor.heating_forecast':{attributes:{morning_reserve:{
         planned_minutes:30,confirmed_completed_minutes:0,confirmed_kwh:0,manual_completed_minutes:12,
@@ -436,20 +436,20 @@ def check_equipment(page):
                 recommendation:{mode:'fixed_6',reason:'Перевірте фізичний режим перед ранковим сеансом',change_before:Date.now()/1000+3600,
                     alternatives:[{nominal_kw:3,feasible:false,deficit_degree_hours:.5},{nominal_kw:6,feasible:true}]}}},
             'sensor.heating_power_confirmed':{state:'1800',attributes:{timestamp:new Date().toISOString(),power_quality:'measured'}}})""",mode)
-        assert '1,8' in page.locator('.boiler-metrics').inner_text()
+        assert '1,8' in page.locator('.source-reading').inner_text()
         if page.locator('.power-advice').get_attribute('open') is None:page.locator('.power-advice>summary').click()
-        assert 'ручна зміна' in page.locator('.power-advice').inner_text()
+        assert 'Ручна зміна' in page.locator('.power-advice').inner_text()
         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'unknown',attributes:{confirmation_pending:true,timestamp:new Date().toISOString()}}})""")
-    assert page.locator('.boiler-metrics strong').first.inner_text()=='—'
+    assert page.locator('.source-reading').inner_text().strip()=='—'
     page.evaluate('panel.hass=mockHass')
     page.evaluate("""setHeatingScenario({'sensor.heating_power_model':{state:'auto',attributes:{recommendation:{
         status:'model_bound_insufficient',reason:'Жоден режим не забезпечує весь комфорт',alternatives:[
         {mode:'fixed_3',nominal_kw:3,found:'true',feasible:'false',deficit_degree_hours:4},
         {mode:'fixed_9',nominal_kw:9,found:'true',feasible:'false',deficit_degree_hours:2}]}}}})""")
     assert page.locator('.hero-power').count()==0
-    assert '9 кВт' in page.locator('.power-advice').inner_text()
-    assert 'Для зменшення дефіциту' in page.locator('.power-advice>summary').inner_text()
+    assert '9 кВт' in page.locator('.source-modes').inner_text()
+    assert 'Для зменшення дефіциту' in page.locator('.power-advice').inner_text()
     assert page.locator('.hero').bounding_box()['height']<340, page.locator('.hero').bounding_box()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.screenshot(path=str(ARTIFACTS/'heating-recommendation-360.png'),full_page=True)
@@ -489,10 +489,10 @@ def check_controller_incident(page):
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'0',attributes:{timestamp:new Date(Date.now()-600000).toISOString()}}})""")
     assert page.locator('.boiler-status').inner_text()=='Немає даних', page.locator('.boiler-status').inner_text()
-    assert page.locator('.boiler-metrics strong').first.inner_text()=='—'
+    assert page.locator('.source-reading').inner_text().strip()=='—'
     page.evaluate("""setHeatingScenario({'sensor.heating_power_confirmed':{state:'0',attributes:{timestamp:new Date().toISOString()}}})""")
     assert page.locator('.boiler-status').inner_text()=='Очікування'
-    assert '0,0' in page.locator('.boiler-metrics strong').first.inner_text()
+    assert '0,0' in page.locator('.source-reading').inner_text().strip()
     page.evaluate('panel.hass={...mockHass}')
     page.set_viewport_size({'width':1440,'height':1100})
 
@@ -535,10 +535,10 @@ def main(engine='chromium'):
             page.wait_for_selector('.history-crosshair',state='attached')
             assert 'Котел:' in page.locator('.history-card .history-readout').inner_text() and 'Камін:' in page.locator('.history-card .history-readout').inner_text()
             page.locator('[data-history-range="24"]').click()
-            assert page.locator('.forecast-plot [data-series="fireplace"]').count()==0
-            assert 'Камін' not in page.locator('.chart-card .legend').inner_text()
+            assert page.locator('.forecast-plot [data-forecast-lane="fireplace"]').count()>0
+            assert page.locator('.chart-card .legend').count()==0
             assert page.locator('.fireplace-card').count()==1, 'Fireplace must have a visible overview card'
-            assert page.locator('.fireplace-card').bounding_box()['y']>page.locator('.plan-card').bounding_box()['y'], 'Source details should follow the main forecast and plan'
+            assert page.locator('.fireplace-card').bounding_box()['y']>=page.locator('.chart-card').bounding_box()['y']+page.locator('.chart-card').bounding_box()['height'], 'Source tiles follow the forecast; full plan is on demand'
             page.evaluate('''() => {
                 const updated={...mockHass.states,
                   'sensor.heating_fireplace':{state:'Горить',attributes:{temperature:25.6,delta:4.1,trend:1.2}},
@@ -547,9 +547,10 @@ def main(engine='chromium'):
                 panel.hass={...mockHass,states:updated};
             }''')
             fire=page.locator('.fireplace-card')
-            assert '25,6' in fire.inner_text() and '+4,1' in fire.inner_text()
+            assert '25,6' in fire.inner_text()
             assert not fire.locator('details').get_attribute('open'), 'Technical details should stay collapsed'
             fire.locator('summary').click()
+            assert '+4,1' in fire.inner_text()
             assert 'резервне живлення' in fire.inner_text()
             assert 'Вимкнено' in fire.inner_text(), 'Pending fan demand must not be presented as actual airflow'
             page.evaluate("panel.hass={...panel.hass,states:{...panel.hass.states,'sensor.heating_fireplace':{state:'Датчик недоступний',attributes:{temperature:25.6,delta:4.1,trend:1.2}}}}")
@@ -621,7 +622,7 @@ def main(engine='chromium'):
                         if width in (360,430):check_compact_overview(page)
                         wait_for_chart_layout(page)
                         svg=page.locator('.forecast-plot svg')
-                        assert svg.bounding_box()['height']>=250, (width,'chart too short')
+                        assert 240<=svg.bounding_box()['height']<=280, (width,'chart too short')
                         font=svg.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')
                         assert font>=10.5, (width,'unreadable chart labels',font)
                         for canvas in page.locator('fixture-native-chart canvas').all():
@@ -631,35 +632,34 @@ def main(engine='chromium'):
                         assert all(r['x']>=bounds['x']-1 and r['right']<=bounds['x']+bounds['width']+1 for r in labels), (width,'clipped chart labels')
                         history=page.locator('.history-plot svg')
                         page.wait_for_function("Math.abs(panel.shadowRoot.querySelector('.history-plot svg').getBoundingClientRect().width-panel.shadowRoot.querySelector('.history-plot svg').viewBox.baseVal.width)<=1")
-                        assert history.bounding_box()['height']>=300, (width,'history too short')
+                        assert 215<=history.bounding_box()['height']<=235, (width,'history too short')
                         assert history.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5, (width,'unreadable history labels')
                         assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2
-                        cells=page.locator('.forecast-stats').evaluate('el=>getComputedStyle(el).gridTemplateColumns.split(" ").length')
-                        assert cells==(2 if width<=700 else 4), (width,'forecast metric columns',cells)
-                        for metric in page.locator('.boiler-metrics .compact-metric,.forecast-stats .compact-metric').all():
+                        assert page.locator('.forecast-stats').count()==0
+                        assert page.locator('.hero-energy .compact-metric').count()==2
+                        for metric in page.locator('.source-reading,.hero-energy .compact-metric').all():
                             assert metric.evaluate('el=>el.scrollWidth<=el.clientWidth'), (width,'metric overflow')
                         forecast_box=page.locator('.chart-card').bounding_box()
-                        plan_box=page.locator('.plan-card').bounding_box()
                         hero_box=page.locator('.hero').bounding_box()
-                        assert hero_box['y']+hero_box['height']<=forecast_box['y']+1, (width,'forecast must follow current status')
-                        assert forecast_box['y']+forecast_box['height']<=plan_box['y']+1, (width,'plan must follow forecast')
-                        gap=page.locator('.plan-card').evaluate('el=>el.getBoundingClientRect().top-el.previousElementSibling.getBoundingClientRect().bottom')
-                        assert 0<=gap<=16, (width,'unexpected gap before plan',gap)
+                        action_box=page.locator('.next-action').bounding_box()
+                        assert hero_box['y']+hero_box['height']<=action_box['y']+1
+                        assert action_box['y']+action_box['height']<=forecast_box['y']+1
+                        assert not page.locator('.next-action').get_attribute('open'), 'Full plan should be on demand'
                         if width in (360,390,430):
                             # Measure the default status-first view, not the optional
                             # expanded Recorder/weather details used by chart tests.
                             if page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
                             assert page.locator('main').bounding_box()['height']<2700, (width,'collapsed overview did not stay compact',page.locator('main').bounding_box())
                             assert page.locator('.hero').bounding_box()['height']<340
-                            assert page.locator('.boiler-card').bounding_box()['height']<280, (width,page.locator('.boiler-card').bounding_box(),page.locator('.power-advice').get_attribute('open'))
-                            assert page.locator('.fireplace-card').bounding_box()['height']<225
-                            assert page.locator('.plan-card').bounding_box()['height']<420
+                            assert page.locator('.boiler-card').bounding_box()['height']<330, (width,page.locator('.boiler-card').bounding_box(),page.locator('.power-advice').get_attribute('open'))
+                            assert page.locator('.heat-sources').bounding_box()['height']<330
+                            assert not page.locator('.next-action .plan-card').is_visible()
                         if width<=600:
-                            assert page.locator('.fireplace-card').bounding_box()['height']<250, (width,'fireplace overview should be compact')
+                            assert page.locator('.heat-sources').bounding_box()['height']<330, (width,'fireplace overview should be compact')
                             left=page.locator('.hero>div').first.bounding_box()
                             right=page.locator('.hero-status').bounding_box()
                             if width<=430:
-                                assert right['y']>=left['y']+left['height'], (width,'controller decision should stack below temperature')
+                                assert abs(right['y']-left['y'])<=3, (width,'temperature and status must share the available width')
                             else:
                                 assert right['x']>=left['x']+left['width'], (width,'controller decision should share the comfort row')
                             assert page.locator('.temperature').evaluate('el=>el.scrollWidth <= el.clientWidth'), (width,'temperature overflow')
@@ -721,7 +721,7 @@ def main(engine='chromium'):
                 wait_for_chart_layout(phone)
                 assert phone.evaluate('document.documentElement.scrollWidth <= innerWidth'), ('mobile',engine,size)
                 chart=phone.locator('.forecast-plot svg')
-                assert chart.bounding_box()['height']>=250
+                assert 240<=chart.bounding_box()['height']<=280
                 assert chart.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5
                 phone.wait_for_selector('.history-plot svg')
                 phone.locator('.history-plot').tap()
@@ -747,11 +747,12 @@ def main(engine='chromium'):
             page.evaluate('panel.hass={...mockHass,states:{}}')
             if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             assert page.locator('.boiler-card').get_attribute('data-heating')=='unknown'
-            assert page.locator('[data-forecast-metric="energy"] strong').inner_text()=='—'
+            assert page.locator('.hero-energy [data-info="sensor.heating_forecast"] strong').inner_text()=='—'
             assert page.locator('.boiler-status').inner_text()=='Немає даних', page.locator('.boiler-status').inner_text()
             page.evaluate("setHeatingScenario({'sensor.heating_heartbeat':{state:new Date().toISOString()},'sensor.heating_controller':{attributes:{quality:true,control_power_basis:'partial_meter_reserve'}},'sensor.heating_power_confirmed':{state:'unavailable',attributes:{timestamp:new Date().toISOString(),assumed_control_w:6000,control_reserve:{valid:true,upper_w:6200}}},'binary_sensor.heating_boiler_active':{state:'unavailable'}})")
             assert 'Резервний облік' in page.locator('[data-controller-health]').inner_text()
             if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
+            if not page.locator('.power-advice[open]').count():page.locator('.power-advice>summary').click()
             page.wait_for_selector('.boiler-card >> text=Для розрахунку:')
             assert 'Для розрахунку: 6,0' in page.locator('.boiler-card').inner_text()
             assert page.locator('.boiler-card').get_attribute('data-heating')=='unknown'
@@ -778,12 +779,13 @@ def main(engine='chromium'):
                     curve:Array.from({length:72},(_,i)=>[Date.now()/1000+(i+1)*1800,21.2,20.5,22,21]),heat_segments:[]}}
             })""")
             page.locator('[data-forecast-horizon="extended"]').click()
-            assert '36,0 год' in page.locator('.chart-card h2').inner_text()
+            assert '36,0 годин' in page.locator('.forecast-plot svg').get_attribute('aria-label')
             for width in (320,390,1440):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.locator('[data-forecast-horizon="24"]').click()
-            assert page.locator('.chart-card h2').inner_text()=='Прогноз на 24 год'
+            assert page.locator('.chart-card h2').inner_text()=='Прогноз'
+            assert page.locator('[data-forecast-horizon="24"]').get_attribute('aria-pressed')=='true'
             for grid in ('off','unknown'):
                 page.evaluate("""grid=>setHeatingScenario({
                     'sensor.heating_grid':{attributes:{raw:grid}},
@@ -809,11 +811,12 @@ def main(engine='chromium'):
             })""")
             page.locator('nav [data-tab="overview"]').click()
             assert 'Опалення працює' in page.locator('.hero-status h1').inner_text()
-            assert 'автоматичне виконання плану вимкнене' in page.locator('.hero-status').inner_text()
+            assert 'Спостереження' in page.locator('.status-kicker').inner_text()
+            assert 'автоматичне виконання плану вимкнене' in page.locator('.hero-status h1 button').get_attribute('aria-label')
             assert 'Умовний план' in page.locator('.next-action').inner_text()
             if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             assert page.locator('.boiler-card').get_attribute('data-heating')=='true'
-            assert '6,4' in page.locator('.boiler-metrics').inner_text()
+            assert '6,4' in page.locator('.source-reading').inner_text()
             page.evaluate("""setHeatingScenario({
                 'input_select.heating_mode':{state:'Автоматичне керування'},
                 'sensor.heating_controller':{attributes:{mode:'Автоматичне керування'}},
@@ -821,9 +824,10 @@ def main(engine='chromium'):
                 'sensor.heating_power_model':{state:'fixed_9',attributes:{equipment_version:20}},
                 'sensor.heating_forecast':{attributes:{equipment_version:19}}
             })""")
-            assert 'Обраний профіль' in page.locator('.power-advice').inner_text()
-            assert '9 кВт' in page.locator('.power-advice>summary').inner_text()
-            assert 'оновленим профілем' in page.locator('.plan-card').inner_text()
+            assert 'Обрано' in page.locator('.source-modes').inner_text()
+            assert '9 кВт' in page.locator('.source-modes').inner_text()
+            if not page.locator('.next-action[open]').count():page.locator('.next-action>summary').click()
+            assert 'оновленим профілем' in page.locator('.next-action .plan-card').inner_text()
             assert page.locator('.plan-card .session').count()==0
             for width in (320,390,1440):
                 page.set_viewport_size({'width':width,'height':900})

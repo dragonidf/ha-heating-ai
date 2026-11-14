@@ -66,7 +66,7 @@ export class HeatingAIPanel extends HTMLElement {
   }
   getCardSize() { return 12; }
   static getStubConfig() { return {}; }
-  id(key) { return this.config.entities?.[key] || this.hass?.states['sensor.heating_ui']?.attributes?.entities?.[key] || defaults[key]; }
+  id(key) { return this.config?.entities?.[key] || this.hass?.states['sensor.heating_ui']?.attributes?.entities?.[key] || defaults[key]; }
   entity(key) { return this.hass?.states[this.id(key)]; }
   state(key) { return this.entity(key)?.state ?? 'unavailable'; }
   attrs(key) { return this.entity(key)?.attributes || {}; }
