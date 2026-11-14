@@ -127,6 +127,44 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(app.call_service, 'climate/set_hvac_mode', entity_id='climate.boiler', hvac_mode='off')
             self.assertTrue(ledger.status()['fenced'])
 
+    async def test_L04_idempotent_off_requires_fresh_entity_readback(self):
+        for refreshed in (True, False):
+            with self.subTest(refreshed=refreshed), TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+                hass, app = self.controller(component)
+                ledger = self.attach_real(component, app, folder)
+                app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
+                row = hass.rows['climate.boiler']
+                row.state = 'off'
+                async def readback(domain, service, data, **kwargs):
+                    if domain == 'homeassistant' and service == 'update_entity' and refreshed:
+                        row.last_reported = row.last_updated = datetime.now(timezone.utc)
+                        row.context = kwargs['context']
+                hass.services.async_call.side_effect = readback
+                with patch.object(component.time, 'time', return_value=2000):
+                    await asyncio.to_thread(app._reconcile_writer_fence)
+                self.assertEqual([c.args[:2] for c in hass.services.async_call.await_args_list],
+                                 [('climate','set_hvac_mode'), ('homeassistant','update_entity')])
+                self.assertEqual(ledger.status()['fenced'], not refreshed)
+                if refreshed:
+                    self.assertEqual(app.memory['ledger_recovery']['state'], 'reconciliation_verified')
+
+    async def test_L04_readback_wrong_mode_never_unfences(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            ledger = self.attach_real(component, app, folder)
+            app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
+            row = hass.rows['climate.boiler']
+            row.state = 'off'
+            async def readback(domain, service, data, **kwargs):
+                if domain == 'homeassistant' and service == 'update_entity':
+                    row.state = 'heat'
+                    row.last_reported = row.last_updated = datetime.now(timezone.utc)
+                    row.context = kwargs['context']
+            hass.services.async_call.side_effect = readback
+            with patch.object(component.time, 'time', return_value=2000):
+                await asyncio.to_thread(app._reconcile_writer_fence)
+            self.assertTrue(ledger.status()['fenced'])
+
     async def test_clean_target_lowering_does_not_create_a_spurious_fence(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             _, app = self.controller(component)
