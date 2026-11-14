@@ -291,6 +291,14 @@ class HeatingRecovery:
             job=self.calculation_jobs.get(result.get('kind'))
             if job and job['id']==result.get('id'):job['completed']=result
 
+    def calculation_rejection(self,kind,reason=None,**details):
+        rejected=getattr(self,'calculation_rejections',{})
+        if reason is None:
+            rejected.pop(kind,None)
+        else:
+            rejected[kind]=dict(reason=reason,**details)
+        self.calculation_rejections=rejected
+
     def poll_calculation(self,kind,key,callback,*args,**kwargs):
         # Workers receive immutable inputs and cannot issue commands or publish state.
         with self.calculation_lock:
@@ -306,17 +314,27 @@ class HeatingRecovery:
                         job.setdefault('timed_out_at',time.time())
                         self.calculation_timeouts=getattr(self,'calculation_timeouts',{})
                         self.calculation_timeouts[kind]=dict(job_id=job['id'],age_seconds=age)
+                        self.calculation_rejection(kind,'timed_out',job_id=job['id'])
                     return None
                 del self.calculation_jobs[kind]
-                if job.get('timed_out_at'):
-                    self.calculation_stale_results=getattr(self,'calculation_stale_results',{})
-                    self.calculation_stale_results[kind]=dict(
-                        job_id=job['id'],completed_at=time.time(),seconds=done.get('seconds'))
-                elif job['key']==key:
-                    if done.get('error'):raise RuntimeError(done['error'])
+                if job['key']==key:
+                    if done.get('error'):
+                        self.calculation_rejection(kind,'worker_error',job_id=job['id'])
+                        raise RuntimeError(done['error'])
                     self.calculation_durations=getattr(self,'calculation_durations',{})
                     self.calculation_durations[kind]=done['seconds']
+                    if job.get('timed_out_at'):
+                        self.calculation_late_results=getattr(self,'calculation_late_results',{})
+                        self.calculation_late_results[kind]=dict(
+                            job_id=job['id'],seconds=done.get('seconds'),accepted_for_replay=True)
+                    self.calculation_rejection(kind)
                     return dict(job,result=done['result'],seconds=done['seconds'])
+                else:
+                    self.calculation_stale_results=getattr(self,'calculation_stale_results',{})
+                    self.calculation_stale_results[kind]=dict(
+                        job_id=job['id'],completed_at=time.time(),seconds=done.get('seconds'),
+                        reason='changed_inputs',timed_out=bool(job.get('timed_out_at')))
+                    self.calculation_rejection(kind,'changed_inputs',job_id=job['id'])
             job=dict(id=uuid4().hex,key=copy.deepcopy(key),args=copy.deepcopy(args),kwargs=copy.deepcopy(kwargs),at=time.time())
             self.calculation_jobs[kind]=job
         try:self.submit_to_executor(self.calculate_snapshot,kind,job['id'],callback,job['args'],job['kwargs'],callback=self.calculation_finished)
@@ -358,6 +376,9 @@ class HeatingRecovery:
             plan_execution=self.memory.get('plan_execution'),applied_plan=self.memory.get('applied_plan'),
             last_full_recompute=self.memory.get('last_full_recompute'),
             calculation_seconds=getattr(self,'calculation_durations',{}),
+            calculation_timeouts=getattr(self,'calculation_timeouts',{}),
+            calculation_rejections=getattr(self,'calculation_rejections',{}),
+            calculation_late_results=getattr(self,'calculation_late_results',{}),
             control_tick_seconds=getattr(self,'control_tick_seconds',None),
             diagnostic_seconds=getattr(self,'diagnostic_seconds',{}),
             state_snapshot_seconds=getattr(self,'state_snapshot_seconds',None),
