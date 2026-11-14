@@ -41,6 +41,7 @@ class BackgroundControlTests(unittest.IsolatedAsyncioTestCase):
         args,kwargs=app.submitted[0];await kwargs['callback']({'result':args[0](*args[1:])})
         with self.assertRaisesRegex(RuntimeError,'division by zero'):
             app.poll_calculation('plan','key',lambda:6)
+        self.assertEqual(app.calculation_rejections['plan']['reason'],'worker_error')
 
     async def test_wrong_or_duplicate_completion_does_not_replace_another_job(self):
         app=self.app();app.poll_calculation('plan','key',lambda:6)
@@ -48,7 +49,7 @@ class BackgroundControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(app.poll_calculation('plan','key',lambda:6))
         self.assertEqual(len(app.submitted),1)
 
-    async def test_timed_out_worker_is_not_duplicated_and_late_result_is_dropped(self):
+    async def test_timed_out_worker_is_not_duplicated_and_late_result_is_accepted_when_key_matches(self):
         app=self.app()
         with patch('heating_recovery.time.time',return_value=100.):
             app.poll_calculation('plan','key',lambda:6)
@@ -58,9 +59,23 @@ class BackgroundControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(app.submitted),1)
         await kwargs['callback']({'result':args[0](*args[1:])})
         with patch('heating_recovery.time.time',return_value=162.):
-            self.assertIsNone(app.poll_calculation('plan','key',lambda:7))
+            ready=app.poll_calculation('plan','key',lambda:7)
+        self.assertEqual(ready['result'],6)
+        self.assertEqual(len(app.submitted),1)
+        self.assertEqual(app.calculation_timeouts['plan']['job_id'],args[2])
+
+    async def test_timed_out_result_with_changed_key_is_rejected_and_replaced_once(self):
+        app=self.app()
+        with patch('heating_recovery.time.time',return_value=100.):
+            app.poll_calculation('plan','old',lambda:6)
+        args,kwargs=app.submitted[0]
+        with patch('heating_recovery.time.time',return_value=161.):
+            self.assertIsNone(app.poll_calculation('plan','old',lambda:7))
+        await kwargs['callback']({'result':args[0](*args[1:])})
+        with patch('heating_recovery.time.time',return_value=162.):
+            self.assertIsNone(app.poll_calculation('plan','new',lambda:9))
         self.assertEqual(len(app.submitted),2)
-        self.assertEqual(app.calculation_stale_results['plan']['job_id'],args[2])
+        self.assertEqual(app.calculation_stale_results['plan']['reason'],'changed_inputs')
 
 
 class BackgroundTickSafetyTests(unittest.TestCase):
@@ -148,6 +163,15 @@ class BackgroundPlanAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         await self.finish(app)
         weather=[dict(ts=now.timestamp()+3600,temperature=-5.)]
         self.assertIsNone(app.background_plan(now,21.5,22.,11.,0.,weather,settings,app.outage_signature))
+        self.assertEqual(len(app.submitted),2)
+
+    async def test_current_key_with_failed_replay_is_rejected_with_bounded_reason(self):
+        app,settings=self.app();now=app.now()
+        app.background_plan(now,21.5,22.,11.,0.,[],settings,app.outage_signature)
+        await self.finish(app)
+        with patch('heating_climate.replay',return_value=None):
+            self.assertIsNone(app.background_plan(now,21.5,22.,11.,0.,[],settings,app.outage_signature))
+        self.assertEqual(app.calculation_rejections['plan']['reason'],'replay_rejected')
         self.assertEqual(len(app.submitted),2)
 
 class DelayedControlEventTests(unittest.TestCase):

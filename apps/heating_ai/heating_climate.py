@@ -673,17 +673,20 @@ class HeatingClimate(HeatingRecovery,Hass):
         changed_gain=any(abs(gain_at(now+timedelta(hours=h),weather,settings)-
             gain_at(now+timedelta(hours=h),issued[6],issued[7]))>=.1 for h in (0,3,12,18))
         if not small or changed_weather or changed_gain:
+            self.calculation_rejection('plan','changed_inputs',job_id=job['id'])
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
             return None
         fresh=replay(now,room,floor,outside,fire,self.model,weather,settings,reference['segments'],
                      reference['split'],3.,reserve_checked=True,window_extensions=approved_extensions(settings,reference))
         if fresh is None:
+            self.calculation_rejection('plan','replay_rejected',job_id=job['id'])
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
             return None
         for name in ('plan_id','parent_plan_id','plan_stable','search_policy_version','search_status','outage_shifted','outage_preheat','split_reason'):
             if name in original:fresh[name]=original[name]
         fresh.update(calculation_started_at=job['at'],calculation_seconds=job['seconds'],
                      stability_reason='План розраховано у фоні та перевірено за поточними вимірами')
+        self.calculation_rejection('plan')
         return fresh,plan_reference(now,room,floor,outside,fire,self.model,weather,settings,fresh)
 
     def publish_equipment(self,ventilation_support=None):
@@ -1564,6 +1567,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                         room is not None and room>=upper or coast_overheat and not once)
         background=getattr(self,'runtime_ready',False) and callable(getattr(self,'submit_to_executor',None))
         ready=None
+        if background and not forecast_quality:
+            self.calculation_rejection('plan','missing_thermal_inputs')
         if background and forecast_quality and valid:
             self.run_diagnostic('power_recommendation',self.update_power_recommendation,now,room,floor,outside,fire,usable_weather,settings,signature)
             if time.time()>=self.next_compute:

@@ -1,5 +1,8 @@
 """Loss of live electrical measurements must not erase the thermal outlook."""
+import asyncio
+from threading import RLock
 import unittest
+from unittest.mock import patch
 import test_planned_execution as execution
 
 
@@ -58,3 +61,33 @@ class OutageForecastContinuityTests(unittest.TestCase):
         self.assertGreater(forecast['planned_kwh'],0)
         self.assertFalse(forecast['validated'])
         self.assertTrue(forecast['electrical_inputs_unavailable'])
+
+    def test_native_background_plan_finishing_after_timeout_is_published_during_blackout(self):
+        fixture=execution.PlannedExecutionTests()
+        actions,_=fixture.cycle(grid='off',measured_power=None,room=20.9,real_planner=True)
+        app=fixture.created_app
+        actions.clear();app.published.clear()
+        app.runtime_ready=True;app.next_compute=0
+        app.calculation_lock=RLock();app.calculation_jobs={};app.submitted=[]
+        app.submit_to_executor=lambda *a,**k:app.submitted.append((a,k))
+        app.memory.pop('plan_reference',None)
+        app.memory.pop('planned_heat_segments',None)
+
+        app.tick_inner()
+        self.assertNotIn('sensor.heating_forecast',app.published)
+        plan_args,plan_kwargs=next(item for item in app.submitted if item[0][1]=='plan')
+        started=app.calculation_jobs['plan']['at']
+        with patch('heating_recovery.time.time',return_value=started+61):
+            app.tick_inner()
+        self.assertEqual(len([item for item in app.submitted if item[0][1]=='plan']),1)
+
+        result=plan_args[0](*plan_args[1:])
+        asyncio.run(plan_kwargs['callback']({'result':result}))
+        with patch('heating_recovery.time.time',return_value=started+62):
+            app.tick_inner()
+
+        forecast=app.published['sensor.heating_forecast']
+        self.assertEqual(forecast['grid_state'],'off')
+        self.assertTrue(forecast['electrical_inputs_unavailable'])
+        self.assertGreater(len(forecast['heat_segments']),0)
+        self.assertNotIn('heat',actions)
