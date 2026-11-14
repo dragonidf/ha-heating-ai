@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import fcntl
 from math import isfinite
 from hashlib import sha256
@@ -256,7 +257,7 @@ class NativeController(HeatingClimate):
                                              **self._ledger_identity())
         self.command_ledger_status["revision"] = result["revision"]
         if action == "STOP":
-            self.command_ledger_status["fenced"] = True
+            self.command_ledger_status["fenced"] = result.get("fenced", True)
             self._pending_command_evidence.clear()
         evidence = dict(command_id=command_id, action=action, domain=domain,
                         service=service, data=dict(data))
@@ -332,9 +333,8 @@ class NativeController(HeatingClimate):
         # Durable SENT stays unresolved for restart reconciliation; it must not
         # later be mistaken for a manual state change that happens to match.
         self._pending_command_evidence.pop(evidence["command_id"], None)
-        if evidence["action"] == "HEAT":
-            self.command_ledger.fence(**self._ledger_identity())
-            self.command_ledger_status = self.command_ledger.status()
+        self.command_ledger.fence(**self._ledger_identity())
+        self.command_ledger_status = self.command_ledger.status()
 
     def record_equipment_command_echo(self, evidence, observed):
         if not observed or not observed.get("matched"):
@@ -371,9 +371,10 @@ class NativeController(HeatingClimate):
                 self.command_ledger_status.update(revision=revision, fenced=False)
                 self.memory["ledger_recovery"] = dict(state="reconciliation_verified", at=time.time())
                 self.next_compute = 0
-                error = (self.memory.get("diagnostic_errors") or {}).get("ledger_recovery")
-                if error:
-                    error.update(active=False, recovered_at=time.time())
+                for stage in ("ledger_recovery", "ledger_echo", "equipment_stop"):
+                    error = (self.memory.get("diagnostic_errors") or {}).get(stage)
+                    if error:
+                        error.update(active=False, recovered_at=time.time())
             self._pending_command_evidence.pop(command_id, None)
         return True
 
@@ -483,8 +484,10 @@ class NativeController(HeatingClimate):
         grid = row(self.args["grid"])
         connection = row(self.args["connection"])
         deye_voltage = row(self.args["grid_voltage"])
-        deye_fresh = all(r.get("at") is not None and -5 <= now-r["at"] <= 90
-                         for r in (grid, connection, deye_voltage))
+        # Binary statuses may legitimately stay unchanged. A live voltage
+        # report from this inverter proves link liveness, not their change time.
+        deye_fresh = (deye_voltage.get("at") is not None
+                      and -5 <= now-deye_voltage["at"] <= 90)
         physical = ("on" if deye_fresh and connection.get("value") == "on"
                     and grid.get("value") == "on" and
                     isinstance(deye_voltage.get("value"), (int, float)) and
@@ -548,7 +551,8 @@ class NativeController(HeatingClimate):
                 state = self.hass.states.get(self.args.get(role))
                 try:
                     value = float(state.state if attribute is None else state.attributes.get(attribute))
-                    if not isfinite(value) or not 0 < value < 65 or not -5 <= now-state.last_reported.timestamp() <= age:
+                    plausible = 0 < value < 65 if role == "return" else 5 < value < 40
+                    if not isfinite(value) or not plausible or not -5 <= now-state.last_reported.timestamp() <= age:
                         return False
                 except (ValueError, TypeError, AttributeError):
                     return False
@@ -715,7 +719,7 @@ class NativeController(HeatingClimate):
                          for v in (room, thermostat, bias, bias_at, lower, upper, comfort))
                  and 0 <= now-bias_at <= 86400 and abs(bias) <= 2
                  and abs(thermostat-room-bias) <= .3
-                 and room < lower-.1 and target > (current or 0)
+                 and room < lower-.1 and target >= (current or 0)
                  and not (self.command_ledger_status or {}).get("fenced", True))
         if valid:
             step = float(attrs.get("target_temp_step") or .5)
@@ -723,6 +727,11 @@ class NativeController(HeatingClimate):
             corrected = min(comfort+bias, ceiling)
             target = max(float(attrs.get("min_temp") or 5),
                          min(round(corrected/step)*step, int(ceiling/step)*step))
+        unavailable = (isinstance(room, (int, float)) and isinstance(thermostat, (int, float))
+                       and isinstance(lower, (int, float)) and room < lower and target <= thermostat)
+        self.memory["fallback_comfort"] = dict(available=not unavailable, bias_applied=bool(valid))
+        if unavailable:
+            self._track_comfort_lock("Резервний auto не запитує нагрів через різницю показів датчиків")
         return target
 
     def fan_tick(self, grid, fire_active):
@@ -741,8 +750,13 @@ class NativeController(HeatingClimate):
         if entity == "sensor.heating_diagnostics":
             now = time.time()
             observation = getattr(self, "power_observation", {})
+            last_tick = self.memory.get("last_successful_tick")
+            try:
+                last_tick = datetime.fromisoformat(last_tick).timestamp() if isinstance(last_tick, str) else float(last_tick or 0)
+            except (TypeError, ValueError):
+                last_tick = 0
             attributes["reliability"] = dict(
-                computation_alive=0 <= now-self.memory.get("last_successful_tick", 0) < 45,
+                computation_alive=0 <= now-last_tick < 45,
                 equipment=getattr(self, "equipment_status", {"ready": False, "reason": "not_verified"}),
                 command_authorized=bool(self._writer and self.memory.get("native_manual_signature")
                     and self.raw("armed") == "on" and self.raw("mode") == "Автоматичне керування"
@@ -753,6 +767,11 @@ class NativeController(HeatingClimate):
                 ledger_recovery=self.memory.get("ledger_recovery"))
         if entity in ("sensor.heating_heartbeat", "sensor.heating_ui", "sensor.heating_controller"):
             attributes["runtime"] = "native_v1"
+        if entity == "sensor.heating_controller" and attributes.get("control_state") == "fallback":
+            comfort = self.memory.get("fallback_comfort", {})
+            attributes["comfort_available"] = comfort.get("available", False)
+            if comfort.get("available") is False:
+                attributes["reason"] = "Резервний auto не запитує нагрів через різницю показів датчиків"
         hold = getattr(self, "memory", {}).get("voltage_hold")
         if entity == "sensor.heating_controller" and hold:
             state = "Захист напруги"

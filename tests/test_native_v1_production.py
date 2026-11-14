@@ -134,6 +134,14 @@ class FakeLedger:
         self.calls.append(("HA_ECHO",command_id))
         return identity["expected_revision"]+1
 
+    def fence(self, **identity):
+        self.identity = dict(revision=identity['expected_revision']+1,
+            owner_id=identity['owner_id'], boot_id=identity['boot_id'],
+            owner_epoch=identity['owner_epoch']+1, fenced=True)
+
+    def status(self):
+        return self.identity
+
     def complete_safe_stop(self, command_id, **identity):
         self.calls.append(("UNFENCED",command_id))
         return identity["expected_revision"]+1

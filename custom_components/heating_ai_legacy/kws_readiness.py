@@ -27,8 +27,12 @@ class KWSReadiness:
                     self.stable_since = now
                 status, relay, fault = (rows.get(k, {}) for k in ('status', 'relay', 'fault'))
                 voltages = [rows.get(p, {}) for p in 'abc']
-                linked = all(fresh(r) and r.get('value') not in (None, 'unknown', 'unavailable')
-                             for r in (status, relay, fault, *voltages))
+                # Same-device voltage reports establish current local link
+                # liveness; an unchanged post-return ON is not a dead relay.
+                linked = (all(fresh(r) for r in voltages) and
+                          all(r.get('at') is not None and r['at'] <= now+5 and
+                              r.get('value') not in (None, 'unknown', 'unavailable')
+                              for r in (status, relay, fault, *voltages)))
                 code = fault.get('fault_code', status.get('fault_code'))
                 if not linked:
                     reason = 'kws_link_unknown'

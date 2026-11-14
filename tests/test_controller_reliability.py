@@ -97,10 +97,31 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
             ledger = self.attach_real(component, app, folder)
+            app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
             hass.rows['climate.boiler'].state = 'off'
             hass.services.async_call.side_effect = lambda *a, **k: None
             with patch.object(component.time, 'time', return_value=2000):
                 await asyncio.to_thread(app.call_service, 'climate/set_hvac_mode', entity_id='climate.boiler', hvac_mode='off')
+            self.assertTrue(ledger.status()['fenced'])
+
+    async def test_clean_target_lowering_does_not_create_a_spurious_fence(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            _, app = self.controller(component)
+            ledger = self.attach_real(component, app, folder)
+            evidence = app.prepare_equipment_command('climate','set_temperature',
+                dict(entity_id='climate.boiler', temperature=20))
+            app.mark_equipment_command_sent(evidence)
+            app.record_equipment_command_echo(evidence, dict(matched=True, observed_at=time.time()))
+            self.assertFalse(ledger.status()['fenced'])
+            app.prepare_equipment_command('climate','set_temperature',
+                dict(entity_id='climate.boiler', temperature=24))
+            # A safe target echo cannot release an existing crash fence.
+            ledger.fence(**app._ledger_identity())
+            app.command_ledger_status = ledger.status()
+            lower = app.prepare_equipment_command('climate','set_temperature',
+                dict(entity_id='climate.boiler', temperature=19))
+            app.mark_equipment_command_sent(lower)
+            app.record_equipment_command_echo(lower, dict(matched=True, observed_at=time.time()))
             self.assertTrue(ledger.status()['fenced'])
 
     async def test_L05_manual_change_during_recovery_prepare_prevents_send(self):
@@ -198,13 +219,13 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.fallback_target(21.5, attrs), 21.5)
                 app.cfg['fallback_bias_enabled'] = True
                 # Correction is allowed only for an actual native demand inside permitted hours.
-                with patch.object(parent, 'fallback_target', return_value=22):
+                with patch.object(parent, 'fallback_target', return_value=21.5):
                     self.assertEqual(app.fallback_target(21.5, attrs), 23)
                     app.command_ledger_status['fenced'] = True
-                    self.assertEqual(app.fallback_target(21.5, attrs), 22)
+                    self.assertEqual(app.fallback_target(21.5, attrs), 21.5)
                     app.command_ledger_status['fenced'] = False
                     app.temperature_quality['primary_status'] = 'stale'
-                    self.assertEqual(app.fallback_target(21.5, attrs), 22)
+                    self.assertEqual(app.fallback_target(21.5, attrs), 21.5)
 
     async def test_U01_recovered_incident_retains_count_and_has_independent_grades(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
@@ -222,6 +243,77 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(grades['physical_heating_confirmed'])
             self.assertFalse(grades['computation_alive'])
             self.assertEqual(grades['ledger_recovery']['state'], 'reconciliation_verified')
+
+    async def test_P01_403mib_archive_tail_off_loop_with_two_busy_jobs(self):
+        import json
+        import tracemalloc
+        from heating_recovery import DecisionJournal
+        with TemporaryDirectory() as folder:
+            path = Path(folder)/'telemetry.jsonl'
+            with path.open('wb') as stream:
+                stream.seek(403*1024*1024)
+                stream.write(b'\n{"ts":1000,"room":21.5}\n')
+            journal = DecisionJournal(folder)
+            heartbeat = []
+            tracemalloc.start()
+            started = time.perf_counter()
+            jobs = asyncio.gather(
+                asyncio.to_thread(lambda: list(journal._recent_telemetry_lines(path, 900))),
+                asyncio.to_thread(time.sleep, .1), asyncio.to_thread(time.sleep, .1))
+            while not jobs.done():
+                heartbeat.append(time.perf_counter())
+                await asyncio.sleep(.01)
+            result = await jobs
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            gaps = sorted(b-a for a,b in zip(heartbeat, heartbeat[1:]))
+            self.assertEqual(json.loads(result[0][-1])['room'], 21.5)
+            self.assertLess(peak, 80*1024*1024)
+            self.assertLess(max(gaps, default=0), 1.5)
+            print(json.dumps(dict(P01='offline sparse 403MiB archive; two busy executor jobs',
+                elapsed_ms=round((time.perf_counter()-started)*1000, 2),
+                heartbeat_p99_ms=round(gaps[min(len(gaps)-1, int(len(gaps)*.99))]*1000, 2) if gaps else 0,
+                python_peak_mib=round(peak/1024/1024, 2))))
+
+    async def test_P02_native_gateway_72h_replay_with_real_bounded_journal(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            ledger = self.attach_real(component, app, folder)
+            on = False
+            for tick in range(72*60*4):
+                stamp = 1000+15*tick
+                phase = tick % 960
+                self.configure_kws(hass, app, stamp)
+                if phase < 8:
+                    hass.rows['binary_sensor.deye_grid'].state = 'off'
+                if 200 <= phase < 210:
+                    hass.rows['binary_sensor.energy_meter_kotel_problema'].state = 'on'
+                if 400 <= phase < 408:
+                    hass.rows['switch.energy_meter_kotel'].state = 'unavailable'
+                manual = 600 <= phase < 620
+                if manual:
+                    hass.rows['input_select.mode'].state = 'Спостереження'
+                with patch.object(component.time, 'time', return_value=stamp):
+                    report = app.async_kws_status()
+                    snap = app._remember_manual_snapshot()
+                    app._dispatch_manual_signature = snap['signature']
+                    app._dispatch_manual_epoch = app.memory['native_manual_epoch']
+                    app._dispatch_action = 'heat'
+                    allowed = app.async_command_allowed('climate', 'set_hvac_mode', {'hvac_mode':'heat'})
+                    self.assertFalse(allowed and (manual or not report['ready']))
+                    demand = tick % 80 < 40 and allowed
+                    if demand != on and not manual:
+                        await asyncio.to_thread(app.call_service, 'climate/set_hvac_mode',
+                            entity_id='climate.boiler', hvac_mode='heat' if demand else 'off')
+                        on = demand
+                if tick % 32 == 0:
+                    self.assertLessEqual(len(ledger.status()['commands']), 256)
+                    await asyncio.sleep(0)
+            status = ledger.status()
+            self.assertLessEqual(len(status['commands']), 256)
+            self.assertFalse(status['fenced'])
+            self.assertFalse(app._pending_command_evidence)
+            self.assertLessEqual(len(app._echoed_command_ids), 256)
 
 
 class BreakerTests(unittest.TestCase):
@@ -283,3 +375,12 @@ class BreakerTests(unittest.TestCase):
         self.assertGreater(ready_count, 0)
         self.assertLess(time.perf_counter()-started, 10)
         self.assertEqual(set(vars(guard)), {'grid_since','stable_since','reset_since'})
+
+    def test_K03_unchanged_post_return_status_uses_live_device_reports(self):
+        guard = kws.KWSReadiness()
+        guard.evaluate(1000, 'on', True, self.rows(1000))
+        rows = self.rows(1600)
+        for key in ('relay', 'status', 'fault'): rows[key]['at'] = 1001
+        self.assertTrue(guard.evaluate(1600, 'on', True, rows)['ready'])
+        rows['relay']['at'] = 999
+        self.assertFalse(guard.evaluate(1600, 'on', True, rows)['ready'])
