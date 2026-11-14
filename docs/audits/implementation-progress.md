@@ -106,3 +106,10 @@ weather, power provenance, archive capacity and temperature-history suites.
   inspection via an approved read channel, staged hardware validation, real
   CPU/RAM/Recorder measurements and seven-day post-release observation. No claim
   of literal 100% uptime or full production certification.
+
+## Production preparation follow-up
+
+See `release-0.5.3-handoff.md`: final review closed restored-config and reload-epoch
+KWS defects, full local suite is now 654 Python + 53 JS, and 0.5.3 metadata/package
+is prepared. Original audit branch and UI PR #44 remain unchanged. Installation
+and integration reload still require explicit operator approval.
