@@ -7,19 +7,25 @@ class KWSReadiness:
         self.grid_since = None
         self.stable_since = None
         self.reset_since = None
+        self.observed_grid_loss = False
 
-    def evaluate(self, now, grid, voltage_ok, rows, reset_delay=120):
+    def evaluate(self, now, grid, voltage_ok, rows, reset_delay=120, grid_epoch=None):
         def fresh(row, age=180):
             at = row.get('at')
             return at is not None and -5 <= now-at <= age
 
         linked = False
         if grid != 'on':
+            self.observed_grid_loss = True
             self.grid_since = self.stable_since = self.reset_since = None
             reason = 'grid_absent' if grid == 'off' else 'grid_unknown'
         else:
             if self.grid_since is None:
-                self.grid_since = now
+                # On reload, use HA's actual grid-return transition. A relay
+                # confirmed after that return need not change again at boot.
+                known_epoch = (not self.observed_grid_loss and isinstance(grid_epoch, (int, float))
+                               and isfinite(grid_epoch) and 0 < grid_epoch <= now)
+                self.grid_since = grid_epoch if known_epoch else now
             if not voltage_ok:
                 self.stable_since = self.reset_since = None
                 reason = 'voltage_unqualified'

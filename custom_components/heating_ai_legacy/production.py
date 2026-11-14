@@ -471,7 +471,7 @@ class NativeController(HeatingClimate):
 
     @callback
     def async_kws_status(self):
-        if self.args.get("power_accounting_method") != "kws":
+        if self.cfg.get("power_accounting_method") != "kws":
             return dict(ready=True, reason="not_configured")
         now = time.time()
         def row(entity):
@@ -486,9 +486,9 @@ class NativeController(HeatingClimate):
             return dict(value=value, at=state.last_reported.timestamp(),
                         **({"fault_code": state.attributes["fault_code"]}
                            if "fault_code" in state.attributes else {}))
-        grid = row(self.args["grid"])
-        connection = row(self.args["connection"])
-        deye_voltage = row(self.args["grid_voltage"])
+        grid = row(self.cfg["grid"])
+        connection = row(self.cfg["connection"])
+        deye_voltage = row(self.cfg["grid_voltage"])
         # Binary statuses may legitimately stay unchanged. A live voltage
         # report from this inverter proves link liveness, not their change time.
         deye_fresh = (deye_voltage.get("at") is not None
@@ -500,13 +500,20 @@ class NativeController(HeatingClimate):
                     "off" if deye_fresh and connection.get("value") == "on" and
                     grid.get("value") == "off" and isinstance(deye_voltage.get("value"), (int, float))
                     and deye_voltage["value"] < 50 else "unknown")
-        rows = {"status": row(self.args.get("kws_status", "sensor.energy_meter_kotel_status")),
-                "relay": row(self.args.get("kws_relay", "switch.energy_meter_kotel")),
-                "fault": row(self.args.get("kws_fault", "binary_sensor.energy_meter_kotel_problema"))}
+        rows = {"status": row(self.cfg.get("kws_status", "sensor.energy_meter_kotel_status")),
+                "relay": row(self.cfg.get("kws_relay", "switch.energy_meter_kotel")),
+                "fault": row(self.cfg.get("kws_fault", "binary_sensor.energy_meter_kotel_problema"))}
         rows.update({p: row("sensor.energy_meter_kotel_napruga_"+p) for p in "abc"})
+        epochs = []
+        for entity in (self.cfg["grid"], self.cfg["grid_presence_helper"]):
+            state = self.hass.states.get(entity)
+            changed = getattr(state, "last_changed", None)
+            if state is not None and state.state in ("on", "Наявна мережа") and changed is not None:
+                epochs.append(changed.timestamp())
+        grid_epoch = max(epochs) if len(epochs) == 2 else None
         self.equipment_status = self.kws_readiness.evaluate(now, physical,
             self.async_voltage_status()["voltage_qualified"], rows,
-            reset_delay=self.args.get("kws_reset_delay", 120))
+            reset_delay=self.cfg.get("kws_reset_delay", 120), grid_epoch=grid_epoch)
         return self.equipment_status
 
     @callback
@@ -551,9 +558,9 @@ class NativeController(HeatingClimate):
             return False
         if not self.async_kws_status()["ready"]:
             return False
-        if self.args.get("power_accounting_method") == "kws":
+        if self.cfg.get("power_accounting_method") == "kws":
             now = time.time()
-            for role, attribute, age in (("return", None, self.args.get("return_max_age", 1200)), ("thermostat", "current_temperature", 5400)):
+            for role, attribute, age in (("return", None, self.cfg.get("return_max_age", 1200)), ("thermostat", "current_temperature", 5400)):
                 state = self.hass.states.get(self.args.get(role))
                 try:
                     value = float(state.state if attribute is None else state.attributes.get(attribute))
@@ -565,7 +572,7 @@ class NativeController(HeatingClimate):
             room = self.hass.states.get(self.args.get("room"))
             try:
                 room_ok = (5 < float(room.state) < 40 and
-                    -5 <= now-room.last_reported.timestamp() <= self.args.get("room_max_age", 14400))
+                    -5 <= now-room.last_reported.timestamp() <= self.cfg.get("room_max_age", 14400))
             except (ValueError, TypeError, AttributeError):
                 room_ok = False
             quality = getattr(self, "temperature_quality", {})

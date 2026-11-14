@@ -227,6 +227,26 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.async_command_allowed('climate','set_hvac_mode', {'hvac_mode':'auto'}))
             hass.services.async_call.assert_not_called()
 
+    async def test_restored_kws_setting_and_existing_post_return_relay_survive_reload(self):
+        with package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            for stamp in range(1000,1151,15):
+                self.configure_kws(hass, app, stamp)
+                # Persisted system settings override the original import args.
+                app.args.pop('power_accounting_method', None)
+                for entity in ('binary_sensor.deye_grid', 'sensor.grid'):
+                    hass.rows[entity].last_changed = datetime.fromtimestamp(800, timezone.utc)
+                for entity in ('sensor.energy_meter_kotel_status','switch.energy_meter_kotel'):
+                    hass.rows[entity].last_reported = datetime.fromtimestamp(900, timezone.utc)
+                with patch.object(component.time, 'time', return_value=stamp):
+                    report = app.async_kws_status()
+            self.assertTrue(report['ready'], report)
+            self.assertNotEqual(report['reason'], 'not_configured')
+            self.assertEqual(report['grid_since'], 800)
+            hass.rows['switch.energy_meter_kotel'].state = 'off'
+            with patch.object(component.time,'time',return_value=1150):
+                self.assertFalse(app.async_kws_status()['ready'])
+
     async def test_T03_opt_in_bias_is_bounded_and_never_used_when_fenced(self):
         with package(self.root/'package') as (component, _):
             _, app = self.controller(component)
@@ -425,7 +445,7 @@ class BreakerTests(unittest.TestCase):
                 self.assertEqual(rows['relay']['value'], 'on')
         self.assertGreater(ready_count, 0)
         self.assertLess(time.perf_counter()-started, 10)
-        self.assertEqual(set(vars(guard)), {'grid_since','stable_since','reset_since'})
+        self.assertEqual(set(vars(guard)), {'grid_since','stable_since','reset_since','observed_grid_loss'})
 
     def test_K03_unchanged_post_return_status_uses_live_device_reports(self):
         guard = kws.KWSReadiness()
@@ -435,3 +455,14 @@ class BreakerTests(unittest.TestCase):
         self.assertTrue(guard.evaluate(1600, 'on', True, rows)['ready'])
         rows['relay']['at'] = 999
         self.assertFalse(guard.evaluate(1600, 'on', True, rows)['ready'])
+
+    def test_observed_grid_loss_cannot_reuse_preoutage_epoch_or_relay(self):
+        guard=kws.KWSReadiness()
+        guard.evaluate(1000,'on',True,self.rows(900),grid_epoch=800)
+        rows=self.rows(1120)
+        for key in ('status','relay','fault'):rows[key]['at']=900
+        self.assertTrue(guard.evaluate(1120,'on',True,rows,grid_epoch=800)['ready'])
+        guard.evaluate(1200,'unknown',False,{})
+        guard.evaluate(1300,'on',True,self.rows(900),grid_epoch=800)
+        self.assertFalse(guard.evaluate(1420,'on',True,self.rows(900),grid_epoch=800)['ready'])
+        self.assertEqual(guard.grid_since,1300)
