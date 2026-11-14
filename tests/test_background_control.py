@@ -48,7 +48,7 @@ class BackgroundControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(app.poll_calculation('plan','key',lambda:6))
         self.assertEqual(len(app.submitted),1)
 
-    async def test_timed_out_worker_is_not_duplicated_and_late_result_is_dropped(self):
+    async def test_timed_out_worker_is_not_duplicated_and_late_result_is_accepted_when_key_matches(self):
         app=self.app()
         with patch('heating_recovery.time.time',return_value=100.):
             app.poll_calculation('plan','key',lambda:6)
@@ -58,9 +58,23 @@ class BackgroundControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(app.submitted),1)
         await kwargs['callback']({'result':args[0](*args[1:])})
         with patch('heating_recovery.time.time',return_value=162.):
-            self.assertIsNone(app.poll_calculation('plan','key',lambda:7))
+            ready=app.poll_calculation('plan','key',lambda:7)
+        self.assertEqual(ready['result'],6)
+        self.assertEqual(len(app.submitted),1)
+        self.assertEqual(app.calculation_timeouts['plan']['job_id'],args[2])
+
+    async def test_timed_out_result_with_changed_key_is_rejected_and_replaced_once(self):
+        app=self.app()
+        with patch('heating_recovery.time.time',return_value=100.):
+            app.poll_calculation('plan','old',lambda:6)
+        args,kwargs=app.submitted[0]
+        with patch('heating_recovery.time.time',return_value=161.):
+            self.assertIsNone(app.poll_calculation('plan','old',lambda:7))
+        await kwargs['callback']({'result':args[0](*args[1:])})
+        with patch('heating_recovery.time.time',return_value=162.):
+            self.assertIsNone(app.poll_calculation('plan','new',lambda:9))
         self.assertEqual(len(app.submitted),2)
-        self.assertEqual(app.calculation_stale_results['plan']['job_id'],args[2])
+        self.assertEqual(app.calculation_stale_results['plan']['reason'],'changed_inputs')
 
 
 class BackgroundTickSafetyTests(unittest.TestCase):
@@ -177,3 +191,4 @@ class DelayedControlEventTests(unittest.TestCase):
         self.assertEqual(power,6000.)
         self.assertAlmostEqual(app.val('energy'),before+6000*45/3600000)
         self.assertGreaterEqual(app.memory['inlet_energy']['unknown_seconds'],225)
+
