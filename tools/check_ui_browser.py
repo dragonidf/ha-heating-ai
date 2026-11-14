@@ -646,10 +646,12 @@ def main(engine='chromium'):
                         gap=page.locator('.plan-card').evaluate('el=>el.getBoundingClientRect().top-el.previousElementSibling.getBoundingClientRect().bottom')
                         assert 0<=gap<=16, (width,'unexpected gap before plan',gap)
                         if width in (360,390,430):
-                            # v0.2.4 was 4493–4550 px on these same synthetic fixtures.
-                            assert page.locator('main').bounding_box()['height']<3650, (width,'overview did not become compact')
-                            assert page.locator('.hero').bounding_box()['height']<225
-                            assert page.locator('.boiler-card').bounding_box()['height']<175, (width,page.locator('.boiler-card').bounding_box(),page.locator('.power-advice').get_attribute('open'))
+                            # Measure the default status-first view, not the optional
+                            # expanded Recorder/weather details used by chart tests.
+                            if page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
+                            assert page.locator('main').bounding_box()['height']<2700, (width,'collapsed overview did not stay compact',page.locator('main').bounding_box())
+                            assert page.locator('.hero').bounding_box()['height']<340
+                            assert page.locator('.boiler-card').bounding_box()['height']<280, (width,page.locator('.boiler-card').bounding_box(),page.locator('.power-advice').get_attribute('open'))
                             assert page.locator('.fireplace-card').bounding_box()['height']<225
                             assert page.locator('.plan-card').bounding_box()['height']<420
                         if width<=600:
@@ -663,6 +665,7 @@ def main(engine='chromium'):
                             assert page.locator('.temperature').evaluate('el=>el.scrollWidth <= el.clientWidth'), (width,'temperature overflow')
                         if width==390:
                             page.screenshot(path=str(ARTIFACTS/f'heating-mobile-overview-{engine}.png'),full_page=True)
+                            page.locator('.overview-details>summary').click()
                             page.locator('.history-card').screenshot(path=str(ARTIFACTS/f'heating-history-mobile-{engine}.png'))
                 if width==390:
                     page.screenshot(path=str(ARTIFACTS/'heating-mobile-model.png'),full_page=True)
