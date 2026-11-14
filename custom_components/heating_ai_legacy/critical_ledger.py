@@ -373,7 +373,9 @@ class CriticalLedger:
             record = body['commands'].get(command_id)
             if (record is None or record['action'] != 'STOP'
                     or record['stage'] != 'HA_ECHO'
-                    or record['request'].get('domain') != 'climate'):
+                    or record['request'].get('domain') != 'climate'
+                    or record['request'].get('service') not in ('set_hvac_mode', 'climate/set_hvac_mode')
+                    or (record['request'].get('values') or record['request']).get('hvac_mode') != 'off'):
                 raise LedgerConflict('Qualified STOP evidence required')
             body['fenced'] = False
             self._trim_confirmed(body)
