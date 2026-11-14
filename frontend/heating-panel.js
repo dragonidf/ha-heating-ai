@@ -1709,7 +1709,7 @@ h1,h2{min-width:0;overflow-wrap:anywhere}button,input,select,textarea{font-famil
 :host{scrollbar-color:var(--muted) var(--surface)}
 @container(max-width:24rem){.model-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.model-grid,.comfort-groups{grid-template-columns:1fr}.hero-side h2{overflow-wrap:anywhere}.comparison-dates>div{grid-template-columns:1fr}}
 
-@container(max-width:18rem){header{flex-wrap:wrap}.brand{flex-shrink:0}.header-status{white-space:normal}.overview .forecast-stats,.plan-energy-grid{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.hero-side{border-left:0;padding-left:0;border-top:1px solid var(--stroke);padding-top:12px}.control-grid,.control-grid.thirds{grid-template-columns:1fr}}
+@container(max-width:18rem){header{flex-wrap:wrap}.brand{flex-shrink:1;max-width:100%}.brand>div{min-width:0}.brand strong,.brand small{overflow-wrap:anywhere}.header-status{white-space:normal}.overview .forecast-stats,.plan-energy-grid{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.hero-side{border-left:0;padding-left:0;border-top:1px solid var(--stroke);padding-top:12px}.control-grid,.control-grid.thirds{grid-template-columns:1fr}}
 @container(max-width:350px){
   .temperature{font-size:2.375rem}
   .temperature span{font-size:1.0625rem}
