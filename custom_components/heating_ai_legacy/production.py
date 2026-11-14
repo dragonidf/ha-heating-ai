@@ -287,6 +287,38 @@ class NativeController(HeatingClimate):
         self.memory["native_command_evidence"].update(stage="SENT", sent_at=evidence["sent_at"])
 
     @callback
+    def async_independent_stop_seen(self, sent_at):
+        """Prove a requested safe STOP from live KWS, never cached OFF alone."""
+        if self.cfg.get("power_accounting_method") != "kws":
+            return False
+        thermostat = self.hass.states.get(self.args["thermostat"])
+        if thermostat is None or thermostat.state != "off":
+            return False
+        if not self.async_kws_status().get("ready"):
+            return False
+        now = time.time()
+        power_kw = 0.0
+        for phase in "abc":
+            volts = self.hass.states.get("sensor.energy_meter_kotel_napruga_" + phase)
+            watts = self.hass.states.get("sensor.energy_meter_kotel_potuzhnist_" + phase)
+            if volts is None or watts is None:
+                return False
+            try:
+                voltage = float(volts.state)
+                power = float(watts.state)
+                reported = volts.last_reported.timestamp()
+            except (ValueError, TypeError, AttributeError):
+                return False
+            if (not isfinite(voltage) or not isfinite(power)
+                    or not sent_at <= reported <= now + 5
+                    or now - reported > 45
+                    or not 190 <= voltage <= 260
+                    or not 0 <= power < 0.15):
+                return False
+            power_kw += power
+        return power_kw < 0.15
+
+    @callback
     def async_equipment_command_echo(self, domain, service, data, evidence=None):
         # Notifications have notification_id, not an equipment entity. They
         # cannot supply physical command evidence or enter HA StateMachine.get.
@@ -315,7 +347,10 @@ class NativeController(HeatingClimate):
             matched = state.state == data.get("hvac_mode")
             if matched and data.get("hvac_mode") == "off" and evidence is not None:
                 # Service return alone cannot reconcile a pre-existing OFF display.
-                matched = state.last_reported.timestamp() >= evidence.get("sent_at", float("inf"))
+                sent_at = evidence.get("sent_at", float("inf"))
+                matched = (state.last_reported.timestamp() >= sent_at or
+                           evidence.get("service_completed_at") is not None and
+                           evidence.get("independent_off_verified_at", -1) >= sent_at)
             if matched and data.get("hvac_mode") == "heat" \
                     and ((evidence or {}).get("action") == "STOP"):
                 try:
