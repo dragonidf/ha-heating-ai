@@ -1074,7 +1074,7 @@ export class HeatingAIPanel extends HTMLElement {
 const styles=`
 /* The surrounding HA theme owns the palette, typography and surface shape. */
 :host {
-  display:block;width:100%;min-width:0;container-type:inline-size;
+  display:block;width:100%;min-width:0;overflow-x:clip;container-type:inline-size;
   color:var(--primary-text-color,#e8e8e8);
   --green:var(--primary-color,#69d5b2);
   --muted:var(--secondary-text-color,#b4b4b4);
