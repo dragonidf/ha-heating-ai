@@ -198,7 +198,7 @@ def check_compact_overview(page):
     details=next(i for i,c in enumerate(order) if 'overview-details' in c.split())
     assert hero < action < metrics < chart < plan < details, order
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
-    assert '17,50' in page.locator('.boiler-card').inner_text()
+    assert '17,50' in page.locator('.overview-metrics').inner_text(), '24-hour energy belongs in the compact summary, not the boiler card'
     assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
     for binary,power,expected in [('on','6000','true'),('off','9000','true'),('off','0','false'),('unavailable','3000','true'),('unavailable','unavailable','unknown')]:
         page.evaluate('''([binary,power])=>setHeatingScenario({
