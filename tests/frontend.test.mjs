@@ -486,6 +486,8 @@ test('mobile overview keeps the full plan on demand and daily energy in the curr
   // Switching to a longer chart horizon must not relabel its energy as 24 hours.
   p.forecastExtended=true;p.forecastData=()=>({planned_kwh:99,horizon_hours:72});
   assert.doesNotMatch(p.overview(),/99,0/);
+  p.controllerHealth=()=>({stale:true});assert.doesNotMatch(p.overview(),/23,0/);
+  p.controllerHealth=()=>({stale:false});
   p.state=()=> 'unavailable';assert.doesNotMatch(p.overview(),/>0,0/);
 });
 test('forecast preserves a distinct residual-fireplace lane without duplicating the legend',()=>{
