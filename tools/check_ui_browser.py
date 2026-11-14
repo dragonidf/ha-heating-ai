@@ -68,7 +68,9 @@ def check_theme_and_motion(page):
         for text in colors[1:]:
             a,b=sorted([lum(colors[0]),lum(text)])
             assert (b+.05)/(a+.05)>=4.5, (name,'text contrast')
-        assert page.locator('.forecast-plot path[stroke="var(--history-room)"][stroke-dasharray]').evaluate('el=>getComputedStyle(el).stroke')==page.locator('[data-history-line="room"]').first.evaluate('el=>getComputedStyle(el).stroke'), (name,'room series color differs between charts')
+        forecast=page.locator('.forecast-plot path[stroke="var(--forecast)"][stroke-dasharray]')
+        assert forecast.count()==1, (name,'forecast line missing')
+        assert forecast.evaluate('el=>getComputedStyle(el).stroke')!=page.locator('[data-history-line="room"]').first.evaluate('el=>getComputedStyle(el).stroke'), (name,'forecast and measured history must stay visually distinct')
         for width in (390,1440):
             page.set_viewport_size({'width':width,'height':1000})
             for tab in ('overview','settings','model'):
