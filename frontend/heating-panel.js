@@ -643,7 +643,10 @@ export class HeatingAIPanel extends HTMLElement {
     const nearest=(values,time,key)=>values.reduce((best,row)=>best===null||Math.abs(row.ts-time)<Math.abs(best.ts-time)?row:best,null)?.[key];
     const cursorTemperature=cursor===null?null:numeric(nearest(rows,cursor,'temperature'));
     const planned=cursor===null?null:mergeSegments(a.heat_segments).find(segment=>segment.start<=cursor&&cursor<segment.end);
-    const readout=cursor===null?'Торкніться або наведіть на графік, щоб побачити значення.':`${this.time(cursor,true)} · Прогноз: ${cursorTemperature===null?'—':fmt(cursorTemperature)+' °C'} · Котел: ${planned?'заплановано':'вимкнено'}`;
+    const scheduledOutage=cursor===null?null:outages.find(segment=>segment.start<=cursor&&cursor<segment.end);
+    const planState=planned?(isTrue(planned.conditional)?'умовний':'підтверджений'):'немає сеансу';
+    const gridState=scheduledOutage?'за графіком недоступна':known===null||cursor>known?'невідомо':'доступна за графіком';
+    const readout=cursor===null?'Торкніться або наведіть на графік, щоб побачити значення.':`${this.time(cursor,true)} · Прогноз: ${cursorTemperature===null?'—':fmt(cursorTemperature)+' °C'} · Котел: ${planned?'заплановано':'вимкнено'} · План: ${planState} · Мережа: ${gridState}`;
     return svg+`</svg></div><div class="legend"><span class="forecast-legend">┄ Прогноз температури</span><span class="heat-legend">■ План нагріву</span>${outages.length?'<span class="outage-legend">■ Відключення</span>':''}</div><p class="history-readout muted" aria-live="polite">${h(readout)}</p>`;
   }
   compactMetric(label,value,unit='',entity='',key='') {

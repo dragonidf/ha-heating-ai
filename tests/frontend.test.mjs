@@ -146,6 +146,7 @@ test('home opens with a forecast-only timeline and three simple tabs',()=>{
   const forecast={created_at:new Date(now*1000).toISOString(),horizon_hours:24,curve:[{ts:now,temperature:21.3,lower:20,upper:22},{ts:now+3600,temperature:21.5,lower:20,upper:22}],heat_segments:[{start:now+600,end:now+1200}]};
   p.attrs=key=>key==='forecast'?forecast:key==='outages'?{outages:[]}:{};p._hass={states:{}};
   const chart=p.forecastChart();assert.match(chart,/home-timeline/);assert.match(chart,/role="slider"/);assert.doesNotMatch(chart,/Факт кімнати|KWS 3·6·9|Факт: 21,2 °C/);assert.match(chart,/Прогноз температури/);assert.match(chart,/План нагріву/);assert.match(chart,/Прогноз: 21,3 °C/);
+  p.timelineCursor=now+700;const planned=p.forecastChart();assert.match(planned,/План: підтверджений/);assert.match(planned,/Мережа: невідомо/);
   const source=HeatingAIPanel.prototype.render.toString();assert.match(source,/\['overview','Огляд'\].*\['model','Історія'\].*\['settings','Налаштування'\]/s);
 });
 test('history graph is the first model content and labels the actual advance lead',()=>{

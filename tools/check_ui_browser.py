@@ -11,7 +11,7 @@ from heating_model import DEFAULT_MODEL
 from playwright.sync_api import sync_playwright
 
 ROOT=Path(__file__).resolve().parents[1]
-ARTIFACTS=ROOT.parent/'artifacts'
+ARTIFACTS=ROOT/'artifacts'
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -507,7 +507,7 @@ def main(engine='chromium'):
             errors=[]
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
-            page.wait_for_selector('heating-ai-panel >> text=Зберігає тепло')
+            page.wait_for_selector('heating-ai-panel .hero-status h1')
             page.evaluate('''fields=>{
                 mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,persisted_revision:0,schema_version:1,values:Object.fromEntries(fields.map(f=>[f.key,f.value]))}}};
                 panel.hass={...mockHass};
