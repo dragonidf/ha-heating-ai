@@ -1759,8 +1759,11 @@ h1,h2{min-width:0;overflow-wrap:anywhere}button,input,select,textarea{font-famil
   .hero-status{padding-left:16px}
 }
 @container(max-width:430px){
-  .overview .hero{grid-template-columns:1fr;gap:14px}
-  .hero-status{border-left:0;border-top:1px solid var(--stroke);padding:14px 0 0}
+  .overview .hero{grid-template-columns:1fr;gap:10px;padding:14px}
+  .hero-status{border-left:0;border-top:1px solid var(--stroke);padding:10px 0 0}
+  .hero-status h1{margin:6px 0 4px}
+  .hero-status p{line-height:1.4}
+  .comfort-line{gap:6px 14px;margin-top:10px;padding-top:10px}
   .overview-metrics .compact-metric{min-height:82px;padding:12px}
   .next-action{align-items:flex-start}.action-arrow{display:none}
   .section-heading{align-items:flex-start}.section-heading>.muted{text-align:right;max-width:48%}

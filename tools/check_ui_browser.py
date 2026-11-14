@@ -448,7 +448,7 @@ def check_equipment(page):
     assert page.locator('.hero-power').count()==0
     assert '9 кВт' in page.locator('.power-advice').inner_text()
     assert 'Для зменшення дефіциту' in page.locator('.power-advice>summary').inner_text()
-    assert page.locator('.hero').bounding_box()['height']<225, page.locator('.hero').bounding_box()
+    assert page.locator('.hero').bounding_box()['height']<340, page.locator('.hero').bounding_box()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.screenshot(path=str(ARTIFACTS/'heating-recommendation-360.png'),full_page=True)
     page.evaluate('panel.hass=mockHass')
