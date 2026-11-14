@@ -184,6 +184,92 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             hass.services.async_call.assert_not_called()
             self.assertTrue(ledger.status()['fenced'])
 
+    async def test_unfinished_setpoint_reservation_defers_mode_and_repeated_apply(self):
+        for action in ('heat', 'fallback'):
+            with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+                hass, app = self.controller(component)
+                app.climate_tz=timezone.utc
+                app.fallback_target=Mock(return_value=24)
+                app.notify_once=Mock()
+                ledger = self.attach_real(component, app, folder)
+                app.cfg['energy']='sensor.energy'
+                hass.rows['climate.boiler'].state = 'off'
+                hass.rows['climate.boiler'].attributes['temperature'] = 20
+                app.save=Mock(); app.decision_event=Mock(); app.run_in=Mock()
+                app.source_temperature=Mock(return_value=(21, 'room'))
+                app.active_upper=Mock(return_value=23)
+                app.grid_state=Mock(return_value='on')
+                app.read_outage_schedule=Mock(return_value=dict(valid=False))
+                async def delayed(domain, service, data, **kwargs):
+                    if service == 'set_hvac_mode':
+                        await hass.service(domain, service, data, **kwargs)
+                hass.services.async_call.side_effect=delayed
+                with patch.object(component.time,'time',return_value=1000), \
+                        patch.object(app,'apply_voltage_stop',return_value=False), \
+                        patch.object(app,'async_voltage_status',return_value=dict(voltage_qualified=True)), \
+                        patch.object(app,'async_kws_status',return_value=dict(ready=True,reason='ready')):
+                    for _ in range(3):
+                        await asyncio.to_thread(app.apply_action,action,False)
+                    self.assertEqual(hass.services.async_call.await_count,1)
+                    pending=next(iter(app._pending_command_evidence.values()))
+                    self.assertEqual(ledger.status()['commands'][pending['command_id']]['stage'],'SENT')
+                    self.assertFalse(ledger.status()['fenced'])
+                    self.assertNotEqual(app.memory.get('last_command'),action)
+                    # A real delayed HA echo permits the next stage on the next tick.
+                    row=hass.rows['climate.boiler']
+                    row.attributes['temperature']=24
+                    row.context=app._context
+                    row.last_updated=row.last_reported=datetime.now(timezone.utc)
+                    await asyncio.to_thread(app.command_echo_changed)
+                    await asyncio.to_thread(app.apply_action,action,False)
+                self.assertEqual(hass.services.async_call.await_count,2)
+                self.assertEqual(row.state,'heat' if action=='heat' else 'auto')
+                self.assertEqual(app.memory['last_command'],action)
+                self.assertFalse(app._pending_command_evidence)
+                self.assertTrue(all(c['stage']=='HA_ECHO' for c in ledger.status()['commands'].values()))
+
+
+    async def test_pending_prepared_or_sent_times_out_to_verified_stop_without_restart(self):
+        for sent in (False, True):
+            with self.subTest(sent=sent), TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+                hass, app=self.controller(component)
+                ledger=self.attach_real(component,app,folder)
+                with patch.object(component.time,'time',return_value=1000):
+                    evidence=app.prepare_equipment_command('climate','set_hvac_mode',
+                        dict(entity_id='climate.boiler',hvac_mode='heat'))
+                    if sent: app.mark_equipment_command_sent(evidence)
+                self.assertTrue(app.equipment_command_pending('climate','set_temperature',dict(temperature=24)))
+                with patch.object(component.time,'time',return_value=1029):
+                    await asyncio.to_thread(app._reconcile_writer_fence)
+                hass.services.async_call.assert_not_called()
+                with patch.object(component.time,'time',return_value=1030):
+                    await asyncio.to_thread(app._reconcile_writer_fence)
+                commands=ledger.status()['commands']
+                self.assertEqual(commands[evidence['command_id']]['stage'],'UNKNOWN')
+                self.assertEqual(len(commands),2)
+                self.assertFalse(ledger.status()['fenced'])
+                self.assertEqual(hass.services.async_call.await_count,1)
+                self.assertEqual(app.memory['ledger_recovery']['state'],'reconciliation_verified')
+
+    async def test_emergency_off_supersedes_pending_heat_but_repeated_off_waits(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            hass, app=self.controller(component)
+            ledger=self.attach_real(component,app,folder)
+            with patch.object(component.time,'time',return_value=1000):
+                evidence=app.prepare_equipment_command('climate','set_hvac_mode',
+                    dict(entity_id='climate.boiler',hvac_mode='heat'))
+                app.mark_equipment_command_sent(evidence)
+                hass.services.async_call.side_effect=lambda *a,**k: None
+                for _ in range(3):
+                    await asyncio.to_thread(app.call_service,'climate/set_hvac_mode',
+                        entity_id='climate.boiler',hvac_mode='off')
+            self.assertEqual(hass.services.async_call.await_count,1)
+            self.assertEqual(len(ledger.status()['commands']),2)
+            self.assertTrue(ledger.status()['fenced'])
+            # A matching older command or pre-existing OFF must not un-fence.
+            self.assertFalse(app.record_equipment_command_echo(evidence,dict(matched=True,observed_at=1001)))
+            self.assertTrue(ledger.status()['fenced'])
+
     async def test_L05_manual_change_during_recovery_prepare_prevents_send(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             hass, app = self.controller(component)

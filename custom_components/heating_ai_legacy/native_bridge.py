@@ -256,6 +256,9 @@ class Hass:
         # The first pass is memory-only and happens before disk evidence. The
         # second pass closes changes between PREPARED and the HA service call.
         asyncio.run_coroutine_threadsafe(permitted(), self.hass.loop).result(30)
+        pending = getattr(self, "equipment_command_pending", None)
+        if pending is not None and pending(domain, action, data):
+            return False  # Deferred, not sent: the caller must not advance stages.
         evidence = None
         prepare = getattr(self, "prepare_equipment_command", None)
         if domain == "climate" and prepare is not None:

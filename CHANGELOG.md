@@ -1,3 +1,8 @@
+# 0.5.5
+
+- Serialize thermostat setpoint/mode stages until durable command echo; repeated control ticks wait without duplicate reservations.
+- Unconfirmed PREPARED/SENT commands retain history and recover through timed, verified safe STOP. Safety and manual interlocks remain enforced.
+
 # 0.5.4 — 2026-11-14
 
 - Mark reconciliation OFF as a controller-owned expected command, preventing its echo from selecting Observation as a false manual override.

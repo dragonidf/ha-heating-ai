@@ -243,6 +243,17 @@ class NativeController(HeatingClimate):
         except (ValueError, TypeError, AttributeError, KeyError):
             return "HEAT"
 
+    def equipment_command_pending(self, domain, service, data):
+        if domain != "climate" or not self._pending_command_evidence:
+            return False
+        # Only a real OFF may supersede unresolved equipment evidence. Normal
+        # setpoint/mode stages wait for echo; a repeated OFF waits too.
+        if service == "set_hvac_mode" and data.get("hvac_mode") == "off":
+            return any(e["service"] == "set_hvac_mode" and
+                       e["data"].get("hvac_mode") == "off"
+                       for e in tuple(self._pending_command_evidence.values()))
+        return True
+
     def prepare_equipment_command(self, domain, service, data):
         if self.command_ledger is None:
             raise PermissionError("Durable command journal is unavailable")
@@ -260,7 +271,7 @@ class NativeController(HeatingClimate):
         if action == "STOP":
             self.command_ledger_status["fenced"] = result.get("fenced", True)
             self._pending_command_evidence.clear()
-        evidence = dict(command_id=command_id, action=action, domain=domain,
+        evidence = dict(command_id=command_id, action=action, domain=domain, prepared_at=time.time(),
                         service=service, data=dict(data))
         self._pending_command_evidence[command_id] = evidence
         self.memory["native_command_evidence"] = dict(
@@ -391,7 +402,7 @@ class NativeController(HeatingClimate):
             return
         if self._pending_command_evidence:
             expired = [e for e in self._pending_command_evidence.values()
-                       if time.time() - e.get("sent_at", time.time()) >= 30]
+                       if time.time() - e.get("sent_at", e.get("prepared_at", time.time())) >= 30]
             if expired:
                 self.command_ledger.fence(**self._ledger_identity())
                 self.command_ledger_status = self.command_ledger.status()
