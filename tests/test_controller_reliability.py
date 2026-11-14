@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import test_native_v1_production as native
 from test_native_v1_production import package, State
@@ -145,6 +145,43 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 dict(entity_id='climate.boiler', temperature=19))
             app.mark_equipment_command_sent(lower)
             app.record_equipment_command_echo(lower, dict(matched=True, observed_at=time.time()))
+            self.assertTrue(ledger.status()['fenced'])
+
+    async def test_recovery_off_echo_is_owned_but_later_manual_change_still_pauses(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            ledger = self.attach_real(component, app, folder)
+            app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
+            app.memory.update(owned=True,expected_mode='heat',expected_setpoint=24)
+            app.decision_event=Mock();app.notify_once=Mock();app.save=Mock()
+            with patch.object(component.time,'time',return_value=1000):
+                await asyncio.to_thread(app._reconcile_writer_fence)
+            self.assertEqual(app.memory['expected_mode'],'off')
+            hass.services.async_call.reset_mock()
+            event=dict(state='off',attributes=dict(temperature=24),last_updated=datetime.fromtimestamp(1000,timezone.utc).isoformat())
+            with patch.object(component.time,'time',return_value=1025):
+                await asyncio.to_thread(app.climate_changed,'climate.boiler','all',None,event)
+            hass.services.async_call.assert_not_called()
+            self.assertTrue(app.memory['owned'])
+            # A genuinely different external mode/target must retain manual priority.
+            event.update(state='heat',attributes=dict(temperature=25),last_updated=datetime.fromtimestamp(1026,timezone.utc).isoformat())
+            with patch.object(component.time,'time',return_value=1026):
+                await asyncio.to_thread(app.climate_changed,'climate.boiler','all',None,event)
+            self.assertFalse(app.memory['owned'])
+            self.assertTrue(any(c.args[:2]==('input_select','select_option') for c in hass.services.async_call.await_args_list))
+
+    async def test_pending_fenced_stop_is_not_superseded_by_normal_off_action(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            ledger=self.attach_real(component,app,folder)
+            app.attach_command_ledger(ledger,ledger.claim_boot('recovery',expected_owner_id='owner'))
+            with patch.object(app,'apply_voltage_stop',return_value=False), \
+                    patch.object(app,'async_kws_status',return_value=dict(ready=True,reason='ready')), \
+                    patch.object(app,'_track_comfort_lock'), \
+                    patch.object(component.HeatingClimate,'apply_action') as parent:
+                await asyncio.to_thread(app.apply_action,'off',False)
+            parent.assert_not_called()
+            hass.services.async_call.assert_not_called()
             self.assertTrue(ledger.status()['fenced'])
 
     async def test_L05_manual_change_during_recovery_prepare_prevents_send(self):
@@ -303,13 +340,15 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             hass, app = self.controller(component)
             ledger = self.attach_real(component, app, folder)
             app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
-            app.memory['diagnostic_errors'] = {'ledger_recovery':dict(active=True, count=3)}
+            app.memory['diagnostic_errors'] = {'ledger_recovery':dict(active=True, count=3), 'fallback_command':dict(active=True,count=245,signature='LedgerConflict: HEAT fenced; external reconciliation required')}
             with patch.object(component.time,'time',return_value=1000):
                 await asyncio.to_thread(app._reconcile_writer_fence)
                 await asyncio.to_thread(app.publish, 'sensor.heating_diagnostics', 'test')
             incident = app.memory['diagnostic_errors']['ledger_recovery']
             self.assertFalse(incident['active'])
             self.assertEqual(incident['count'], 3)
+            self.assertFalse(app.memory['diagnostic_errors']['fallback_command']['active'])
+            self.assertEqual(app.memory['diagnostic_errors']['fallback_command']['count'],245)
             grades = hass.rows['sensor.heating_diagnostics'].attributes['reliability']
             self.assertFalse(grades['physical_heating_confirmed'])
             self.assertFalse(grades['computation_alive'])
