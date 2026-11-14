@@ -826,7 +826,8 @@ def main(engine='chromium'):
             })""")
             assert 'Обрано' in page.locator('.source-modes').inner_text()
             assert '9 кВт' in page.locator('.source-modes').inner_text()
-            assert 'оновленим профілем' in page.locator('.plan-card').inner_text()
+            if not page.locator('.next-action[open]').count():page.locator('.next-action>summary').click()
+            assert 'оновленим профілем' in page.locator('.next-action .plan-card').inner_text()
             assert page.locator('.plan-card .session').count()==0
             for width in (320,390,1440):
                 page.set_viewport_size({'width':width,'height':900})
