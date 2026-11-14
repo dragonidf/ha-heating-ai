@@ -1,7 +1,7 @@
 {
   "domain": "heating_ai_legacy",
   "name": "Heating AI",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "documentation": "https://github.com/dragonidf/ha-heating-ai/blob/main/docs/marketplace-v1.md",
   "issue_tracker": "https://github.com/dragonidf/ha-heating-ai/issues",
   "codeowners": [],

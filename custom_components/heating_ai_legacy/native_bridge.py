@@ -15,6 +15,7 @@ import multiprocessing
 from pathlib import Path
 import site
 import threading
+import time
 from uuid import uuid4
 
 from homeassistant.core import Context, callback
@@ -75,6 +76,7 @@ class Hass:
         self._closing = False
         self._closed = False
         self._context = Context()
+        self._equipment_service_task = None
         self._loop_thread = threading.get_ident()
 
     def _on_loop(self, function, *args):
@@ -100,8 +102,29 @@ class Hass:
             return None
         task = self.hass.async_create_task(coro, "Heating AI V1 callback")
         self._jobs.add(task)
-        task.add_done_callback(self._jobs.discard)
+        task.add_done_callback(self._callback_finished)
         return task
+
+    @callback
+    def _callback_finished(self, task):
+        self._jobs.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        now = time.time()
+        signature = (type(error).__name__+": "+str(error))[:300]
+        memory = getattr(self, "memory", {})
+        errors = memory.setdefault("diagnostic_errors", {})
+        previous = errors.get("native_callback", {})
+        incident = (previous if previous.get("signature") == signature else
+                    dict(signature=signature, first_at=now, count=0))
+        incident.update(active=True, last_at=now, count=incident["count"]+1)
+        if now-incident.get("logged_at", 0) >= 300:
+            _LOGGER.error("Heating AI callback failed (%s): %s", incident["count"], signature)
+            incident["logged_at"] = now
+        errors["native_callback"] = incident
 
     async def async_start(self, *, writer=False):
         self._running = True
@@ -125,6 +148,12 @@ class Hass:
             self._handles.clear()
 
             current = asyncio.current_task()
+            service = self._equipment_service_task
+            if service is not None and service is not current and not service.done():
+                service.cancel()
+                done, _ = await asyncio.wait({service}, timeout=_SERIAL_CLOSE_TIMEOUT)
+                if not done:
+                    _LOGGER.error("Heating AI thermostat service did not cancel during shutdown")
             jobs = tuple(job for job in self._jobs if job is not current)
             for job in jobs:
                 job.cancel()
@@ -210,6 +239,9 @@ class Hass:
         async def permitted():
             if not self._running or not self._writer:
                 raise PermissionError("Controller writer is closed")
+            active = self._equipment_service_task
+            if domain == "climate" and active is not None and not active.done() and active is not asyncio.current_task():
+                raise PermissionError("Previous thermostat service is still in flight")
             guard = getattr(self, "async_command_allowed", None)
             if guard is not None and not guard(domain, action, data):
                 # A voltage change between planning and dispatch must also stop heat.
@@ -226,21 +258,29 @@ class Hass:
         asyncio.run_coroutine_threadsafe(permitted(), self.hass.loop).result(30)
         evidence = None
         prepare = getattr(self, "prepare_equipment_command", None)
-        if domain in ("climate", "fan") and prepare is not None:
+        if domain == "climate" and prepare is not None:
             evidence = prepare(domain, action, data)
             getattr(self, "mark_equipment_command_sent")(evidence)
 
         async def send():
             await permitted()
-            await self.hass.services.async_call(domain, action, data, blocking=True,
-                                               context=self._context)
+            if domain == "climate":
+                self._equipment_service_task = asyncio.current_task()
+            try:
+                await self.hass.services.async_call(domain, action, data, blocking=True,
+                                                   context=self._context)
+            finally:
+                if domain == "climate" and self._equipment_service_task is asyncio.current_task():
+                    self._equipment_service_task = None
             if evidence is not None:
                 evidence["service_completed_at"] = datetime.now(timezone.utc).timestamp()
             observe = getattr(self, "async_equipment_command_echo", None)
             return observe(domain, action, data, evidence) if observe is not None else None
+        sent = asyncio.run_coroutine_threadsafe(send(), self.hass.loop)
         try:
-            observed = asyncio.run_coroutine_threadsafe(send(), self.hass.loop).result(30)
+            observed = sent.result(30)
         except BaseException:
+            sent.cancel()
             if evidence is not None:
                 getattr(self, "discard_pending_equipment_command", lambda *_: None)(evidence)
             raise

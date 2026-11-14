@@ -97,3 +97,16 @@ class KWSTests(unittest.TestCase):
         self.row('potuzhnist_a',3,'W')
         self.assertIsNone(self.tick(a))
         self.assertEqual(a.kws_source_quality['sensor.energy_meter_kotel_potuzhnist_a']['reason'],'unit_mismatch')
+
+    def test_K04_response_requires_fresh_measured_phase_sum_not_legacy_power(self):
+        a=self.app();a.memory.update(owned=True,last_command='heat')
+        a.raw=lambda key,*args:{'mode':'Автоматичне керування','armed':'on'}.get(key)
+        a.grid_state=lambda:'on';a.decision_event=lambda *args,**kwargs:None
+        a.notify_once=lambda *args:None
+        a.enter_temporary_fallback=lambda *args:None
+        for watts,quality,age,expected in ((3000,'measured',0,True),(6000,'measured',0,True),
+                (9000,'measured',0,True),(0,'measured',0,False),(9000,'estimated',0,False),
+                (9000,'measured',181,False)):
+            a.current_power_w=watts;a.power_observation=dict(quality=quality,at=self.at-age)
+            with patch('heating_climate.time.time',return_value=self.at):a.verify_boiler_response()
+            self.assertEqual(a.memory['command_diagnostic']['boiler_confirmed'],expected)

@@ -1,3 +1,11 @@
+# 0.5.3 — 2026-11-14
+
+- Recover durable HEAT fences using one journalled STOP, fresh OFF evidence and bounded retries; retain SQLite schema v1 and all unresolved evidence.
+- Qualify KWS contactor, protection and voltage before HEAT. Honor restored system settings and pre-reload post-grid-return acknowledgments; never toggle the breaker.
+- Isolate fan failures, preserve manual authority, cancel pending thermostat calls during shutdown, and verify heating from measured KWS phase power.
+- Add honest recovery/comfort health diagnostics and opt-in bounded fallback bias; invalidate contradicted calibration.
+- Preserve energy origins/deltas, planner policy and existing UI layout/API. Frontend version marker only; PR #44 redesign is not included.
+
 # 0.5.2 — 2026-11-14
 
 - Retry reconciliation of a persisted durable ledger fence once after a fresh native runtime restart.

@@ -295,7 +295,7 @@ class CriticalLedger:
             if old is not None:
                 if old['fingerprint'] != record['fingerprint']:
                     raise LedgerConflict('Immutable command conflict')
-                return dict(created=False, revision=revision, command=old)
+                return dict(created=False, revision=revision, command=old, fenced=body['fenced'])
             if body['fenced'] and action == 'HEAT':
                 raise LedgerConflict('HEAT fenced; external reconciliation required')
             if len(body['commands']) >= MAX_RECORDS:
@@ -307,13 +307,14 @@ class CriticalLedger:
                 # unresolved reservation. Preserve every prior record as
                 # UNKNOWN evidence, keep the fence closed, and let the
                 # independently echoed STOP open it through complete_safe_stop.
+                outstanding = any(r['stage'] in ('PREPARED', 'SENT') for r in body['commands'].values())
                 self._unknown(body, heat_only=False)
-                body['fenced'] = True
+                body['fenced'] = body['fenced'] or outstanding
             elif any(r['stage'] in ('PREPARED', 'SENT') for r in body['commands'].values()):
                 raise LedgerConflict('Outstanding reservation')
             body['commands'][command_id] = record
             self._write(con, revision + 1, body)
-            return dict(created=True, revision=revision + 1, command=record)
+            return dict(created=True, revision=revision + 1, command=record, fenced=body['fenced'])
 
     def _record(self, command_id, stage, at, *, expected_revision, owner_id, boot_id, owner_epoch):
         _at(at)
@@ -373,7 +374,9 @@ class CriticalLedger:
             record = body['commands'].get(command_id)
             if (record is None or record['action'] != 'STOP'
                     or record['stage'] != 'HA_ECHO'
-                    or record['request'].get('domain') != 'climate'):
+                    or record['request'].get('domain') != 'climate'
+                    or record['request'].get('service') not in ('set_hvac_mode', 'climate/set_hvac_mode')
+                    or (record['request'].get('values') or record['request']).get('hvac_mode') != 'off'):
                 raise LedgerConflict('Qualified STOP evidence required')
             body['fenced'] = False
             self._trim_confirmed(body)
