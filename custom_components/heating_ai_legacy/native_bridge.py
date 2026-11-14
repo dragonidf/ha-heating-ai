@@ -76,6 +76,7 @@ class Hass:
         self._closing = False
         self._closed = False
         self._context = Context()
+        self._equipment_service_task = None
         self._loop_thread = threading.get_ident()
 
     def _on_loop(self, function, *args):
@@ -232,6 +233,9 @@ class Hass:
         async def permitted():
             if not self._running or not self._writer:
                 raise PermissionError("Controller writer is closed")
+            active = self._equipment_service_task
+            if domain == "climate" and active is not None and not active.done() and active is not asyncio.current_task():
+                raise PermissionError("Previous thermostat service is still in flight")
             guard = getattr(self, "async_command_allowed", None)
             if guard is not None and not guard(domain, action, data):
                 # A voltage change between planning and dispatch must also stop heat.
@@ -254,8 +258,14 @@ class Hass:
 
         async def send():
             await permitted()
-            await self.hass.services.async_call(domain, action, data, blocking=True,
-                                               context=self._context)
+            if domain == "climate":
+                self._equipment_service_task = asyncio.current_task()
+            try:
+                await self.hass.services.async_call(domain, action, data, blocking=True,
+                                                   context=self._context)
+            finally:
+                if domain == "climate" and self._equipment_service_task is asyncio.current_task():
+                    self._equipment_service_task = None
             if evidence is not None:
                 evidence["service_completed_at"] = datetime.now(timezone.utc).timestamp()
             observe = getattr(self, "async_equipment_command_echo", None)

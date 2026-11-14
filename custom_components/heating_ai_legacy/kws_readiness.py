@@ -13,6 +13,7 @@ class KWSReadiness:
             at = row.get('at')
             return at is not None and -5 <= now-at <= age
 
+        linked = False
         if grid != 'on':
             self.grid_since = self.stable_since = self.reset_since = None
             reason = 'grid_absent' if grid == 'off' else 'grid_unknown'
@@ -56,7 +57,16 @@ class KWSReadiness:
             self.reset_since = None
         elif grid == 'on' and voltage_ok and self.reset_since is None:
             self.reset_since = now
-        return dict(ready=reason == 'ready', reason=reason,
+        labels = dict(grid_absent='Електромережі немає', grid_unknown='Стан електромережі не підтверджено',
+            voltage_unqualified='Напруга не підтверджена або поза безпечними межами',
+            kws_link_unknown='KWS: немає актуального зв’язку', kws_protection='KWS: активний захист',
+            kws_reset_pending='KWS: очікування підтвердженого відновлення',
+            kws_relay_off='KWS: реле вимкнене', kws_voltage_unqualified='KWS: напруга не в нормі', ready='Обладнання готове')
+        return dict(ready=reason == 'ready', reason=reason, reason_text=labels[reason],
+                    grid_confirmed=grid == 'on', voltage_qualified=voltage_ok,
+                    kws_link_fresh=linked, kws_contactor_on=rows.get('relay', {}).get('value') == 'on',
+                    kws_fault=rows.get('fault', {}).get('fault_code', rows.get('fault', {}).get('value')),
+                    kws_reset_pending=reason == 'kws_reset_pending',
                     grid_since=self.grid_since, stable_since=self.stable_since,
                     diagnosis_overdue=self.grid_since is not None and
                     now-self.grid_since >= max(120, reset_delay)+300 and reason != 'ready')

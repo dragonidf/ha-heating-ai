@@ -38,6 +38,11 @@ class CirculationTests(unittest.TestCase):
         app.fan_tick('off',True)
         self.assertEqual(app.calls,[('fan/turn_on',dict(entity_id='fan.test',percentage=42))])
 
+    def test_unknown_grid_is_not_proved_by_backup_permission(self):
+        app=self.app(**{'input_boolean.heating_fan_backup_verified':'on'})
+        app.fan_tick('unknown',True)
+        self.assertFalse(any(service=='fan/turn_on' for service,_ in app.calls))
+
     def test_unknown_backup_helper_does_not_fall_back_to_true_config(self):
         app=self.app(**{'input_boolean.heating_fan_backup_verified':'unavailable'})
         app.cfg['fan_backup_verified']=True

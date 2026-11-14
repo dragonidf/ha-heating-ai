@@ -73,7 +73,8 @@ class NativeController(HeatingClimate):
         """Recover on the existing tick; never create another polling task."""
         try:
             equipment = self._on_loop(self.async_kws_status)
-            signature = equipment["reason"]
+            signature = (equipment["reason"], equipment.get("kws_fault"),
+                         (self.voltage_status or {}).get("status"))
             if signature != getattr(self, "_equipment_signature", None):
                 journal = getattr(self, "decision_journal", None)
                 if journal:
@@ -400,6 +401,10 @@ class NativeController(HeatingClimate):
             self._recovery_next_at = 0
             return
         now = time.time()
+        active = self._equipment_service_task
+        if active is not None and not active.done():
+            self.memory["ledger_recovery"] = dict(state="reconciliation_waiting", reason="service_in_flight")
+            return
         online = self.raw("thermostat") not in (None, "unknown", "unavailable")
         if not online:
             self._recovery_was_offline = True
@@ -493,7 +498,8 @@ class NativeController(HeatingClimate):
                     isinstance(deye_voltage.get("value"), (int, float)) and
                     deye_voltage["value"] >= 150 else
                     "off" if deye_fresh and connection.get("value") == "on" and
-                    grid.get("value") == "off" else "unknown")
+                    grid.get("value") == "off" and isinstance(deye_voltage.get("value"), (int, float))
+                    and deye_voltage["value"] < 50 else "unknown")
         rows = {"status": row(self.args.get("kws_status", "sensor.energy_meter_kotel_status")),
                 "relay": row(self.args.get("kws_relay", "switch.energy_meter_kotel")),
                 "fault": row(self.args.get("kws_fault", "binary_sensor.energy_meter_kotel_problema"))}
@@ -655,7 +661,7 @@ class NativeController(HeatingClimate):
         equipment = self._on_loop(self.async_kws_status)
         fenced = (self.command_ledger_status or {}).get("fenced", True)
         if action in ("heat", "fallback") and (fenced or not equipment["ready"]):
-            reason = "Журнал команд: очікується підтверджене вимкнення" if fenced else equipment["reason"]
+            reason = "Журнал команд: очікується підтверджене вимкнення" if fenced else equipment.get("reason_text", equipment["reason"])
             self.publish("sensor.heating_controller", "Нагрів заблоковано",
                          reason=reason, control_state="blocked", equipment_readiness=equipment,
                          ledger_recovery=self.memory.get("ledger_recovery"),

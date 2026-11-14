@@ -227,6 +227,33 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                     app.temperature_quality['primary_status'] = 'stale'
                     self.assertEqual(app.fallback_target(21.5, attrs), 21.5)
 
+    async def test_inflight_service_blocks_parallel_stop_before_reservation(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            ledger = self.attach_real(component, app, folder)
+            pending = asyncio.create_task(asyncio.sleep(30))
+            app._equipment_service_task = pending
+            try:
+                with self.assertRaisesRegex(PermissionError, 'still in flight'):
+                    await asyncio.to_thread(app.call_service, 'climate/set_hvac_mode',
+                        entity_id='climate.boiler', hvac_mode='off')
+                self.assertEqual(ledger.status()['commands'], {})
+                hass.services.async_call.assert_not_called()
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_callback_exception_is_consumed_and_retained_as_diagnostic(self):
+        with package(self.root/'package') as (component, _):
+            _, app = self.controller(component)
+            async def failed():
+                raise component.LedgerConflict('late echo')
+            task = app._launch(failed())
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+            self.assertFalse(app._jobs)
+            self.assertEqual(app.memory['diagnostic_errors']['native_callback']['count'], 1)
+
     async def test_U01_recovered_incident_retains_count_and_has_independent_grades(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
