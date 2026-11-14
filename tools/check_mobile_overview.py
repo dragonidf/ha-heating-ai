@@ -31,6 +31,7 @@ def main():
                 window.entityOpens=[];
                 panel.addEventListener('hass-more-info',e=>entityOpens.push(e.detail.entityId));
             }''')
+            page.screenshot(path=str(ARTIFACTS/'heating-mobile-initial-390.png'),full_page=True)
             for width in (320,360,390,430,768,1024,1440):
                 page.set_viewport_size({'width':width,'height':844})
                 page.evaluate('()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))')
@@ -48,7 +49,7 @@ def main():
                     assert page.locator('.hero').bounding_box()['height']<300
                     assert page.locator('.heat-sources').bounding_box()['height']<330
                 for button in page.locator('button:visible,summary:visible').all():
-                    assert button.bounding_box()['height']>=44,(width,'touch target',button.inner_text())
+                    assert button.bounding_box()['height']>=44,(width,'touch target',button.inner_text(),button.bounding_box())
                 measurements.append(dict(width=width,hero=page.locator('.hero').bounding_box()['height'],forecast=page.locator('.chart-card').bounding_box()['height'],sources=page.locator('.heat-sources').bounding_box()['height'],total=page.locator('main').bounding_box()['height']))
                 if width in (390,1440):
                     page.screenshot(path=str(ARTIFACTS/f'heating-mobile-overview-{width}.png'),full_page=True)

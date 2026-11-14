@@ -1831,6 +1831,10 @@ main{max-width:1120px;margin:auto}
 @container(max-width:15rem){.overview .hero,.overview .heat-sources{grid-template-columns:1fr}.overview .hero-energy{grid-column:1}.overview .hero-status{border-top:1px solid var(--stroke);padding-top:8px}.overview .temperature{font-size:2.5rem}}
 .row>button{min-height:44px;padding:4px 0;border:0;font-size:inherit;text-align:right}.row>button strong{font-size:inherit}.history-series .history-value{max-width:55%;overflow-wrap:anywhere}
 .hero-status .status-kicker{border:0;padding:0;text-align:left;color:var(--muted)}.conditional-plan{font-style:normal;color:var(--source-yellow)}
+
+main .overview .hero button,main .overview .heat-sources button,main .overview .heat-sources summary{min-height:44px}
+.history-placeholder{min-height:238px}
+.heat-sources:has(details[open]){align-items:start}
 `;
 if(!customElements.get('heating-ai-panel'))customElements.define('heating-ai-panel',HeatingAIPanel);
 window.customCards=window.customCards||[];
