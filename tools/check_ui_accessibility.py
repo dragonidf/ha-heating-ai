@@ -30,7 +30,7 @@ def main(engine='chromium'):
                         page.evaluate('()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))')
                         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'),(width,scale,tab,'overflow',page.evaluate('document.documentElement.scrollWidth'),page.locator('heating-ai-panel').evaluate("e=>[...e.shadowRoot.querySelectorAll('*')].filter(x=>x.getBoundingClientRect().width>0&&(x.getBoundingClientRect().right>innerWidth+1||x.scrollWidth>x.clientWidth+1)).slice(0,12).map(x=>[x.tagName,x.className,x.parentElement?.className||'',(x.textContent||'').slice(0,65),x.getBoundingClientRect().width,x.getBoundingClientRect().right])"))
                         if tab=='overview':
-                            font=page.locator('.hero-side h2').evaluate('e=>parseFloat(getComputedStyle(e).fontSize)')
+                            font=page.locator('.hero-status h1').evaluate('e=>parseFloat(getComputedStyle(e).fontSize)')
                             assert font>=14*scale-.1,(width,scale,'fixed-size text',font)
                         for item in page.locator('button:visible,select:visible,input:visible,summary:visible').all():
                             assert item.bounding_box()['height']>=44,(width,scale,tab,'touch target')

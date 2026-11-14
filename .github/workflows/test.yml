@@ -62,6 +62,9 @@ jobs:
         if: matrix.python == '3.12'
         with:
           name: native-v1-ui-screenshots
-          path: native-v1-preview-*.png
+          path: |
+            native-v1-preview-*.png
+            artifacts/heating-*.png
+            artifacts/heating-qa-layout-*.json
           if-no-files-found: error
           retention-days: 7

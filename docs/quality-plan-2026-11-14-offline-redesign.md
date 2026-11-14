@@ -31,19 +31,19 @@ GitHub CI is green and the owner explicitly proceeds with installation.
 - [x] Keep worker concurrency bounded and avoid duplicate jobs or polling.
 - [x] Publish bounded rejection diagnostics without new Recorder entities.
 - [x] Run focused tests and full GitHub CI on the implementation commit.
-- [ ] Merge the focused PR after its documentation-only head is green.
+- [x] Merge the focused PR after its documentation-only head is green.
 
 ### 2. Modern UI/UX Redesign — after recovery is green
 
-- [ ] Record a UI parity map for every current control, chart, setting and
+- [x] Record a UI parity map for every current control, chart, setting and
   administrative function before moving components.
-- [ ] Split the monolithic frontend into presentation/view-model modules and a
+- [x] Split the monolithic frontend into presentation/view-model modules and a
   thin HA transport/controller shell; preserve the generated single asset.
-- [ ] Rebuild Overview, History and Settings according to the attached TZ,
+- [x] Rebuild Overview, History and Settings according to the attached TZ,
   without changing planner, model, safety, energy or actuator semantics.
-- [ ] Preserve all history ranges, forecast interactions, 46 schema settings,
+- [x] Preserve all history ranges, forecast interactions, 46 schema settings,
   helpers, permissions and confirmation/revision behavior.
-- [ ] Add semantic statuses, compact heat-source cards, responsive layouts,
+- [x] Add semantic statuses, compact heat-source cards, responsive layouts,
   keyboard/accessibility support and local settings search.
 - [ ] Add Chromium/WebKit coverage at required widths, long-open tests,
   light/dark screenshots and performance comparison.
@@ -65,8 +65,15 @@ GitHub CI is green and the owner explicitly proceeds with installation.
 
 ## Current checkpoint
 
-- Base: `main` at `8b606c5a6e8a7c1a8b6fe99f3bca4a95b69f563c`
-  (released as v0.5.2).
+- Backend follow-up PR #46 passed both GitHub workflows (Python 3.12/3.13,
+  native HA 2026.11, package, Chromium/WebKit and browser interaction jobs) and
+  was squash-merged as `9874743cb0c72ab09c0abab2c6ccd0fe8f9c60d0`
+  (candidate 0.5.4). Production HA remains on its separately installed 0.5.3;
+  this work did not install, reload or restart anything.
+- Base for the redesign is now `main` at
+  `9874743cb0c72ab09c0abab2c6ccd0fe8f9c60d0`. The UI checkout was reconciled
+  with every changed backend file before regenerating the bundle, so the 0.5.4
+  command-ledger, KWS and package hashes are not replaced by older versions.
 - Confirmed root cause: `poll_calculation` marked a plan timed out after
   60 seconds and then discards its completed result solely because
   `timed_out_at` exists. `background_plan` already performs exact-key checks,
@@ -78,5 +85,22 @@ GitHub CI is green and the owner explicitly proceeds with installation.
   GitHub run `43575757402` passed Python 3.12/3.13, native HA 2026.11,
   generated manifest checks, Chromium/WebKit, accessibility and responsive UI.
 - HA remained read-only; no installation, reload or restart was performed.
-- Next action: merge PR #43 after the documentation checkpoint passes, then
-  start the separate UI parity/modularization branch from updated `main`.
+- PR #43 was squash-merged as
+  `9fcc5c05c8ff0a962651cf0c661500a6851ed3d6`.
+- UI work continues on `redesign/modern-ui-ux`. The maintainable sources are
+  split under `frontend/src/`; `tools/build_ui.py` still emits one local,
+  dependency-free `frontend/heating-panel.js` and its Python asset.
+- Overview now has a single truthful primary status, a compact next-action
+  summary, a 2x2 mobile metric grid, semantic forecast colors, explicit
+  conditional-plan presentation and compact side-by-side heat sources.
+- History retains 24-hour/7-day/30-day/custom comparison, frozen advance
+  forecasts, actual temperature, plan/fact markers, boiler/fireplace/grid
+  evidence, zoom and source-quality gaps without adding Recorder load.
+- Settings retains all 46 schema fields, HA helpers, revision/conflict checks,
+  staged saving and undo; expert search is local and creates no polling.
+- KWS readiness, recovered ledger state and physical heating are presented as
+  separate concepts. A historical recovered `LedgerConflict` cannot turn a
+  currently healthy controller into an active emergency banner.
+- Local deterministic bundle check and 56 frontend regressions pass. The
+  remaining gates are GitHub full CI, responsive/light/dark screenshot review,
+  long-open/performance evidence and final Draft PR documentation.

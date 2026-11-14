@@ -11,7 +11,7 @@ from heating_model import DEFAULT_MODEL
 from playwright.sync_api import sync_playwright
 
 ROOT=Path(__file__).resolve().parents[1]
-ARTIFACTS=ROOT.parent/'artifacts'
+ARTIFACTS=ROOT/'artifacts'
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -68,7 +68,9 @@ def check_theme_and_motion(page):
         for text in colors[1:]:
             a,b=sorted([lum(colors[0]),lum(text)])
             assert (b+.05)/(a+.05)>=4.5, (name,'text contrast')
-        assert page.locator('.forecast-plot path[stroke="var(--history-room)"][stroke-dasharray]').evaluate('el=>getComputedStyle(el).stroke')==page.locator('[data-history-line="room"]').first.evaluate('el=>getComputedStyle(el).stroke'), (name,'room series color differs between charts')
+        forecast=page.locator('.forecast-plot path[stroke="var(--forecast)"][stroke-dasharray]')
+        assert forecast.count()==1, (name,'forecast line missing')
+        assert forecast.evaluate('el=>getComputedStyle(el).stroke')!=page.locator('[data-history-line="room"]').first.evaluate('el=>getComputedStyle(el).stroke'), (name,'forecast and measured history must stay visually distinct')
         for width in (390,1440):
             page.set_viewport_size({'width':width,'height':1000})
             for tab in ('overview','settings','model'):
@@ -188,15 +190,17 @@ def check_compact_overview(page):
     assert page.locator('[data-native="grid"]').count()==0, 'Grid history is no longer displayed'
     headings=page.locator('.heat-sources>.card,.overview>.chart-card,.overview>.plan-card').evaluate_all('els=>els.map(x=>x.querySelector("h2")?.textContent)')
     assert headings==['Прогноз на 24 год','План нагріву','Котел','Камін і циркуляція'], headings
-    assert page.locator('.overview > :first-child.chart-card').count()==1, 'Shared actual/forecast timeline must be first'
+    assert page.locator('.overview > :first-child.hero').count()==1, 'Current temperature and truthful status must be first'
     order=page.locator('.overview > *').evaluate_all('els=>els.map(el=>el.className)')
     chart=next(i for i,c in enumerate(order) if 'chart-card' in c.split())
     hero=next(i for i,c in enumerate(order) if 'hero' in c.split())
+    action=next(i for i,c in enumerate(order) if 'next-action' in c.split())
+    metrics=next(i for i,c in enumerate(order) if 'overview-metrics' in c.split())
     plan=next(i for i,c in enumerate(order) if 'plan-card' in c.split())
     details=next(i for i,c in enumerate(order) if 'overview-details' in c.split())
-    assert chart < hero < plan < details, order
+    assert hero < action < metrics < chart < plan < details, order
     assert page.locator('.overview .plan-details').count()==0, 'Technical plan details belong on AI'
-    assert '17,50' in page.locator('.boiler-card').inner_text()
+    assert '17,50' in page.locator('.overview-metrics').inner_text(), '24-hour energy belongs in the compact summary, not the boiler card'
     assert page.locator('.boiler-card').get_attribute('data-heating')=='false'
     for binary,power,expected in [('on','6000','true'),('off','9000','true'),('off','0','false'),('unavailable','3000','true'),('unavailable','unavailable','unknown')]:
         page.evaluate('''([binary,power])=>setHeatingScenario({
@@ -446,7 +450,7 @@ def check_equipment(page):
     assert page.locator('.hero-power').count()==0
     assert '9 кВт' in page.locator('.power-advice').inner_text()
     assert 'Для зменшення дефіциту' in page.locator('.power-advice>summary').inner_text()
-    assert page.locator('.hero').bounding_box()['height']<225, page.locator('.hero').bounding_box()
+    assert page.locator('.hero').bounding_box()['height']<340, page.locator('.hero').bounding_box()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.screenshot(path=str(ARTIFACTS/'heating-recommendation-360.png'),full_page=True)
     page.evaluate('panel.hass=mockHass')
@@ -505,7 +509,7 @@ def main(engine='chromium'):
             errors=[]
             page.on('pageerror',lambda error: errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
-            page.wait_for_selector('heating-ai-panel >> text=Зберігає тепло')
+            page.wait_for_selector('heating-ai-panel .hero-status h1')
             page.evaluate('''fields=>{
                 mockHass.states={...mockHass.states,'sensor.heating_system_settings':{state:'Налаштування системи',attributes:{revision:0,persisted_revision:0,schema_version:1,values:Object.fromEntries(fields.map(f=>[f.key,f.value]))}}};
                 panel.hass={...mockHass};
@@ -637,25 +641,31 @@ def main(engine='chromium'):
                         forecast_box=page.locator('.chart-card').bounding_box()
                         plan_box=page.locator('.plan-card').bounding_box()
                         hero_box=page.locator('.hero').bounding_box()
-                        assert forecast_box['y']+forecast_box['height']<=hero_box['y']+1, (width,'timeline must precede comfort')
-                        assert hero_box['y']+hero_box['height']<=plan_box['y']+1, (width,'plan must follow comfort')
+                        assert hero_box['y']+hero_box['height']<=forecast_box['y']+1, (width,'forecast must follow current status')
+                        assert forecast_box['y']+forecast_box['height']<=plan_box['y']+1, (width,'plan must follow forecast')
                         gap=page.locator('.plan-card').evaluate('el=>el.getBoundingClientRect().top-el.previousElementSibling.getBoundingClientRect().bottom')
                         assert 0<=gap<=16, (width,'unexpected gap before plan',gap)
                         if width in (360,390,430):
-                            # v0.2.4 was 4493–4550 px on these same synthetic fixtures.
-                            assert page.locator('main').bounding_box()['height']<3650, (width,'overview did not become compact')
-                            assert page.locator('.hero').bounding_box()['height']<225
-                            assert page.locator('.boiler-card').bounding_box()['height']<175, (width,page.locator('.boiler-card').bounding_box(),page.locator('.power-advice').get_attribute('open'))
+                            # Measure the default status-first view, not the optional
+                            # expanded Recorder/weather details used by chart tests.
+                            if page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
+                            assert page.locator('main').bounding_box()['height']<2700, (width,'collapsed overview did not stay compact',page.locator('main').bounding_box())
+                            assert page.locator('.hero').bounding_box()['height']<340
+                            assert page.locator('.boiler-card').bounding_box()['height']<280, (width,page.locator('.boiler-card').bounding_box(),page.locator('.power-advice').get_attribute('open'))
                             assert page.locator('.fireplace-card').bounding_box()['height']<225
                             assert page.locator('.plan-card').bounding_box()['height']<420
                         if width<=600:
                             assert page.locator('.fireplace-card').bounding_box()['height']<250, (width,'fireplace overview should be compact')
                             left=page.locator('.hero>div').first.bounding_box()
-                            right=page.locator('.hero-side').bounding_box()
-                            assert right['x']>=left['x']+left['width'], (width,'controller decision should share the comfort row')
+                            right=page.locator('.hero-status').bounding_box()
+                            if width<=430:
+                                assert right['y']>=left['y']+left['height'], (width,'controller decision should stack below temperature')
+                            else:
+                                assert right['x']>=left['x']+left['width'], (width,'controller decision should share the comfort row')
                             assert page.locator('.temperature').evaluate('el=>el.scrollWidth <= el.clientWidth'), (width,'temperature overflow')
                         if width==390:
                             page.screenshot(path=str(ARTIFACTS/f'heating-mobile-overview-{engine}.png'),full_page=True)
+                            page.locator('.overview-details>summary').click()
                             page.locator('.history-card').screenshot(path=str(ARTIFACTS/f'heating-history-mobile-{engine}.png'))
                 if width==390:
                     page.screenshot(path=str(ARTIFACTS/'heating-mobile-model.png'),full_page=True)
@@ -795,9 +805,9 @@ def main(engine='chromium'):
                 'binary_sensor.heating_boiler_active':{state:'off'}
             })""")
             page.locator('nav [data-tab="overview"]').click()
-            assert 'Гріє' in page.locator('.hero-side h2').inner_text()
-            assert 'Автокерування' in page.locator('.hero-side').inner_text()
-            assert 'призупинене' in page.locator('.hero-side').inner_text()
+            assert 'Опалення працює' in page.locator('.hero-status h1').inner_text()
+            assert 'автоматичне виконання плану вимкнене' in page.locator('.hero-status').inner_text()
+            assert 'Умовний план' in page.locator('.next-action').inner_text()
             if not page.locator('.overview-details[open]').count():page.locator('.overview-details>summary').click()
             assert page.locator('.boiler-card').get_attribute('data-heating')=='true'
             assert '6,4' in page.locator('.boiler-metrics').inner_text()
