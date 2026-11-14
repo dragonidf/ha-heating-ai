@@ -111,6 +111,22 @@ class QATruthfulnessTests(unittest.TestCase):
             app.memory['thermostat_bias_at']=(at-timedelta(days=2)).timestamp()
             self.assertIsNone(app.source_temperature()[0])
 
+    def test_T01_four_hour_missing_room_uses_bias_until_fresh_disagreement(self):
+        app=HeatingClimate();at=datetime(2026,11,14,14,tzinfo=ZoneInfo('Europe/Kyiv'));stamp=at.timestamp()
+        app.cfg=dict(room='room',room_max_age=14400,thermostat='thermostat')
+        app.memory=dict(thermostat_bias=.5,thermostat_bias_at=stamp-4*3600)
+        primary=[None]
+        app.val=lambda key,default=None,attribute=None:primary[0] if key=='room' else 22.5
+        app.raw=lambda *a,**k:'heat'
+        app.get_state=lambda entity,**kw:dict(state='unavailable' if entity=='room' and primary[0] is None else 'heat',last_reported=at.isoformat())
+        with patch('heating_climate.time.time',return_value=stamp):
+            self.assertEqual(app.source_temperature()[:2],(22.,'Термостат · резерв'))
+            primary[0]=19.
+            self.assertEqual(app.source_temperature()[0],19.)
+            self.assertNotIn('thermostat_bias_at',app.memory)
+            primary[0]=None
+            self.assertIsNone(app.source_temperature()[0])
+
     def test_latest_eligible_issue_may_be_older_than_twelve_hours_ten_minutes(self):
         case=accountability.FrozenTemperatureTests();case.setUp()
         case.observe(case.at-timedelta(hours=12,minutes=30),forecast=case.forecast)

@@ -783,8 +783,12 @@ class HeatingClimate(HeatingRecovery,Hass):
         thermostat_ok=(thermostat is not None and 5<thermostat<40 and thermostat_state not in ('unavailable','unknown',None) and
             thermostat_age is not None and thermostat_age<=self.cfg.get('thermostat_temperature_max_age',5400))
         if (primary_ok and primary_age is not None and primary_age<=self.room_limits['warning_seconds'] and
-                thermostat_ok and bias is not None and abs(thermostat-primary-bias)<=.3):
-            self.memory['thermostat_bias_at']=stamp;bias_at=stamp
+                thermostat_ok and bias is not None):
+            if abs(thermostat-primary-bias)<=.3:
+                self.memory['thermostat_bias_at']=stamp;bias_at=stamp
+            else:
+                # A fresh disagreement invalidates the old backup calibration.
+                self.memory.pop('thermostat_bias_at',None);bias_at=None
         backup_ok=thermostat_ok and bias is not None and bias_at is not None and 0<=stamp-bias_at<=86400
         status=('unknown' if primary_age is None or not plausible else 'critical' if not primary_ok else
                 'stale' if primary_age>self.room_limits['warning_seconds'] else 'normal')
@@ -931,7 +935,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             thermo_at=number(row.get('thermostat_reported_at'))
             if (getattr(self,'temperature_quality',{}).get('primary_status')=='normal' and
                     thermo_at is not None and 0<=stamp-thermo_at<=self.cfg.get('thermostat_temperature_max_age',5400)):
-                self.memory['thermostat_bias_at']=stamp
+                if abs(row['thermostat']-row['room']-self.memory['thermostat_bias'])<=.3:
+                    self.memory['thermostat_bias_at']=stamp
+                else:self.memory.pop('thermostat_bias_at',None)
         pending=self.memory.setdefault("predictions",[])
         matured=[p for p in pending if p["ts"]<=stamp]
         if room is not None and source=="Вітальня" and quality and row['grid']=='on' and not row['power_estimated']:
