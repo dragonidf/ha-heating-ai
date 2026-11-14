@@ -360,6 +360,23 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.command_ledger.calls[0][2],"STOP")
             self.assertFalse(app.command_ledger_status["fenced"])
 
+    async def test_duplicate_equipment_echo_is_idempotent(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            evidence = app.prepare_equipment_command(
+                "climate", "set_hvac_mode",
+                {"entity_id": "climate.boiler", "hvac_mode": "off"})
+            app.mark_equipment_command_sent(evidence)
+            evidence["service_completed_at"] = 1001
+            hass.rows["climate.boiler"].state = "off"
+            observed = app.async_equipment_command_echo(
+                "climate", "set_hvac_mode", evidence["data"], evidence)
+            self.assertTrue(app.record_equipment_command_echo(evidence, observed))
+            self.assertTrue(app.record_equipment_command_echo(evidence, observed))
+            self.assertEqual(
+                [call[0] for call in app.command_ledger.calls],
+                ["PREPARED", "SENT", "HA_ECHO", "UNFENCED"])
+
     async def test_raw_settings_event_is_not_registered_in_native_production(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
