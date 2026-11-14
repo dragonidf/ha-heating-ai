@@ -4,10 +4,62 @@ from threading import RLock
 import unittest
 from unittest.mock import patch
 import test_planned_execution as execution
-\n\nclass OutageForecastContinuityTests(unittest.TestCase):\n    def test_preoutage_control_reserve_is_not_reused_as_live_watts(self):\n        fixture=execution.PlannedExecutionTests()\n        actions,_=fixture.cycle(grid='unknown',measured_power=None,reserve_prior=6000.)\n        self.assertEqual(actions,['off'])\n        self.assertNotEqual(fixture.forecast_status['control_power_basis'],'partial_meter_reserve')\n        self.assertIsNone(fixture.created_app.memory['floor_observer']['energy_kwh'])\n\n    def test_missing_power_during_grid_loss_still_plans_without_issuing_heat(self):\n        for grid in ('off','unknown'):\n            with self.subTest(grid=grid):\n                fixture=execution.PlannedExecutionTests();actions,_=fixture.cycle(grid=grid,measured_power=None)\n                self.assertEqual(actions,['off'])\n                self.assertEqual(fixture.planner_calls,1)\n                self.assertEqual(fixture.forecast_status['horizon_hours'],24)\n                self.assertTrue(fixture.forecast_status['electrical_inputs_unavailable'])\n                self.assertEqual(fixture.forecast_status['grid_state'],grid)\n                self.assertIsNone(fixture.created_app.sample_calls[-1][3])\n                self.assertFalse(fixture.created_app.sample_calls[-1][8])\n\n    def test_stored_heat_supports_outlook_when_return_sensor_disappears_during_outage(self):\n        fixture=execution.PlannedExecutionTests()\n        actions,_=fixture.cycle(grid='unknown',measured_power=None,probe_available=False,stored_floor=25.)\n        self.assertEqual(actions,['off']);self.assertEqual(fixture.planner_calls,1)\n        self.assertGreater(fixture.forecast_status['estimated_floor'],24.)\n        self.assertLess(fixture.forecast_status['estimated_floor'],25.)\n        self.assertEqual(fixture.created_app.memory['floor_observer']['grid'],'unknown')\n\n    def test_no_stored_heat_and_invalid_probe_does_not_invent_a_forecast(self):\n        fixture=execution.PlannedExecutionTests()\n        self.assertEqual(fixture.cycle(grid='unknown',measured_power=None,probe_available=False)[0],['off'])\n        self.assertEqual(fixture.planner_calls,0)\n        self.assertEqual(fixture.forecast_status['state'],'unavailable')\n\n    def test_unknown_power_with_confirmed_grid_keeps_existing_control_protection(self):\n        fixture=execution.PlannedExecutionTests();actions,_=fixture.cycle(grid='on',measured_power=None)\n        self.assertNotIn('heat',actions);self.assertEqual(fixture.planner_calls,1)\n\n    def test_grid_loss_and_return_force_fresh_replanning_instead_of_reusing_preoutage_commands(self):\n        fixture=execution.PlannedExecutionTests()\n        actions,_=fixture.cycle(grid_sequence=['on','off','on'])\n        self.assertEqual(actions,['heat','off','heat'])\n        self.assertEqual(fixture.planner_calls,3)\n\n    def test_real_planner_keeps_full_curve_and_planned_intervals_without_live_watts(self):
+
+
+class OutageForecastContinuityTests(unittest.TestCase):
+    def test_preoutage_control_reserve_is_not_reused_as_live_watts(self):
+        fixture=execution.PlannedExecutionTests()
+        actions,_=fixture.cycle(grid='unknown',measured_power=None,reserve_prior=6000.)
+        self.assertEqual(actions,['off'])
+        self.assertNotEqual(fixture.forecast_status['control_power_basis'],'partial_meter_reserve')
+        self.assertIsNone(fixture.created_app.memory['floor_observer']['energy_kwh'])
+
+    def test_missing_power_during_grid_loss_still_plans_without_issuing_heat(self):
+        for grid in ('off','unknown'):
+            with self.subTest(grid=grid):
+                fixture=execution.PlannedExecutionTests();actions,_=fixture.cycle(grid=grid,measured_power=None)
+                self.assertEqual(actions,['off'])
+                self.assertEqual(fixture.planner_calls,1)
+                self.assertEqual(fixture.forecast_status['horizon_hours'],24)
+                self.assertTrue(fixture.forecast_status['electrical_inputs_unavailable'])
+                self.assertEqual(fixture.forecast_status['grid_state'],grid)
+                self.assertIsNone(fixture.created_app.sample_calls[-1][3])
+                self.assertFalse(fixture.created_app.sample_calls[-1][8])
+
+    def test_stored_heat_supports_outlook_when_return_sensor_disappears_during_outage(self):
+        fixture=execution.PlannedExecutionTests()
+        actions,_=fixture.cycle(grid='unknown',measured_power=None,probe_available=False,stored_floor=25.)
+        self.assertEqual(actions,['off']);self.assertEqual(fixture.planner_calls,1)
+        self.assertGreater(fixture.forecast_status['estimated_floor'],24.)
+        self.assertLess(fixture.forecast_status['estimated_floor'],25.)
+        self.assertEqual(fixture.created_app.memory['floor_observer']['grid'],'unknown')
+
+    def test_no_stored_heat_and_invalid_probe_does_not_invent_a_forecast(self):
+        fixture=execution.PlannedExecutionTests()
+        self.assertEqual(fixture.cycle(grid='unknown',measured_power=None,probe_available=False)[0],['off'])
+        self.assertEqual(fixture.planner_calls,0)
+        self.assertEqual(fixture.forecast_status['state'],'unavailable')
+
+    def test_unknown_power_with_confirmed_grid_keeps_existing_control_protection(self):
+        fixture=execution.PlannedExecutionTests();actions,_=fixture.cycle(grid='on',measured_power=None)
+        self.assertNotIn('heat',actions);self.assertEqual(fixture.planner_calls,1)
+
+    def test_grid_loss_and_return_force_fresh_replanning_instead_of_reusing_preoutage_commands(self):
+        fixture=execution.PlannedExecutionTests()
+        actions,_=fixture.cycle(grid_sequence=['on','off','on'])
+        self.assertEqual(actions,['heat','off','heat'])
+        self.assertEqual(fixture.planner_calls,3)
+
+    def test_real_planner_keeps_full_curve_and_planned_intervals_without_live_watts(self):
         fixture=execution.PlannedExecutionTests()
         actions,_=fixture.cycle(grid='unknown',measured_power=None,room=20.9,real_planner=True)
-        self.assertEqual(actions,['off'])\n        forecast=fixture.forecast_status\n        self.assertEqual(len(forecast['curve']),48)\n        self.assertEqual(forecast['horizon_hours'],24)\n        self.assertGreater(len(forecast['heat_segments']),0)\n        self.assertGreater(forecast['planned_kwh'],0)\n        self.assertFalse(forecast['validated'])
+        self.assertEqual(actions,['off'])
+        forecast=fixture.forecast_status
+        self.assertEqual(len(forecast['curve']),48)
+        self.assertEqual(forecast['horizon_hours'],24)
+        self.assertGreater(len(forecast['heat_segments']),0)
+        self.assertGreater(forecast['planned_kwh'],0)
+        self.assertFalse(forecast['validated'])
         self.assertTrue(forecast['electrical_inputs_unavailable'])
 
     def test_native_background_plan_finishing_after_timeout_is_published_during_blackout(self):
@@ -39,4 +91,3 @@ import test_planned_execution as execution
         self.assertTrue(forecast['electrical_inputs_unavailable'])
         self.assertGreater(len(forecast['heat_segments']),0)
         self.assertNotIn('heat',actions)
-
