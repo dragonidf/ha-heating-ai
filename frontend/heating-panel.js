@@ -706,7 +706,7 @@ export class HeatingAIPanel extends HTMLElement {
   equipmentReadiness() {
     const report=this.attrs('diagnostics').reliability?.equipment||this.attrs('controller').equipment_readiness||{};
     const reason=report.reason||'not_verified';
-    const configured=reason!=='not_configured'||this.attrs('system_settings').values?.power_accounting_method==='kws';
+    const configured=this.attrs('system_settings').values?.power_accounting_method==='kws'||!['not_configured','not_verified'].includes(reason);
     const labels={
       ready:'Готовий',not_configured:'Не використовується',kws_protection:'Активний захист',
       kws_reset_pending:'Очікує відновлення',kws_relay_off:'Реле вимкнене',

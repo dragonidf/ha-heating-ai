@@ -52,6 +52,8 @@ test('overview translates KWS readiness without confusing recovered ledger histo
   attrs.diagnostics.reliability.equipment={ready:true,reason:'ready'};
   assert.notEqual(p.overviewStatus().tone,'error');
   assert.match(p.diagnosticSummary(),/Відновлено/);
+  attrs.diagnostics.reliability.equipment={};
+  assert.equal(p.equipmentReadiness().configured,false);
 });
 test('compact history decodes AppDaemon wire zeros, gaps and cycle identity',async()=>{
   const {unpackHistoryItems}=await import('../frontend/heating-panel.js');
