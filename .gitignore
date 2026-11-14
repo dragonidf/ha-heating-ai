@@ -11,3 +11,4 @@ telemetry.jsonl
 *.db*
 *.backup-*
 before/
+artifacts/

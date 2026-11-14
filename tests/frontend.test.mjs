@@ -31,6 +31,30 @@ test('grid loss explains unavailable electric measurements without calling the c
   attrs.grid_status.raw='unknown';assert.match(p.controllerHealth().message,/підтвердження електромережі/);
   attrs.grid_status.raw='on';assert.match(p.controllerHealth().message,/бракує актуальних/);
 });
+test('overview status separates controller heartbeat, grid blocking and actual heating',()=>{
+  const p=Object.create(HeatingAIPanel.prototype),values={heartbeat:new Date().toISOString(),alive:'on',mode:'Автоматичне керування',permitted:'on'};
+  const attrs={controller:{quality:true},diagnostics:{control_health:'healthy'},forecast:{created_at:new Date().toISOString(),heat_segments:[]},grid_status:{raw:'off'}};
+  p.state=key=>values[key]??'off';p.attrs=key=>attrs[key]||{};p.boilerActual=()=>({heating:false,power:0});
+  p.controllerHealth=()=>({message:'',severity:'info',stale:false});
+  assert.deepEqual(p.overviewStatus().label,'Немає електромережі');
+  attrs.grid_status.raw='unknown';assert.equal(p.overviewStatus().label,'Мережу не підтверджено');
+  attrs.grid_status.raw='on';values.permitted='off';assert.equal(p.overviewStatus().label,'Нагрів призупинено');
+  values.permitted='on';p.boilerActual=()=>({heating:true,power:6000});
+  assert.equal(p.overviewStatus().label,'Опалення працює');
+});
+test('overview translates KWS readiness without confusing recovered ledger history with an active failure',()=>{
+  const p=Object.create(HeatingAIPanel.prototype),values={heartbeat:new Date().toISOString(),alive:'on',mode:'Автоматичне керування',permitted:'on'};
+  const attrs={controller:{quality:true},diagnostics:{control_health:'healthy',control_error:null,reliability:{equipment:{ready:false,reason:'kws_reset_pending',reason_text:'KWS: очікування підтвердженого відновлення'},ledger_recovery:{state:'reconciliation_verified',at:Date.now()/1000}}},forecast:{created_at:new Date().toISOString(),heat_segments:[]},grid_status:{raw:'on'}};
+  p.state=key=>values[key]??'off';p.attrs=key=>attrs[key]||{};p.boilerActual=()=>({heating:false,power:0});p.controllerHealth=()=>({message:'',severity:'info',stale:false});
+  assert.deepEqual(p.equipmentReadiness(),{ready:false,configured:true,reason:'kws_reset_pending',label:'Очікує відновлення'});
+  assert.equal(p.overviewStatus().label,'Нагрів заблоковано захистом');
+  assert.match(p.overviewStatus().reason,/KWS/);
+  attrs.diagnostics.reliability.equipment={ready:true,reason:'ready'};
+  assert.notEqual(p.overviewStatus().tone,'error');
+  assert.match(p.diagnosticSummary(),/Відновлено/);
+  attrs.diagnostics.reliability.equipment={};
+  assert.equal(p.equipmentReadiness().configured,false);
+});
 test('compact history decodes AppDaemon wire zeros, gaps and cycle identity',async()=>{
   const {unpackHistoryItems}=await import('../frontend/heating-panel.js');
   const page={encoding:'columns-v1',cycle_ids:['night'],items:[['0',null,15,100,null,21,22],[1,'0',3,101,'0'],[2,{kind:'marker',value:{kind:'grid_off'}}]]};
@@ -122,7 +146,8 @@ test('home opens with a forecast-only timeline and three simple tabs',()=>{
   const forecast={created_at:new Date(now*1000).toISOString(),horizon_hours:24,curve:[{ts:now,temperature:21.3,lower:20,upper:22},{ts:now+3600,temperature:21.5,lower:20,upper:22}],heat_segments:[{start:now+600,end:now+1200}]};
   p.attrs=key=>key==='forecast'?forecast:key==='outages'?{outages:[]}:{};p._hass={states:{}};
   const chart=p.forecastChart();assert.match(chart,/home-timeline/);assert.match(chart,/role="slider"/);assert.doesNotMatch(chart,/Факт кімнати|KWS 3·6·9|Факт: 21,2 °C/);assert.match(chart,/Прогноз температури/);assert.match(chart,/План нагріву/);assert.match(chart,/Прогноз: 21,3 °C/);
-  const source=HeatingAIPanel.prototype.render.toString();assert.match(source,/\['overview','Дім'\].*\['model','Історія'\].*\['settings','Налаштування'\]/s);
+  p.timelineCursor=now+700;const planned=p.forecastChart();assert.match(planned,/План: підтверджений/);assert.match(planned,/Мережа: невідомо/);
+  const source=HeatingAIPanel.prototype.render.toString();assert.match(source,/\['overview','Огляд'\].*\['model','Історія'\].*\['settings','Налаштування'\]/s);
 });
 test('history graph is the first model content and labels the actual advance lead',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.attrs=()=>({});p.state=()=> 'unavailable';p.entity=()=>null;
@@ -184,6 +209,15 @@ test('expert help opens with the compact values schema and no runtime error',()=
   p.attrs=()=>({schema_version:1,values:{room_max_age:7200}});p.entity=()=>null;p.state=()=> 'unavailable';p.id=x=>x;
   const markup=p.systemSettings();assert.match(markup,/<dialog/);assert.match(markup,/Свіжість кімнатного датчика/);
   assert.equal(p.systemFields().find(f=>f.key==='room_max_age').value,7200);
+});
+test('expert settings search filters locally without dropping schema fields',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.settingsQuery='камін';
+  p.attrs=()=>({schema_version:1,values:{}});p.entity=()=>null;p.state=()=> 'unavailable';p.id=x=>x;
+  const filtered=p.systemSettings();
+  assert.match(filtered,/data-settings-search/);assert.match(filtered,/data-system-key="fire_start_delta"/);
+  assert.doesNotMatch(filtered,/data-system-key="room_loss"/);
+  p.settingsQuery='';const all=p.systemSettings();
+  assert.equal(p.systemFields().length,46);assert.ok((all.match(/data-system-key=/g)||[]).length>=35);
 });
 test('paged history ignores duplicate and foreign pages and completes only after every point',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='mine';
