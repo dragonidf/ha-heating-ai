@@ -377,6 +377,21 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 [call[0] for call in app.command_ledger.calls],
                 ["PREPARED", "SENT", "HA_ECHO", "UNFENCED"])
 
+    async def test_persisted_fence_recovery_guard_is_reset_on_native_restart(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.memory.update(
+                fence_recovery_tick_seen=True,
+                fence_recovery_attempted=True,
+                native_runtime_initialized=True,
+            )
+            app._fence_recovery_attempted = True
+            with patch.object(component.HeatingClimate, "initialize"):
+                await asyncio.to_thread(app.initialize)
+            self.assertNotIn("fence_recovery_tick_seen", app.memory)
+            self.assertNotIn("fence_recovery_attempted", app.memory)
+            self.assertFalse(app._fence_recovery_attempted)
+
     async def test_raw_settings_event_is_not_registered_in_native_production(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
