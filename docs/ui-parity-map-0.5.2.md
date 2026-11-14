@@ -1,10 +1,13 @@
-# Heating AI UI parity map — v0.5.2 redesign baseline
+# Heating AI UI parity map — v0.5.5 redesign baseline
 
 Updated: 2026-11-14. This is the regression contract for the 0.5.x redesign.
 
 ## Baseline and non-negotiable behavior
 
-- Source commit: `9fcc5c05c8ff0a962651cf0c661500a6851ed3d6`.
+- Original redesign baseline: `9fcc5c05c8ff0a962651cf0c661500a6851ed3d6`.
+- Preserved backend baseline: `main` at
+  `8532df334137c0cfef7572048bb7dc17a645c209` (release 0.5.5). The redesign
+  branch contains that commit as a parent and is zero commits behind it.
 - The browser receives one generated local JavaScript asset. There are no
   external fonts, UI libraries, CDNs or extra runtime module requests.
 - Baseline asset size: 203,049 bytes before source modularization.
@@ -86,3 +89,31 @@ Updated: 2026-11-14. This is the regression contract for the 0.5.x redesign.
   blocked/error state and admin settings at 390 and 1440 px where applicable.
 - Final evidence must compare asset size, recurring timers, HA request counts
   and render behavior against this baseline.
+
+## Verified redesign evidence
+
+- Verified branch head: `2c0354e7c60e7140414d1c331261a766c1900cc8`.
+  Its diff from `main` contains only UI sources/generated assets, UI tests,
+  build/CI support and documentation; controller backend files are inherited
+  unchanged from release 0.5.5.
+- The generated asset is 218,059 bytes versus the 203,049-byte baseline:
+  +15,010 bytes (+7.39%). It remains one local dependency-free JavaScript
+  response, so the redesign adds no CDN, font or runtime module requests.
+- The single 60-second presentation refresh remains unchanged. Settings search
+  is local, history caching remains in place and ordinary HA state updates do
+  not re-fetch Recorder history. No new periodic poller or Recorder entity was
+  added.
+- Pure frontend regression suite: 56/56 passed. Chromium and WebKit cover the
+  required ten widths, touch/rotation, light/dark themes, 100/125/200% text,
+  keyboard use, 44 px targets, container resizing and absence of horizontal
+  page overflow.
+- GitHub Actions run `43612464681` passed Python 3.12, Python 3.13, native HA
+  2026.11, package/manifest checks and browser/accessibility tests. Screenshot
+  artifact `14121145941` contains the final Overview, History and Settings
+  states.
+- Final visual review confirmed compact, content-sized desktop heat-source
+  cards and the intended mobile 2x2 metric grid; a 1440 px regression assertion
+  prevents the heat-source cards from regaining excessive empty height.
+- Production HA was inspected read-only and reported installed/latest 0.5.5,
+  a live controller, healthy control diagnostics and verified release assets.
+  No install, reload, restart or HA write was performed during this work.

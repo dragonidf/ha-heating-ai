@@ -45,9 +45,9 @@ GitHub CI is green and the owner explicitly proceeds with installation.
   helpers, permissions and confirmation/revision behavior.
 - [x] Add semantic statuses, compact heat-source cards, responsive layouts,
   keyboard/accessibility support and local settings search.
-- [ ] Add Chromium/WebKit coverage at required widths, long-open tests,
+- [x] Add Chromium/WebKit coverage at required widths, long-open tests,
   light/dark screenshots and performance comparison.
-- [ ] Regenerate UI/release assets and run full GitHub CI.
+- [x] Regenerate UI/release assets and run full GitHub CI.
 
 ## Release gates
 
@@ -65,15 +65,16 @@ GitHub CI is green and the owner explicitly proceeds with installation.
 
 ## Current checkpoint
 
-- Backend follow-up PR #46 passed both GitHub workflows (Python 3.12/3.13,
-  native HA 2026.11, package, Chromium/WebKit and browser interaction jobs) and
-  was squash-merged as `9874743cb0c72ab09c0abab2c6ccd0fe8f9c60d0`
-  (candidate 0.5.4). Production HA remains on its separately installed 0.5.3;
-  this work did not install, reload or restart anything.
-- Base for the redesign is now `main` at
-  `9874743cb0c72ab09c0abab2c6ccd0fe8f9c60d0`. The UI checkout was reconciled
-  with every changed backend file before regenerating the bundle, so the 0.5.4
-  command-ledger, KWS and package hashes are not replaced by older versions.
+- Backend PR #46 was squash-merged as
+  `9874743cb0c72ab09c0abab2c6ccd0fe8f9c60d0`; the subsequent 0.5.5 fixes were
+  merged to `main` as `8532df334137c0cfef7572048bb7dc17a645c209`.
+  They preserve pending thermostat reservations, handle delayed echoes and
+  keep STOP behavior safe.
+- The redesign branch contains the 0.5.5 `main` commit as a merge parent and is
+  zero commits behind it. Its GitHub diff changes only UI sources/generated
+  assets, UI tests, build/CI support and documentation. It therefore cannot
+  replace the installed 0.5.5 controller backend with the earlier 0.5.2/0.5.4
+  implementation.
 - Confirmed root cause: `poll_calculation` marked a plan timed out after
   60 seconds and then discards its completed result solely because
   `timed_out_at` exists. `background_plan` already performs exact-key checks,
@@ -101,6 +102,18 @@ GitHub CI is green and the owner explicitly proceeds with installation.
 - KWS readiness, recovered ledger state and physical heating are presented as
   separate concepts. A historical recovered `LedgerConflict` cannot turn a
   currently healthy controller into an active emergency banner.
-- Local deterministic bundle check and 56 frontend regressions pass. The
-  remaining gates are GitHub full CI, responsive/light/dark screenshot review,
-  long-open/performance evidence and final Draft PR documentation.
+- Local deterministic bundle check and 56/56 frontend regressions pass. The
+  final generated asset is 218,059 bytes, +15,010 bytes (+7.39%) over the
+  original baseline, while retaining one dependency-free response and the
+  existing single 60-second presentation interval.
+- GitHub Actions run `43612464681` passed Python 3.12/3.13, native HA 2026.11,
+  package/manifest checks and Chromium/WebKit browser/accessibility coverage.
+  Screenshot artifact `14121145941` was reviewed for Overview, History and
+  Settings at mobile/desktop sizes and light/dark themes. The final desktop
+  heat-source cards are content-sized and protected by a 1440 px regression.
+- Production HA was verified read-only: installed/latest version 0.5.5,
+  controller alive, release assets verified and current control diagnostics
+  healthy. No installation, reload, restart or HA write was performed.
+- Draft PR #44 remains intentionally unmerged. Development gates are complete;
+  the remaining production step is the owner's backup and explicit decision to
+  install the reviewed release candidate.
