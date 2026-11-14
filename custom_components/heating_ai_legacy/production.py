@@ -719,7 +719,7 @@ class NativeController(HeatingClimate):
         equipment = self._on_loop(self.async_kws_status)
         fenced = (self.command_ledger_status or {}).get("fenced", True)
         automatic_fence = (fenced and self.raw("mode") == "Автоматичне керування" and self.raw("armed") == "on")
-        if automatic_fence or action in ("heat", "fallback") and (fenced or not equipment["ready"]):
+        if automatic_fence or not equipment["ready"] or (fenced and action in ("heat", "fallback")):
             reason = "Журнал команд: очікується підтверджене вимкнення" if fenced else equipment.get("reason_text", equipment["reason"])
             self.publish("sensor.heating_controller", "Нагрів заблоковано",
                          reason=reason, control_state="blocked", equipment_readiness=equipment,

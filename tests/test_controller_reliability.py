@@ -209,6 +209,40 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.memory['owned'])
             self.assertTrue(any(c.args[:2]==('input_select','select_option') for c in hass.services.async_call.await_args_list))
 
+    async def test_kws_reset_pending_defers_all_normal_actions_without_fallback(self):
+        with package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            equipment = dict(ready=False, reason='kws_reset_pending',
+                             reason_text='KWS: очікування підтвердженого відновлення',
+                             diagnosis_overdue=False)
+            with patch.object(app, 'apply_voltage_stop', return_value=False), \
+                    patch.object(app, 'async_kws_status', return_value=equipment), \
+                    patch.object(app, '_track_comfort_lock'), \
+                    patch.object(app, 'publish') as published, \
+                    patch.object(app, 'call_service') as service, \
+                    patch.object(component.HeatingClimate, 'apply_action') as parent:
+                hass.rows['climate.boiler'].state = 'off'
+                for action in ('off', 'heat', 'fallback', 'release', 'observe'):
+                    await asyncio.to_thread(app.apply_action, action, False)
+                parent.assert_not_called()
+                service.assert_not_called()
+                self.assertNotIn('temporary_fallback', app.memory)
+                self.assertNotIn('control_incident', app.memory)
+                self.assertEqual(published.call_args.args[:2],
+                                 ('sensor.heating_controller', 'Нагрів заблоковано'))
+                self.assertEqual(published.call_args.kwargs['reason'],
+                                 equipment['reason_text'])
+                # A live thermostat must still receive the physical safe OFF.
+                hass.rows['climate.boiler'].state = 'heat'
+                await asyncio.to_thread(app.apply_action, 'off', False)
+                service.assert_called_once_with('climate/set_hvac_mode',
+                                                entity_id='climate.boiler', hvac_mode='off')
+                parent.assert_not_called()
+                # Once KWS is qualified, keep the existing V1 action dispatch.
+                equipment['ready'] = True
+                await asyncio.to_thread(app.apply_action, 'off', False)
+                parent.assert_called_once_with('off', False)
+
     async def test_pending_fenced_stop_is_not_superseded_by_normal_off_action(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
