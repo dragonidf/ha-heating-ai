@@ -535,10 +535,10 @@ def main(engine='chromium'):
             page.wait_for_selector('.history-crosshair',state='attached')
             assert 'Котел:' in page.locator('.history-card .history-readout').inner_text() and 'Камін:' in page.locator('.history-card .history-readout').inner_text()
             page.locator('[data-history-range="24"]').click()
-            assert page.locator('.forecast-plot [data-series="fireplace"]').count()==0
-            assert 'Камін' not in page.locator('.chart-card .legend').inner_text()
+            assert page.locator('.forecast-plot [data-forecast-lane="fireplace"]').count()>0
+            assert page.locator('.chart-card .legend').count()==0
             assert page.locator('.fireplace-card').count()==1, 'Fireplace must have a visible overview card'
-            assert page.locator('.fireplace-card').bounding_box()['y']>page.locator('.plan-card').bounding_box()['y'], 'Source details should follow the main forecast and plan'
+            assert page.locator('.fireplace-card').bounding_box()['y']>=page.locator('.chart-card').bounding_box()['y']+page.locator('.chart-card').bounding_box()['height'], 'Source tiles follow the forecast; full plan is on demand'
             page.evaluate('''() => {
                 const updated={...mockHass.states,
                   'sensor.heating_fireplace':{state:'Горить',attributes:{temperature:25.6,delta:4.1,trend:1.2}},
@@ -547,9 +547,10 @@ def main(engine='chromium'):
                 panel.hass={...mockHass,states:updated};
             }''')
             fire=page.locator('.fireplace-card')
-            assert '25,6' in fire.inner_text() and '+4,1' in fire.inner_text()
+            assert '25,6' in fire.inner_text()
             assert not fire.locator('details').get_attribute('open'), 'Technical details should stay collapsed'
             fire.locator('summary').click()
+            assert '+4,1' in fire.inner_text()
             assert 'резервне живлення' in fire.inner_text()
             assert 'Вимкнено' in fire.inner_text(), 'Pending fan demand must not be presented as actual airflow'
             page.evaluate("panel.hass={...panel.hass,states:{...panel.hass.states,'sensor.heating_fireplace':{state:'Датчик недоступний',attributes:{temperature:25.6,delta:4.1,trend:1.2}}}}")
