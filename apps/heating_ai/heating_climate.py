@@ -1931,7 +1931,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         backup_state=self.get_state(backup_entity)
         backup_verified=backup_state=='on' if backup_state is not None else self.cfg.get('fan_backup_verified',False) is True
         inverter_ok=self.raw('connection')=='on' and self.heartbeat_fresh(self.cfg.get('inverter_heartbeat',[]),90)
-        power_ok=grid=='on' or backup_verified and inverter_ok
+        power_ok=grid=='on' or grid=='off' and backup_verified and inverter_ok
         reason="Камін" if fire_active else "Нічна циркуляція" if self.memory.get("night_fan_until",0)>time.time() else "Ручний запуск" if request else "Не потрібна"
         if mode=='Зупинити':
             reason='Зупинено вручну'

@@ -1429,7 +1429,10 @@ class HeatingRecovery:
         if self.grid_state()!="on":
             return
         inlet=self.cfg.get('power_accounting_method')=='inlet'
-        power=getattr(self,'current_power_w',None) if inlet else self.val("power")
+        kws=self.cfg.get('power_accounting_method')=='kws'
+        observation=getattr(self,'power_observation',{})
+        power=getattr(self,'current_power_w',None) if inlet or kws else self.val("power")
+        if kws and (observation.get('quality')!='measured' or not -5<=time.time()-observation.get('at',0)<=180):power=None
         threshold=500 if self.cfg.get('power_measurement_policy')=='audited' else 1500
         bounds=getattr(self,'control_power_bounds',{}) or {};prior=number(getattr(self,'control_power_prior',None))
         reserve=((inlet or self.cfg.get('power_partial_reserve')=='enabled') and getattr(self,'current_power_w',None) is None
