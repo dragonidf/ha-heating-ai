@@ -663,6 +663,9 @@ def main(engine='chromium'):
                             else:
                                 assert right['x']>=left['x']+left['width'], (width,'controller decision should share the comfort row')
                             assert page.locator('.temperature').evaluate('el=>el.scrollWidth <= el.clientWidth'), (width,'temperature overflow')
+                        if width>=1024:
+                            assert page.locator('.boiler-card').bounding_box()['height']<360, (width,'boiler card should fit its content')
+                            assert page.locator('.fireplace-card').bounding_box()['height']<360, (width,'fireplace card should fit its content')
                         if width==390:
                             page.screenshot(path=str(ARTIFACTS/f'heating-mobile-overview-{engine}.png'),full_page=True)
                             page.locator('.overview-details>summary').click()
