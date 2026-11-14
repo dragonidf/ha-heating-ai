@@ -275,6 +275,22 @@ class Hass:
             finally:
                 if domain == "climate" and self._equipment_service_task is asyncio.current_task():
                     self._equipment_service_task = None
+            if (evidence is not None and domain == "climate"
+                    and action == "set_hvac_mode" and data.get("hvac_mode") == "off"
+                    and getattr(self, "_recovery_inflight", False)
+                    and self.cfg.get("power_accounting_method") == "kws"):
+                state = self.hass.states.get(data["entity_id"])
+                if (state is not None and state.state == "off"
+                        and state.last_reported.timestamp() < evidence["sent_at"]):
+                    # Tuya may not emit a new OFF state for an idempotent OFF.
+                    # Accept only a fresh, independent post-command KWS zero.
+                    verify = getattr(self, "async_independent_stop_seen", None)
+                    if verify is not None:
+                        for _ in range(20):
+                            if verify(evidence["sent_at"]):
+                                evidence["independent_off_verified_at"] = time.time()
+                                break
+                            await asyncio.sleep(1)
             if evidence is not None:
                 evidence["service_completed_at"] = datetime.now(timezone.utc).timestamp()
             observe = getattr(self, "async_equipment_command_echo", None)
