@@ -275,6 +275,18 @@ class Hass:
             finally:
                 if domain == "climate" and self._equipment_service_task is asyncio.current_task():
                     self._equipment_service_task = None
+            if (evidence is not None and domain == "climate"
+                    and action == "set_hvac_mode" and data.get("hvac_mode") == "off"
+                    and getattr(self, "_recovery_inflight", False)):
+                state = self.hass.states.get(data["entity_id"])
+                if (state is not None and state.state == "off"
+                        and state.last_reported.timestamp() < evidence["sent_at"]):
+                    # Re-read the actual Tuya entity after the idempotent OFF.
+                    # The old OFF display must never release the journal fence.
+                    await self.hass.services.async_call(
+                        "homeassistant", "update_entity",
+                        {"entity_id": data["entity_id"]}, blocking=True,
+                        context=self._context)
             if evidence is not None:
                 evidence["service_completed_at"] = datetime.now(timezone.utc).timestamp()
             observe = getattr(self, "async_equipment_command_echo", None)
