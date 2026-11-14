@@ -35,8 +35,8 @@ export const calendarMidnight = (day,timeZone) => {
   return stamp/1000;
 };
 export const chartLayout = width => {
-  const w=Math.max(1,Math.round(numeric(width)??880)), height=w<520?350:370;
-  return {width:w,height,left:46,right:12,top:24,bottom:height-124,tickIntervals:w<520?2:4};
+  const w=Math.max(1,Math.round(numeric(width)??880)), height=w<520?246:272;
+  return {width:w,height,left:46,right:12,top:24,bottom:height-100,tickIntervals:w<520?2:4};
 };
 // Recorder uses compact {s, lu} records over WebSocket; REST uses ISO timestamps.
 export const normalizeHistory = rows => [...new Map((Array.isArray(rows)?rows:[]).map(row=>{

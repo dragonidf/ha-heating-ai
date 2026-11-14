@@ -81,7 +81,7 @@ test('extended forecast uses the matching plan only and preserves unknown plan i
   assert.equal(p.forecastData().horizon_hours,24);
 });
 test('a wholly unmeasured cycle is not displayed as zero actual consumption',()=>{
-  const p=Object.create(HeatingAIPanel.prototype),now=Date.now()/1000;
+  const p=Object.create(HeatingAIPanel.prototype),now=Date.now()/1000;p.config={};
   const row={start:now-3600,end:now+3600,initial_plan:{kwh:4},observed_kwh:0,complete:false,unknown_seconds:3600};
   p.time=()=> '07:00';p.attrs=()=>({energy_cycles:[row]});
   const text=p.energyComparison();assert.match(text,/немає даних/);assert.doesNotMatch(text,/0,00/);
@@ -89,7 +89,7 @@ test('a wholly unmeasured cycle is not displayed as zero actual consumption',()=
   assert.match(p.energyComparison(),/0,00/);
 });
 test('inlet nominal accounting is labelled as calculated in the boiler and cycle cards',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
   const now=Date.now()/1000;
   const data={power_confirmed:{measurement_basis:'nominal_inlet_stage',timestamp:new Date().toISOString()},
     plan_history:{energy_cycles:[{start:now-3600,end:now+3600,observed_kwh:1,calculated_kwh:2,calculated_other_kwh:2,complete:false,initial_plan:{kwh:2}}]}};
@@ -107,7 +107,7 @@ test('inlet nominal accounting is labelled as calculated in the boiler and cycle
   assert.doesNotMatch(p.energyComparison(true),/≥/);
 });
 test('partial-meter reserve is visible without calling assumed watts actual boiler heating',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
   const data={controller:{quality:true,control_power_basis:'partial_meter_reserve'},
     forecast:{created_at:new Date().toISOString(),weather_complete:true},grid_status:{raw:'on'},
     power_confirmed:{assumed_control_w:6000,control_reserve:{valid:true,upper_w:6200}}};
@@ -138,14 +138,14 @@ test('home minimum uses the real forecast sensor state rather than an absent att
   p.attrs=k=>k==='controller'?{quality:true}:{};p.state=k=>k==='forecast'?'21.4':'unavailable';
   p.controllerHealth=()=>({stale:false});
   for(const method of ['energyComparison','forecastOverview','heatingPlan','boilerOverview','fireplaceOverview','historyChart'])p[method]=()=>'';
-  assert.match(p.overview(),/Очікуваний мінімум <strong>21,4 °C/);
+  assert.match(p.overview(),/data-info="sensor.heating_forecast">Мін. прогноз <strong>21,4°/);
 });
 test('home opens with a forecast-only timeline and three simple tabs',()=>{
   const now=Date.now()/1000,p=Object.create(HeatingAIPanel.prototype);p.timelineCursor=now;p.forecastExtended=false;p.clientWidth=780;
   p.shadowRoot={querySelector:()=>null};p.time=()=> '12:00';p.historyData={rows:{room:[{ts:now-1800,state:'21.2'}],boiler_stage:[{ts:now-1200,state:'6 кВт'}]}};
   const forecast={created_at:new Date(now*1000).toISOString(),horizon_hours:24,curve:[{ts:now,temperature:21.3,lower:20,upper:22},{ts:now+3600,temperature:21.5,lower:20,upper:22}],heat_segments:[{start:now+600,end:now+1200}]};
   p.attrs=key=>key==='forecast'?forecast:key==='outages'?{outages:[]}:{};p._hass={states:{}};
-  const chart=p.forecastChart();assert.match(chart,/home-timeline/);assert.match(chart,/role="slider"/);assert.doesNotMatch(chart,/Факт кімнати|KWS 3·6·9|Факт: 21,2 °C/);assert.match(chart,/Прогноз температури/);assert.match(chart,/План нагріву/);assert.match(chart,/Прогноз: 21,3 °C/);
+  const chart=p.forecastChart();assert.match(chart,/home-timeline/);assert.match(chart,/role="slider"/);assert.doesNotMatch(chart,/Факт кімнати|KWS 3·6·9|Факт: 21,2 °C/);assert.match(chart,/прогнозу температури, нагріву й мережі/);assert.match(chart,/>Камін<\/text>/);assert.doesNotMatch(chart,/class="legend"/);assert.match(chart,/Прогноз: 21,3 °C/);
   p.timelineCursor=now+700;const planned=p.forecastChart();assert.match(planned,/План: підтверджений/);assert.match(planned,/Мережа: невідомо/);
   const source=HeatingAIPanel.prototype.render.toString();assert.match(source,/\['overview','Огляд'\].*\['model','Історія'\].*\['settings','Налаштування'\]/s);
 });
@@ -199,7 +199,7 @@ test('all missed page pushes recover through REST without a polling delay per pa
 });
 test('healthy missing schedule stays neutral but unknown source remains an explicit warning',()=>{
   const p=Object.create(HeatingAIPanel.prototype);let mode='unknown';
-  p.state=k=>k==='heartbeat'?new Date().toISOString():'on';p.time=()=> '00:00';
+  p.state=k=>k==='heartbeat'?new Date().toISOString():'on';p.time=()=> '00:00';p.config={};
   p.attrs=k=>({controller:{quality:true},forecast:{created_at:new Date().toISOString(),weather_complete:true},
     grid_status:{raw:'on'},outages:{mode,warning:'Джерело Svitlo недоступне'}})[k]||{};
   assert.match(p.controllerHealth().message,/Svitlo/);mode='normal';assert.equal(p.controllerHealth().message,'');
@@ -368,7 +368,7 @@ test('active primary readings override fallback and unknown readings break lines
 test('chart keeps a readable height and reduces ticks for narrow containers',()=>{
   for(const width of [258,320,390,480,720,1440]) {
     const g=chartLayout(width);
-    assert.equal(g.width,width);assert.ok(g.height>=300);
+    assert.equal(g.width,width);assert.ok(g.height>=240&&g.height<=280);
     assert.ok(g.bottom>g.top);assert.ok(g.width-g.right>g.left);
     assert.equal(g.tickIntervals,width<520?2:4);
   }
@@ -463,4 +463,30 @@ test('an unconfirmed later start cannot truncate the frozen post-heat temperatur
   p.attrs=()=>({});p.shadowRoot={querySelector:()=>null};p.clientWidth=390;
   const text=p.temperatureComparison();const path=text.match(/data-comparison-line="forecast" d="([^"]+)"/)[1];
   assert.equal((path.match(/L/g)||[]).length,3);
+});
+test('mobile overview keeps the full plan on demand and daily energy in the current-state card',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;
+  p.attrs=key=>key==='forecast'?{planned_kwh:23,horizon_hours:24}:key==='controller'?{target_temperature:22}:{};
+  p.state=key=>({energy_24h:'0',forecast:'21.4',mode:'Автоматичне керування'})[key]??'unknown';
+  p.controllerHealth=()=>({stale:false});p.overviewStatus=()=>({tone:'normal',label:'Очікує',reason:'Очікує сеансу'});
+  p.overviewAction=()=>({title:'Наступний нагрів',value:'23:00',detail:'За планом',tone:'scheduled'});
+  for(const method of ['energyComparison','forecastOverview','boilerOverview','fireplaceOverview','historyChart'])p[method]=()=>'';
+  p.heatingPlan=()=>'<section class="plan-card">Усі сеанси</section>';
+  const view=p.overview();
+  assert.match(view,/<details class="next-action card"[^>]*><summary>/);
+  assert.match(view,/Більше/);assert.match(view,/next-action-details.*Усі сеанси/s);
+  assert.doesNotMatch(view,/overview-metrics|Енергія за місяць/);
+  assert.match(view,/data-info="sensor.heating_energy_24h"[^>]*>.*?0,0/s);
+  assert.match(view,/data-info="sensor.heating_forecast"[^>]*>.*?23,0/s);
+  // Switching to a longer chart horizon must not relabel its energy as 24 hours.
+  p.forecastExtended=true;p.forecastData=()=>({planned_kwh:99,horizon_hours:72});
+  assert.doesNotMatch(p.overview(),/99,0/);
+  p.state=()=> 'unavailable';assert.doesNotMatch(p.overview(),/>0,0/);
+});
+test('forecast preserves a distinct residual-fireplace lane without duplicating the legend',()=>{
+  const now=Date.now()/1000,p=Object.create(HeatingAIPanel.prototype);p.clientWidth=390;p.timelineCursor=null;
+  p.shadowRoot={querySelector:()=>null};p.time=()=> '12:00';p.attrs=()=>({outages:[]});
+  p.forecastData=()=>({created_at:new Date(now*1000).toISOString(),curve:[{ts:now,temperature:21},{ts:now+86400,temperature:22}],fireplace_segments:[{start:now-3600,end:now+3600,estimated:true}],heat_segments:[]});
+  const chart=p.forecastChart();assert.match(chart,/data-forecast-lane="fireplace"/);
+  assert.match(chart,/оцінка залишкового тепла/);assert.doesNotMatch(chart,/class="legend"/);
 });

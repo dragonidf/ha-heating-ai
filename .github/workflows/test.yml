@@ -53,13 +53,14 @@ jobs:
       - name: Browser interaction and responsive layout
         if: matrix.python == '3.12'
         run: |
+          python tools/check_mobile_overview.py
           python tools/check_ui_browser.py
           python tools/check_ui_browser.py --browser webkit
           python tools/check_ui_accessibility.py
           python tools/check_ui_accessibility.py --browser webkit
           python tools/check_native_v1_panel.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: matrix.python == '3.12'
+        if: always() && matrix.python == '3.12'
         with:
           name: native-v1-ui-screenshots
           path: |
