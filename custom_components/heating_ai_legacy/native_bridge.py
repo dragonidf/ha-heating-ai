@@ -148,6 +148,12 @@ class Hass:
             self._handles.clear()
 
             current = asyncio.current_task()
+            service = self._equipment_service_task
+            if service is not None and service is not current and not service.done():
+                service.cancel()
+                done, _ = await asyncio.wait({service}, timeout=_SERIAL_CLOSE_TIMEOUT)
+                if not done:
+                    _LOGGER.error("Heating AI thermostat service did not cancel during shutdown")
             jobs = tuple(job for job in self._jobs if job is not current)
             for job in jobs:
                 job.cancel()

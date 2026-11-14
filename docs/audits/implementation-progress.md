@@ -36,8 +36,9 @@ only two backend checksum updates; UI author must preserve these when rebasing.
 
 ## Validation
 
-Local `make check test`: 651 Python + 53 JS passed before the final additional
-permanent-failure retry-cap regression (that case also passed separately).
+Local `make check test`: 652 Python + 53 JS passed on the complete acceptance set.
+The final shutdown service-cancellation change also passed all 42 targeted
+native-production/reliability tests; CI repeats the complete suite.
 Full Python/JS/HA/browser CI gates run on the Draft PR. Exact latest CI status is
 reported in the PR description. No frontend change or API removal.
 Accelerated 72h replay covers KWS state and the native dispatch gateway with a

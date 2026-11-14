@@ -263,7 +263,8 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ledger.status()['commands'], {})
                 hass.services.async_call.assert_not_called()
             finally:
-                pending.cancel()
+                await app.async_close()
+                self.assertTrue(pending.cancelled())
                 await asyncio.gather(pending, return_exceptions=True)
 
     async def test_callback_exception_is_consumed_and_retained_as_diagnostic(self):
