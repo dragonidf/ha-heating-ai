@@ -25,6 +25,9 @@ reservation at set_hvac_mode (synthetic HA and real SQLite, no physical services
   than marking the full transition sent/owned or creating another reservation.
 - Repeated apply_action ticks do not resend the setpoint or mode. A matching
   owned echo lets the existing next tick continue the remaining stage.
+- The service-return observation privilege is consumed immediately; a later
+  echo must retain controller context. A matching manual change cannot complete
+  the pending reservation (separate red/green injection for HEAT and AUTO).
 - Actual OFF can supersede pending HEAT for safety; repeated pending OFF waits.
   Existing voltage/KWS/manual checks still run before dispatch.
 - PREPARED evidence now has a timestamp too. Missing PREPARED/SENT confirmation
@@ -42,8 +45,8 @@ reservation at set_hvac_mode (synthetic HA and real SQLite, no physical services
   Python peak 52.08MiB; these are synthetic measurements, not production load.
 - CI repeats full tests on Python 3.12/3.13, HA 2026.11 on Python 3.14 and browsers.
 
-Marketplace candidate 0.5.5: 60 files, 542986 bytes; SHA-256
-`08ae493edbdb28438ca37969e89d37e83d435187c9bd3d29d1444888405b389d`.
+Marketplace candidate 0.5.5: 60 files, 543070 bytes; SHA-256
+`56e6c0260965ffb9e04db8ca46a1839a24582971ddad9ec3d158bc54afff6714`.
 Manifests, nine-module fingerprints and reproducible ZIP checked.
 Frontend change is version metadata only; WebSocket API remains [1,0].
 UI GPT should rebase its branch and preserve this backend/release manifest;

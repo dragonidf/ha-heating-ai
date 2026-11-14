@@ -278,7 +278,13 @@ class Hass:
             if evidence is not None:
                 evidence["service_completed_at"] = datetime.now(timezone.utc).timestamp()
             observe = getattr(self, "async_equipment_command_echo", None)
-            return observe(domain, action, data, evidence) if observe is not None else None
+            try:
+                return observe(domain, action, data, evidence) if observe is not None else None
+            finally:
+                if evidence is not None:
+                    # Only this immediate observation may borrow service return.
+                    # Delayed echoes must prove the controller's own context.
+                    evidence.pop("service_completed_at", None)
         sent = asyncio.run_coroutine_threadsafe(send(), self.hass.loop)
         try:
             observed = sent.result(30)

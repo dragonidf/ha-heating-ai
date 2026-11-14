@@ -218,6 +218,10 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                     # A real delayed HA echo permits the next stage on the next tick.
                     row=hass.rows['climate.boiler']
                     row.attributes['temperature']=24
+                    row.context=type(app._context)(id='manual-user')
+                    row.last_updated=row.last_reported=datetime.now(timezone.utc)
+                    await asyncio.to_thread(app.command_echo_changed)
+                    self.assertIn(pending['command_id'],app._pending_command_evidence)
                     row.context=app._context
                     row.last_updated=row.last_reported=datetime.now(timezone.utc)
                     await asyncio.to_thread(app.command_echo_changed)
