@@ -1,3 +1,8 @@
+# 0.5.2 — 2026-11-14
+
+- Retry reconciliation of a persisted durable ledger fence once after a fresh native runtime restart.
+- Preserve voltage, KWS, manual mode, thermostat and single-writer protections; add a restart regression test.
+
 # 0.5.1 — 2026-11-14
 
 - Make equipment command echo reconciliation idempotent when the blocking
