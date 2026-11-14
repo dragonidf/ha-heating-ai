@@ -31,13 +31,13 @@ GitHub CI is green and the owner explicitly proceeds with installation.
 - [x] Keep worker concurrency bounded and avoid duplicate jobs or polling.
 - [x] Publish bounded rejection diagnostics without new Recorder entities.
 - [x] Run focused tests and full GitHub CI on the implementation commit.
-- [ ] Merge the focused PR after its documentation-only head is green.
+- [x] Merge the focused PR after its documentation-only head is green.
 
 ### 2. Modern UI/UX Redesign — after recovery is green
 
-- [ ] Record a UI parity map for every current control, chart, setting and
+- [x] Record a UI parity map for every current control, chart, setting and
   administrative function before moving components.
-- [ ] Split the monolithic frontend into presentation/view-model modules and a
+- [x] Split the monolithic frontend into presentation/view-model modules and a
   thin HA transport/controller shell; preserve the generated single asset.
 - [ ] Rebuild Overview, History and Settings according to the attached TZ,
   without changing planner, model, safety, energy or actuator semantics.
@@ -65,8 +65,9 @@ GitHub CI is green and the owner explicitly proceeds with installation.
 
 ## Current checkpoint
 
-- Base: `main` at `8b606c5a6e8a7c1a8b6fe99f3bca4a95b69f563c`
-  (released as v0.5.2).
+- Base for the redesign: `main` at
+  `9fcc5c05c8ff0a962651cf0c661500a6851ed3d6` (v0.5.2 plus merged
+  Offline Plan Recovery).
 - Confirmed root cause: `poll_calculation` marked a plan timed out after
   60 seconds and then discards its completed result solely because
   `timed_out_at` exists. `background_plan` already performs exact-key checks,
@@ -78,5 +79,10 @@ GitHub CI is green and the owner explicitly proceeds with installation.
   GitHub run `43575757402` passed Python 3.12/3.13, native HA 2026.11,
   generated manifest checks, Chromium/WebKit, accessibility and responsive UI.
 - HA remained read-only; no installation, reload or restart was performed.
-- Next action: merge PR #43 after the documentation checkpoint passes, then
-  start the separate UI parity/modularization branch from updated `main`.
+- PR #43 was squash-merged as
+  `9fcc5c05c8ff0a962651cf0c661500a6851ed3d6`.
+- UI work continues on `redesign/modern-ui-ux`. The maintainable sources are
+  split under `frontend/src/`; `tools/build_ui.py` still emits one local,
+  dependency-free `frontend/heating-panel.js` and its Python asset.
+- Next action: keep the structural parity tests green, then implement the
+  Overview, History and Settings redesign in focused tested increments.

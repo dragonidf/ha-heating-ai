@@ -7,6 +7,24 @@ from heating_ui import install_panel, project_fireplace, verify_installation
 
 
 class PanelTests(unittest.TestCase):
+    def test_frontend_sources_keep_transport_views_and_styles_separate(self):
+        root=Path(__file__).resolve().parents[1]
+        source=root/'frontend'/'src'
+        runtime=(source/'10-panel-runtime.js').read_text()
+        views=(source/'20-panel-views.js').read_text()
+        styles=(source/'styles.css').read_text()
+        register=(source/'30-register.js').read_text()
+        self.assertIn('callWS',runtime)
+        self.assertIn('callService',runtime)
+        self.assertNotIn('callWS',views)
+        self.assertNotIn('callService',views)
+        self.assertIn('overview()',views)
+        self.assertIn('temperatureComparison()',views)
+        self.assertIn('settings()',views)
+        self.assertIn(':host',styles)
+        self.assertNotIn('<style>',runtime)
+        self.assertIn("customElements.define('heating-ai-panel'",register)
+
     def test_release_manifest_detects_partial_replacement(self):
         import hashlib
         from heating_ui_assets import VERSION
