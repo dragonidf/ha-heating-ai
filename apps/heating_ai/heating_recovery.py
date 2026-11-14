@@ -1355,14 +1355,22 @@ class HeatingRecovery:
                 self.command_pending_until=time.time()+20
                 if mode=='auto':
                     if self.val('thermostat',attribute='temperature')!=target:
-                        self.call_service('climate/set_temperature',entity_id=self.cfg['thermostat'],temperature=target)
-                    self.call_service('climate/set_hvac_mode',entity_id=self.cfg['thermostat'],hvac_mode='auto')
+                        if self.call_service('climate/set_temperature',entity_id=self.cfg['thermostat'],temperature=target) is False:
+                            command.update(status='awaiting_echo')
+                            return
+                    if self.call_service('climate/set_hvac_mode',entity_id=self.cfg['thermostat'],hvac_mode='auto') is False:
+                        command.update(status='awaiting_echo')
+                        return
                     if self.memory.get('temporary_fallback'):
                         self.memory['temporary_fallback']['last_attempt_at']=time.time()
                 else:
                     if self.val('thermostat',attribute='temperature')!=target:
-                        self.call_service('climate/set_temperature',entity_id=self.cfg['thermostat'],temperature=target)
-                    self.call_service('climate/set_hvac_mode',entity_id=self.cfg['thermostat'],hvac_mode=mode)
+                        if self.call_service('climate/set_temperature',entity_id=self.cfg['thermostat'],temperature=target) is False:
+                            command.update(status='awaiting_echo')
+                            return
+                    if self.call_service('climate/set_hvac_mode',entity_id=self.cfg['thermostat'],hvac_mode=mode) is False:
+                        command.update(status='awaiting_echo')
+                        return
                 generation=self.memory.get("command_generation",0)+1
                 self.memory["command_generation"]=generation
                 self.run_in(self.verify_command,12,expected=mode,target=target,generation=generation)
