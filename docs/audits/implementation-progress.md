@@ -34,12 +34,15 @@ already in main (`DecisionJournal.read_telemetry`); retained unchanged.
 #44 is a mergeable UI draft: no frontend edits here. Shared `release.json` has
 only two backend checksum updates; UI author must preserve these when rebasing.
 
-## Validation (in progress)
+## Validation
 
-Targeted native production, persisted-ledger, KWS and reliability injections run
-locally. Full Python/JS and CI gates follow. Accelerated 72h test currently covers
-the breaker qualification state machine at 15s steps; it is not a production soak
-or a full model/worker/resource endurance certification.
+Local `make check test`: 651 Python + 53 JS passed before the final additional
+permanent-failure retry-cap regression (that case also passed separately).
+Full Python/JS/HA/browser CI gates run on the Draft PR. Exact latest CI status is
+reported in the PR description. No frontend change or API removal.
+Accelerated 72h replay covers KWS state and the native dispatch gateway with a
+real journal at 15s steps; it is not a production soak or a full numerical-worker
+and hardware endurance certification.
 
 ## Remaining evidence requirements
 

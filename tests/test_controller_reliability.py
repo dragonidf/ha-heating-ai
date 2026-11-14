@@ -93,6 +93,29 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(attempts, 2)
             self.assertFalse(ledger.status()['fenced'])
 
+    async def test_permanent_failure_caps_attempts_and_reconnect_restores_recovery(self):
+        with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            ledger = self.attach_real(component, app, folder)
+            app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
+            hass.services.async_call.side_effect = TimeoutError('persistent failure')
+            for attempt in range(24):
+                with patch.object(component.time, 'time', return_value=1000+attempt*300):
+                    try:
+                        await asyncio.to_thread(app._reconcile_writer_fence)
+                    except TimeoutError:
+                        pass
+            self.assertEqual(hass.services.async_call.await_count, 8)
+            self.assertEqual(len(ledger.status()['commands']), 8)
+            self.assertEqual(app.memory['ledger_recovery']['reason'], 'manual_reconciliation_required')
+            hass.rows['climate.boiler'].state = 'unavailable'
+            await asyncio.to_thread(app._reconcile_writer_fence)
+            hass.rows['climate.boiler'].state = 'heat'
+            hass.services.async_call.side_effect = hass.service
+            await asyncio.to_thread(app._reconcile_writer_fence)
+            self.assertFalse(ledger.status()['fenced'])
+            self.assertEqual(len(ledger.status()['commands']), 9)
+
     async def test_L04_old_off_display_cannot_clear_fence_on_service_return(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
