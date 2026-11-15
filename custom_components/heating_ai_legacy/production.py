@@ -20,7 +20,7 @@ from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .native_controller.heating_climate import HeatingClimate
-from .native_controller.heating_model import comfort_at
+from .native_controller.heating_model import comfort_at, number
 from .native_controller.heating_ui import system_fields
 from .native_controller.heating_recovery import wire_values
 from .native_voltage import VoltageGuard
@@ -199,7 +199,11 @@ class NativeController(HeatingClimate):
         external = (previous is not None and previous != snapshot["device"]
                     and snapshot["device"][2] != self._context.id)
         self.memory["native_fan_device_signature"] = snapshot["device"]
-        if external and not baseline:
+        if snapshot["control"] == "on":
+            # Explicit fan controls own the device. Tuya telemetry/context
+            # changes must not create an indefinite manual hold in AUTO.
+            self.memory.pop("native_fan_manual_hold", None)
+        elif external and not baseline:
             self.memory["native_fan_manual_epoch"] = self.memory.get("native_fan_manual_epoch", 0)+1
             self.memory["native_fan_manual_hold"] = dict(
                 state=snapshot["state"], percentage=snapshot["percentage"], at=time.time())
@@ -221,6 +225,48 @@ class NativeController(HeatingClimate):
         self.next_compute = 0
         self.save()
         self._reconcile_writer_fence()
+
+    def climate_changed(self, entity, attribute, old, new, kwargs=None, **extra):
+        # Only the user's mode helper may switch controller modes. A Tuya
+        # echo or transient thermostat drift must never select Observation.
+        if (not self.memory.get("owned") or time.time() < getattr(self, "command_pending_until", 0)
+                or self.memory.get("temporary_fallback")):
+            return
+        expected = self.memory.get("expected_mode")
+        if isinstance(new, dict):
+            try:
+                stamp = datetime.fromisoformat(
+                    (new.get("last_updated") or new.get("last_changed")).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, AttributeError):
+                stamp = None
+            target = number(self.memory.get("expected_setpoint"))
+            actual = self.val("thermostat", attribute="temperature")
+            if (stamp is not None and stamp <= self.memory.get("command_at", 0)
+                    and self.raw("thermostat") == expected
+                    and target is not None and actual is not None
+                    and abs(actual-target) <= .1):
+                return
+        state = new.get("state") if isinstance(new, dict) else new
+        target = number((new.get("attributes") or {}).get("temperature")) if isinstance(new, dict) else None
+        changed = (state not in (expected, "unknown", "unavailable", None)
+                   or (target is not None and target != self.memory.get("expected_setpoint")))
+        if not changed:
+            return
+        if self.raw("mode") == "Автоматичне керування" and self.raw("armed") == "on":
+            # Cancel stale confirmation and replan under unchanged KWS,
+            # voltage and command-ledger guards.
+            self.memory["command_generation"] = self.memory.get("command_generation", 0)+1
+            self.next_compute = 0
+            self.decision_event("thermostat_external_change",
+                                reason="Термостат змінився; автоматичне керування збережено",
+                                force=True)
+        else:
+            # Explicit manual choices are authoritative and never overwritten.
+            self.memory["owned"] = False
+            self.decision_event("manual_thermostat_change",
+                                reason="Ручний режим збережено після зміни термостата",
+                                force=True)
+        self.save()
 
     def _ledger_identity(self):
         status = self.command_ledger_status
