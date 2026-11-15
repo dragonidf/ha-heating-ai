@@ -186,28 +186,48 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             app.record_equipment_command_echo(lower, dict(matched=True, observed_at=time.time()))
             self.assertTrue(ledger.status()['fenced'])
 
-    async def test_recovery_off_echo_is_owned_but_later_manual_change_still_pauses(self):
+    async def test_recovery_off_echo_keeps_auto_on_delayed_thermostat_change(self):
         with TemporaryDirectory() as folder, package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
             ledger = self.attach_real(component, app, folder)
             app.attach_command_ledger(ledger, ledger.claim_boot('recovery', expected_owner_id='owner'))
-            app.memory.update(owned=True,expected_mode='heat',expected_setpoint=24)
-            app.decision_event=Mock();app.notify_once=Mock();app.save=Mock()
-            with patch.object(component.time,'time',return_value=1000):
+            app.memory.update(owned=True, expected_mode='heat', expected_setpoint=24)
+            app.decision_event=Mock(); app.notify_once=Mock(); app.save=Mock()
+            with patch.object(component.time, 'time', return_value=1000):
                 await asyncio.to_thread(app._reconcile_writer_fence)
-            self.assertEqual(app.memory['expected_mode'],'off')
+            self.assertEqual(app.memory['expected_mode'], 'off')
             hass.services.async_call.reset_mock()
-            event=dict(state='off',attributes=dict(temperature=24),last_updated=datetime.fromtimestamp(1000,timezone.utc).isoformat())
+            event=dict(state='off', attributes=dict(temperature=24),
+                       last_updated=datetime.fromtimestamp(1000,timezone.utc).isoformat())
             with patch.object(component.time,'time',return_value=1025):
                 await asyncio.to_thread(app.climate_changed,'climate.boiler','all',None,event)
             hass.services.async_call.assert_not_called()
             self.assertTrue(app.memory['owned'])
-            # A genuinely different external mode/target must retain manual priority.
-            event.update(state='heat',attributes=dict(temperature=25),last_updated=datetime.fromtimestamp(1026,timezone.utc).isoformat())
+            # Tuya cloud drift does not authorize an input_select mode change.
+            event.update(state='heat', attributes=dict(temperature=25),
+                         last_updated=datetime.fromtimestamp(1026,timezone.utc).isoformat())
+            app.next_compute=9999
+            generation=app.memory.get('command_generation',0)
             with patch.object(component.time,'time',return_value=1026):
                 await asyncio.to_thread(app.climate_changed,'climate.boiler','all',None,event)
+            self.assertTrue(app.memory['owned'])
+            self.assertEqual(app.next_compute, 0)
+            self.assertEqual(app.memory['command_generation'], generation+1)
+            self.assertEqual(hass.rows['input_select.mode'].state, 'Автоматичне керування')
+            hass.services.async_call.assert_not_called()
+            self.assertFalse(ledger.status()['fenced'])
+
+    async def test_explicit_observation_is_not_undone_by_thermostat_echo(self):
+        with package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            app.memory.update(owned=True, expected_mode='heat', expected_setpoint=24)
+            hass.rows['input_select.mode'].state='Спостереження'
+            app.decision_event=Mock(); app.save=Mock()
+            event=dict(state='off', attributes=dict(temperature=20))
+            await asyncio.to_thread(app.climate_changed,'climate.boiler','all',None,event)
             self.assertFalse(app.memory['owned'])
-            self.assertTrue(any(c.args[:2]==('input_select','select_option') for c in hass.services.async_call.await_args_list))
+            self.assertEqual(hass.rows['input_select.mode'].state,'Спостереження')
+            hass.services.async_call.assert_not_called()
 
     async def test_kws_reset_pending_defers_all_normal_actions_without_fallback(self):
         with package(self.root/'package') as (component, _):
