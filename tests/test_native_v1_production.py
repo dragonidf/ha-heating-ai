@@ -427,22 +427,60 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                                         entity_id="fan.circulation")
             hass.services.async_call.assert_not_called()
 
-    async def test_persisted_external_fan_hold_clears_only_on_explicit_fan_choice(self):
+    async def test_auto_fan_tuya_echo_does_not_steal_control(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
+            baseline = app.async_fan_snapshot()
+            app.memory.update(fan_owned=True, native_fan_manual_epoch=3,
+                              native_fan_device_signature=baseline["device"],
+                              native_fan_manual_hold=dict(state="on", at=1))
+            hass.rows["fan.circulation"].replace("on", context="tuya-echo")
+            await asyncio.to_thread(app.fan_state_changed)
+            self.assertNotIn("native_fan_manual_hold", app.memory)
+            self.assertTrue(app.memory["fan_owned"])
+            self.assertEqual(app.memory["native_fan_manual_epoch"], 3)
+            fan = app.async_fan_snapshot()
+            app._fan_dispatch_signature = fan["permissions"]
+            app._fan_dispatch_device_signature = fan["device"]
+            app._fan_dispatch_epoch = 3
+            await asyncio.to_thread(app.call_service, "fan/turn_off",
+                                    entity_id="fan.circulation")
+            self.assertEqual(hass.services.async_call.await_count, 1)
+
+    async def test_persisted_external_fan_hold_clears_on_explicit_control_enable(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            hass.rows["input_boolean.fan_control"].state = "off"
             app.memory["native_fan_device_signature"] = app.async_fan_snapshot()["device"]
             hass.rows["fan.circulation"].replace("on", context="external-manual")
             await asyncio.to_thread(app.fan_state_changed)
             self.assertTrue(app.memory["native_fan_manual_hold"])
+            hass.rows["input_boolean.fan_control"].state = "on"
             await asyncio.to_thread(app.fan_permission_changed)
-            self.assertNotIn("native_fan_manual_hold",app.memory)
+            self.assertNotIn("native_fan_manual_hold", app.memory)
             fan = app.async_fan_snapshot()
             app._fan_dispatch_signature = fan["permissions"]
             app._fan_dispatch_device_signature = fan["device"]
             app._fan_dispatch_epoch = app.memory["native_fan_manual_epoch"]
             await asyncio.to_thread(app.call_service, "fan/turn_off",
                                     entity_id="fan.circulation")
-            self.assertEqual(hass.services.async_call.await_count,1)
+            self.assertEqual(hass.services.async_call.await_count, 1)
+
+    async def test_explicit_stop_blocks_fan_start_but_allows_off(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            hass.rows["input_select.fan_mode"].state = "Зупинити"
+            fan = app.async_fan_snapshot()
+            app._fan_dispatch_signature = fan["permissions"]
+            app._fan_dispatch_device_signature = fan["device"]
+            app._fan_dispatch_epoch = 0
+            with self.assertRaisesRegex(PermissionError, "safety interlock"):
+                await asyncio.to_thread(app.call_service, "fan/turn_on",
+                                        entity_id="fan.circulation", percentage=38)
+            hass.services.async_call.assert_not_called()
+            await asyncio.to_thread(app.call_service, "fan/turn_off",
+                                    entity_id="fan.circulation")
+            self.assertEqual(hass.services.async_call.await_count, 1)
 
     async def test_source_heartbeat_is_not_mistaken_for_native_ownership(self):
         with package(self.root / "package") as (component, _):
