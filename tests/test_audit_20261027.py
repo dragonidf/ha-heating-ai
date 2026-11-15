@@ -31,7 +31,8 @@ class GainAuditTests(unittest.TestCase):
         self.assertFalse(any(x['gain']>.5 for x in state['observations']))
     def test_unvalidated_observed_gain_is_not_lower_scenario_free_heat(self):
         at=datetime(2026,10,27,12,tzinfo=ZoneInfo('Europe/Kiev'))
-        settings={'environment':{'solar':dict(validated=False,observed_gain=.8,observed_at=at.timestamp())}}
+        from test_environment import solar_geometry
+        settings={'environment':{'astronomy':solar_geometry(at),'solar':dict(validated=False,observed_gain=.8,observed_at=at.timestamp())}}
         self.assertEqual(gain_at(at,[],settings),0.)
         self.assertGreater(gain_at(at,[],settings,upper=True),0.)
 

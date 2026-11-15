@@ -11,7 +11,7 @@ from heating_model import (held_action,number,plan as optimise, step, outdoor_at
                            reserve_context,attach_reserve,coast_reserve_needed,local_boundary,
                            SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics,power_profile)
 from heating_outages import blocked, availability, schedule_covered
-from heating_environment import forecast_step,gain_at,safe_upper,ENVIRONMENT_POLICY_VERSION
+from heating_environment import forecast_step,gain_at,safe_upper,has_upper_risk,ENVIRONMENT_POLICY_VERSION
 
 
 def policy(settings):
@@ -95,7 +95,9 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 boundary=local_boundary(now.date()+timedelta(days=day),value,now.tzinfo).timestamp()
                 if start<boundary<finish:
                     boundaries.add(boundary)
-    rows=[]; r,f=room,floor; low=high=room; energy=0.; all_segments=[]
+    rows=[]; r,f=room,floor; ur,uf=room,floor;low=high=room; energy=0.; all_segments=[]
+    risk_enabled=has_upper_risk(settings)
+    risk_heat=(settings.get('environment') or {}).get('last_heated_at') or start-10801
     actuator=settings.get('actuator') or {};command=actuator.get('action');command_at=actuator.get('changed_at',0.)
     for block in range(count):
         a=start+1800*block; b=a+1800
@@ -126,9 +128,13 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                     return None
                 r,f=forecast_step(r,f,outdoor_at(weather,tm,outside),kw if active else 0.,
                          fire*math.exp(-(t-start)/7200),model,dt,tm,weather,settings)
+                if active:risk_heat=u
+                ur,uf=(forecast_step(ur,uf,outdoor_at(weather,tm,outside),kw if active else 0.,
+                         fire*math.exp(-(t-start)/7200),model,dt,tm,weather,settings,upper=True)
+                         if risk_enabled and t-risk_heat<=10800 else (r,f))
                 low=min(low,r); high=max(high,r)
-                fine.append(dict(ts=u,temperature=r,**{'return':f}))
-                if r>max(room,hi)+.01 and (active or all_segments):
+                fine.append(dict(ts=u,temperature=r,upper_temperature=max(r,ur),**{'return':f}))
+                if max(r,ur)>max(room,hi)+.01 and (active or all_segments or heats):
                     return None
                 if active:
                     if r>hi or f>50:

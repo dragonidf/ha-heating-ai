@@ -32,7 +32,7 @@ class LearningLimitTests(unittest.TestCase):
     def setUp(self):self.samples=samples_for()
     def test_delta_boundary_and_true_excess_on_all_coefficient_scales(self):
         for key in BOUNDS:
-            for fraction,expected in [(-.20,True),(.20,True),(.19999,True),(.20001,False)]:
+            for fraction,expected in [(-.05,True),(.05,True),(.04999,True),(.05001,False)]:
                 with self.subTest(key=key,fraction=fraction):
                     candidate=dict(LIVE_MODEL,**{key:LIVE_MODEL[key]*(1+fraction)})
                     with patch('heating_model.error',side_effect=[.2,.1]):
@@ -44,13 +44,13 @@ class LearningLimitTests(unittest.TestCase):
             self.assertFalse(validate_candidate(model,dict(model,room_loss=.0025),self.samples)[0])
     def test_learning_clamp_uses_the_same_cumulative_daily_limits(self):
         baseline=dict(LIVE_MODEL)
-        for multiplier in (.8,1.2):
+        for multiplier in (.95,1.05):
             model={**baseline,**{k:v*multiplier for k,v in baseline.items() if k in BOUNDS}}
             with patch('heating_model.solve',side_effect=[[.2,.15],[3.,1.5]]):
                 candidate=learn(model,self.samples,baseline)
             for key in BOUNDS:
-                self.assertLessEqual(candidate[key],baseline[key]*1.2+1e-15)
-                self.assertGreaterEqual(candidate[key],baseline[key]*.8-1e-15)
+                self.assertLessEqual(candidate[key],baseline[key]*1.05+1e-15)
+                self.assertGreaterEqual(candidate[key],baseline[key]*.95-1e-15)
     def test_zero_is_frozen_and_physical_nonfinite_and_boolean_values_are_rejected(self):
         zero=dict(LIVE_MODEL,fire_gain=0.)
         for value in (.000001,float('nan'),float('inf'),None,'bad','0.0',False):
@@ -65,7 +65,7 @@ class LearningLimitTests(unittest.TestCase):
                     with patch('heating_model.error',side_effect=[.2,.1]):
                         self.assertEqual(validate_candidate(model,dict(model,**{key:value}),self.samples)[0],valid)
     def test_real_holdout_must_improve_and_training_does_not_consume_holdout(self):
-        old=dict(LIVE_MODEL);candidate=dict(old,floor_air=old['floor_air']*1.1)
+        old=dict(LIVE_MODEL);candidate=dict(old,floor_air=old['floor_air']*1.03)
         self.assertTrue(validate_candidate(old,candidate,self.samples)[0])
         self.assertFalse(validate_candidate(old,dict(old,floor_air=old['floor_air']*.9),self.samples)[0])
         changed=deepcopy(self.samples)
@@ -85,7 +85,7 @@ class LearningFixture:
 class LearningAdapterTests(LearningFixture,unittest.TestCase):
     def test_accepted_candidate_keeps_validated_control_during_confirmation(self):
         app=self.app();before=dict(app.model)
-        self.assertTrue(app.consider(dict(before,floor_air=before['floor_air']*1.1),'test',apply=True))
+        self.assertTrue(app.consider(dict(before,floor_air=before['floor_air']*1.03),'test',apply=True))
         self.assertEqual(app.model,before)
         self.assertEqual(decide('Автоматичне керування',True,True,21.,True,'on',True,True,
                                 app.model['validated'],True),'heat')
@@ -94,17 +94,17 @@ class LearningAdapterTests(LearningFixture,unittest.TestCase):
         app=self.app();base=app.model['floor_air']
         app.samples=samples_for(dict(app.model,floor_air=base*1.4))
         # Model acceptance and later prospective confirmation are separate.
-        self.assertTrue(app.consider(dict(app.model,floor_air=base*1.2),'test',apply=True))
+        self.assertTrue(app.consider(dict(app.model,floor_air=base*1.05),'test',apply=True))
         self.assertEqual(app.memory['learning_day']['baseline']['floor_air'],base)
         app.memory['pending_model']['errors']=[dict(old=.2,new=.1)]*12
         app.confirm_learning_candidate()
-        self.assertEqual(app.model['floor_air'],base*1.2)
+        self.assertEqual(app.model['floor_air'],base*1.05)
         app.memory=json.loads(json.dumps(app.memory))
-        self.assertFalse(app.consider(dict(app.model,floor_air=base*1.44),'test',apply=True))
+        self.assertFalse(app.consider(dict(app.model,floor_air=base*1.1025),'test',apply=True))
         self.assertEqual(app.memory['learning_day']['baseline']['floor_air'],base)
         app.at+=timedelta(days=1)
-        self.assertTrue(app.consider(dict(app.model,floor_air=base*1.44),'test',apply=True))
-        self.assertEqual(app.memory['learning_day']['baseline']['floor_air'],base*1.2)
+        self.assertTrue(app.consider(dict(app.model,floor_air=base*1.1025),'test',apply=True))
+        self.assertEqual(app.memory['learning_day']['baseline']['floor_air'],base*1.05)
     def test_rejected_candidate_retains_model_ready_and_records_real_attempt(self):
         app=self.app();before=dict(app.model)
         self.assertFalse(app.consider(dict(before,floor_air=before['floor_air']*1.3),'test',apply=True))
@@ -116,7 +116,7 @@ class LearningAdapterTests(LearningFixture,unittest.TestCase):
 
 class LearningLifecycleTests(LearningFixture,unittest.TestCase):
     def pending(self):
-        app=self.app();app.consider(dict(app.model,floor_air=app.model['floor_air']*1.1),'test',apply=True)
+        app=self.app();app.consider(dict(app.model,floor_air=app.model['floor_air']*1.03),'test',apply=True)
         return app
     def test_prospective_confirmation_retains_ready_and_invalidates_old_long_validation(self):
         app=self.pending();before=dict(app.model);attempt=app.memory['pending_model']['attempt_id']
@@ -157,9 +157,9 @@ class LearningLifecycleTests(LearningFixture,unittest.TestCase):
     def test_day_boundary_uses_local_date_over_both_dst_changes(self):
         for month,day in [(3,28),(10,24)]:
             app=self.app();app.at=datetime(2026,month,day,23,59,tzinfo=app.climate_tz)
-            before=app.learning_baseline();app.model=dict(app.model,floor_air=before['floor_air']*1.1)
+            before=app.learning_baseline();app.model=dict(app.model,floor_air=before['floor_air']*1.03)
             app.at=datetime.fromtimestamp(app.at.timestamp()+120,app.climate_tz)
-            self.assertEqual(app.learning_baseline()['floor_air'],before['floor_air']*1.1)
+            self.assertEqual(app.learning_baseline()['floor_air'],before['floor_air']*1.03)
     def test_rejected_thermal_training_does_not_reset_modulation(self):
         from heating_model import learn_modulation
         app=self.app();profile=learn_modulation(app.samples);app.memory['modulation_profile']=profile
@@ -207,7 +207,7 @@ class ProspectiveMeasurementTests(LearningFixture,unittest.TestCase):
                 (True,'unknown',False,100.,0),(True,'on',True,100.,0),(True,'on',False,None,0),
                 (True,'on',False,102.,0)]:
             with self.subTest(quality=quality,grid=grid,estimated=estimated,energy=energy),tempfile.TemporaryDirectory() as directory:
-                app=self.app();app.consider(dict(app.model,floor_air=app.model['floor_air']*1.1),'test',apply=True)
+                app=self.app();app.consider(dict(app.model,floor_air=app.model['floor_air']*1.03),'test',apply=True)
                 attempt=app.memory['pending_model']['attempt_id'];stamp=app.at.timestamp()
                 app.memory['predictions']=[dict(ts=stamp,temperature=21.5,candidate_temperature=21.55,
                     learning_attempt_id=attempt,version=app.model['version'],start_energy=100.,expected_energy=0.)]

@@ -8,11 +8,173 @@ from heating_model import DEFAULT_MODEL,step,transitions,plan
 from heating_stability import replay,stable_plan
 
 
+def solar_geometry(at):
+    # Deterministic astronomical context, not private household telemetry.
+    summer=at.month in (6,7)
+    return {'latitude':50.35,'days':{(at+timedelta(days=i)).date().isoformat():dict(
+        noon=(at+timedelta(days=i)).replace(hour=13 if summer else 12,minute=0,second=0).timestamp(),
+        sunrise=(at+timedelta(days=i)).replace(hour=4 if summer else 7,minute=0,second=0).timestamp(),
+        sunset=(at+timedelta(days=i)).replace(hour=21 if summer else 16,minute=13 if summer else 10,second=0).timestamp(),
+        declination=23.44 if summer else -18.5) for i in range(5)}}
+
+
+class AdaptiveSolarRegressions(unittest.TestCase):
+    def setUp(self):
+        self.at=datetime(2026,11,15,12,tzinfo=ZoneInfo('Europe/Kyiv'))
+        self.geometry=solar_geometry(self.at)
+    def test_seasonal_sunset_night_and_summer_evening(self):
+        from heating_environment import daylight
+        self.assertEqual(daylight(self.at.replace(hour=17),self.geometry),0.)
+        self.assertEqual(daylight(self.at.replace(hour=0),self.geometry),0.)
+        summer=self.at.replace(month=6,day=21,hour=20)
+        self.assertGreater(daylight(summer,solar_geometry(summer)),0.)
+        self.assertEqual(daylight(self.at,{}),0.)
+    def test_clouds_are_smooth_and_do_not_cross_hourly_coverage(self):
+        from heating_environment import weather_factor
+        values=[weather_factor('sunny',x) for x in (0,10,50,90,100)]
+        self.assertEqual(values,sorted(values,reverse=True))
+        self.assertLess(values[-1],values[0]*.25)
+        self.assertEqual(weather_factor('cloudy',float('nan')),weather_factor('cloudy'))
+        s={'environment':{'astronomy':self.geometry,'solar':dict(coefficient=.283,validated=True)}}
+        weather=[dict(ts=self.at.timestamp(),temperature=8,condition='sunny',cloud_coverage=6)]
+        self.assertGreater(gain_at(self.at,weather,s),0)
+        self.assertEqual(gain_at(self.at+timedelta(hours=2),weather,s),0)
+        self.assertEqual(gain_at(self.at+timedelta(days=1),weather,s),0)
+    def test_local_sensor_sunspot_requires_persistent_synced_disagreement(self):
+        from heating_environment import room_source_check
+        t=self.at.timestamp()
+        first=room_source_check({},t,[(24.9,t),(22.8,t),(23.,t)])
+        self.assertEqual(first['status'],'pending')
+        repeated=room_source_check(first,t+240,[(24.9,t),(22.8,t),(23.,t)])
+        self.assertNotEqual(repeated['status'],'room_source_disagreement')
+        final=room_source_check(first,t+240,[(24.9,t+240),(22.8,t+240),(23.,t+240)])
+        self.assertEqual(final['status'],'room_source_disagreement')
+        self.assertEqual(room_source_check(final,t+1000,[(24.9,t),(None,t),(23.,t)])['status'],'unconfirmed')
+    def test_fast_bias_requires_new_reports_decays_and_expires_at_midnight(self):
+        from heating_environment import observe_residual,residual_at
+        t=self.at.timestamp()
+        for change in (-.2,.2):
+            state={}
+            for at,room,reported in ((t,21.,t),(t+900,21.+change,t+900)):
+                state=observe_residual(state,at,room,21.,8.,DEFAULT_MODEL,reported,True,[],{})
+            self.assertGreater(state['rate']*change,0)
+            self.assertLessEqual(abs(state['rate']),.4)
+            repeated=observe_residual(state,t+915,22.,21.,8.,DEFAULT_MODEL,t+900,True,[],{})
+            self.assertEqual(repeated['at'],state['at'])
+            self.assertAlmostEqual(residual_at(self.at+timedelta(seconds=900+5400),state),state['rate']/2)
+            self.assertEqual(residual_at(self.at+timedelta(days=1),state),0)
+            invalid=observe_residual(state,t+920,22.,21.,8.,DEFAULT_MODEL,t+920,False,[],{})
+            self.assertEqual(invalid['at'],state['at'])
+            self.assertNotIn('last',invalid)
+    def test_disagreement_cannot_identify_physical_model(self):
+        from test_learning_limits import samples_for
+        self.assertEqual(transitions([dict(r,room_source_disagreement=True) for r in samples_for()]),[])
+    def test_upper_risk_is_separate_and_replay_rejects_unsafe_stored_heat(self):
+        from heating_model import coast_trajectory,coast_exceeds_profile
+        at=self.at.replace(hour=9)
+        model=dict(DEFAULT_MODEL,floor_air=.044,room_loss=.0128)
+        settings=dict(target=21.3,lower=21.,upper=21.35,start='00:00',end='23:59',
+            strategy='Комфорт протягом доби',morning_min_minutes=0,
+            environment={'astronomy':self.geometry,'solar':dict(validated=False,
+                observed_gain=.8,observed_at=at.timestamp())})
+        normal=coast_trajectory(at,21.1,22.,8.,0.,model,settings)
+        upper=coast_trajectory(at,21.1,22.,8.,0.,model,settings,upper=True)
+        self.assertLess(max(r['temperature'] for r in normal),settings['upper'])
+        self.assertGreater(max(r['temperature'] for r in upper),settings['upper'])
+        self.assertTrue(coast_exceeds_profile(at,21.1,22.,8.,0.,model,settings))
+        self.assertIsNone(replay(at,21.1,22.,8.,0.,model,[],settings,
+            [dict(start=at.timestamp(),end=at.timestamp()+900)],False,3.))
+    def test_solar_candidate_cannot_replace_a_better_current_holdout(self):
+        t=self.at.timestamp();rows=[]
+        for day in range(3):
+            for i in range(4):
+                factor=.2+i*.05
+                rows.append(dict(at=t-(2-day)*86400-i*60,day=(self.at-timedelta(days=2-day)).date().isoformat(),
+                    gain=(.45 if day<2 else .3)*factor,factor=factor,stable=True,factor_policy=6))
+        state=observe_gain(dict(coefficient=.3,commissioned=True,factor_policy=6,observations=rows),t,
+            22.,22.,8.,0.,False,DEFAULT_MODEL,self.at.tzinfo,astronomy=self.geometry)
+        self.assertEqual(state['coefficient'],.3)
+    def test_first_block_post_stop_upper_risk_is_rejected(self):
+        from heating_model import _plan
+        at=self.at.replace(hour=9)
+        settings=dict(target=21.12,lower=21.,upper=21.13,start='00:00',end='23:59',
+            strategy='Комфорт протягом доби',night_price=1.,day_price=2.,
+            actuator=dict(action='heat',changed_at=at.timestamp()-540),
+            environment={'astronomy':self.geometry,'solar':dict(validated=False,
+                observed_gain=.8,observed_at=at.timestamp())})
+        self.assertIsNone(_plan(at,21.1,22.,8.,0.,dict(DEFAULT_MODEL,room_loss=.0128),[],settings,3.,hours_override=.5))
+    def test_post_stop_peak_keeps_frozen_forecast_and_sensor_disagreement(self):
+        from heating_recovery import HeatingRecovery
+        app=HeatingRecovery();app.memory={'last_command':'heat'};app.model=DEFAULT_MODEL
+        app.decision_context={'coast_peak':21.03,'coast_upper_peak':21.5}
+        app.observe_stop_peak(self.at-timedelta(seconds=15),21.,3000.,True)
+        app.memory['last_command']='off';app.observe_stop_peak(self.at,21.,0.,True)
+        for seconds in range(15,10801,15):
+            if seconds>=7200:app.memory['room_source_check']={'status':'room_source_disagreement'}
+            app.decision_context['coast_peak']=30.  # Later replans cannot rewrite the STOP prediction.
+            app.observe_stop_peak(self.at+timedelta(seconds=seconds),21.+1.4*seconds/10800,0.,True)
+        record=app.memory['forecast_validation'][-1]
+        self.assertEqual(record['predicted_peak'],21.03)
+        self.assertAlmostEqual(record['measured_peak'],22.4)
+        self.assertIn('room_source_disagreement',record['reasons'])
+        self.assertFalse(record['valid'])
+    def test_unverified_signed_drift_has_no_comfort_credit_on_heldout_days(self):
+        from heating_environment import observe_residual,forecast_step
+        model=dict(DEFAULT_MODEL,floor_air=0.,room_loss=0.,floor_decay=0.)
+        for day in (16,17,18):
+            at=self.at.replace(day=day)
+            for rate in (-.2,.2):
+                state=observe_residual({},at.timestamp()-900,21.-rate/4,21.,8.,model,
+                                       at.timestamp()-900,True,[],{})
+                state=observe_residual(state,at.timestamp(),21.,21.,8.,model,at.timestamp(),True,[],{})
+                for hours in (1,3):
+                    room,floor=21.,21.
+                    for i in range(hours*12):
+                        when=at+timedelta(minutes=i*5)
+                        room,floor=forecast_step(room,floor,8.,0.,0.,model,1/12,when,[],
+                            {'environment':{'residual':state}})
+                    self.assertAlmostEqual(abs(room-(21.+rate*hours)),abs(rate*hours))
+                    self.assertEqual(room,21.)  # Diagnostics are not evidence of real household MAE improvement.
+    def test_coast_uses_interval_start_weather_at_cloud_boundary(self):
+        from heating_model import coast_trajectory
+        from heating_environment import forecast_step
+        at=self.at.replace(minute=55)
+        weather=[dict(ts=at.timestamp()-3300,temperature=8.,condition='sunny',cloud_coverage=0),
+                 dict(ts=at.timestamp()+300,temperature=-4.,condition='cloudy',cloud_coverage=100)]
+        settings={'environment_weather':weather,'environment':{'astronomy':self.geometry,
+            'solar':dict(coefficient=.283,validated=True)}}
+        rows=coast_trajectory(at,21.,22.,8.,0.,DEFAULT_MODEL,settings,hours=1/12,upper=True)
+        expected,_=forecast_step(21.,22.,8.,0.,0.,DEFAULT_MODEL,1/12,at,weather,settings,upper=True)
+        self.assertAlmostEqual(rows[-1]['temperature'],expected)
+    def test_known_ventilation_difference_cannot_be_learned_as_sun(self):
+        t=self.at.timestamp()
+        settings=dict(thermal_model_version=1,ventilation_model=dict(validated=True,model_version=1,
+            base_room_loss=.001,recuperator=0.,bath=0.),ventilation_expected=dict(recuperator=0.,bath=0.))
+        model=dict(DEFAULT_MODEL,floor_air=0.)
+        state=observe_gain({},t,22.,22.,8.,0.,False,model,self.at.tzinfo,'sunny',
+                           reported_at=t,astronomy=self.geometry,settings=settings)
+        state=observe_gain(state,t+1800,21.993,22.,8.,0.,False,model,self.at.tzinfo,'sunny',
+                           reported_at=t+1800,astronomy=self.geometry,settings=settings)
+        self.assertAlmostEqual(state.get('observed_gain',0.),0.,places=6)
+    def test_frequent_reports_accumulate_without_reusing_old_reports(self):
+        from heating_environment import observe_residual
+        t=self.at.timestamp();state={}
+        for i in range(6):
+            state=observe_residual(state,t+i*60,21.+i*.01,21.,8.,DEFAULT_MODEL,t+i*60,True,[],{})
+        self.assertEqual(state['at'],t+300)
+    def test_hourly_weather_adapter_retains_only_valid_cloud_coverage(self):
+        from test_adapter_modulation import HeatingClimate
+        app=HeatingClimate();app.memory={};app.save=lambda:None
+        app.weather_event(None,{'forecast':[dict(datetime=(self.at+timedelta(hours=i)).isoformat(),
+            temperature=8.,condition='sunny',cloud_coverage=value) for i,value in enumerate((6,90,101,None))]})
+        self.assertEqual([r.get('cloud_coverage') for r in app.weather],[6.,90.,None,None])
+
+
 class EnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.at=datetime(2026,10,14,6,10,tzinfo=ZoneInfo('Europe/Kiev'))
         self.model=dict(DEFAULT_MODEL,floor_air=.0442385,room_loss=.0128,floor_decay=.1728,heat_gain=.72)
-        self.settings=dict(target=22,lower=21.5,upper=22.5,night_target=21.5,night_lower=21,
+        self.settings=dict(environment={'astronomy':solar_geometry(self.at)},target=22,lower=21.5,upper=22.5,night_target=21.5,night_lower=21,
                            night_upper=22,sleep_start='23:00',sleep_end='07:00',start='23:00',end='07:00',
                            strategy='Тільки в дозволені години',split_comfort=True,morning_min_minutes=30)
     def test_outage_cold_probe_does_not_erase_stored_heat(self):
@@ -39,10 +201,10 @@ class EnvironmentTests(unittest.TestCase):
         self.assertGreater(value,28)
     def test_provisional_sun_never_counts_as_guaranteed_future_heat(self):
         when=self.at.replace(hour=12)
-        settings={'environment':{'solar':dict(coefficient=.6,validated=False)}}
+        settings={'environment':{'astronomy':solar_geometry(when),'solar':dict(coefficient=.6,validated=False)}}
         weather=[dict(ts=when.timestamp(),temperature=15,condition='sunny')]
         self.assertEqual(gain_at(when,weather,settings),0)
-        self.assertGreater(gain_at(when,weather,settings,upper=True),0)
+        self.assertEqual(gain_at(when,weather,settings,upper=True),0)  # Unconfirmed sunshine cannot remove night heat.
     def test_learned_gain_is_zero_at_night_and_unknown_weather(self):
         settings={'environment':{'solar':dict(coefficient=.6,validated=True)}}
         self.assertEqual(gain_at(self.at.replace(hour=0),[],settings),0)
@@ -53,7 +215,7 @@ class EnvironmentTests(unittest.TestCase):
             for hour in range(9,16):
                 when=self.at.replace(day=14+day,hour=hour)
                 state=observe_gain(state,when.timestamp(),21+(hour-9)*.2,22,12,0,False,
-                                   self.model,when.tzinfo,'sunny')
+                                   self.model,when.tzinfo,'sunny',astronomy=solar_geometry(self.at))
         self.assertTrue(state['validated'])
         self.assertEqual(state['days'],3)
     def test_hourly_room_update_not_repeated_as_five_minute_gain(self):
@@ -87,7 +249,7 @@ class EnvironmentTests(unittest.TestCase):
     def test_validated_sunny_day_changes_night_energy_plan(self):
         at=self.at.replace(hour=23,minute=0)
         s=dict(self.settings,day_price=2.64,night_price=1.32,
-               environment={'solar':dict(coefficient=.25,validated=True)})
+               environment={'astronomy':solar_geometry(at),'solar':dict(coefficient=.25,validated=True)})
         weather=[dict(ts=at.timestamp()+i*3600,temperature=10,condition='sunny') for i in range(25)]
         cloudy=[dict(x,condition='cloudy') for x in weather]
         sunny_plan=plan(at,21.5,24,10,0,self.model,weather,s,6)

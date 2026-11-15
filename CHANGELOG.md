@@ -1,3 +1,11 @@
+# 0.5.8 — review candidate, not deployed
+
+- Prepare seasonal Astral solar geometry once per day; retain hourly cloud coverage and stop carrying old sunshine beyond its actual hourly interval.
+- Smooth physical-model proposals (alpha 0.20), cap cumulative local-day coefficient changes at 5%, and retain holdout/prospective rejection and rollback.
+- Exclude independently corroborated room-source disagreements from learning; treat signed short-lived residuals as diagnostics/upper-risk only, without unverified comfort credit.
+- Align STOP, planner and retained-session upper-risk trajectories; preserve the frozen STOP prediction and observed-window peak with source-quality diagnostics.
+- Real withheld-day 1h/3h accuracy and reconstruction of the 15 November incident remain unverified without telemetry. Preserve current v6; no production migration or installation.
+
 # 0.5.7
 
 - Compact smartphone overview with daily actual/planned energy, on-demand heating plan and two adjacent heat-source cards.
