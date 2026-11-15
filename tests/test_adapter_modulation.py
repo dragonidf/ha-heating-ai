@@ -51,6 +51,35 @@ class AdapterModulationTests(unittest.TestCase):
     def test_expired_session_stops_even_without_outage_data(self):
         at=datetime(2026,10,13,7,0,tzinfo=ZoneInfo('Europe/Kiev'))
         self.assertEqual(self.fast_tick(at,[dict(start=at.timestamp()-1800,end=at.timestamp())]),['off'])
+    def test_old_primary_report_is_not_a_fresh_post_stop_peak(self):
+        from unittest.mock import Mock
+        at=datetime(2026,11,15,9,tzinfo=ZoneInfo('Europe/Kyiv'))
+        for age,expected in ((0,True),(3600,False)):
+            captured=[]
+            def setup(app):
+                app.temperature_quality={'primary_reported_at':at.timestamp()-age}
+                app.observe_stop_peak=Mock();captured.append(app)
+            self.fast_tick(at,[],before_tick=setup)
+            self.assertEqual(captured[0].observe_stop_peak.call_args.args[-1],expected)
+    def test_residual_gate_requires_fresh_actual_outdoor_source(self):
+        from unittest.mock import Mock
+        at=datetime(2026,11,15,9,tzinfo=ZoneInfo('Europe/Kyiv'))
+        for fresh in (True,False):
+            captured=[]
+            def setup(app):
+                app.sample=Mock();captured.append(app)
+                app.cfg['outside']='sensor.outside'
+                app.fresh=lambda *args:fresh
+                app.temperature_quality={'primary_reported_at':at.timestamp()}
+                app.learning_environment=lambda *args:({},dict(status='agree'))
+                app.update_heating_power=lambda:0.
+                app.equipment_status={'ready':True}
+                app.memory.update(fire_phase='Неактивний',weather_at=at.timestamp())
+                app.weather=[dict(ts=at.timestamp(),temperature=10.)]
+            with patch('heating_climate.observe_residual',return_value={}) as observer:
+                self.fast_tick(at,[],before_tick=setup)
+            self.assertEqual(observer.call_args.args[7],fresh)
+            self.assertEqual(captured[0].sample.call_args.args[8],fresh)
     def test_active_session_keeps_demand_and_one_shot_is_preserved(self):
         at=datetime(2026,10,13,6,30,tzinfo=ZoneInfo('Europe/Kiev'))
         self.assertEqual(self.fast_tick(at,[dict(start=at.timestamp(),end=at.timestamp()+1800)]),['heat'])

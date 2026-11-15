@@ -722,6 +722,10 @@ class HeatingRecovery:
         previous=self.memory.get('peak_observation')
         watch=self.memory.get('peak_watch')
         if watch:
+            if (self.memory.get('room_source_check') or {}).get('status')=='room_source_disagreement':
+                watch['room_source_disagreement']=True
+            if (self.memory.get('room_source_check') or {}).get('status')=='pending':
+                watch['room_sources_suspect']=True
             reason=('unknown_measurement' if not quality or power is None else
                 'measurement_gap' if stamp-watch['last_at']>45 else
                 'model_changed' if self.model.get('version')!=watch['model_version'] else
@@ -729,8 +733,13 @@ class HeatingRecovery:
             if quality:watch['maximum']=max(watch['maximum'],room)
             watch['last_at']=stamp
             if reason or stamp>=watch['end']:
+                reason=reason or ('room_source_disagreement' if watch.get('room_source_disagreement') else
+                                 'room_sources_suspect' if watch.get('room_sources_suspect') else None)
                 self.memory.setdefault('forecast_validation',[]).append(dict(kind='post_stop_peak',horizon='3',hours=3.,
                     at=stamp,model_version=watch['model_version'],window_start=watch['start'],window_end=stamp,
+                    predicted_peak=watch['predicted'],upper_risk_peak=watch.get('upper_risk_peak'),measured_peak=watch['maximum'],
+                    room_source_disagreement=bool(watch.get('room_source_disagreement')),
+                    room_sources_suspect=bool(watch.get('room_sources_suspect')),
                     valid=reason is None,error=watch['predicted']-watch['maximum'] if reason is None else None,
                     reasons=[reason] if reason else []))
                 if reason:
@@ -741,7 +750,10 @@ class HeatingRecovery:
             peak=number(getattr(self,'decision_context',{}).get('coast_peak'))
             if peak is not None:
                 self.memory['peak_watch']=dict(start=stamp,end=stamp+3*3600,last_at=stamp,maximum=room,
-                    predicted=peak,model_version=self.model.get('version'))
+                    predicted=peak,upper_risk_peak=getattr(self,'decision_context',{}).get('coast_upper_peak'),
+                    room_source_disagreement=(self.memory.get('room_source_check') or {}).get('status')=='room_source_disagreement',
+                    room_sources_suspect=(self.memory.get('room_source_check') or {}).get('status')=='pending',
+                    model_version=self.model.get('version'))
         self.memory['peak_observation']=dict(at=stamp,request=requested)
 
     def observe_cycle_energy(self,now,settings,power,energy,grid,automatic,temperature=None,temperature_valid=False):

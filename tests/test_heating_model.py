@@ -4,6 +4,23 @@ from zoneinfo import ZoneInfo
 from heating_model import *
 
 class LogicTests(unittest.TestCase):
+    def test_physical_learning_is_smoothed_and_capped_per_day(self):
+        from unittest.mock import patch
+        from test_learning_limits import samples_for,LIVE_MODEL
+        with patch('heating_model.solve',side_effect=[[.2,.15],[3.,1.5]]):
+            candidate=learn(LIVE_MODEL,samples_for())
+        for key in ('floor_air','room_loss','heat_gain','floor_decay'):
+            self.assertAlmostEqual(candidate[key],LIVE_MODEL[key]*1.04)
+        with patch('heating_model.error',side_effect=[.2,.1]):
+            self.assertFalse(validate_candidate(LIVE_MODEL,dict(LIVE_MODEL,floor_air=LIVE_MODEL['floor_air']*1.06),samples_for())[0])
+    def test_worse_v6_holdout_is_rejected_after_smoothing_too(self):
+        from unittest.mock import patch
+        from test_learning_limits import samples_for,LIVE_MODEL
+        old=dict(LIVE_MODEL,version=6)
+        candidate={**old,**{key:old[key]*1.04 for key in ('floor_air','room_loss','heat_gain','floor_decay')}}
+        with patch('heating_model.error',side_effect=[.01660,.01760]):
+            self.assertFalse(validate_candidate(old,candidate,samples_for())[0])
+        self.assertEqual(old['version'],6)
     def test_midnight_window(self):
         now=datetime(2026,10,7,23,30,tzinfo=ZoneInfo("Europe/Kiev"))
         self.assertTrue(in_window(now,"23:00","07:00"))

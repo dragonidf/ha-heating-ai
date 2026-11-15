@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import math
 import hashlib
 import json
-from heating_environment import forecast_step,safe_upper,ENVIRONMENT_POLICY_VERSION
+from heating_environment import forecast_step,safe_upper,has_upper_risk,ENVIRONMENT_POLICY_VERSION
 import statistics
 from heating_outages import blocked, covered, availability, schedule_covered
 
@@ -52,14 +52,21 @@ def coast(room, floor, outside, fire_delta, model, hours=3):
         values.append(room)
     return max(values), values[-1]
 
-def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours=3):
+def coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours=3,upper=False):
+    rows=[dict(ts=now.timestamp(),temperature=room)]
     for i in range(int(hours*12)):
-        when=now+timedelta(minutes=5*(i+1))
-        room,floor=forecast_step(room,floor,outside,0.,fire_delta*math.exp(-i/24),model,1/12,
-                                 when,settings.get('environment_weather',[]),settings,upper=True)
-        profile=comfort_at(when,settings)
-        if room>=safe_upper(profile[2],profile[3],settings):
-            return True
+        when=now+timedelta(minutes=5*i)
+        weather=settings.get('environment_weather',[])
+        room,floor=forecast_step(room,floor,outdoor_at(weather,when,outside),0.,fire_delta*math.exp(-i/24),model,1/12,
+                                 when,weather,settings,upper=upper)
+        rows.append(dict(ts=(when+timedelta(minutes=5)).timestamp(),temperature=room))
+    return rows
+
+
+def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours=3):
+    for row in coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours,upper=True)[1:]:
+        profile=comfort_at(datetime.fromtimestamp(row['ts'],now.tzinfo),settings)
+        if row['temperature']>=safe_upper(profile[2],profile[3],settings):return True
     return False
 
 def held_action(last,changed_at,stamp,wanted,urgent=False):
@@ -462,7 +469,9 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
         equipment_version=settings.get('equipment_version'),ventilation_model=settings.get('ventilation_model'),
         ventilation_expected=settings.get('ventilation_expected'),profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
         actuator=settings.get('actuator'),
-        environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain')})
+        environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain','observed_at')},
+        astronomy=(settings.get('environment') or {}).get('astronomy'),
+        residual=(settings.get('environment') or {}).get('residual'))
     return hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
@@ -508,7 +517,9 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     evaluated=0;rejections=dict(upper_temperature=0,energy_limit=0)
     # score, room, floor, decisions, curve, energy, min_temperature, max_temperature
     actuator=settings.get('actuator') or {};actuator_enabled=bool(actuator)
-    beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.),0.)]
+    risk_enabled=has_upper_risk(settings)
+    last_heat=(settings.get('environment') or {}).get('last_heated_at') or now.timestamp()-10801
+    beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.),0.,room,floor,last_heat)]
     budget=settings.get('cycle_energy_budget') or {}
     def rank(value):
         excess=max(0.,value[11]-budget['remaining_kwh']) if budget else 0.
@@ -571,10 +582,12 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                          (normal or extension or settings["strategy"] != "Тільки в дозволені години"))
         choices = [False, True] if any(masks) else [False]
         candidates = []
-        for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at, cycle_used in beams:
+        for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at, cycle_used, risk_room, risk_floor, risk_heat in beams:
             for heat in choices:
                 evaluated+=1
                 nr, nf, penalty = r, f, 0.
+                ur,uf=risk_room,risk_floor
+                last_risk_heat=risk_heat
                 command,command_at=last,changed_at
                 shortage=deficit; fine=[]
                 used, outside_minutes, unsafe = 0., 0., False
@@ -604,12 +617,16 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                         effective_kw=modulation_power(nf,profile,3.,anchor,elapsed_minutes) if profile is not None else power_kw
                         nr, nf = forecast_step(nr, nf, out, effective_kw if active else 0.,
                                       fire_delta*math.exp(-elapsed_minutes/120), model, dt,tm,forecast,settings)
+                        if active:last_risk_heat=end.timestamp()
+                        ur,uf=(forecast_step(ur,uf,out,effective_kw if active else 0.,
+                                      fire_delta*math.exp(-elapsed_minutes/120),model,dt,tm,forecast,settings,upper=True)
+                                      if risk_enabled and tm.timestamp()-last_risk_heat<=10800 else (nr,nf))
                         # A session remains unsafe if its stored heat overshoots
                         # later, after the boiler has stopped (including daytime).
-                        if nr>max(room,limit_high)+.01 and (active or any(decisions)):
+                        if max(nr,ur)>max(room,limit_high)+.01 and (active or any(decisions) or heat_segments):
                             unsafe=True
                         shortage+=max(0.,limit_low-nr)*dt
-                        fine.append(dict(ts=end.timestamp(),temperature=nr,**{'return':nf}))
+                        fine.append(dict(ts=end.timestamp(),temperature=nr,upper_temperature=max(nr,ur),**{'return':nf}))
                         penalty += (max(0., limit_low-nr)**2 +
                                     max(0., nr-limit_high)**2)*500*dt*12
                         desired = night_target if split and in_window(tm,"01:00","05:00") else settings["target"]
@@ -666,14 +683,14 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                                    "temperature":round(nr,2),"return":round(nf,2),"heat":bool(heat_segments),
                                    "kwh":round(used,4),"heat_segments":heat_segments,
                                    "outside_minutes":outside_minutes,"_fine":fine}],
-                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage,command,command_at,cycle_used+cycle_added))
+                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage,command,command_at,cycle_used+cycle_added,ur,uf,last_risk_heat))
         if not candidates:
             return None
         candidates.sort(key=rank)
         # Keep diverse room/floor states instead of 12 nearly identical paths.
         seen, beams = set(), []
         for candidate in candidates:
-            key=(round(candidate[1]*10), round(candidate[2]*2), candidate[3][-1])
+            key=(round(candidate[1]*10), round(candidate[2]*2), candidate[3][-1],round(candidate[12]*10))
             if actuator_enabled:
                 key+=(candidate[9],round(max(0.,candidate[10]+(600 if candidate[9]=='heat' else 900)-when.timestamp()-1800)/60))
             if split:
@@ -935,9 +952,15 @@ def transitions(samples):
             continue
         if any(number(a.get(k)) is None or number(b.get(k)) is None for k in ("room","return","outside","power")):
             continue
-        if any(r.get('power_estimated') or str(r.get('power_source','balance')).startswith('fallback') or
+        if any(r.get('room_source_disagreement') or r.get('room_sources_suspect') or r.get('power_estimated') or str(r.get('power_source','balance')).startswith('fallback') or
                r.get('fire_valid') is False or number(r.get('fire',0)) is None or r.get('fire',0)>2 or
-               r.get('external_gain',0)>.1 for r in (a,b)):
+               r.get('external_gain',0)>.1 or abs(r.get('residual_gain',0))>.1 for r in (a,b)):
+            continue
+        if a.get('room_reported_at') is not None and b.get('room_reported_at') is not None and b['room_reported_at']<=a['room_reported_at']:
+            continue
+        if any(r.get('environment_version',0)>=6 and
+               (not r.get('astronomy_valid') or number(r.get('room_reported_at')) is None or not 0<=r['ts']-r['room_reported_at']<=300)
+               for r in (a,b)):
             continue
         # Daytime gains and stagnant pipes cannot identify floor transfer/loss.
         # Keep the records for energy, modulation and external-gain learning.
@@ -964,9 +987,9 @@ def error(model, pairs):
         errors.append(abs(room-b["room"]))
     return sum(errors)/len(errors) if errors else None
 
-def learning_bounds(value):
-    """One shared ±20% rule. A zero baseline stays zero, without an absolute escape."""
-    return value*(1-.20),value*(1+.20)
+def learning_bounds(value,fraction=.05):
+    """Cumulative local-day cap; a zero baseline stays zero."""
+    return value*(1-fraction),value*(1+fraction)
 
 
 def learning_change_allowed(value,baseline):
@@ -1016,8 +1039,9 @@ def learn(model, samples, baseline=None):
     candidate=dict(model)
     for k,value in zip(("floor_air","room_loss"),coefficients):
         lo,hi=BOUNDS[k]
-        low,high=learning_bounds(model[k]);day_low,day_high=learning_bounds((baseline or model)[k])
-        candidate[k]=max(lo,low,day_low,min(hi,high,day_high,value))
+        low,high=learning_bounds(model[k],.2);day_low,day_high=learning_bounds((baseline or model)[k])
+        value=model[k]+.2*(max(lo,low,min(hi,high,value))-model[k])
+        candidate[k]=max(lo,day_low,min(hi,day_high,value))
     # The return sensor is a proxy; identify its response only during actual boiler operation.
     heated=[pair for pair in train if pair[0]["power"]>1.5]
     if len(heated)>=12:
@@ -1026,8 +1050,9 @@ def learn(model, samples, baseline=None):
         coefficients=solve(rows,y,[model["heat_gain"],model["floor_decay"]])
         for k,value in zip(("heat_gain","floor_decay"),coefficients):
             lo,hi=BOUNDS[k]
-            low,high=learning_bounds(model[k]);day_low,day_high=learning_bounds((baseline or model)[k])
-            candidate[k]=max(lo,low,day_low,min(hi,high,day_high,value))
+            low,high=learning_bounds(model[k],.2);day_low,day_high=learning_bounds((baseline or model)[k])
+            value=model[k]+.2*(max(lo,low,min(hi,high,value))-model[k])
+            candidate[k]=max(lo,day_low,min(hi,day_high,value))
     return candidate
 
 def decide(mode, armed, allow_actuation, room, probe_ok, grid, thermostat_ok, power_ok,
