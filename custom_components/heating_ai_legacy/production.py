@@ -229,7 +229,7 @@ class NativeController(HeatingClimate):
     def climate_changed(self, entity, attribute, old, new, kwargs=None, **extra):
         # Only the user's mode helper may switch controller modes. A Tuya
         # echo or transient thermostat drift must never select Observation.
-        if (not self.memory.get("owned") or time.time() < self.command_pending_until
+        if (not self.memory.get("owned") or time.time() < getattr(self, "command_pending_until", 0)
                 or self.memory.get("temporary_fallback")):
             return
         expected = self.memory.get("expected_mode")
