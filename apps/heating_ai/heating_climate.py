@@ -1006,19 +1006,53 @@ class HeatingClimate(HeatingRecovery,Hass):
         last_valid=number(tracker.get('last_valid'))
         continuous=last_valid is not None and 0<=stamp-last_valid<=p['fire_continuity_seconds']
         below=number(tracker.get('below_since')) if continuous else None
+        # A sensor next to the fireplace stays hot long after useful airflow fades.
+        # Track the local peak and require sustained cooling before stopping.
+        peak=number(tracker.get('peak_temperature')) if continuous else None
+        cooling_since=number(tracker.get('cooling_since')) if continuous else None
+        cooling_latched=bool(tracker.get('cooling_latched',False))
+        cooling_low=number(tracker.get('cooling_low'))
         active=False
         if valid:
-            if signal>=p['fire_start_delta']:
-                active=True;below=None
-            elif was_active and not (signal<p['fire_fast_stop_delta'] and trend<=p['fire_fast_stop_slope']):
+            if cooling_latched:
+                cooling_low=min(temperature,cooling_low if cooling_low is not None else temperature)
+                # Only renewed heating can re-arm a stopped, cooling fireplace.
                 if signal<p['fire_stop_delta']:
-                    below=stamp if below is None else below
-                    active=stamp-below<p['fire_cooldown_seconds']
+                    cooling_latched=False;cooling_low=None
+                elif (signal>=p['fire_start_delta'] and
+                      temperature-cooling_low>=p['fire_ignite_delta'] and
+                      trend>p['fire_ignite_slope']):
+                    cooling_latched=False;cooling_low=None
+                    peak=temperature;cooling_since=None
+            if not cooling_latched:
+                if not was_active and signal>=p['fire_start_delta']:
+                    peak=temperature
+                elif was_active:
+                    peak=max(temperature,peak if peak is not None else temperature)
+                sustained_cooling=(was_active and peak is not None and
+                                   peak-temperature>=p['fire_start_delta'] and
+                                   trend<=p['fire_fast_stop_slope'])
+                if sustained_cooling:
+                    cooling_since=stamp if cooling_since is None else cooling_since
+                    if stamp-cooling_since>=max(900,3*p['fire_cooldown_seconds']):
+                        cooling_latched=True;cooling_low=temperature
                 else:
+                    cooling_since=None
+            if not cooling_latched:
+                if signal>=p['fire_start_delta']:
                     active=True;below=None
+                elif was_active and not (signal<p['fire_fast_stop_delta'] and trend<=p['fire_fast_stop_slope']):
+                    if signal<p['fire_stop_delta']:
+                        below=stamp if below is None else below
+                        active=stamp-below<p['fire_cooldown_seconds']
+                    else:
+                        active=True;below=None
         if not active:
             below=None
-        self.memory['fire_circulation']=dict(active=active,below_since=below,last_valid=stamp if valid else None)
+        self.memory['fire_circulation']=dict(active=active,below_since=below,
+            last_valid=stamp if valid else None,peak_temperature=peak if valid else None,
+            cooling_since=cooling_since if valid else None,cooling_latched=cooling_latched if valid else False,
+            cooling_low=cooling_low if valid else None)
         if not valid:
             phase="Датчик недоступний"
         elif trend<p['fire_fade_slope'] and signal>=p['fire_ignite_delta']:

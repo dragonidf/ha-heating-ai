@@ -95,4 +95,47 @@ class FireplaceCirculationTests(unittest.TestCase):
         self.assertFalse(self.cycle(app,2.9,stamp=10465)[1])
 
 
+    def test_hot_fireplace_stops_after_sustained_cooling_from_its_peak(self):
+        app=self.app()
+        self.assertTrue(self.cycle(app,27,stamp=10000,slope=3)[1])
+        # Still much hotter than the room; cooling begins after a 5 C peak drop.
+        self.assertTrue(self.cycle(app,22,stamp=10015,slope=-3)[1])
+        for stamp in range(10030,10915,15):
+            self.assertTrue(self.cycle(app,19,stamp=stamp,slope=-3)[1])
+        self.assertFalse(self.cycle(app,19,stamp=10915,slope=-3)[1])
+        self.assertEqual(app.published['sensor.heating_fireplace']['state'],'Згасає')
+        self.assertTrue(app.memory['fire_circulation']['cooling_latched'])
+        # A hot sensor and small fluctuations must not immediately restart the fan.
+        self.assertFalse(self.cycle(app,19.5,stamp=10930,slope=1)[1])
+        self.assertFalse(self.cycle(app,19.7,stamp=10945,slope=1)[1])
+        # A genuine fresh rise clears the cooling latch.
+        self.assertTrue(self.cycle(app,21.5,stamp=10960,slope=2)[1])
+        self.assertFalse(app.memory['fire_circulation']['cooling_latched'])
+
+    def test_brief_cooling_and_missing_continuity_do_not_trigger_early_stop(self):
+        app=self.app()
+        self.cycle(app,27,stamp=10000)
+        self.assertTrue(self.cycle(app,22,stamp=10015,slope=-3)[1])
+        for stamp in range(10030,10315,15):
+            self.assertTrue(self.cycle(app,21,stamp=stamp,slope=-3)[1])
+        # Cooling evidence disappears; the countdown must restart.
+        self.assertTrue(self.cycle(app,21,stamp=10315,slope=0)[1])
+        self.assertIsNone(app.memory['fire_circulation']['cooling_since'])
+        self.assertTrue(self.cycle(app,20,stamp=10330,slope=-3)[1])
+        self.assertTrue(self.cycle(app,20,stamp=10345,slope=-3)[1])
+        # Missing control ticks must not be interpreted as 15 minutes of cooling.
+        self.assertTrue(self.cycle(app,20,stamp=11330,slope=-3)[1])
+        self.assertIsNone(app.memory['fire_circulation']['cooling_since'])
+
+    def test_cooling_latch_survives_short_reload(self):
+        app=self.app();self.cycle(app,27,stamp=10000)
+        for stamp in range(10015,10930,15):
+            self.cycle(app,19,stamp=stamp,slope=-4)
+        self.assertTrue(app.memory['fire_circulation']['cooling_latched'])
+        restored=self.app();restored.memory=deepcopy(app.memory)
+        self.assertFalse(self.cycle(restored,19,stamp=10930,slope=-3)[1])
+        self.assertFalse(self.cycle(restored,19.5,stamp=10945,slope=1)[1])
+        self.assertTrue(self.cycle(restored,21.5,stamp=10960,slope=2)[1])
+
+
 if __name__=='__main__':unittest.main()

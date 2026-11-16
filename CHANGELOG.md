@@ -1,3 +1,9 @@
+# 0.5.9 — fireplace circulation cool-down stop
+
+- Stop automatic fireplace circulation after the near-fire sensor cools by at least the start delta from its measured peak while the strong negative trend persists for at least 15 minutes (or three configured cooldown periods).
+- Keep circulation off through residual localized heat until measured renewed warming is confirmed; preserve manual, overnight, inverter and boiler behavior.
+- Add regression coverage for lingering heat, a fresh ignition, interrupted cooling, and short reloads.
+
 # 0.5.8 — review candidate, not deployed
 
 - Prepare seasonal Astral solar geometry once per day; retain hourly cloud coverage and stop carrying old sunshine beyond its actual hourly interval.
