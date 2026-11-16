@@ -21,6 +21,7 @@ def policy(settings):
     return {**{k:settings.get(k) for k in keys},'environment_policy_version':ENVIRONMENT_POLICY_VERSION,
             'energy_budget_policy_version':1,
             'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
+            'runtime_supply_override':(settings.get('outage_schedule') or {}).get('runtime_supply_override'),
             'search_policy_version':SEARCH_POLICY_VERSION}
 
 
