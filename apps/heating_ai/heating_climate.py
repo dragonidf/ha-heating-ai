@@ -1489,11 +1489,21 @@ class HeatingClimate(HeatingRecovery,Hass):
                                          automatic,getattr(self,'power_source','unknown'),
                                          control_reserve=(reserve_active or getattr(self,'power_source','') in ('fallback_inlet_stage','fallback_group_balance')) and power>=500 and
                                          (self.memory.get('command_diagnostic') or {}).get('status')=='confirmed'))
-        settings["outage_schedule"] = outage_data
+        # The source calendar stays untouched. Runtime supply can temporarily
+        # free the *current* published OFF period after two 15-minute checks;
+        # future published outages and their pre-stop margins remain binding.
+        operational=self.outage_execution_schedule(outage_data,grid,now.timestamp())
+        runtime_override=operational.get('runtime_supply_override')
+        runtime_key=(runtime_override['published_start'],runtime_override['start']) if runtime_override else None
+        if runtime_key!=getattr(self,'operational_outage_key',None):
+            self.next_compute=0
+            self.operational_outage_key=runtime_key
+        settings["outage_schedule"] = operational
         settings["outage_advance_limit"] = self.cfg.get("outage_advance_limit",180)
         settings.update({k:system_values(self.cfg)[k] for k in ('risk_cold_delta','risk_blackout_short_minutes','risk_blackout_long_minutes')})
         emergency = outage_data['emergency']
-        outage_now = bool(outage_data.get("valid") and blocked(now.timestamp(),now.timestamp()+15,outage_data["outages"]))
+        published_outage_now=bool(outage_data.get("valid") and blocked(now.timestamp(),now.timestamp()+15,outage_data["outages"]))
+        outage_now=bool(operational.get("valid") and blocked(now.timestamp(),now.timestamp()+15,operational["outages"]))
         upcoming = [o for o in outage_data.get("outages",[]) if o["end"] > now.timestamp()]
         self.publish("sensor.heating_outage_schedule",outage_data.get("reason","Графік не підключений"),
                      friendly_name="Клімат — графік відключень 3.1",valid=bool(outage_data.get("valid")),
@@ -1501,7 +1511,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                      source_available=outage_data['source_available'],source_fresh=outage_data['source_fresh'],
                      assumed_available=bool(outage_data.get('assumed')),source_mode=outage_data.get('source_mode',outage_data['mode']),
                      reason=outage_data['reason'],
-                     scheduled_outage_now=outage_now,next_outage=upcoming[0] if upcoming else None,
+                     scheduled_outage_now=published_outage_now,heating_blocked_now=outage_now,
+                     runtime_supply_override=runtime_override,
+                     next_outage=upcoming[0] if upcoming else None,
                      outages=upcoming,known_until=outage_data.get("known_until"),
                      warning=outage_data['warning'])
         budget=self.val("monthly_budget",0)
