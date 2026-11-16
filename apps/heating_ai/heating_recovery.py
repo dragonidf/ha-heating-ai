@@ -16,7 +16,7 @@ import shutil
 import copy
 import zlib
 from heating_model import number,in_window,heating_cycle,step,held_action,comfort_at,local_boundary
-from heating_outages import schedule,blocked
+from heating_outages import schedule,blocked,operational_schedule
 from heating_fallback import estimated_power
 
 CALCULATION_TIMEOUT_SECONDS=60
@@ -1234,12 +1234,34 @@ class HeatingRecovery:
             self.memory.pop('temporary_fallback',None)
             self.memory['recovering_from_fallback']=True
 
+    def track_confirmed_grid(self,grid,stamp=None):
+        """Volatile continuity proof, never restored from state.json after restart."""
+        stamp=time.time() if stamp is None else stamp
+        previous=getattr(self,'_actual_grid_observed_at',None)
+        if previous is not None and (stamp<previous or stamp-previous>45):
+            self._actual_grid_on_since=None  # An unobserved gap is not continuous power.
+        if grid=='on':
+            if getattr(self,'_actual_grid_on_since',None) is None:
+                self._actual_grid_on_since=stamp
+        else:
+            self._actual_grid_on_since=None
+        self._actual_grid_observed_at=stamp
+        return self._actual_grid_on_since
+
+    def outage_execution_schedule(self,published=None,grid=None,stamp=None):
+        """Use live network confirmation without modifying the Svitlo source."""
+        stamp=time.time() if stamp is None else stamp
+        grid=self.grid_state() if grid is None else grid
+        on_since=self.track_confirmed_grid(grid,stamp)
+        source=published if published is not None else self.read_outage_schedule()
+        return operational_schedule(source,stamp,on_since if grid=='on' else None)
+
     def fallback_target(self,current,attrs):
         outside=(self.raw('strategy')=='Тільки в дозволені години' and
                  not in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))
         room=self.source_temperature()[0]
         hot=room is not None and room>=self.active_upper()
-        outage=self.read_outage_schedule()
+        outage=self.outage_execution_schedule()
         scheduled_off=bool(outage.get('valid') and blocked(time.time(),time.time()+15,outage.get('outages',[])))
         target=(current-2 if current is not None else number(attrs.get('min_temp')) or 5) if outside or hot or scheduled_off else self.val('native_setpoint',26)
         step=number(attrs.get('target_temp_step')) or .5
@@ -1280,13 +1302,14 @@ class HeatingRecovery:
         if release:
             action="off"
         last=self.memory.get("last_command")
-        if self.memory.get('temporary_fallback') and not release and self.grid_state()=='on':
+        grid=self.grid_state()
+        outage=self.outage_execution_schedule(grid=grid)
+        scheduled_off=bool(outage.get("valid") and blocked(time.time(),time.time()+15,outage["outages"]))
+        if self.memory.get('temporary_fallback') and not release and grid=='on' and not scheduled_off:
             action='fallback'
-        if action=='fallback' and self.grid_state()!='on':
+        if action=='fallback' and (grid!='on' or scheduled_off):
             action='off'
         room=self.source_temperature()[0]
-        outage=self.read_outage_schedule()
-        scheduled_off=bool(outage.get("valid") and blocked(time.time(),time.time()+15,outage["outages"]))
         if action=='heat' and (scheduled_off or self.grid_state()!='on' or
                               room is None or room>=self.active_upper()):
             action="off"
