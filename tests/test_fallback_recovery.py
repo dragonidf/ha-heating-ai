@@ -171,6 +171,63 @@ class FinalDispatchGuardTests(unittest.TestCase):
         self.run_action(app,'fallback')
         self.assertFalse(any(c[0]=='climate/set_hvac_mode' and c[1].get('hvac_mode')=='auto' for c in app.calls))
 
+
+class ConfirmedSupplyDispatchTests(unittest.TestCase):
+    app=FallbackRecoveryTests.app
+    run_action=FallbackRecoveryTests.run_action
+
+    def published_blackout(self,app,begin,end):
+        return dict(valid=True,mode='scheduled',
+                    outages=[dict(start=begin,end=end)],slots=[])
+
+    def test_pre_stop_overrides_existing_heat_and_minimum_on(self):
+        app=self.app(23)
+        app.at=app.at.replace(minute=45)
+        begin=app.at.timestamp()+900
+        app.read_outage_schedule=lambda:self.published_blackout(app,begin,begin+10800)
+        app.memory.update(last_command='heat',command_at=app.at.timestamp()-60)
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertEqual(app.values['thermostat'],'heat')
+        self.assertLessEqual(app.attrs['temperature'],21)
+
+    def test_temporary_fallback_cannot_heat_during_pre_stop(self):
+        app=self.app(23)
+        app.at=app.at.replace(minute=45)
+        begin=app.at.timestamp()+900
+        app.read_outage_schedule=lambda:self.published_blackout(app,begin,begin+10800)
+        app.memory.update(last_command='heat',command_at=app.at.timestamp()-60,
+                          temporary_fallback=dict(reason='test',retry_at=app.at.timestamp()+300))
+        self.run_action(app,'fallback')
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertNotEqual(app.values['thermostat'],'auto')
+        self.assertLessEqual(app.attrs['temperature'],21)
+
+    def test_confirmed_early_supply_allows_heat_and_grid_loss_cancels(self):
+        app=self.app(0)
+        app.at=app.at.replace(minute=15)
+        begin=app.at.timestamp()-900
+        app.read_outage_schedule=lambda:self.published_blackout(app,begin,begin+10800)
+        app._actual_grid_on_since=app.at.timestamp()-1800
+        app._actual_grid_observed_at=app.at.timestamp()-15
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'heat')
+        app.grid_state=lambda:'unknown'
+        self.run_action(app,'heat',app.at.timestamp()+15)
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertIsNone(app._actual_grid_on_since)
+
+    def test_short_real_return_cannot_bypass_outage(self):
+        app=self.app(0)
+        app.at=app.at.replace(minute=15)
+        begin=app.at.timestamp()-900
+        app.read_outage_schedule=lambda:self.published_blackout(app,begin,begin+10800)
+        app._actual_grid_on_since=app.at.timestamp()-600
+        app._actual_grid_observed_at=app.at.timestamp()-15
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'off')
+
+
 class HealthContractTests(unittest.TestCase):
     def test_health_exposes_fresh_heartbeat_and_writer_state(self):
         app=HeatingClimate();app.at=datetime(2026,10,12,19,10,tzinfo=ZoneInfo('Europe/Kiev'));app.now=lambda:app.at
