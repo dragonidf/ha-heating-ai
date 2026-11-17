@@ -27,6 +27,20 @@ class OperationalOutageTests(unittest.TestCase):
         self.assertTrue(blocked(self.midnight-600,self.midnight-599,at_limit['outages']))
         self.assertEqual(at_limit['outages'][0]['start'],self.midnight-600)
 
+    def test_optimizer_rejects_short_heat_when_blackout_is_six_minutes_away(self):
+        from heating_model import _plan, DEFAULT_MODEL
+        now=datetime(2026,11,17,20,44,tzinfo=self.tz)
+        start=now.replace(hour=21,minute=0).timestamp()
+        blackout=dict(start=start,end=start+10800)
+        published=dict(valid=True,mode='scheduled',outages=[blackout],slots=[])
+        operational=operational_schedule(published,now.timestamp(),None)
+        settings=dict(start='00:00',end='23:59',strategy='Комфорт протягом доби',
+                      target=22,lower=21.5,upper=22.5,night_price=.5,day_price=1)
+        result=_plan(now,20.0,21.0,-5.0,0.,DEFAULT_MODEL,[],settings,
+                     outages=operational['outages'],hours_override=.5,beam_width=12)
+        self.assertIsNotNone(result)
+        self.assertFalse(result['heat_segments'])
+
     def test_refresh_timestamp_only_does_not_change_schedule_identity(self):
         from heating_outages import signature
         before=signature(self.source)
