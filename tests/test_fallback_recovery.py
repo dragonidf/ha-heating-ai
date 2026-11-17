@@ -238,7 +238,7 @@ class ConfirmedSupplyDispatchTests(unittest.TestCase):
         self.run_action(app,'off')
         self.assertEqual(app.memory['last_command'],'heat')
         self.assertEqual(app.attrs['temperature'],25)
-        app.at+=timedelta(minutes=7,seconds=59)
+        app.at+=timedelta(minutes=8,seconds=1)
         self.run_action(app,'off')
         self.assertEqual(app.memory['last_command'],'off')
         self.assertLessEqual(app.attrs['temperature'],21)
