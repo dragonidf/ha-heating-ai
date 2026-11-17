@@ -529,6 +529,26 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     anchor=settings.get('modulation_anchor')
     reserved=set()
     reserved_exact=None
+    # A new heat request must fit a complete minimum-on cycle before the
+    # next hard outage/strict-window boundary. Already-running sessions are
+    # instead protected by held_action(), and hard safety can always stop.
+    def can_start_minimum(stamp):
+        end=stamp+600
+        if blocked(stamp,end,outages):
+            return False
+        if settings['strategy']!='Тільки в дозволені години':
+            return True
+        cursor=stamp
+        while cursor<end-.001:
+            next_at=min(end,cursor+60)
+            a=datetime.fromtimestamp(cursor,now.tzinfo)
+            b=datetime.fromtimestamp(next_at-.001,now.tzinfo)
+            inside=in_window(a,settings['start'],settings['end']) and in_window(b,settings['start'],settings['end'])
+            extra=any(cursor>=lo and next_at<=hi for lo,hi in extensions)
+            if not (inside or extra):
+                return False
+            cursor=next_at
+        return True
     minimum=number(settings.get('morning_min_minutes')) or 0
     elapsed=number(settings.get('morning_elapsed_minutes')) or 0
     cycle_policy=bool(settings.get('split_comfort') and 'night_target' in settings)
@@ -602,6 +622,15 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                         out = outdoor_at(forecast, tm, outside)
                         reserved_here=(reserved_exact[0]<=tm and end<=reserved_exact[1]) if reserved_exact else int(elapsed_minutes//5) in reserved
                         active = (heat or reserved_here) and masks[j]
+                        # Reject new short pulses near the hard cut; continued
+                        # heating may finish normally until the safe boundary.
+                        prior_end=(heat_segments[-1]['end'] if heat_segments else
+                                   curve[-1]['heat_segments'][-1]['end']
+                                   if curve and curve[-1]['heat_segments'] else None)
+                        continuing=(command=='heat' if actuator_enabled else
+                                    prior_end is not None and abs(prior_end-tm.timestamp())<.01)
+                        if active and not continuing and not can_start_minimum(tm.timestamp()):
+                            active=False
                         wanted,limit_low,limit_high,zone=comfort_at(tm,settings)
                         limit_low+=min(settings.get('_reserve_margin',0.),max(0.,wanted-limit_low)/2)
                         limit_high=safe_upper(limit_high,zone,settings)
