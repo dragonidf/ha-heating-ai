@@ -182,8 +182,8 @@ class ConfirmedSupplyDispatchTests(unittest.TestCase):
 
     def test_pre_stop_overrides_existing_heat_and_minimum_on(self):
         app=self.app(23)
-        app.at=app.at.replace(minute=45)
-        begin=app.at.timestamp()+900
+        app.at=app.at.replace(minute=50)
+        begin=app.at.timestamp()+600
         app.read_outage_schedule=lambda:self.published_blackout(app,begin,begin+10800)
         app.memory.update(last_command='heat',command_at=app.at.timestamp()-60)
         self.run_action(app,'heat')
@@ -193,8 +193,8 @@ class ConfirmedSupplyDispatchTests(unittest.TestCase):
 
     def test_temporary_fallback_cannot_heat_during_pre_stop(self):
         app=self.app(23)
-        app.at=app.at.replace(minute=45)
-        begin=app.at.timestamp()+900
+        app.at=app.at.replace(minute=50)
+        begin=app.at.timestamp()+600
         app.read_outage_schedule=lambda:self.published_blackout(app,begin,begin+10800)
         app.memory.update(last_command='heat',command_at=app.at.timestamp()-60,
                           temporary_fallback=dict(reason='test',retry_at=app.at.timestamp()+300))
@@ -216,6 +216,55 @@ class ConfirmedSupplyDispatchTests(unittest.TestCase):
         self.run_action(app,'heat',app.at.timestamp()+15)
         self.assertEqual(app.memory['last_command'],'off')
         self.assertIsNone(app._actual_grid_on_since)
+
+    def test_pre_blackout_heat_survives_replans_until_ten_minutes_elapsed(self):
+        from datetime import timedelta
+        app=self.app(20)
+        app.at=app.at.replace(minute=35)
+        initial=app.at.timestamp()
+        blackout=app.at.replace(hour=21,minute=0).timestamp()
+        app.read_outage_schedule=lambda:self.published_blackout(app,blackout,blackout+10800)
+        app.decision_context=dict(forecast=dict(
+            heat_segments=[dict(start=initial-60,end=blackout-600)],
+            approved_window_extensions=[[initial-900,blackout-600]]))
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'heat')
+        self.assertGreater(app._heat_exception_until,initial+599)
+        self.assertEqual(app.attrs['temperature'],25)
+        # A fresh optimisation deletes the old heat segment, but cannot stop
+        # the just-started 10-minute minimum while supply and safety are good.
+        app.decision_context=dict(forecast=dict(heat_segments=[]))
+        app.at+=timedelta(minutes=2)
+        self.run_action(app,'off')
+        self.assertEqual(app.memory['last_command'],'heat')
+        self.assertEqual(app.attrs['temperature'],25)
+        app.at+=timedelta(minutes=7,seconds=59)
+        self.run_action(app,'off')
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertLessEqual(app.attrs['temperature'],21)
+
+    def test_hard_blackout_cutoff_vetoes_even_committed_heat(self):
+        from datetime import timedelta
+        app=self.app(20)
+        app.at=app.at.replace(minute=46)
+        blackout=app.at.replace(hour=21,minute=0).timestamp()
+        app.read_outage_schedule=lambda:self.published_blackout(app,blackout,blackout+10800)
+        app.memory.update(last_command='heat',command_at=app.at.timestamp()-60)
+        app._heat_exception_policy=('Тільки в дозволені години','23:00','07:00')
+        app._heat_exception_until=app.at.timestamp()+540
+        app.at=app.at.replace(minute=50)
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertLessEqual(app.attrs['temperature'],21)
+
+    def test_strict_window_end_remains_hard_even_during_minimum_on(self):
+        from datetime import timedelta
+        app=self.app(6)
+        app.at=app.at.replace(minute=59)
+        app.memory.update(last_command='heat',command_at=app.at.timestamp()-60)
+        app.at+=timedelta(minutes=1)
+        self.run_action(app,'off')
+        self.assertEqual(app.memory['last_command'],'off')
 
     def test_short_real_return_cannot_bypass_outage(self):
         app=self.app(0)
