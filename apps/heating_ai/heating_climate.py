@@ -1678,6 +1678,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['actuator']=dict(action=self.memory.get('last_command'),changed_at=command_at or 0.,
             safety_stop=grid!='on' or not permitted or self.raw('mode')!='Автоматичне керування' or
                         room is not None and room>=upper or coast_overheat and not once)
+        committed_heat=self.minimum_heat_commit(now.timestamp(),grid,outage_now,room,coast_overheat and not once)
         background=getattr(self,'runtime_ready',False) and callable(getattr(self,'submit_to_executor',None))
         ready=None
         if background and not forecast_quality:
@@ -1694,7 +1695,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         if time.time()<self.next_compute or background and forecast_quality and valid and ready is None:
             segments=self.memory.get("planned_heat_segments",[])
             demand=any(s["start"] <= now.timestamp() < s["end"] for s in segments)
-            if once:
+            if once or committed_heat:
                 demand=True
             if outage_now or (room is not None and room>=upper) or coast_overheat and not once:
                 demand=False
@@ -1717,8 +1718,10 @@ class HeatingClimate(HeatingRecovery,Hass):
                     'Досягнуто верхню межу' if room is not None and room>=upper else
                     'Планове відключення' if outage_now else
                     'Недостатньо актуальних вимірювань' if not quality else
+                    'Мінімальний сеанс — утримуємо 10 хв' if committed_heat and demand else
                     'Заплановано нагрів' if demand else 'Очікування за поточним планом')
-            self.publish_control_decision(action,reason,demand,thermostat,**control_attrs)
+            self.publish_control_decision(action,reason,demand,thermostat,**control_attrs,
+                minimum_heat_commit=committed_heat)
             self.apply_action(action,False)
             self.fan_tick(grid,fire_active)
             self.publish("sensor.heating_heartbeat",now.isoformat(),friendly_name="Клімат — останній цикл",device_class="timestamp")
@@ -1837,6 +1840,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             demand=False
         if outage_now:
             demand=False
+        if committed_heat and not outage_now:
+            demand=True
         action=decide(self.raw("mode"),self.raw("armed")=="on",bool(self.cfg.get("allow_actuation",False)),
                       room,probe_ok,grid,self.raw("thermostat") not in ("unknown","unavailable",None),
                       power is not None,self.model.get("validated",False),demand,valid)
@@ -1845,6 +1850,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 "Некоректні межі температури або часу" if not valid else
                 "Недостатньо актуальних вимірювань" if not quality else
                 "Планове відключення 3.1 — нагрів не планується" if outage_now else
+                "Мінімальний сеанс — утримуємо 10 хв" if committed_heat and demand and not planned_heat else
                 "Завчасний нагрів перед відключенням 3.1" if demand and preheat else
                 "Ранковий підігрів підлоги" if demand and morning_comfort else
                 reserve['impossibility_reason'] if not demand and reserve.get('impossibility_reason') else
@@ -1867,7 +1873,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.publish_control_decision(action,reason,demand,thermostat,**control_attrs,
                      outage_preheat=preheat,outage_shifted=bool(forecast and forecast["outage_shifted"]),
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,
-                     comfort_shortfall=bool(forecast and forecast["comfort_shortfall"]))
+                     comfort_shortfall=bool(forecast and forecast["comfort_shortfall"]),
+                     minimum_heat_commit=committed_heat)
         self.publish("sensor.heating_model","Точність знижена" if environment_quality['degraded'] else "Є короткострокові перевірки" if self.model.get("validated") else "Збір даних",
                      reliability=environment_quality,environment_version=1,
                      friendly_name="Клімат — модель",parameters=self.model,samples=len(self.samples),

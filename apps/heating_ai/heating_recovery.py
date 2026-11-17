@@ -1281,6 +1281,25 @@ class HeatingRecovery:
         self.next_compute=fallback['retry_at']
         self.apply_action('fallback',False)
 
+    def minimum_heat_commit(self,stamp,grid,scheduled_off,room,coast_overheat=False):
+        """Keep a requested heat cycle for 10 minutes unless a hard veto occurs."""
+        started=number(self.memory.get('command_at'))
+        if (not self.memory.get('owned') or self.memory.get('last_command')!='heat' or
+                started is None or not 0<=stamp-started<600 or grid!='on' or
+                scheduled_off or room is None or room>=self.active_upper() or coast_overheat or
+                self.raw('armed')!='on' or self.raw('mode')!='Автоматичне керування'):
+            return False
+        try:
+            strategy=self.raw('strategy')
+        except KeyError:
+            return False  # Partial test/config state is never permission to hold heat.
+        start=self.raw('start') or '23:00'
+        end=self.raw('end') or '07:00'
+        if strategy=='Тільки в дозволені години' and not in_window(self.now(),start,end):
+            return (getattr(self,'_heat_exception_until',0)>stamp and
+                    getattr(self,'_heat_exception_policy',None)==(strategy,start,end))
+        return True
+
     def apply_action(self,action,once):
         requested_action=action
         if getattr(getattr(self,'_tick_read_local',None),'states',None) is not None:self.refresh_tick_snapshot()
@@ -1314,13 +1333,17 @@ class HeatingRecovery:
                               room is None or room>=self.active_upper()):
             action="off"
         plan_forecast=(getattr(self,'decision_context',None) or {}).get('forecast')
+        committed=self.minimum_heat_commit(time.time(),grid,scheduled_off,room,
+            (getattr(self,'decision_context',None) or {}).get('coast_overheat',False))
         if action=='heat' and not once and isinstance(plan_forecast,dict) and 'heat_segments' in plan_forecast:
-            if not any(s['start']<=time.time()<s['end'] for s in plan_forecast['heat_segments']):action='off'
+            if not committed and not any(s['start']<=time.time()<s['end'] for s in plan_forecast['heat_segments']):action='off'
+        outside_window=(action=='off' and not once and
+            self.raw('strategy')=='Тільки в дозволені години' and not
+            in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))
         urgent=release or action=="fallback" or (action=="off" and (
-            scheduled_off or self.grid_state()!="on" or room is None or room>=self.active_upper() or
-            getattr(self,'decision_context',{}).get('coast_overheat',False) or
-            (not once and self.raw('strategy')=='Тільки в дозволені години' and
-             not in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))))
+            scheduled_off or grid!='on' or room is None or room>=self.active_upper() or
+            (getattr(self,'decision_context',None) or {}).get('coast_overheat',False) or
+            (not once and outside_window and not committed)))
         action=held_action(last,self.memory.get('command_at',0),time.time(),action,urgent)
         current=self.val("thermostat",attribute="current_temperature")
         if action!="fallback" and (current is None or not 5<=current<=40 or
@@ -1422,6 +1445,23 @@ class HeatingRecovery:
             self.memory["command_at"]=time.time()
             if action=='heat':
                 self.memory['heat_session_start_energy']=self.val('energy')
+                try:
+                    strategy=self.raw('strategy')
+                except KeyError:
+                    strategy=None
+                start=self.raw('start') or '23:00' if strategy else '23:00'
+                end=self.raw('end') or '07:00' if strategy else '07:00'
+                self._heat_exception_until=0
+                self._heat_exception_policy=None
+                if strategy=='Тільки в дозволені години' and not in_window(self.now(),start,end):
+                    for window in (plan_forecast or {}).get('approved_window_extensions',[]):
+                        if window[0]<=time.time()<window[1]:
+                            self._heat_exception_until=min(window[1],time.time()+600)
+                            self._heat_exception_policy=(strategy,start,end)
+                            break
+            else:
+                self._heat_exception_until=0
+                self._heat_exception_policy=None
             if action=="fallback":
                 self.notify_once("Тимчасовий штатний auto: модель повторить спробу керування на наступному перерахунку")
             if once and action=="heat":

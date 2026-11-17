@@ -26,7 +26,7 @@ def availability(data, start, finish):
 
 
 
-def operational_schedule(published, stamp, grid_on_since=None, guard_seconds=900):
+def operational_schedule(published, stamp, grid_on_since=None, guard_seconds=600, confirmation_seconds=900):
     """Runtime-only forecast mask. Never mutate the published Svitlo schedule.
 
     End heat 15 minutes before every published interruption. Within a
@@ -43,7 +43,7 @@ def operational_schedule(published, stamp, grid_on_since=None, guard_seconds=900
     for slot in published.get('outages', []):
         begin,end=slot['start'],slot['end']
         protected_begin=begin-guard_seconds
-        eligible_at=(max(begin+guard_seconds,grid_on_since+guard_seconds)
+        eligible_at=(max(begin+confirmation_seconds,grid_on_since+confirmation_seconds)
                      if grid_on_since is not None else None)
         if (begin<=stamp<end and eligible_at is not None and stamp>=eligible_at):
             # Keep the original past/protected interval masked; permit only
@@ -73,7 +73,9 @@ def schedule_covered(data, start, end):
 def signature(data):
     # A rolling virtual slot must not trigger optimisation every controller tick.
     slots=data.get('slots',[]) if data.get('mode') == 'scheduled' else []
-    return (data.get('mode'),data.get('valid'),data.get('updated'),data.get('emergency'),
+    # Refreshing the publication timestamp without changing its intervals
+    # must not invalidate an active pre-outage heating session.
+    return (data.get('mode'),data.get('valid'),data.get('emergency'),
             tuple((s['start'],s['end'],s['off']) for s in slots))
 
 
