@@ -503,6 +503,65 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             lease.close.assert_called_once()
             self.assertTrue(runtime._closed)
 
+    async def test_ha_stop_listener_is_unsubscribed_once_after_event(self):
+        """A consumed one-shot listener must not be unsubscribed again at shutdown."""
+        with package(self.root / "package") as (component, _):
+            install_id = "a" * 32
+            root = self.root / "stop-hook-fixture"
+            (root / "heating_ai_v1" / install_id).mkdir(parents=True, exist_ok=True)
+            hass = FakeHA()
+            hass.config = SimpleNamespace(path=lambda *parts: str(root.joinpath(*parts)))
+            hass.data = {component.DOMAIN: {"_api": True, "production_assets": True}}
+            hass.http = SimpleNamespace(async_register_static_paths=AsyncMock())
+
+            class EventBus:
+                def __init__(self):
+                    self.listeners = {}
+
+                def async_listen(self, name, handler):
+                    handlers = self.listeners.setdefault(name, [])
+                    handlers.append(handler)
+                    return lambda: handlers.remove(handler)
+
+                def async_listen_once(self, name, handler):
+                    async def once(event):
+                        unsubscribe()  # Real HA consumes a one-shot before invoking it.
+                        await handler(event)
+                    unsubscribe = self.async_listen(name, once)
+                    return unsubscribe
+
+                async def fire(self, name):
+                    for handler in tuple(self.listeners.get(name, ())):
+                        result = handler(SimpleNamespace(data={}))
+                        if asyncio.iscoroutine(result):
+                            await result
+
+            hass.bus = EventBus()
+            cfg = self.config()
+            cfg.update(room="sensor.room", **{"return": "sensor.return"})
+            for entity in ("climate.boiler", "sensor.room", "sensor.return",
+                           "input_boolean.armed", "input_select.mode"):
+                hass.rows[entity] = State(entity, "on")
+            controller = SimpleNamespace(
+                async_start=AsyncMock(), async_close=AsyncMock(),
+                attach_command_ledger=Mock(),
+                _context=SimpleNamespace(id="fixture-controller"))
+            ledger = Mock()
+            ledger.claim_boot.return_value = {
+                "revision": 1, "owner_id": install_id,
+                "boot_id": "fixture-boot", "owner_epoch": 1, "fenced": False}
+            entry = SimpleNamespace(
+                data={"installation_id": install_id}, options={}, entry_id="fixture",
+                add_update_listener=Mock(return_value=lambda: None),
+                async_on_unload=Mock())
+            with patch.object(component, "load_installation", return_value=(cfg, {})), \
+                 patch.object(component, "NativeController", return_value=controller), \
+                 patch.object(component, "CriticalLedger", return_value=ledger):
+                self.assertTrue(await component.async_setup_production(hass, entry))
+                await hass.bus.fire("homeassistant_stop")
+            controller.async_close.assert_awaited_once()
+            self.assertEqual(hass.bus.listeners["homeassistant_stop"], [])
+
     async def test_close_cancels_launched_jobs_and_rejects_late_launch(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
