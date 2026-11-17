@@ -39,7 +39,7 @@ class OperationalOutageTests(unittest.TestCase):
         result=_plan(now,20.0,21.0,-5.0,0.,DEFAULT_MODEL,[],settings,
                      outages=operational['outages'],hours_override=.5,beam_width=12)
         self.assertIsNotNone(result)
-        self.assertFalse(result['heat_segments'])
+        self.assertFalse(any(row['heat_segments'] for row in result['curve']))
 
     def test_refresh_timestamp_only_does_not_change_schedule_identity(self):
         from heating_outages import signature
