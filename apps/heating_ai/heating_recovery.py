@@ -1289,7 +1289,10 @@ class HeatingRecovery:
                 scheduled_off or room is None or room>=self.active_upper() or coast_overheat or
                 self.raw('armed')!='on' or self.raw('mode')!='Автоматичне керування'):
             return False
-        strategy=self.raw('strategy')
+        try:
+            strategy=self.raw('strategy')
+        except KeyError:
+            return False  # Partial test/config state is never permission to hold heat.
         start=self.raw('start') or '23:00'
         end=self.raw('end') or '07:00'
         if strategy=='Тільки в дозволені години' and not in_window(self.now(),start,end):
@@ -1442,9 +1445,12 @@ class HeatingRecovery:
             self.memory["command_at"]=time.time()
             if action=='heat':
                 self.memory['heat_session_start_energy']=self.val('energy')
-                strategy=self.raw('strategy')
-                start=self.raw('start') or '23:00'
-                end=self.raw('end') or '07:00'
+                try:
+                    strategy=self.raw('strategy')
+                except KeyError:
+                    strategy=None
+                start=self.raw('start') or '23:00' if strategy else '23:00'
+                end=self.raw('end') or '07:00' if strategy else '07:00'
                 self._heat_exception_until=0
                 self._heat_exception_policy=None
                 if strategy=='Тільки в дозволені години' and not in_window(self.now(),start,end):
