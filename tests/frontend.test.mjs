@@ -106,6 +106,29 @@ test('inlet nominal accounting is labelled as calculated in the boiler and cycle
   assert.match(p.energyComparison(true),/≈/);
   assert.doesNotMatch(p.energyComparison(true),/≥/);
 });
+test('plan/fact names KWS measurements and explicitly unclassified meter increments',()=>{
+  const now=Date.now()/1000,p=Object.create(HeatingAIPanel.prototype);
+  p.time=()=> '06:00';p.config={};p.attrs=()=>({energy_cycles:[{
+    cycle_id:'meter',start:now-7200,end:now-3600,
+    initial_plan:{at:now-10800,kwh:9,before_start:true},
+    observed_kwh:7.5,meter_kwh:7.5,transition_kwh:7.5,
+    automatic_kwh:0,other_kwh:0,energy_basis:'kws_counter_delta',complete:true
+  }]});
+  const markup=p.energyComparison(true);
+  assert.match(markup,/KWS/);
+  assert.match(markup,/7,50/);
+  assert.match(markup,/не визначен|без визначення режиму/i);
+  assert.doesNotMatch(markup,/лічильником розрахункової потужності/);
+  p.comparisonData={energy_cycles:[{
+    cycle_id:'meter',start:now-7200,end:now-3600,
+    initial_plan:{at:now-10800,kwh:9},latest_plan:{kwh:10},
+    observed_kwh:7.5,transition_kwh:7.5,energy_basis:'kws_counter_delta',complete:true
+  }],reviews:[]};
+  const history=p.cycleHistory();
+  assert.match(history,/KWS/);
+  assert.doesNotMatch(history,/незалежного лічильника котла немає|розрахунковий баланс/);
+});
+
 test('partial-meter reserve is visible without calling assumed watts actual boiler heating',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
   const data={controller:{quality:true,control_power_basis:'partial_meter_reserve'},

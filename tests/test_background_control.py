@@ -143,6 +143,26 @@ class BackgroundPlanAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reference['at'],later.timestamp())
         self.assertTrue(forecast['plan_id'])
 
+    async def test_accepted_replay_keeps_first_cycle_energy_plan(self):
+        app,settings=self.app();now=app.now()
+        app.observe_cycle_energy(now,settings,0.,100.,'on',True)
+        self.assertIsNone(app.background_plan(now,21.5,22.,11.,0.,[],settings,app.outage_signature))
+        await self.finish(app)
+        later=now+timedelta(seconds=15)
+        forecast,_=app.background_plan(later,21.5,22.,11.,0.,[],settings,app.outage_signature)
+        reserve=forecast['morning_reserve']
+        self.assertIn('end_cycle_planned_kwh',reserve)
+        first=app.cycle_budget(later,forecast,{'weather':[]})
+        self.assertIn('initial_plan',first)
+        self.assertEqual(first['initial_plan']['kwh'],reserve['end_cycle_planned_kwh'])
+        self.assertFalse(first['initial_plan_is_prestart'])
+        changed=copy.deepcopy(forecast)
+        changed['plan_id']='replan'
+        changed['morning_reserve']['end_cycle_planned_kwh']+=2
+        revised=app.cycle_budget(later+timedelta(minutes=5),changed,{'weather':[]})
+        self.assertEqual(revised['initial_plan'],first['initial_plan'])
+        self.assertGreater(revised['latest_plan']['kwh'],first['latest_plan']['kwh'])
+
     async def test_changed_model_rejects_completed_result(self):
         app,settings=self.app();now=app.now()
         app.background_plan(now,21.5,22.,11.,0.,[],settings,app.outage_signature)

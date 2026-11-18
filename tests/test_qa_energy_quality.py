@@ -68,6 +68,17 @@ class EnergyQualityTests(unittest.TestCase):
             observed_kwh=12.,automatic_kwh=11.,other_kwh=.8,transition_kwh=.2,
             complete=False,unknown_seconds=20.)
 
+    def test_kws_cycle_report_names_actual_meter_without_inventing_a_second_meter(self):
+        row=self.entry()
+        row.update(complete=True,energy_basis='kws_counter_delta',meter_kwh=12.,
+                   observed_kwh=12.,transition_kwh=12.,automatic_kwh=0.,other_kwh=0.,
+                   unknown_seconds=0.)
+        report=recovery.cycle_quality_summary(row,250.)
+        self.assertEqual(report['energy_basis'],'kws_counter_delta')
+        self.assertEqual(report['power_confidence'],'kws_counter_observed_without_second_meter')
+        self.assertEqual(report['transition_kwh'],12.)
+        self.assertIsNone(report['independent_energy_kwh'])
+
     def test_unknown_intervals_do_not_remove_the_known_spend_from_the_budget(self):
         row=self.entry();before=copy.deepcopy(row)
         budget=recovery.cycle_energy_allowance(row)
