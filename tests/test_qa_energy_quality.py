@@ -79,6 +79,14 @@ class EnergyQualityTests(unittest.TestCase):
         self.assertEqual(report['transition_kwh'],12.)
         self.assertIsNone(report['independent_energy_kwh'])
 
+    def test_new_report_only_plan_is_visible_but_does_not_limit_heating(self):
+        row=self.entry()
+        row['initial_plan']['report_only']=True
+        self.assertIsNone(recovery.cycle_energy_allowance(row))
+        self.assertEqual(recovery.cycle_quality_summary(row,250.)['initial_plan_kwh'],10.)
+        row['initial_plan'].pop('report_only')
+        self.assertEqual(recovery.cycle_energy_allowance(row)['remaining_kwh'],0.)
+
     def test_unknown_intervals_do_not_remove_the_known_spend_from_the_budget(self):
         row=self.entry();before=copy.deepcopy(row)
         budget=recovery.cycle_energy_allowance(row)
