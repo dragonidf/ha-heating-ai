@@ -58,5 +58,46 @@ class BudgetABTests(unittest.TestCase):
             exhausted=signature(exhausted)), sort_keys=True))
 
 
+    def test_split_night_optimizer_budget_comparison(self):
+        # The night-target branch has a second budget influence: ranking among
+        # equally comfortable trajectories. Audit it without changing control.
+        from heating_model import plan
+        fixture = json.loads(Path(__file__).with_name("audit_case.json").read_text())
+        at = datetime.fromisoformat("2026-10-12T21:00:30+03:00")
+        settings = dict(
+            start="23:00", end="07:00",
+            sleep_start="23:00", sleep_end="06:30",
+            strategy="Тільки в дозволені години",
+            target=22., lower=21.5, upper=22.5,
+            night_target=21., night_lower=20.5, night_upper=21.5,
+            night_price=1.32, day_price=2.64,
+            split_comfort=True, morning_min_minutes=30,
+            modulation_profile=fixture["profile"],
+        )
+        args=(at, 22.1, 22.8, 10.73, 0., fixture["model"], fixture["weather"])
+        baseline=plan(*args,settings,power_kw=3.)
+        exhausted=plan(*args,dict(settings,cycle_energy_budget=dict(
+            start=at.timestamp(),end=at.timestamp()+86400,remaining_kwh=0.)),
+            power_kw=3.)
+        self.assertIsNotNone(baseline)
+        self.assertIsNotNone(exhausted)
+        def summary(result):
+            for segment in result["heat_segments"]:
+                dt=datetime.fromtimestamp(segment["start"],at.tzinfo)
+                self.assertTrue(in_window(dt,settings["start"],settings["end"]))
+            return dict(planned_kwh=result["energy"],minimum_c=result["minimum"],
+                        maximum_c=result["maximum"],
+                        heat_minutes=round(sum(s["end"]-s["start"]
+                            for s in result["heat_segments"])/60.,1),
+                        deficit_degree_hours=(result.get("morning_reserve") or {}).get("deficit_degree_hours"),
+                        schedule=[int(s["start"]) for s in result["heat_segments"]])
+        a,b=summary(baseline),summary(exhausted)
+        print("BUDGET_AB_NIGHT_SYNTHETIC="+json.dumps(dict(
+            baseline={k:v for k,v in a.items() if k!="schedule"},
+            exhausted={k:v for k,v in b.items() if k!="schedule"},
+            session_timing_differs=a["schedule"]!=b["schedule"]),sort_keys=True))
+
+
+
 if __name__ == "__main__":
     unittest.main()
