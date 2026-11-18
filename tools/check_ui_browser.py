@@ -710,32 +710,6 @@ def main(engine='chromium'):
             page.evaluate('resolveOldHistory({})')
             page.wait_for_timeout(50)
             assert page.locator('[data-history-lane="boiler"][data-state="on"]').count()==2, 'Late history response replaced a fresh load'
-            # Phone WebView: touch, high pixel density and rotation in-place.
-            mobile=browser.new_context(viewport={'width':390,'height':844},is_mobile=True,has_touch=True,device_scale_factor=3)
-            phone=mobile.new_page()
-            phone.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
-            phone.wait_for_selector('.forecast-plot svg')
-            phone.locator('.overview-details>summary').tap()
-            for size in ({'width':390,'height':844},{'width':844,'height':390},{'width':360,'height':800}):
-                phone.set_viewport_size(size)
-                wait_for_chart_layout(phone)
-                assert phone.evaluate('document.documentElement.scrollWidth <= innerWidth'), ('mobile',engine,size)
-                chart=phone.locator('.forecast-plot svg')
-                assert 240<=chart.bounding_box()['height']<=280
-                assert chart.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5
-                phone.wait_for_selector('.history-plot svg')
-                phone.locator('.history-plot').tap()
-                phone.wait_for_selector('.history-crosshair',state='attached')
-                assert 'Котел:' in phone.locator('.history-card .history-readout').inner_text()
-            phone.locator('nav [data-tab="model"]').tap()
-            phone.wait_for_selector('[data-comparison-line="forecast"]')
-            phone.locator('[data-comparison-days="1"]').tap()
-            assert phone.locator('[data-comparison-days="1"]').get_attribute('aria-pressed')=='true'
-            phone.locator('[data-comparison-days="7"]').tap()
-            assert phone.evaluate('comparisonRequests.at(-1).end-comparisonRequests.at(-1).start')==7*86400
-            phone.locator('.comparison-plot').tap()
-            assert 'Фактична' in phone.locator('.comparison-readout').inner_text()
-            mobile.close()
             page.evaluate("panel.hass={...mockHass,themes:{darkMode:false}};document.body.style.background='#fafafa';document.body.style.setProperty('--primary-text-color','#17271f');document.body.style.setProperty('--secondary-text-color','#56675d');document.body.style.setProperty('--ha-card-background','#fff')")
             page.locator('.history-card').screenshot(path=str(ARTIFACTS/f'heating-history-light-{engine}.png'))
             page.locator('.heat-sources').screenshot(path=str(ARTIFACTS/f'heating-sources-light-{engine}.png'))
@@ -833,6 +807,32 @@ def main(engine='chromium'):
                 page.set_viewport_size({'width':width,'height':900})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             assert not errors, errors
+            # Phone WebView: touch, high pixel density and rotation in-place.
+            mobile=browser.new_context(viewport={'width':390,'height':844},is_mobile=True,has_touch=True,device_scale_factor=3)
+            phone=mobile.new_page()
+            phone.goto(f'http://127.0.0.1:{server.server_port}/tests/browser-fixture.html')
+            phone.wait_for_selector('.forecast-plot svg')
+            phone.locator('.overview-details>summary').tap()
+            for size in ({'width':390,'height':844},{'width':844,'height':390},{'width':360,'height':800}):
+                phone.set_viewport_size(size)
+                wait_for_chart_layout(phone)
+                assert phone.evaluate('document.documentElement.scrollWidth <= innerWidth'), ('mobile',engine,size)
+                chart=phone.locator('.forecast-plot svg')
+                assert 240<=chart.bounding_box()['height']<=280
+                assert chart.locator('text').first.evaluate('el=>parseFloat(el.getAttribute("font-size"))*el.getScreenCTM().a')>=10.5
+                phone.wait_for_selector('.history-plot svg')
+                phone.locator('.history-plot').tap()
+                phone.wait_for_selector('.history-crosshair',state='attached')
+                assert 'Котел:' in phone.locator('.history-card .history-readout').inner_text()
+            phone.locator('nav [data-tab="model"]').tap()
+            phone.wait_for_selector('[data-comparison-line="forecast"]')
+            phone.locator('[data-comparison-days="1"]').tap()
+            assert phone.locator('[data-comparison-days="1"]').get_attribute('aria-pressed')=='true'
+            phone.locator('[data-comparison-days="7"]').tap()
+            assert phone.evaluate('comparisonRequests.at(-1).end-comparisonRequests.at(-1).start')==7*86400
+            phone.locator('.comparison-plot').tap()
+            assert 'Фактична' in phone.locator('.comparison-readout').inner_text()
+            mobile.close()
             browser.close()
             print(f'{engine}: browser checks passed: extended forecast toggle, physical modes/independent watts, equipment settings without device commands, compact grouping/order/heights, boiler and five fireplace states, conditional forecast warnings, unavailable energy, unique IDs, ten widths, touch/rotation, stable charts and instant summary display.')
     finally:
