@@ -30,7 +30,7 @@ def wire_values(value):
 def cycle_energy_allowance(entry):
     if not entry:return None
     initial=entry.get('initial_plan') or entry.get('baseline')
-    if not initial or number(initial.get('kwh')) is None:return None
+    if not initial or initial.get('report_only') or number(initial.get('kwh')) is None:return None
     spent=max(0.,number(entry.get('observed_kwh')) or 0.)+max(0.,number(entry.get('calculated_kwh')) or 0.)
     if entry.get('complete') and number(entry.get('meter_kwh')) is not None:spent=entry['meter_kwh']
     return dict(start=entry['start'],end=entry['end'],remaining_kwh=max(0.,initial['kwh']-spent),
@@ -858,7 +858,7 @@ class HeatingRecovery:
                 entry['overrun_review']=dict(at=stamp,known_kwh=entry['observed_kwh'],initial_kwh=initial['kwh'],
                     calculated_kwh=entry.get('calculated_kwh',0.),accounted_kwh=accounted,
                     attribution='Причина не встановлена',unknown_seconds=entry['unknown_seconds'])
-                if entry['start']<=stamp<entry['end']:self.next_compute=0
+                if entry['start']<=stamp<entry['end'] and not initial.get('report_only'):self.next_compute=0
             if stamp>=entry['end'] and not entry.get('quality_report'):
                 entry['quality_report']=cycle_quality_summary(entry,stamp)
         if kws and energy is not None and (not counter_previous or energy!=counter_previous.get('energy')):self.memory['kws_cycle_counter']=current.copy()
@@ -879,7 +879,8 @@ class HeatingRecovery:
         if stamp<entry['end'] and entry['start']-stamp<=12*3600:
             base=legacy_base
             entry.setdefault('initial_plan',dict(base,before_start=base['at']<entry['start'],legacy=True) if base else
-                dict(at=stamp,kwh=remaining,plan_id=forecast.get('plan_id'),before_start=stamp<entry['start']))
+                dict(at=stamp,kwh=remaining,plan_id=forecast.get('plan_id'),before_start=stamp<entry['start'],
+                     report_only=bool(forecast.get('plan_fact_reporting_only'))))
         sessions=[]
         for segment in sorted(forecast.get('heat_segments',[]),key=lambda s:s['start']):
             a=max(entry['start'],segment['start']);b=min(entry['end'],segment['end'])
