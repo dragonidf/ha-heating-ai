@@ -1,8 +1,10 @@
 # Plan, execution and temperature evidence
 
-The initial cycle estimate is stored once before heating. Subsequent calculations have a separate current estimate; measured consumption is never added to the initial number. Legacy three-hour baselines retain their provenance. An installation started during heating cannot claim a prestart estimate.
+The first cycle estimate is stored once when available. Subsequent calculations have a separate current estimate; measured consumption is never added to the initial number. Legacy three-hour baselines retain their provenance. If the first estimate is captured during heating, its timestamp remains after the cycle start; it must not be called a prestart plan.
 
-The planner subtracts recorded consumption from this reference. Among trajectories with the same comfort deficit it prefers less reference overrun, before tariff and timing preferences. This is not a hard energy shutoff: an actual forecast temperature violation remains higher priority. Diagnostics retain its time/temperature/limit, observed supply interruptions and mean requested power. These observations do not independently identify causal kWh shares.
+The native background replay previously lost its energy-estimate metadata. Recovered replay baselines are now marked `report_only`: they feed plan-versus-fact reporting but neither introduce a `cycle_energy_budget` constraint nor force a planner recomputation when measured energy exceeds the estimate. Existing unmarked baselines retain their prior budget behavior. A future proposal to apply budgets to newly recovered plans is a separate policy change, not part of this repair.
+
+Where an existing non-report-only energy budget is active, the planner subtracts recorded consumption from that reference. Among trajectories with the same comfort deficit it prefers less reference overrun, before tariff and timing preferences. This is not a hard energy shutoff: an actual forecast temperature violation remains higher priority. Diagnostics retain its time/temperature/limit, observed supply interruptions and mean requested power. These observations do not independently identify causal kWh shares.
 
 The floor observer integrates credible counter deltas or contiguous measured power. It treats return water as a proxy and cannot replace a warmer integrated inventory with a colder pipe. Gaps, resets and implausible counter jumps do not become heating energy. Coefficients and existing counters are preserved. This model estimate is not a floor-surface temperature or an independent energy measurement.
 
