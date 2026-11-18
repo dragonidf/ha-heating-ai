@@ -8,7 +8,7 @@ from threading import RLock
 import test_fallback_recovery as recovery
 import test_inlet_accounting as inlet
 import test_planned_execution as execution
-from heating_recovery import HeatingRecovery
+from heating_recovery import HeatingRecovery,cycle_energy_allowance
 
 
 class BackgroundControlTests(unittest.IsolatedAsyncioTestCase):
@@ -155,6 +155,8 @@ class BackgroundPlanAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         first=app.cycle_budget(later,forecast,{'weather':[]})
         self.assertIn('initial_plan',first)
         self.assertEqual(first['initial_plan']['kwh'],reserve['end_cycle_planned_kwh'])
+        self.assertTrue(first['initial_plan'].get('report_only'))
+        self.assertIsNone(cycle_energy_allowance(next(iter(app.memory['cycle_energy'].values()))))
         self.assertFalse(first['initial_plan_is_prestart'])
         changed=copy.deepcopy(forecast)
         changed['plan_id']='replan'
