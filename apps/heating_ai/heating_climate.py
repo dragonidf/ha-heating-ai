@@ -707,6 +707,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             return None
         # Replay returns fresh physical times but omits the energy reference metadata.
         apply_search_diagnostics(now,settings,fresh)
+        # Record the replay baseline for analysis, not as a new control budget.
+        fresh['plan_fact_reporting_only']=True
         for name in ('plan_id','parent_plan_id','plan_stable','search_policy_version','search_status','outage_shifted','outage_preheat','split_reason'):
             if name in original:fresh[name]=original[name]
         fresh.update(calculation_started_at=job['at'],calculation_seconds=job['seconds'],
