@@ -1,9 +1,8 @@
-"""Build/verify a non-actuating Marketplace carrier for Heating AI V1.
+"""Build and verify the native Heating AI V1 Marketplace release ZIP.
 
-The release ZIP installs under custom_components/heating_ai_legacy.
-The nine verified AppDaemon modules live in legacy_app/ but are inert until
-the owner explicitly repoints ONE existing AppDaemon app to this directory.
-No YAML, saved model, counters or personal configuration are included.
+The nine authoritative V1 source modules are checksum-verified and adapted
+into native_controller/. The optional shadow uses native_engine/.
+Neither source duplication nor private installation data enters the ZIP.
 """
 from __future__ import annotations
 
@@ -80,6 +79,7 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
     if not isinstance(hashes, dict) or set(hashes) != set(EXPECTED):
         raise ValueError("Nine-module release manifest is incomplete")
     contents: dict[str, bytes] = {}
+    originals: dict[str, bytes] = {}
     for name in EXPECTED:
         path = SOURCE / name
         if not path.is_file() or path.is_symlink():
@@ -87,16 +87,15 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
         data = path.read_bytes()
         if checksum(data) != hashes[name]:
             raise ValueError(f"Module checksum mismatch: {name}")
-        contents[f"legacy_app/{name}"] = data
-    contents[f"legacy_app/{RELEASE}"] = (SOURCE / RELEASE).read_bytes()
+        originals[name] = data
 
-    # Staged migration: immutable V1 math as a native Python library.
-    # Nothing inside this package opens HA connections or sends commands.
+    # The optional shadow/preview still uses the immutable native V1 math.
+    # Nothing in this engine opens HA connections or sends commands.
     contents["native_engine/__init__.py"] = (
         b'"""Original V1 model in an isolated package; no HA commands."""' + bytes([10])
     )
     for name in PURE_MODULES:
-        original = contents[f"legacy_app/{name}"]
+        original = originals[name]
         native = as_native_module(original)
         verify_native_module(native, original)
         compile(native, f"native_engine/{name}", "exec")
@@ -107,7 +106,7 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
     contents["native_controller/__init__.py"] = b'"""V1 controller on native HA I/O."""\n'
     native_hashes = {}
     for name in EXPECTED:
-        original = contents[f"legacy_app/{name}"]
+        original = originals[name]
         adapted = re.sub(rb"(?m)^(\s*)from (heating_[a-z_]+) import ", rb"\1from .\2 import ", original)
         adapted = adapted.replace(b"from appdaemon.plugins.hass.hassapi import Hass",
                                   b"from ..native_bridge import Hass")

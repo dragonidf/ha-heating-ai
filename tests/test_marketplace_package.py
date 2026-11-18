@@ -18,15 +18,15 @@ from tools.build_marketplace import (
 
 
 class MarketplaceCarrierTests(unittest.TestCase):
-    def test_package_exact_legacy_source_without_activation(self):
+    def test_package_contains_only_native_runtime_and_source_provenance(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 60)
+            self.assertEqual(result["files"], 50)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 wanted = {
-                    "__init__.py", "manifest.json", "legacy_app/release.json",
+                    "__init__.py", "manifest.json",
                     "native_engine/__init__.py", "const.py", "config_flow.py",
                     "native_runtime.py", "plan_snapshot.py", "native_planner.py", "native_sources.py", "native_api.py", "native_safety.py", "native_intent.py", "native_calendar.py",
                     "native_outages.py",
@@ -37,21 +37,27 @@ class MarketplaceCarrierTests(unittest.TestCase):
                     "assets/full-panel.js", "assets/full-panel-loader.js",
                     "critical_ledger.py", "kws_readiness.py", "sensor.py",
                     "strings.json", "translations/uk.json", "assets/panel.js",
-                    *(f"legacy_app/{name}" for name in EXPECTED),
                     *(f"native_engine/{name}" for name in PURE_MODULES),
                     *(f"native_controller/{name}" for name in EXPECTED),
                 }
                 self.assertEqual(names, wanted)
-                recorded = json.loads(archive.read("legacy_app/release.json"))
+                self.assertFalse(any(name.startswith("legacy_app/") for name in names))
+                source = ROOT / "apps" / "heating_ai"
+                recorded = json.loads((source / "release.json").read_bytes())
+                native = json.loads(archive.read("native_controller/release.json"))
                 self.assertEqual(recorded["version"], (ROOT / "VERSION").read_text().strip())
+                self.assertEqual(native["version"], recorded["version"])
                 for name in EXPECTED:
-                    content = archive.read(f"legacy_app/{name}")
-                    self.assertEqual(hashlib.sha256(content).hexdigest(),
+                    original = (source / name).read_bytes()
+                    self.assertEqual(hashlib.sha256(original).hexdigest(),
                                      recorded["module_hashes"][name])
+                    adapted = archive.read(f"native_controller/{name}")
+                    self.assertEqual(hashlib.sha256(adapted).hexdigest(),
+                                     native["module_hashes"][name])
                 for name in PURE_MODULES:
                     verify_native_module(
                         archive.read(f"native_engine/{name}"),
-                        archive.read(f"legacy_app/{name}"),
+                        (source / name).read_bytes(),
                     )
                 self.assertNotIn("config.yaml", names)
                 self.assertFalse(any(name.endswith(".yaml") for name in names))

@@ -1,4 +1,4 @@
-"""Bundle the frontend into Python so HACS AppDaemon downloads every asset."""
+"""Bundle Heating AI frontend assets and keep V1 source hashes in sync."""
 import argparse
 import hashlib
 import json

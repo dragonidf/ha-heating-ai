@@ -135,7 +135,9 @@ def main() -> None:
         folder = Path(temp)
         archive = folder / "carrier.zip"
         summary = build(archive)
-        assert summary["files"] == 60
+        assert summary["files"] == 50
+        with zipfile.ZipFile(archive) as package:
+            assert not any(name.startswith("legacy_app/") for name in package.namelist())
         target = folder / "isolated" / "custom_components" / "heating_ai_legacy"
         target.mkdir(parents=True)
         with zipfile.ZipFile(archive) as package:
