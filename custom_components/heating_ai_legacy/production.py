@@ -965,7 +965,7 @@ async def async_setup_production(hass, entry):
         await runtime.close()
 
     runtime.unsubscribers.append(
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_runtime)
+        hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, stop_runtime)
     )
     try:
         assets = Path(__file__).parent / "assets"
