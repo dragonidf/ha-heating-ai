@@ -111,6 +111,18 @@ class EnergyQualityTests(unittest.TestCase):
         self.assertEqual(result['energy_error_lower_bound_kwh'],-2.)
         self.assertIsNone(result['energy_error_percent'])
 
+    def test_report_only_overrun_is_recorded_without_forcing_replan(self):
+        at=datetime(2026,11,1,1,tzinfo=ZoneInfo('Europe/Kyiv'))
+        app=recovery.HeatingRecovery();app.memory={};app.power_source='balance';app.next_compute=54321.
+        settings=dict(start='23:00',end='07:00')
+        app.observe_cycle_energy(at,settings,6000.,100.,'on',True)
+        entry=next(iter(app.memory['cycle_energy'].values()))
+        entry['initial_plan']=dict(at=at.timestamp()-3600,kwh=.01,report_only=True)
+        app.observe_cycle_energy(at+timedelta(seconds=15),settings,6000.,100.025,'on',True)
+        self.assertIn('overrun_review',entry)
+        self.assertEqual(app.next_compute,54321.)
+        self.assertEqual(entry['initial_plan']['kwh'],.01)
+
     def test_overrun_requests_one_review_without_raising_the_original_plan(self):
         at=datetime(2026,11,1,1,tzinfo=ZoneInfo('Europe/Kyiv'))
         app=recovery.HeatingRecovery();app.memory={};app.power_source='balance';app.next_compute=12345.
