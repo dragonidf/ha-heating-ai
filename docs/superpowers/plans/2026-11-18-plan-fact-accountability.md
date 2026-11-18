@@ -35,4 +35,12 @@
 - [ ] Create PR for review, **do not install or restart HA**, do not backfill missing past evidence.
 - [ ] Recheck live HA read-only after GitHub work.
 
+## Two-step rollout boundary (owner decision, 2026-11-18)
+
+**Step 1 — ANALYTICS ONLY:** accepted background replay regains the missing cycle-energy estimate and first immutable reference, while tagging newly captured baseline as `report_only`. Such a baseline remains visible in reports but is not passed to the planner via `cycle_energy_budget` and does not force a recompute on budget exceedance. Previously persisted baselines without this marker retain their existing planner behavior. Preserve KWS counter totals and genuinely unclassified energy. Tests explicitly pin both the old baseline behavior and the reporting-only boundary.
+
+**Step 1 verification gate:** reproduce RED failures first; pass 3 new regression assertions, existing Python suites on 3.12/3.13, HA native smoke, browser UI/UX, ZIP/hash integrity; review diff for zero actuation/physical command, safety, model, writer, and meter-total changes. Commit/merge code only after verification; no VERSION change, Marketplace release, HA installation or restart. Check actual HA read-only.
+
+**Step 2 — PLANNER POLICY REVIEW, SEPARATE APPROVAL:** after Step 1 is verified and frozen, evaluate whether/how a new cycle energy budget could improve schedule selection, using separate tests and a separate branch/PR. Do not turn the reporting-only baseline into a live energy constraint without a new explicit owner decision, regression proof and deployment consent. Historic missing plans stay unknown.
+
 **High-risk exclusions:** no inferred AUTO/manual energy splits across sparse samples; no rewriting old historical records; no version bump or release/install.
