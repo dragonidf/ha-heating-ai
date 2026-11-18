@@ -19,7 +19,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,outdoor_at)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
-from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions
+from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics
 from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at,
                                  solar_context,room_source_check,observe_residual,residual_at,ENVIRONMENT_POLICY_VERSION)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
@@ -705,6 +705,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.calculation_rejection('plan','replay_rejected',job_id=job['id'])
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
             return None
+        # Replay returns fresh physical times but omits the energy reference metadata.
+        apply_search_diagnostics(now,settings,fresh)
         for name in ('plan_id','parent_plan_id','plan_stable','search_policy_version','search_status','outage_shifted','outage_preheat','split_reason'):
             if name in original:fresh[name]=original[name]
         fresh.update(calculation_started_at=job['at'],calculation_seconds=job['seconds'],

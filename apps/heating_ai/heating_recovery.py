@@ -39,6 +39,7 @@ def cycle_energy_allowance(entry):
 def cycle_quality_summary(entry,stamp):
     initial=entry.get('initial_plan') or entry.get('baseline') or {}
     known=number(entry.get('observed_kwh'));expected=number(initial.get('kwh'))
+    energy_basis='kws_counter_delta' if entry.get('energy_basis')=='kws_counter_delta' else 'calculated_meter_balance'
     error=known-expected if known is not None and expected is not None else None
     reported_error=error if entry.get('complete') or error is not None and error>0 else None
     thermal=entry.get('thermal_quality') or {}
@@ -53,11 +54,13 @@ def cycle_quality_summary(entry,stamp):
             first_confirmed_timing_error_seconds=confirmed-first if first is not None and confirmed is not None and entry.get('first_heat_edge_known') else None)
     return dict(start=entry['start'],end=entry['end'],completed=stamp>=entry['end'],initial_plan_kwh=expected,
         known_energy_kwh=known,calculated_energy_kwh=entry.get('calculated_kwh',0.),energy_complete=bool(entry.get('complete')),independent_energy_kwh=None,
-        energy_basis='calculated_meter_balance',counter_delta_kwh=entry.get('meter_kwh'),
+        energy_basis=energy_basis,counter_delta_kwh=entry.get('meter_kwh'),
         energy_error_kwh=round(reported_error,5) if reported_error is not None else None,
         energy_error_percent=round(reported_error/expected*100,2) if reported_error is not None and expected else None,
         energy_error_lower_bound_kwh=round(error,5) if error is not None and not entry.get('complete') else None,
-        energy_error_is_lower_bound=not bool(entry.get('complete')),power_confidence='balance_without_independent_boiler_meter',
+        energy_error_is_lower_bound=not bool(entry.get('complete')),
+        power_confidence=('kws_counter_observed_without_second_meter' if energy_basis=='kws_counter_delta'
+                          else 'balance_without_independent_boiler_meter'),
         unknown_seconds=entry.get('unknown_seconds'),automatic_kwh=entry.get('automatic_kwh'),
         other_kwh=entry.get('other_kwh'),transition_kwh=entry.get('transition_kwh'),
         attribution='Причина не встановлена' if error is not None and error>0 else 'Перевищення не підтверджено',
@@ -1073,7 +1076,7 @@ class HeatingRecovery:
             protocol=2,request_id=request_id,selected=selected,comparison=summary,
             periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
             energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
-                'latest_plan','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
+                'latest_plan','energy_basis','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh''calculated_other_kwh','calculated_transition_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
                 'cycle_id':k} for k,v in sorted(energy.items(),
                 key=lambda pair:pair[1]['start'],reverse=True)[:3]])))
 
@@ -1137,7 +1140,7 @@ class HeatingRecovery:
         try:
             energy=history.pop('__energy_cycles',{})
             result=self.decision_journal.temperature_comparison(start,end,history)
-            fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh',
+            fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','energy_basis','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh''calculated_other_kwh','calculated_transition_kwh','meter_kwh',
                 'complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh','quality_report','overrun_review','plan_reviews')
             result['energy_cycles']=[dict(cycle_id=k,**{f:v[f] for f in fields if f in v}) for k,v in energy.items()
                 if v['end']>start and v['start']<end]
