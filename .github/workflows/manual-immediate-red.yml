@@ -1,0 +1,13 @@
+name: Manual KWS progress regression
+on:
+  push:
+    branches: [fix/manual-immediate-start]
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: PYTHONPATH=apps/heating_ai:tests python -m unittest test_manual_energy_session.ManualEnergyTest.test_repeated_unchanged_reports_do_not_shrink_counter_jump_window test_manual_energy_session.ManualEnergyTest.test_live_measured_power_progress_stops_small_request_before_counter_report -v
