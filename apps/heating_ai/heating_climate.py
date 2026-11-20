@@ -981,7 +981,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                 energy=self.val("energy")
                 matched=(energy is not None and p.get("start_energy") is not None and
                          abs(energy-p["start_energy"]-p.get("expected_energy",0))<=.5)
-                if stamp-p["ts"]<=420 and p["version"]==self.model["version"] and matched:
+                if (not p.get("manual_invalid") and stamp-p["ts"]<=420
+                        and p["version"]==self.model["version"] and matched):
                     errors.append(abs(p["temperature"]-room))
                     candidate=self.memory.get('pending_model')
                     if candidate and p.get('learning_attempt_id')==candidate['attempt_id']:
@@ -1826,7 +1827,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          power_prior_kw=3.,power_estimate_provisional=True,
                          actual_session_kwh=self.actual_session_energy(),session_energy_estimated=self.cfg.get('power_accounting_method')=='inlet')
             one_hour=next((r for r in forecast["curve"] if r["ts"]>=time.time()+3500),None)
-            if one_hour:
+            if one_hour and not manual_requested:
                 expected_energy=sum(r["kwh"] for r in forecast["curve"][:2])
                 self.memory.setdefault("predictions",[]).append({**one_hour,"version":self.model["version"],
                     "start_energy":self.val("energy"),"expected_energy":expected_energy})

@@ -147,8 +147,17 @@ class NativeController(HeatingClimate):
                                      self.val("session_limit", 180), idle_since)
         session["origin_was_idle"] = self.memory.get("last_command") != "heat"
         self.memory["manual_energy"] = session
-        self.memory["predictions"] = []
-        self.memory["reserve_predictions"] = []
+        # Preserve historical queues and predictions, but do not score a
+        # pre-existing automatic forecast against a user-requested session.
+        for pending in self.memory.get("predictions", []):
+            if isinstance(pending, dict):
+                pending["manual_invalid"] = True
+        for pending in self.memory.get("reserve_predictions", []):
+            if isinstance(pending, dict):
+                pending["valid"] = False
+                reasons = pending.setdefault("reasons", [])
+                if "manual_extra_request" not in reasons:
+                    reasons.append("manual_extra_request")
         self._manual_energy_ending = False
         self.save()
         self.publish_manual_energy()
