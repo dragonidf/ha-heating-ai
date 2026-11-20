@@ -84,7 +84,7 @@ async def lifecycle(readings, directory) -> None:
         assert args["require_admin"] is True
         # The native API consists of the read-only preview plus the
         # administrator-only, versioned settings read/save endpoints.
-        assert api.call_count == 3
+        assert api.call_count == 4
         assert hass.data[component.DOMAIN][entry.entry_id] is entry.runtime_data
         assert entry.runtime_data.data["physical_commands_enabled"] is False
         assert entry.runtime_data.ledger_summary["fenced"] is True
