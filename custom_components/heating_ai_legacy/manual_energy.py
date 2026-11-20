@@ -6,6 +6,20 @@ from math import isfinite
 MAX_RUNNING_REPORT_AGE = 1200
 MAX_IDLE_BASELINE_AGE = 1800
 MAX_ACTIVE_BASELINE_AGE = 30
+MAX_TARGET_KWH = 40
+
+
+def valid_target(target):
+    return type(target) is int and 1 <= target <= MAX_TARGET_KWH
+
+
+def watchdog_minutes(target, configured_limit):
+    """Bound manual sessions independently: 3 kW nominal + 30 min reporting grace."""
+    if not valid_target(target):
+        raise ValueError('invalid_target')
+    if not _finite(configured_limit) or not 30 <= configured_limit <= 480:
+        raise ValueError('invalid_time_limit')
+    return max(configured_limit, target*20+30)
 
 
 def _counter(value):
@@ -20,7 +34,7 @@ def _finite(value):
 
 def start(target, value, at, now, limit_minutes, idle_since=None):
     """Create one request only with a qualified baseline, before any HEAT."""
-    if type(target) is not int or not 1 <= target <= 9:
+    if not valid_target(target):
         raise ValueError('invalid_target')
     if _counter(value) is None or not _finite(at) or not _finite(now):
         raise ValueError('counter_invalid')

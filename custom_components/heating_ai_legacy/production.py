@@ -164,7 +164,8 @@ class NativeController(HeatingClimate):
             raise ValueError("scheduled_outage")
         value, reported_at, idle_since = self._manual_kws_snapshot()
         session = manual_energy.start(target, value, reported_at, time.time(),
-                                     self.val("session_limit", 180), idle_since)
+                                     manual_energy.watchdog_minutes(target, self.val("session_limit", 180)),
+                                     idle_since)
         session["origin_was_idle"] = self.memory.get("last_command") != "heat"
         self.memory["manual_energy"] = session
         self._kws_idle_since = None

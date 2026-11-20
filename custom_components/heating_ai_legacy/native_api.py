@@ -14,6 +14,7 @@ from homeassistant.components.websocket_api.decorators import (
 )
 
 from .const import DOMAIN
+from .manual_energy import MAX_TARGET_KWH, valid_target
 
 
 def register(hass):
@@ -174,8 +175,8 @@ def register(hass):
         if msg["version"] != [1, 0] or msg["action"] not in ("start", "stop"):
             connection.send_error(msg["id"], "invalid_format", "Unsupported manual command")
             return
-        if msg["action"] == "start" and (type(msg.get("kwh")) is not int or not 1 <= msg["kwh"] <= 9):
-            connection.send_error(msg["id"], "invalid_target", "Select 1–9 kWh")
+        if msg["action"] == "start" and not valid_target(msg.get("kwh")):
+            connection.send_error(msg["id"], "invalid_target", f"Select 1–{MAX_TARGET_KWH} kWh")
             return
         runtime = hass.data.get(DOMAIN, {}).get(msg["entry_id"])
         controller = getattr(runtime, "controller", None)

@@ -196,15 +196,19 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(app, "async_voltage_status", return_value={"voltage_qualified": True}), \
                  patch.object(app, "grid_state", return_value="on"), \
                  patch.object(app, "source_temperature", return_value=(21, "Вітальня", 21, 21)), \
-                 patch.object(app, "val", return_value=22), \
+                 patch.object(app, "val", return_value=180), \
                  patch.object(app, "outage_execution_schedule", return_value={"valid": False}), \
                  patch.object(app, "active_upper", return_value=22), \
                  patch.object(app, "save"), \
                  patch.object(app, "publish"):
                 app._manual_kws_snapshot = lambda: (100.0, 10000., 10000.)
                 with patch("time.time", return_value=10000.):
-                    app.start_manual_energy(6)
-                self.assertTrue(app.memory["manual_energy"]["status"] == "active")
+                    app.start_manual_energy(40)
+                self.assertEqual(app.memory["manual_energy"]["status"], "active")
+                self.assertEqual(app.memory["manual_energy"]["target_kwh"], 40)
+                self.assertEqual(app.memory["manual_energy"]["deadline"], 10000+830*60)
+                with self.assertRaisesRegex(ValueError, "already_active"):
+                    app.start_manual_energy(1)
                 with patch("time.time", return_value=10001.):
                     app.stop_manual_energy()
                 self.assertEqual(app.memory["manual_energy"]["reason"], "user_stop")

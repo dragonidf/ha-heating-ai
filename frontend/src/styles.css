@@ -780,7 +780,7 @@ main .overview .hero button,main .overview .heat-sources button,main .overview .
 .manual-energy{border-top:1px solid var(--divider-color,rgba(127,127,127,.25));margin-top:12px;padding-top:12px}
 .manual-energy h3{font-size:14px;margin:0 0 9px}
 .manual-request{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.manual-request strong{font-variant-numeric:tabular-nums;min-width:95px;text-align:center}
+.manual-request select{font-variant-numeric:tabular-nums;min-width:105px;text-align:center;border:1px solid var(--divider-color,rgba(127,127,127,.25));border-radius:8px;background:var(--card-background-color,transparent);color:var(--primary-text-color);padding:8px;font:inherit}
 .manual-request button,.manual-progress button{border:1px solid var(--divider-color,rgba(127,127,127,.25));border-radius:8px;background:var(--card-background-color,transparent);color:var(--primary-text-color);padding:8px 12px;font:inherit;cursor:pointer}
 .manual-request button:last-child{flex:1;background:var(--primary-color);color:var(--text-primary-color,#fff);min-width:145px}
 .manual-request button:disabled,.manual-progress button:disabled{opacity:.5;cursor:default}

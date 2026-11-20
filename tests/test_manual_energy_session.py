@@ -20,10 +20,10 @@ class ManualEnergyTest(unittest.TestCase):
         self.s = self.m.start(6, 419.37, self.t, self.t, 180)
 
     def test_whole_kwh_only(self):
-        for bad in (True, False, 0, 10, 1.5, '6', float('nan')):
+        for bad in (True, False, 0, 41, 1.5, '6', float('nan')):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.m.start(bad, 100, self.t, self.t, 180)
-        for good in (1, 6, 9):
+        for good in (1, 6, 9, 10, 39, 40):
             self.assertEqual(self.m.start(good, 100, self.t, self.t, 180)['target_kwh'], good)
 
     def test_exact_decimal_threshold(self):
@@ -81,3 +81,27 @@ class ManualEnergyTest(unittest.TestCase):
         s = self.m.start(6, 100, self.t, self.t, 15)
         self.m.advance(s, 101, self.t+900, self.t+900)
         self.assertEqual((s['status'], s['reason']), ('cancelled', 'time_limit'))
+
+    def test_40_kwh_can_complete_at_3_6_and_9_kw_without_legacy_limit(self):
+        for power in (3, 6, 9):
+            with self.subTest(power=power):
+                s = self.m.start(40, 100, self.t, self.t,
+                                 self.m.watchdog_minutes(40, 180))
+                self.assertEqual(s['deadline']-self.t, 830*60)
+                at = self.t
+                value = 100.
+                while value < 140:
+                    at += 900
+                    value = min(140., value+power/4)
+                    self.m.advance(s, value, at, at)
+                    if value < 140:
+                        self.assertEqual(s['status'], 'active')
+                self.assertEqual((s['status'], s['consumed_kwh']), ('completed', 40.))
+                self.assertLess(at, s['deadline'])
+
+    def test_manual_watchdog_preserves_existing_floor_and_is_bounded(self):
+        self.assertEqual(self.m.watchdog_minutes(1,180),180)
+        self.assertEqual(self.m.watchdog_minutes(40,480),830)
+        for invalid in (None, 0, 481, True, float('nan')):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.m.watchdog_minutes(40,invalid)

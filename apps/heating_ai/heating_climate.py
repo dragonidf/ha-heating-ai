@@ -1863,7 +1863,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         morning_comfort=bool(demand and forecast and forecast['split_comfort_applied'] and
                              in_window(now,'05:00','07:00'))
         if (peak is not None and room is not None and room>=lower and
-                (coast_overheat or peak>=target and not planned_heat and not preheat and not morning_comfort)):
+                (coast_overheat or peak>=target and not planned_heat and not preheat and not morning_comfort and not manual_requested)):
             demand=False
         if outage_now:
             demand=False

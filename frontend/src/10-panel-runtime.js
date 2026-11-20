@@ -326,6 +326,10 @@ export class HeatingAIPanel extends HTMLElement {
     if(el.dataset.press){if(el.dataset.press==='rollback'&&!confirm('Повернути попередню модель? Поточна модель збережеться для наступного відкату.'))return;await this.call(el.dataset.press,'press',{});}
   }
   async changed(e) {
+    if(e.target.hasAttribute('data-manual-kwh')){
+      const k=Number(e.target.value);if(!this.manualEnergyPending&&Number.isInteger(k)&&k>=1&&k<=MANUAL_ENERGY_MAX)this.manualEnergyKwh=k;
+      this.render();return;
+    }
     if(e.target.hasAttribute('data-comparison-date')){this.comparisonDateDraft={...this.comparisonDateDraft,[e.target.dataset.comparisonDate]:e.target.value};return;}
     if(e.target.hasAttribute('data-system-key')) {
       const el=e.target;
@@ -357,7 +361,7 @@ export class HeatingAIPanel extends HTMLElement {
   async manualEnergyClick(action) {
     if(this.manualEnergyPending)return;
     if(action==='plus'||action==='minus'){
-      this.manualEnergyKwh=Math.max(1,Math.min(9,(this.manualEnergyKwh||6)+(action==='plus'?1:-1)));
+      this.manualEnergyKwh=Math.max(1,Math.min(MANUAL_ENERGY_MAX,(this.manualEnergyKwh||6)+(action==='plus'?1:-1)));
       this.render();return;
     }
     if(action!=='start'&&action!=='stop')return;

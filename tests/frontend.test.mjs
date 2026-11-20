@@ -544,3 +544,19 @@ test('manual KWS UI presents measured progress and only a stop action while acti
   assert.match(html,/data-manual-energy="stop"/);
   assert.doesNotMatch(html,/data-manual-energy="start"/);
 });
+
+test('manual KWS selector exposes every integer from 1 to 40 and clamps buttons',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.manualEnergyKwh=39;p.manualEnergyPending=false;p.manualEnergyMessage='';
+  p.state=k=>k==='manual_energy'?'idle':'on';p.attrs=()=>({});p.render=()=>{};
+  await p.manualEnergyClick('plus');assert.equal(p.manualEnergyKwh,40);
+  await p.manualEnergyClick('plus');assert.equal(p.manualEnergyKwh,40);
+  const html=p.manualEnergyControls();
+  assert.equal((html.match(/<option value="/g)||[]).length,40);
+  assert.match(html,/value="40" selected/);assert.doesNotMatch(html,/value="41"/);
+  assert.match(html,/data-manual-energy="plus"[^>]*disabled/);
+  await p.changed({target:{value:'1',hasAttribute:k=>k==='data-manual-kwh'}});
+  await p.manualEnergyClick('minus');assert.equal(p.manualEnergyKwh,1);
+  await p.changed({target:{value:'41',hasAttribute:k=>k==='data-manual-kwh'}});
+  assert.equal(p.manualEnergyKwh,1);
+});
