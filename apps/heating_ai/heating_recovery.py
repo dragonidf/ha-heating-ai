@@ -1340,11 +1340,11 @@ class HeatingRecovery:
         committed=self.minimum_heat_commit(time.time(),grid,scheduled_off,room,
             (getattr(self,'decision_context',None) or {}).get('coast_overheat',False))
         if action=='heat' and not once and isinstance(plan_forecast,dict) and 'heat_segments' in plan_forecast:
-            if not committed and not any(s['start']<=time.time()<s['end'] for s in plan_forecast['heat_segments']):action='off'
+            if not committed and not getattr(self,'manual_energy_demand',False) and not any(s['start']<=time.time()<s['end'] for s in plan_forecast['heat_segments']):action='off'
         outside_window=(action=='off' and not once and
             self.raw('strategy')=='Тільки в дозволені години' and not
             in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))
-        urgent=release or action=="fallback" or (action=="off" and (
+        urgent=release or (action=="off" and getattr(self,'_manual_energy_ending',False)) or action=="fallback" or (action=="off" and (
             scheduled_off or grid!='on' or room is None or room>=self.active_upper() or
             (getattr(self,'decision_context',None) or {}).get('coast_overheat',False) or
             (not once and outside_window and not committed)))

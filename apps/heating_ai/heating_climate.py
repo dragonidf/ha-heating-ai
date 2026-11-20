@@ -911,7 +911,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         if getattr(self,'temperature_quality',{}).get('primary_status','normal')!='normal':row['quality']=False
         row['room_valid']=bool(source=='Вітальня' and primary is not None and
             getattr(self,'temperature_quality',{}).get('primary_status','normal')=='normal')
-        row['execution']='automatic' if self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if power is not None and power>=1.5 else 'idle'
+        manual_live=self.memory.get('manual_energy',{}).get('status')=='active'
+        manual_planned=any(s['start']<=stamp<s['end'] for s in self.memory.get('planned_heat_segments',[]))
+        row['manual_extra_active']=manual_live
+        row['execution']='automatic' if self.memory.get('owned') and self.memory.get('last_command')=='heat' and (not manual_live or manual_planned) else 'manual_or_native' if power is not None and power>=1.5 else 'idle'
         row["power_estimated"]=getattr(self,"fallback_interval",False)
         row['heating_requested']=self.memory.get('last_command')=='heat'
         row['heat_command_at']=self.memory.get('command_at') if row['heating_requested'] else None
@@ -1487,8 +1490,12 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings["split_comfort"] = True
         settings["morning_min_minutes"] = self.cfg.get("morning_min_minutes",30)
         command_at=number(self.memory.get("command_at"))
+        manual_live=self.memory.get('manual_energy',{}).get('status')=='active'
+        planned_now=any(s['start']<=now.timestamp()<s['end']
+                        for s in self.memory.get('planned_heat_segments',[]))
         automatic=(self.raw('mode')=='Автоматичне керування' and permitted and
-                   self.memory.get('owned',False) and self.memory.get('last_command')=='heat')
+                   self.memory.get('owned',False) and self.memory.get('last_command')=='heat'
+                   and (not manual_live or planned_now))
         settings.update(confirmed_morning(self.memory,now,settings,measured_power,self.val('energy'),grid,
                                          automatic,getattr(self,'power_source','unknown'),
                                          control_reserve=(reserve_active or getattr(self,'power_source','') in ('fallback_inlet_stage','fallback_group_balance')) and power>=500 and
@@ -1679,10 +1686,15 @@ class HeatingClimate(HeatingRecovery,Hass):
             peak=max(r['temperature'] for r in coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings))
             upper_peak=max(r['temperature'] for r in coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings,upper=True))
             coast_overheat=coast_exceeds_profile(now,room,guard_floor,outside,fire,self.model,settings)
+        manual_requested=bool(getattr(self,'manual_extra_demand',lambda *_:False)(
+            now.timestamp(),grid,outage_now,room,upper,coast_overheat,permitted))
+        manual_ending=bool(getattr(self,'_manual_energy_ending',False)
+                           and self.memory.get('manual_energy',{}).get('origin_was_idle'))
         settings['actuator']=dict(action=self.memory.get('last_command'),changed_at=command_at or 0.,
             safety_stop=grid!='on' or not permitted or self.raw('mode')!='Автоматичне керування' or
                         room is not None and room>=upper or coast_overheat and not once)
         committed_heat=self.minimum_heat_commit(now.timestamp(),grid,outage_now,room,coast_overheat and not once)
+        if manual_ending and not planned_now:committed_heat=False
         background=getattr(self,'runtime_ready',False) and callable(getattr(self,'submit_to_executor',None))
         ready=None
         if background and not forecast_quality:
@@ -1698,7 +1710,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             calculation_pending=bool((getattr(self,'calculation_jobs',{}).get('plan') or {}).get('id')))
         if time.time()<self.next_compute or background and forecast_quality and valid and ready is None:
             segments=self.memory.get("planned_heat_segments",[])
-            demand=any(s["start"] <= now.timestamp() < s["end"] for s in segments)
+            planned_now=any(s["start"] <= now.timestamp() < s["end"] for s in segments)
+            demand=planned_now or manual_requested
+            if manual_ending and not planned_now:committed_heat=False
             if once or committed_heat:
                 demand=True
             if outage_now or (room is not None and room>=upper) or coast_overheat and not once:
@@ -1827,11 +1841,11 @@ class HeatingClimate(HeatingRecovery,Hass):
         else:
             self.publish("sensor.heating_forecast","unavailable",friendly_name="Клімат — мінімум прогнозу",curve=[],
                          reason="Недостатньо актуальних даних або некоректні межі",planning_policy_version=4,created_at=now.isoformat())
-        demand=bool(forecast and forecast["heat"])
+        planned_heat=bool(forecast and forecast["heat"])
+        demand=planned_heat or manual_requested
         # The optimiser already balances comfort, stored heat and tariff.
         # Reaching the soft air target must not cancel its scheduled session.
         # Actual upper limits, coast overheating and outages still veto heat.
-        planned_heat=demand
         if once:
             demand=True
         if room is not None and room>=upper:
@@ -1844,6 +1858,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             demand=False
         if outage_now:
             demand=False
+        if manual_ending and not planned_heat:committed_heat=False
         if committed_heat and not outage_now:
             demand=True
         action=decide(self.raw("mode"),self.raw("armed")=="on",bool(self.cfg.get("allow_actuation",False)),
