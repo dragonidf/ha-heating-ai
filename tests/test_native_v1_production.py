@@ -187,6 +187,55 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             boot_id="fixture-boot",owner_epoch=1,fenced=False))
         return hass, app
 
+    async def test_manual_request_uses_native_serialized_control_only(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.model["validated"] = True
+            app.cfg.update(power_accounting_method="kws", session_limit="180")
+            with patch.object(app, "async_kws_status", return_value={"ready": True}), \
+                 patch.object(app, "async_voltage_status", return_value={"voltage_qualified": True}), \
+                 patch.object(app, "grid_state", return_value="on"), \
+                 patch.object(app, "source_temperature", return_value=(21, "Вітальня", 21, 21)), \
+                 patch.object(app, "val", return_value=180), \
+                 patch.object(app, "outage_execution_schedule", return_value={"valid": False}), \
+                 patch.object(app, "active_upper", return_value=22), \
+                 patch.object(app, "save"), \
+                 patch.object(app, "publish"):
+                app._manual_kws_snapshot = lambda: (100.0, 10000., 10000.)
+                with patch("time.time", return_value=10000.):
+                    app.start_manual_energy(40)
+                self.assertEqual(app.memory["manual_energy"]["status"], "active")
+                self.assertEqual(app.memory["manual_energy"]["target_kwh"], 40)
+                self.assertEqual(app.memory["manual_energy"]["deadline"], 10000+830*60)
+                with self.assertRaisesRegex(ValueError, "already_active"):
+                    app.start_manual_energy(1)
+                with patch("time.time", return_value=10001.):
+                    app.stop_manual_energy()
+                self.assertEqual(app.memory["manual_energy"]["reason"], "user_stop")
+
+    async def test_manual_energy_native_completion_and_grid_cancellation(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            with patch.object(app, "async_kws_status", return_value={"ready": True}), \
+                 patch.object(app, "async_voltage_status", return_value={"voltage_qualified": True}), \
+                 patch.object(app, "save"), patch.object(app, "publish"):
+                for grid,expected in [('on','completed'),('off','cancelled')]:
+                    with self.subTest(grid=grid):
+                        stamp=10000.
+                        session=component.manual_energy.start(40,100.,stamp,stamp,830)
+                        app.memory["manual_energy"]=session
+                        app._manual_energy_ending=False
+                        for n in range(1,20):
+                            at=stamp+n*900
+                            app._manual_kws_snapshot=lambda: (100.+2*n, at, None)
+                            self.assertTrue(app.manual_extra_demand(at,'on',False,21.,22.5,False,True))
+                        at=stamp+20*900
+                        app._manual_kws_snapshot=lambda:(140.,at,None)
+                        self.assertFalse(app.manual_extra_demand(at,grid,False,21.,22.5,False,True))
+                        self.assertEqual(session["status"],expected)
+                        self.assertTrue(app._manual_energy_ending)
+                        self.assertFalse(app.manual_energy_demand)
+
     async def test_voltage_trip_bypasses_minimum_on_and_blocks_auto_dispatch(self):
         with package(self.root / "package") as (component, _):
             for voltage in (196, 255):

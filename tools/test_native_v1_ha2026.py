@@ -84,7 +84,7 @@ async def lifecycle(readings, directory) -> None:
         assert args["require_admin"] is True
         # The native API consists of the read-only preview plus the
         # administrator-only, versioned settings read/save endpoints.
-        assert api.call_count == 3
+        assert api.call_count == 4
         assert hass.data[component.DOMAIN][entry.entry_id] is entry.runtime_data
         assert entry.runtime_data.data["physical_commands_enabled"] is False
         assert entry.runtime_data.ledger_summary["fenced"] is True
@@ -135,7 +135,7 @@ def main() -> None:
         folder = Path(temp)
         archive = folder / "carrier.zip"
         summary = build(archive)
-        assert summary["files"] == 50
+        assert summary["files"] == 51
         with zipfile.ZipFile(archive) as package:
             assert not any(name.startswith("legacy_app/") for name in package.namelist())
         target = folder / "isolated" / "custom_components" / "heating_ai_legacy"

@@ -775,3 +775,18 @@ main .overview .hero button,main .overview .heat-sources button,main .overview .
 .table-value{min-height:44px;padding:2px 0;border:0;border-radius:0;font-size:inherit;line-height:1.3;color:inherit;text-align:left}.table-scroll td:has(.table-value){padding:0 6px}
 .compact-history .history-tools h2{max-width:100px;overflow-wrap:normal}
 @container(max-width:360px){.compact-history .history-tools{flex-wrap:wrap}.compact-history .history-tools h2{flex-basis:100%;max-width:none}}
+
+/* Compact energy request inside the existing next-action disclosure. */
+.manual-energy{border-top:1px solid var(--divider-color,rgba(127,127,127,.25));margin-top:12px;padding-top:12px}
+.manual-energy h3{font-size:14px;margin:0 0 9px}
+.manual-request{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.manual-request select{font-variant-numeric:tabular-nums;min-width:105px;text-align:center;border:1px solid var(--divider-color,rgba(127,127,127,.25));border-radius:8px;background:var(--card-background-color,transparent);color:var(--primary-text-color);padding:8px;font:inherit}
+.manual-request button,.manual-progress button{border:1px solid var(--divider-color,rgba(127,127,127,.25));border-radius:8px;background:var(--card-background-color,transparent);color:var(--primary-text-color);padding:8px 12px;font:inherit;cursor:pointer}
+.manual-request button:last-child{flex:1;background:var(--primary-color);color:var(--text-primary-color,#fff);min-width:145px}
+.manual-request button:disabled,.manual-progress button:disabled{opacity:.5;cursor:default}
+.manual-progress>div:first-child{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+.manual-progress>div:first-child span{font-size:12px}
+.manual-progress .manual-bar{height:7px;margin:10px 0;background:var(--divider-color,#bbb);border-radius:8px;overflow:hidden}
+.manual-progress .manual-bar span{display:block;height:100%;background:var(--primary-color);border-radius:8px}
+.manual-progress button{width:100%}
+.manual-energy .note{font-size:12px;margin:8px 0 0}

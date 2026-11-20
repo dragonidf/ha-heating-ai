@@ -2,7 +2,7 @@ export class HeatingAIPanel extends HTMLElement {
   constructor() {
     super(); this.attachShadow({mode:'open'}); this.tab='overview'; this.config={}; this.nativeCards=new Map(); this.nativeConfigs=new Map(); this.pending=new Set();
     this.historyRange=24;this.historyVisible=new Set(['room','return']);this.historyEpoch=0;this.timelineCursor=null;this.settingsQuery='';
-    this.comparisonDays=7;this.comparisonCache=new Map();this.systemDraft={};this.systemHelp=null;this.systemPending=null;
+    this.comparisonDays=7;this.comparisonCache=new Map();this.systemDraft={};this.systemHelp=null;this.systemPending=null;this.manualEnergyKwh=6;this.manualEnergyPending=false;this.manualEnergyMessage='';
     this.shadowRoot.addEventListener('click',e=>this.clicked(e));
     this.shadowRoot.addEventListener('change',e=>this.changed(e));
     this.shadowRoot.addEventListener('input',e=>this.inputted(e));
@@ -305,7 +305,8 @@ export class HeatingAIPanel extends HTMLElement {
     } catch { this.helpersPromise=null;for(const slot of slots)if(slot.isConnected)slot.textContent='Не вдалося завантажити графік Home Assistant. Оновіть сторінку.'; }
   }
   async clicked(e) {
-    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo]'); if(!el)return;
+    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo],[data-manual-energy]'); if(!el)return;
+    if(el.hasAttribute('data-manual-energy')){await this.manualEnergyClick(el.dataset.manualEnergy);return;}
     if(el.hasAttribute('data-system-help')){this.systemHelp=el.dataset.systemHelp;this.render();return;}
     if(el.hasAttribute('data-system-close')){this.closeSystemHelp();return;}
     if(el.hasAttribute('data-system-save')){await this.saveSystemSettings();return;}
@@ -325,6 +326,10 @@ export class HeatingAIPanel extends HTMLElement {
     if(el.dataset.press){if(el.dataset.press==='rollback'&&!confirm('Повернути попередню модель? Поточна модель збережеться для наступного відкату.'))return;await this.call(el.dataset.press,'press',{});}
   }
   async changed(e) {
+    if(e.target.hasAttribute('data-manual-kwh')){
+      const k=Number(e.target.value);if(!this.manualEnergyPending&&Number.isInteger(k)&&k>=1&&k<=MANUAL_ENERGY_MAX)this.manualEnergyKwh=k;
+      this.render();return;
+    }
     if(e.target.hasAttribute('data-comparison-date')){this.comparisonDateDraft={...this.comparisonDateDraft,[e.target.dataset.comparisonDate]:e.target.value};return;}
     if(e.target.hasAttribute('data-system-key')) {
       const el=e.target;
@@ -352,6 +357,33 @@ export class HeatingAIPanel extends HTMLElement {
   inputted(e) {
     if(!e.target.hasAttribute('data-settings-search'))return;
     this.settingsQuery=e.target.value;this.render();
+  }
+  async manualEnergyClick(action) {
+    if(this.manualEnergyPending)return;
+    if(action==='plus'||action==='minus'){
+      this.manualEnergyKwh=Math.max(1,Math.min(MANUAL_ENERGY_MAX,(this.manualEnergyKwh||6)+(action==='plus'?1:-1)));
+      this.render();return;
+    }
+    if(action!=='start'&&action!=='stop')return;
+    this.manualEnergyPending=true;this.manualEnergyMessage='';this.render();
+    try {
+      if(!this.hass?.callWS)throw new Error('Немає зв’язку з Home Assistant');
+      const result=await this.hass.callWS({type:'heating_ai_legacy/manual_energy',
+        entry_id:this.config.entry_id,version:[1,0],action,
+        ...(action==='start'?{kwh:this.manualEnergyKwh}:{})});
+      if(result?.status==='active'&&action==='start')this.manualEnergyMessage='Запит прийнято. Очікуємо підтвердження котла.';
+      else if(action==='stop')this.manualEnergyMessage='Ручний запит зупинено; план збережено.';
+    } catch(error) {
+      const reasons={counter_baseline_stale:'Лічильник KWS давно не оновлювався; запуск відхилено.',
+        safety_blocked:'Запуск заблокований чинними захистами.',
+        scheduled_outage:'Планове відключення: запуск недоступний.',
+        temperature_guard:'Захист температури не дозволяє нагрів.',
+        already_active:'Додатковий нагрів уже активний.'};
+      const code=error?.message||'';
+      this.manualEnergyMessage=reasons[code]||'Не вдалося виконати: '+code;
+    } finally {
+      this.manualEnergyPending=false;this.render();
+    }
   }
   async call(key,service,data) {
     const id=this.id(key), entity=this.hass.states[id];

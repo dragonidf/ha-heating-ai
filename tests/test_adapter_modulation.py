@@ -87,6 +87,20 @@ class AdapterModulationTests(unittest.TestCase):
     def test_future_session_starts_on_time_between_full_computations(self):
         at=datetime(2026,10,13,5,30,tzinfo=ZoneInfo('Europe/Kiev'))
         self.assertEqual(self.fast_tick(at,[dict(start=at.timestamp()-15,end=at.timestamp()+1800)],initial_demand=False),['heat'])
+    def test_extra_energy_uses_cached_plan_without_imposing_a_new_schedule(self):
+        at=datetime(2026,10,13,6,30,tzinfo=ZoneInfo('Europe/Kiev'))
+        stamp=at.timestamp()
+        for active,plan,expected in ((True,False,'heat'),(False,False,'off'),(False,True,'heat')):
+            with self.subTest(active=active,plan=plan):
+                def setup(app):
+                    app.memory.update(last_command='heat',command_at=stamp-60,owned=True,
+                                      manual_energy=dict(status='active' if active else 'completed',
+                                                         origin_was_idle=True, target_kwh=40))
+                    app.manual_extra_demand=lambda *_:active
+                    app._manual_energy_ending=not active
+                segments=[dict(start=stamp,end=stamp+600)] if plan else []
+                self.assertEqual(self.fast_tick(at,segments,before_tick=setup),[expected])
+
     def test_actual_session_energy_is_counter_delta_not_nominal_power(self):
         app=HeatingClimate()
         app.memory=dict(last_command='heat',heat_session_start_energy=100)

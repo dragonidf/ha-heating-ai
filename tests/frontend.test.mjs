@@ -520,3 +520,43 @@ test('forecast preserves a distinct residual-fireplace lane without duplicating 
   const chart=p.forecastChart();assert.match(chart,/data-forecast-lane="fireplace"/);
   assert.match(chart,/оцінка залишкового тепла/);assert.doesNotMatch(chart,/class="legend"/);
 });
+
+test('manual KWS UI is inside existing disclosure and never changes the planned text',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.manualEnergyKwh=6;p.manualEnergyPending=false;p.manualEnergyMessage='';
+  p.state=k=>k==='manual_energy'?'idle':'on';
+  p.attrs=k=>k==='manual_energy'?{}:k==='controller'?{target_temperature:22}:k==='forecast'?{heat_segments:[],created_at:new Date().toISOString()}:{};
+  p.boilerActual=()=>({power:6000,heating:false});
+  const manual=p.manualEnergyControls();
+  assert.match(manual,/Додатковий нагрів/);
+  assert.match(manual,/6 кВт·год/);
+  assert.match(manual,/data-manual-energy="start"/);
+  assert.doesNotMatch(manual,/data-manual-energy="stop"/);
+});
+test('manual KWS UI presents measured progress and only a stop action while active',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.manualEnergyKwh=6;p.manualEnergyPending=false;p.manualEnergyMessage='';
+  p.state=k=>k==='manual_energy'?'active':'on';
+  p.attrs=k=>k==='manual_energy'?{target_kwh:6,consumed_kwh:2.4}:({});
+  p.boilerActual=()=>({power:6000,heating:true});
+  const html=p.manualEnergyControls();
+  assert.match(html,/2,40 \/ 6 кВт·год/);
+  assert.match(html,/data-manual-energy="stop"/);
+  assert.doesNotMatch(html,/data-manual-energy="start"/);
+});
+
+test('manual KWS selector exposes every integer from 1 to 40 and clamps buttons',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.manualEnergyKwh=39;p.manualEnergyPending=false;p.manualEnergyMessage='';
+  p.state=k=>k==='manual_energy'?'idle':'on';p.attrs=()=>({});p.render=()=>{};
+  await p.manualEnergyClick('plus');assert.equal(p.manualEnergyKwh,40);
+  await p.manualEnergyClick('plus');assert.equal(p.manualEnergyKwh,40);
+  const html=p.manualEnergyControls();
+  assert.equal((html.match(/<option value="/g)||[]).length,40);
+  assert.match(html,/value="40" selected/);assert.doesNotMatch(html,/value="41"/);
+  assert.match(html,/data-manual-energy="plus"[^>]*disabled/);
+  await p.changed({target:{value:'1',hasAttribute:k=>k==='data-manual-kwh'}});
+  await p.manualEnergyClick('minus');assert.equal(p.manualEnergyKwh,1);
+  await p.changed({target:{value:'41',hasAttribute:k=>k==='data-manual-kwh'}});
+  assert.equal(p.manualEnergyKwh,1);
+});

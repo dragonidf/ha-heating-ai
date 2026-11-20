@@ -28,6 +28,8 @@ from .production_migration import load_installation
 from .const import DOMAIN, SOURCE_HINTS
 from .critical_ledger import CriticalLedger, LedgerConflict, FILENAME
 from .kws_readiness import KWSReadiness
+from . import manual_energy
+from .native_controller.heating_outages import blocked
 
 
 def source_writer_active(hass, now=None):
@@ -60,6 +62,9 @@ class NativeController(HeatingClimate):
         self._recovery_attempts = 0
         self._recovery_next_at = 0
         self._fence_recovery_attempted = False
+        self._manual_energy_ending = False
+        self.manual_energy_demand = False
+        self._kws_idle_since = None
 
     def attach_command_ledger(self, ledger, status):
         self.command_ledger = ledger
@@ -84,7 +89,145 @@ class NativeController(HeatingClimate):
             self._reconcile_writer_fence()
         except Exception as exc:
             self.record_failure("ledger_recovery", exc)
-        return super().tick(kwargs, **extra)
+        try:
+            result = super().tick(kwargs, **extra)
+            # Only continuous observed idle, spanning the meter report,
+            # authorizes a previously reported KWS baseline.
+            observed_idle = (getattr(self, "power_source", "") == "kws_phases"
+                and getattr(self, "power_quality", "") == "measured"
+                and getattr(self, "current_power_w", None) is not None
+                and self.current_power_w < 500
+                and self.memory.get("last_command") != "heat"
+                and self.grid_state() == "on"
+                and time.time() - (getattr(self, "power_observation", {}) or {}).get("at", 0) <= 30)
+            if observed_idle:
+                if self._kws_idle_since is None:
+                    self._kws_idle_since = time.time()
+            else:
+                self._kws_idle_since = None
+            return result
+        finally:
+            # An unconfirmed manual-only STOP must be retried on subsequent
+            # ticks, not accidentally held by the normal minimum-on timer.
+            now = time.time()
+            scheduled = any(s["start"] <= now < s["end"] for s in
+                            self.memory.get("planned_heat_segments", []))
+            if self.memory.get("last_command") != "heat" or scheduled:
+                self._manual_energy_ending = False
+
+    def _manual_kws_snapshot(self):
+        """Read raw KWS without touching energy counters."""
+        def read():
+            row = self.hass.states.get("sensor.energy_meter_kotel_energiia")
+            power = self.hass.states.get("sensor.heating_power_confirmed")
+            if row is None or row.attributes.get("unit_of_measurement") != "kWh":
+                return None, None, None
+            try:
+                value = float(row.state)
+            except (ValueError, TypeError):
+                value = None
+            idle_since = None
+            if (power is not None and power.attributes.get("measurement_basis") == "kws_phases"
+                    and power.attributes.get("power_quality") == "measured"
+                    and number(power.state) is not None and number(power.state) < 500
+                    and self.memory.get("last_command") != "heat"):
+                idle_since = self._kws_idle_since
+            return value, row.last_reported.timestamp(), idle_since
+        return self._on_loop(read)
+
+    def manual_energy_snapshot(self):
+        return dict(self.memory.get("manual_energy") or {"status": "idle"})
+
+    def publish_manual_energy(self):
+        session = self.manual_energy_snapshot()
+        self.publish("sensor.heating_manual_energy", session.get("status", "idle"),
+                     friendly_name="Клімат — додатковий нагрів",
+                     **{k: v for k, v in session.items() if k != "status"})
+
+    def start_manual_energy(self, target):
+        if self.memory.get("manual_energy", {}).get("status") == "active":
+            raise ValueError("already_active")
+        if (not self._writer or self._closing or self.cfg.get("power_accounting_method") != "kws"
+                or not self.cfg.get("allow_actuation") or self.raw("armed") != "on"
+                or self.raw("mode") != "Автоматичне керування"
+                or self.memory.get("temporary_fallback") or self.grid_state() != "on"
+                or (self.command_ledger_status or {}).get("fenced", True)
+                or not self._on_loop(self.async_voltage_status)["voltage_qualified"]
+                or not self._on_loop(self.async_kws_status).get("ready")
+                or not self.model.get("validated")):
+            raise ValueError("safety_blocked")
+        room = self.source_temperature()[0]
+        if room is None or room >= self.active_upper():
+            raise ValueError("temperature_guard")
+        outage = self.outage_execution_schedule(grid="on")
+        if outage.get("valid") and blocked(time.time(), time.time()+15, outage["outages"]):
+            raise ValueError("scheduled_outage")
+        value, reported_at, idle_since = self._manual_kws_snapshot()
+        session = manual_energy.start(target, value, reported_at, time.time(),
+                                     manual_energy.watchdog_minutes(target, self.val("session_limit", 180)),
+                                     idle_since)
+        session["origin_was_idle"] = self.memory.get("last_command") != "heat"
+        self.memory["manual_energy"] = session
+        self._kws_idle_since = None
+        # Preserve historical queues and predictions, but do not score a
+        # pre-existing automatic forecast against a user-requested session.
+        for pending in self.memory.get("predictions", []):
+            if isinstance(pending, dict):
+                pending["manual_invalid"] = True
+        for pending in self.memory.get("reserve_predictions", []):
+            if isinstance(pending, dict):
+                pending["valid"] = False
+                reasons = pending.setdefault("reasons", [])
+                if "manual_extra_request" not in reasons:
+                    reasons.append("manual_extra_request")
+        self._manual_energy_ending = False
+        self.save()
+        self.publish_manual_energy()
+        return self.manual_energy_snapshot()
+
+    def stop_manual_energy(self):
+        session = self.memory.get("manual_energy")
+        if session and session.get("status") == "active":
+            manual_energy.finish(session, "user_stop", time.time())
+            self._manual_energy_ending = True
+            self.save()
+        self.publish_manual_energy()
+        return self.manual_energy_snapshot()
+
+    def manual_extra_demand(self, stamp, grid, outage, room, upper, coast, permitted):
+        session = self.memory.get("manual_energy")
+        if not session or session.get("status") != "active":
+            self.manual_energy_demand = False
+            return False
+        if (grid != "on" or outage or not permitted or self.raw("mode") != "Автоматичне керування"
+                or room is None or room >= upper or coast or self.memory.get("temporary_fallback")
+                or (self.command_ledger_status or {}).get("fenced", True)
+                or not self._on_loop(self.async_voltage_status)["voltage_qualified"]
+                or not self._on_loop(self.async_kws_status).get("ready")):
+            manual_energy.finish(session, "safety_stop", stamp)
+        else:
+            value, at, _ = self._manual_kws_snapshot()
+            manual_energy.advance(session, value, at, stamp)
+        self.manual_energy_demand = session.get("status") == "active"
+        if not self.manual_energy_demand:
+            self._manual_energy_ending = True
+            self.save()
+        self.publish_manual_energy()
+        return self.manual_energy_demand
+
+    def manual_energy_command(self, action, target=None):
+        if action == "start":
+            self.start_manual_energy(target)
+        elif action == "stop":
+            self.stop_manual_energy()
+        else:
+            raise ValueError("invalid_action")
+        self.tick()
+        return self.manual_energy_snapshot()
+
+    def manual_kws_changed(self, *args):
+        if self.memory.get("manual_energy", {}).get("status") == "active":
+            self.tick()
 
     def listen_event(self, function, event_name, **kwargs):
         # Production settings are accepted only through the authenticated
@@ -120,7 +263,13 @@ class NativeController(HeatingClimate):
                         "expected_mode", "expected_setpoint", "once"):
                 self.memory.pop(key, None)
             self.memory["native_runtime_initialized"] = True
+        session = self.memory.get("manual_energy")
+        if session and session.get("status") == "active":
+            manual_energy.finish(session, "controller_restart", time.time())
+            self.save()
         self._remember_manual_snapshot()
+        self.listen_state(self.manual_kws_changed, "sensor.energy_meter_kotel_energiia", attribute="all")
+        self.publish_manual_energy()
         # A fence is durable safety state, but the one-shot recovery guard is
         # runtime state. Reset only the guard on each fresh native runtime so
         # a fence created by an older process can be reconciled once after
@@ -221,6 +370,8 @@ class NativeController(HeatingClimate):
         self.save()
 
     def manual_intent_changed(self, *args):
+        if self.memory.get("manual_energy", {}).get("status") == "active":
+            self.stop_manual_energy()
         self._remember_manual_snapshot()
         self.next_compute = 0
         self.save()

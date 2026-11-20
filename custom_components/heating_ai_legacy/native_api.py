@@ -14,6 +14,7 @@ from homeassistant.components.websocket_api.decorators import (
 )
 
 from .const import DOMAIN
+from .manual_energy import MAX_TARGET_KWH, valid_target
 
 
 def register(hass):
@@ -159,6 +160,40 @@ def register(hass):
         snapshot = await hass.async_add_executor_job(controller.native_settings_snapshot)
         connection.send_result(msg["id"], snapshot)
 
+    @websocket_command({
+        "type": "heating_ai_legacy/manual_energy",
+        probatio.Required("entry_id"): str,
+        probatio.Required("version"): [int],
+        probatio.Required("action"): str,
+        probatio.Optional("kwh"): int,
+    })
+    @async_response
+    async def manual_energy_command(hass, connection, msg):
+        if connection.user is None or not connection.user.is_admin:
+            connection.send_error(msg["id"], "forbidden", "Administrator access required")
+            return
+        if msg["version"] != [1, 0] or msg["action"] not in ("start", "stop"):
+            connection.send_error(msg["id"], "invalid_format", "Unsupported manual command")
+            return
+        if msg["action"] == "start" and not valid_target(msg.get("kwh")):
+            connection.send_error(msg["id"], "invalid_target", f"Select 1–{MAX_TARGET_KWH} kWh")
+            return
+        runtime = hass.data.get(DOMAIN, {}).get(msg["entry_id"])
+        controller = getattr(runtime, "controller", None)
+        if controller is None or not controller._running or not controller._writer:
+            connection.send_error(msg["id"], "unavailable", "Native writer is not active")
+            return
+        try:
+            await controller._dispatch(controller.manual_energy_command, msg["action"], msg.get("kwh"))
+        except ValueError as exc:
+            connection.send_error(msg["id"], "blocked", str(exc))
+            return
+        except Exception:
+            connection.send_error(msg["id"], "internal_error", "Manual heating command failed")
+            return
+        connection.send_result(msg["id"], controller.manual_energy_snapshot())
+
+    websocket_api.async_register_command(hass, manual_energy_command)
     websocket_api.async_register_command(hass, preview)
     websocket_api.async_register_command(hass, settings_read)
     websocket_api.async_register_command(hass, settings_save)
