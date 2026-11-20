@@ -1,4 +1,4 @@
-"""Single-session raw KWS energy accounting; never sends equipment commands."""
+"""Single-session KWS counter and measured-power integral; never sends equipment commands."""
 from decimal import Decimal
 from math import isfinite
 
@@ -7,6 +7,8 @@ MAX_RUNNING_REPORT_AGE = 1200
 MAX_IDLE_BASELINE_AGE = 1800
 MAX_ACTIVE_BASELINE_AGE = 30
 MAX_TARGET_KWH = 40
+MAX_POWER_GAP = 45
+MAX_POWER_AGE = 60
 
 
 def valid_target(target):
@@ -45,8 +47,9 @@ def start(target, value, at, now, limit_minutes, idle_since=None):
     if not -5 <= age <= (MAX_IDLE_BASELINE_AGE if continuous_idle else MAX_ACTIVE_BASELINE_AGE):
         raise ValueError('counter_baseline_stale')
     return dict(status='active', target_kwh=target, baseline_kwh=value,
-                last_kwh=value, last_report_at=at, started_at=now,
-                deadline=now+limit_minutes*60, consumed_kwh=0., reason=None)
+                last_kwh=value, last_report_at=at, last_change_at=now, started_at=now,
+                deadline=now+limit_minutes*60, consumed_kwh=0., integrated_kwh=0.,
+                progress_kwh=0., progress_basis='counter', reason=None)
 
 
 def finish(session, reason, now):
@@ -75,13 +78,48 @@ def advance(session, value, at, now):
     delta = _counter(value)-_counter(session['last_kwh'])
     if delta < 0:
         return finish(session, 'counter_reset', now)
-    if delta > Decimal('12')*Decimal(str(max(0, at-anchor)))/Decimal(3600)+Decimal('.05'):
+    # Repeated unchanged HA reports confirm liveness, not counter advancement.
+    change_anchor = max(session.get('last_change_at', previous), session['started_at'])
+    if delta > Decimal('12')*Decimal(str(max(0, at-change_anchor)))/Decimal(3600)+Decimal('.05'):
         return finish(session, 'counter_jump', now)
     consumed = _counter(value)-_counter(session['baseline_kwh'])
     session.update(last_kwh=value, last_report_at=at, consumed_kwh=float(consumed))
-    if consumed >= session['target_kwh']:
+    if delta > 0:
+        session['last_change_at'] = at
+    return update_progress(session, now)
+
+
+def update_progress(session, now):
+    # Both channels measure the SAME session. Never sum them.
+    counter = session['consumed_kwh']
+    integral = session.get('integrated_kwh', 0.)
+    basis = 'kws_power' if integral > counter else 'counter'
+    session.update(progress_kwh=max(counter, integral), progress_basis=basis)
+    if session['progress_kwh'] >= session['target_kwh'] - 1e-9:
+        session['completion_basis'] = basis
         finish(session, 'target_reached', now)
     return session
+
+
+def observe_power(session, watts, at, now):
+    """Integrate only consecutive fresh measured KWS phase-power observations."""
+    if session.get('status') != 'active':
+        return session
+    if (not _finite(watts) or not 0 <= watts <= 12000 or not _finite(at)
+            or not _finite(now) or not -5 <= now-at <= MAX_POWER_AGE
+            or at < session['started_at']):
+        session.pop('power_sample', None)
+        return session
+    previous = session.get('power_sample')
+    if previous is not None:
+        elapsed = at-previous['at']
+        if elapsed <= 0:
+            return session
+        if elapsed <= MAX_POWER_GAP:
+            energy = (previous['watts']+watts)*elapsed/7200000
+            session['integrated_kwh'] = session.get('integrated_kwh', 0.) + energy
+    session['power_sample'] = dict(at=at, watts=watts)
+    return update_progress(session, now)
 
 
 def arbitrate(planned, manual, ending):

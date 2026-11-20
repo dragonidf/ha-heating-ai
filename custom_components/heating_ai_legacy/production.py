@@ -208,6 +208,18 @@ class NativeController(HeatingClimate):
         else:
             value, at, _ = self._manual_kws_snapshot()
             manual_energy.advance(session, value, at, stamp)
+            observation = getattr(self, "power_observation", {}) or {}
+            sources = observation.get("source_quality") or {}
+            # Each phase must be genuinely measured and recently reported;
+            # estimated zero or a stale/fallback source cannot add energy.
+            fresh = all(
+                sources.get("sensor.energy_meter_kotel_potuzhnist_"+phase, {}).get("quality") == "measured"
+                and isinstance(sources.get("sensor.energy_meter_kotel_potuzhnist_"+phase, {}).get("value_reported_at"), (int, float))
+                and -5 <= stamp-sources["sensor.energy_meter_kotel_potuzhnist_"+phase]["value_reported_at"] <= manual_energy.MAX_POWER_AGE
+                for phase in "abc")
+            watts = (observation.get("watts") if fresh and observation.get("policy") == "kws"
+                     and observation.get("quality") == "measured" else None)
+            manual_energy.observe_power(session, watts, observation.get("at"), stamp)
         self.manual_energy_demand = session.get("status") == "active"
         if not self.manual_energy_demand:
             self._manual_energy_ending = True

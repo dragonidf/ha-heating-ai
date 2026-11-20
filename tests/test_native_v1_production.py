@@ -236,6 +236,28 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(app._manual_energy_ending)
                         self.assertFalse(app.manual_energy_demand)
 
+    async def test_native_manual_progress_uses_measured_phase_power_with_unchanged_counter(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            stamp=10000.
+            session=component.manual_energy.start(1,100.,stamp,stamp,180)
+            app.memory["manual_energy"]=session
+            with patch.object(app, "async_kws_status", return_value={"ready": True}), \
+                 patch.object(app, "async_voltage_status", return_value={"voltage_qualified": True}), \
+                 patch.object(app, "save"), patch.object(app, "publish"):
+                for n in range(41):
+                    at=stamp+n*15
+                    app._manual_kws_snapshot=lambda:(100.,at,None)
+                    app.power_observation=dict(at=at,watts=6000,quality='measured',policy='kws',
+                        source_quality={'sensor.energy_meter_kotel_potuzhnist_'+phase:
+                            dict(quality='measured',value_reported_at=at) for phase in 'abc'})
+                    self.assertEqual(app.manual_extra_demand(at,'on',False,21.,22.5,False,True),n<40)
+                self.assertEqual(session['status'],'completed')
+                self.assertEqual(session['completion_basis'],'kws_power')
+                self.assertAlmostEqual(session['progress_kwh'],1)
+                self.assertEqual(session['consumed_kwh'],0)
+                self.assertTrue(app._manual_energy_ending)
+
     async def test_immediate_manual_request_cannot_bypass_native_voltage_or_kws(self):
         with package(self.root / "package") as (component, _):
             for fault in ('voltage','kws'):
@@ -250,7 +272,8 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.to_thread(app.apply_action,'heat',False)
                     else:
                         with patch.object(app,'apply_voltage_stop',return_value=False), \
-                             patch.object(app,'async_kws_status',return_value={'ready':False,'reason':'test','reason_text':'KWS blocked'}):
+                             patch.object(app,'async_kws_status',return_value={'ready':False,'reason':'test','reason_text':'KWS blocked'}), \
+                             patch.object(app,'source_temperature',return_value=(None,'',None,None)):
                             await asyncio.to_thread(app.apply_action,'heat',False)
                     self.assertEqual(hass.rows['climate.boiler'].state,'off')
                     self.assertFalse(any(c.kwargs.get('service_data',{}).get('hvac_mode')=='heat'
