@@ -184,6 +184,16 @@ class NativeController(HeatingClimate):
         self.publish_manual_energy()
         return self.manual_energy_demand
 
+    def manual_energy_command(self, action, target=None):
+        if action == "start":
+            self.start_manual_energy(target)
+        elif action == "stop":
+            self.stop_manual_energy()
+        else:
+            raise ValueError("invalid_action")
+        self.tick()
+        return self.manual_energy_snapshot()
+
     def manual_kws_changed(self, *args):
         if self.memory.get("manual_energy", {}).get("status") == "active":
             self.tick()
