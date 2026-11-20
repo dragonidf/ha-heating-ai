@@ -1,0 +1,14 @@
+name: Manual start regression (red)
+on:
+  push:
+    branches: [fix/manual-immediate-start]
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r tests/requirements.txt
+      - run: PYTHONPATH=apps/heating_ai:tests python -m unittest test_fallback_recovery.FinalDispatchGuardTests.test_manual_request_starts_immediately_after_stop -v
