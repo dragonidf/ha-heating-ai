@@ -8,7 +8,7 @@ from heating_model import DEFAULT_MODEL
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None,probe_available=True,stored_floor=None,grid_sequence=None,real_planner=False,mode='Автоматичне керування'):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None,probe_available=True,stored_floor=None,grid_sequence=None,real_planner=False,mode='Автоматичне керування',extra=False,manual_only=False):
         app=HeatingClimate()
         self.created_app=app
         app.control_power_prior=reserve_prior
@@ -21,6 +21,8 @@ class PlannedExecutionTests(unittest.TestCase):
         app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
         if stored_floor is not None:app.memory['floor_observer']=dict(at=at.timestamp()-900,estimate=stored_floor,power_kw=0.)
         app.model=dict(DEFAULT_MODEL,validated=True,version=4)
+        if manual_only:app.memory.update(manual_extra_only=True,owned=True,last_command='heat',command_at=at.timestamp()-60)
+        app.manual_energy_demand=lambda allowed,stamp,power: extra and allowed
         app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
         if weather_age is not None:
             app.weather=[dict(ts=at.timestamp()+i*3600,temperature=11.) for i in range(24)]
@@ -77,6 +79,23 @@ class PlannedExecutionTests(unittest.TestCase):
         self.outage_status=app.published['sensor.heating_outage_schedule']
         return actions,app.published['sensor.heating_controller']
 
+    def test_manual_extra_heat_is_demand_not_a_plan_segment(self):
+        actions,status=self.cycle(planned=False,extra=True)
+        self.assertEqual(actions,['heat'])
+        self.assertTrue(self.created_app.memory['manual_extra_only'])
+        self.assertEqual(self.created_app.memory['planned_heat_segments'],[])
+        self.assertEqual(status['reason'],'Додатковий нагрів')
+    def test_manual_extra_respects_hard_safety(self):
+        for params in ({'grid':'off'},{'room':22},{'overheat':True}):
+            with self.subTest(params=params):
+                self.assertEqual(self.cycle(planned=False,extra=True,**params)[0],['off'])
+    def test_manual_energy_end_does_not_extend_minimum_hold(self):
+        actions,_=self.cycle(planned=False,manual_only=True)
+        self.assertEqual(actions,['off'])
+    def test_manual_energy_end_hands_off_to_plan(self):
+        actions,_=self.cycle(planned=True,manual_only=True)
+        self.assertEqual(actions,['heat'])
+        self.assertFalse(self.created_app.memory.get('manual_extra_only',False))
     def test_midnight_session_runs_at_night_target(self):
         actions,status=self.cycle()
         self.assertEqual(actions,['heat'])

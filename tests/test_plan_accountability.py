@@ -70,6 +70,49 @@ class PlanAccountabilityTests(unittest.TestCase):
         self.assertEqual(app.memory['last_command'],'off')
         self.assertLess(app.attrs['temperature'],app.attrs['current_temperature'])
 
+    def test_manual_only_dispatch_stops_inside_minimum_hold(self):
+        from test_fallback_recovery import FallbackRecoveryTests
+        app=FallbackRecoveryTests().app(hour=0);stamp=app.at.timestamp()
+        app.memory.update(last_command='heat',command_at=stamp-60,manual_extra_only=True)
+        app.decision_context=dict(forecast=dict(heat_segments=[]))
+        with patch('heating_recovery.time.time',return_value=stamp):app.apply_action('off',False)
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertLess(app.attrs['temperature'],app.attrs['current_temperature'])
+        self.assertFalse(app.memory.get('manual_extra_only'))
+
+    def test_manual_start_and_handoff_do_not_cycle_the_physical_thermostat(self):
+        from test_fallback_recovery import FallbackRecoveryTests
+        app=FallbackRecoveryTests().app(hour=19);stamp=app.at.timestamp()
+        app.memory['plan_execution']=dict(plan_id='auto-plan',status='intended')
+        app.decision_context=dict(forecast=dict(heat_segments=[]))
+        app.manual_energy_intent(True,False,'heat')
+        with patch('heating_recovery.time.time',return_value=stamp):app.apply_action('heat',False)
+        self.assertEqual(app.memory['last_command'],'heat')
+        self.assertEqual(app.memory['plan_execution']['status'],'intended')
+        self.assertEqual(app.memory['command_diagnostic']['execution_source'],'manual_extra')
+        command_at=app.memory['command_at'];app.calls.clear()
+        app.decision_context['forecast']['heat_segments']=[dict(start=stamp+60,end=stamp+600)]
+        app.manual_energy_intent(False,True,'heat')
+        with patch('heating_recovery.time.time',return_value=stamp+60):app.apply_action('heat',False)
+        self.assertEqual(app.calls,[])
+        self.assertEqual(app.memory['command_at'],command_at)
+        self.assertFalse(app.memory.get('manual_extra_only'))
+
+    def test_manual_kws_intervals_remain_part_of_real_fact_not_automatic(self):
+        app=HeatingRecovery();app.cfg={'power_accounting_method':'kws'};app.power_source='kws_phases'
+        app.memory={'manual_extra_only':True,'manual_extra_epoch':1,'last_command':'heat'}
+        app.observe_cycle_energy(self.at,self.settings,6000,100.,'on',False)
+        for i in range(1,61):
+            app.observe_cycle_energy(self.at+timedelta(seconds=15*i),self.settings,6000,101.5 if i==60 else 100.,'on',False)
+        entry=next(iter(app.memory['cycle_energy'].values()))
+        self.assertAlmostEqual(entry['observed_kwh'],1.5)
+        self.assertAlmostEqual(entry['manual_extra_kwh'],1.5)
+        self.assertAlmostEqual(entry['other_kwh'],1.5)
+        self.assertEqual(entry['automatic_kwh'],0.)
+        self.assertEqual(entry.get('measured_heat_seconds',0),0)
+        self.assertEqual(entry['manual_extra_seconds'],900)
+        self.assertTrue(entry['manual_extra_seen'])
+
     def test_deficit_names_temperature_limit_and_time_in_same_trajectory(self):
         s=dict(target=21.5,lower=21.,upper=22.)
         rows=[dict(ts=self.at.timestamp()+300,temperature=20.8)]

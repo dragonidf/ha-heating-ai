@@ -71,11 +71,12 @@ class ManualEnergyTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.m.start(6, 100, self.t-1000, self.t, 180, idle_since=self.t-500)
 
-    def test_manual_only_stop_and_allowed_handoff(self):
-        self.assertEqual(self.m.arbitrate(False, True, False), (True, False))
-        self.assertEqual(self.m.arbitrate(False, False, True), (False, True))
-        self.assertEqual(self.m.arbitrate(True, False, True), (True, False))
-        self.assertEqual(self.m.arbitrate(True, True, False), (True, False))
+    def test_long_idle_is_supported_only_with_proven_continuity(self):
+        with self.assertRaises(ValueError):
+            self.m.start(6, 100, self.t-3600, self.t, 180)
+        self.assertEqual(self.m.start(6, 100, self.t-3600, self.t, 180, idle_since=self.t-4000)['target_kwh'], 6)
+        with self.assertRaises(ValueError):
+            self.m.start(6, 100, self.t-3600, self.t, 180, idle_since=self.t-3500)
 
     def test_session_deadline_is_a_safety_limit(self):
         s = self.m.start(6, 100, self.t, self.t, 15)

@@ -4,7 +4,7 @@ from math import isfinite
 
 # Measured reporting cadence is approximately 15 min; leave 5 min grace.
 MAX_RUNNING_REPORT_AGE = 1200
-MAX_IDLE_BASELINE_AGE = 1800
+MAX_IDLE_BASELINE_AGE = 86400
 MAX_ACTIVE_BASELINE_AGE = 30
 
 
@@ -51,7 +51,7 @@ def advance(session, value, at, now):
         return finish(session, 'counter_invalid', now)
     if now >= session['deadline']:
         return finish(session, 'time_limit', now)
-    if at < previous or at == previous and value != session['last_kwh']:
+    if at < previous or at == previous and value != session['last_kwh'] or previous < at < session['started_at']:
         return finish(session, 'counter_order', now)
     anchor = max(previous, session['started_at'])
     if now-max(at, session['started_at']) > MAX_RUNNING_REPORT_AGE or at-anchor > MAX_RUNNING_REPORT_AGE:
@@ -68,9 +68,3 @@ def advance(session, value, at, now):
     if consumed >= session['target_kwh']:
         finish(session, 'target_reached', now)
     return session
-
-
-def arbitrate(planned, manual, ending):
-    """Return effective demand and immediate release of manual-only HEAT."""
-    demand = bool(planned or manual)
-    return demand, bool(ending and not demand)

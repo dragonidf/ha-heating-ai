@@ -187,6 +187,49 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             boot_id="fixture-boot",owner_epoch=1,fenced=False))
         return hass, app
 
+    async def test_manual_energy_native_start_and_stop_use_existing_tick(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.cfg['power_accounting_method']='kws'
+            app.grid_state=lambda:'on'
+            app.async_voltage_status=lambda:{'voltage_qualified':True}
+            app.async_kws_status=lambda:{'ready':True}
+            app.val=lambda key,default=None,**kwargs:180 if key=='session_limit' else default
+            app.tick=Mock()
+            app.async_manual_energy_inputs=lambda:(100.,1000.,900.)
+            with patch.object(component.time,'time',return_value=1000):
+                result=await asyncio.to_thread(app.manual_energy_command,'start',6)
+                self.assertEqual(result['target_kwh'],6)
+                self.assertEqual(result['status'],'active')
+                with self.assertRaisesRegex(ValueError,'already_active'):
+                    await asyncio.to_thread(app.manual_energy_command,'start',7)
+                self.assertEqual(app.tick.call_count,1)
+                result=await asyncio.to_thread(app.manual_energy_command,'stop',None)
+                self.assertEqual((result['status'],result['reason']),('cancelled','user_stop'))
+                await asyncio.to_thread(app.manual_energy_command,'stop',None)
+                self.assertEqual(app.tick.call_count,2)
+                hass.services.async_call.assert_not_called()
+
+    async def test_manual_energy_limit_and_guard_cancel_without_fallback_estimate(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.cfg['power_accounting_method']='kws'
+            app.grid_state=lambda:'on'
+            app.async_kws_status=lambda:{'ready':True}
+            app.async_voltage_status=lambda:{'voltage_qualified':True}
+            app.val=lambda key,default=None,**kwargs:180 if key=='session_limit' else default
+            app.tick=Mock()
+            app.async_manual_energy_inputs=lambda:(100.,1000.,900.)
+            with patch.object(component.time,'time',return_value=1000):
+                await asyncio.to_thread(app.manual_energy_command,'start',6)
+            app.async_manual_energy_inputs=lambda:(101.5,1900.,None)
+            with patch.object(component.time,'time',return_value=1900):
+                self.assertTrue(await asyncio.to_thread(app.manual_energy_demand,True,1900,6000))
+                self.assertEqual(app.manual_energy_snapshot()['consumed_kwh'],1.5)
+                self.assertFalse(await asyncio.to_thread(app.manual_energy_demand,False,1900,6000))
+                self.assertEqual(app.manual_energy_snapshot()['status'],'cancelled')
+                self.assertFalse(await asyncio.to_thread(app.manual_energy_demand,True,1900,6000))
+
     async def test_voltage_trip_bypasses_minimum_on_and_blocks_auto_dispatch(self):
         with package(self.root / "package") as (component, _):
             for voltage in (196, 255):
