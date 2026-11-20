@@ -197,6 +197,8 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(app, "grid_state", return_value="on"), \
                  patch.object(app, "source_temperature", return_value=(21, "Вітальня", 21, 21)), \
                  patch.object(app, "val", return_value=22), \
+                 patch.object(app, "outage_execution_schedule", return_value={"valid": False}), \
+                 patch.object(app, "active_upper", return_value=22), \
                  patch.object(app, "save"), \
                  patch.object(app, "publish"):
                 app._manual_kws_snapshot = lambda: (100.0, 10000., 10000.)
