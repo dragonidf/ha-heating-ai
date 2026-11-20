@@ -1,8 +1,8 @@
 """Authenticated native V1 planner and production-settings dashboard API.
 
 Settings writes are administrator-only, versioned and routed through the
-controller's serialized validation/persistence transaction. No physical command
-or automation target exists here. Large forecast arrays are not stored in Recorder.
+controller's serialized validation/persistence transaction. Manual energy requests
+use the same controller; no direct equipment or automation target exists here.
 """
 from __future__ import annotations
 
@@ -159,6 +159,40 @@ def register(hass):
         snapshot = await hass.async_add_executor_job(controller.native_settings_snapshot)
         connection.send_result(msg["id"], snapshot)
 
+    @websocket_command({
+        "type": "heating_ai_legacy/manual_energy",
+        probatio.Required("entry_id"): str,
+        probatio.Required("version"): [int],
+        probatio.Required("action"): str,
+        probatio.Optional("target_kwh"): int,
+    })
+    @async_response
+    async def manual_energy(hass, connection, msg):
+        if connection.user is None or not connection.user.is_admin:
+            connection.send_error(msg["id"], "forbidden", "Administrator access required")
+            return
+        if msg["version"] != [1, 0]:
+            connection.send_error(msg["id"], "version", "Unsupported manual energy contract")
+            return
+        runtime = hass.data.get(DOMAIN, {}).get(msg["entry_id"])
+        controller = getattr(runtime, "controller", None)
+        if controller is None:
+            connection.send_error(msg["id"], "unavailable", "Production V1 is not loaded")
+            return
+        result = {}
+        def request():
+            result.update(controller.manual_energy_command(msg["action"], msg.get("target_kwh")))
+        try:
+            await controller._dispatch(request)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "manual_energy_rejected", str(exc))
+            return
+        if not result:
+            connection.send_error(msg["id"], "unavailable", "Production V1 is not loaded")
+            return
+        connection.send_result(msg["id"], result)
+
+    websocket_api.async_register_command(hass, manual_energy)
     websocket_api.async_register_command(hass, preview)
     websocket_api.async_register_command(hass, settings_read)
     websocket_api.async_register_command(hass, settings_save)

@@ -911,7 +911,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         if getattr(self,'temperature_quality',{}).get('primary_status','normal')!='normal':row['quality']=False
         row['room_valid']=bool(source=='Вітальня' and primary is not None and
             getattr(self,'temperature_quality',{}).get('primary_status','normal')=='normal')
-        row['execution']='automatic' if self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if power is not None and power>=1.5 else 'idle'
+        row['execution']='manual_extra' if self.memory.get('manual_extra_only') and self.memory.get('last_command')=='heat' else 'automatic' if self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if power is not None and power>=1.5 else 'idle'
         row["power_estimated"]=getattr(self,"fallback_interval",False)
         row['heating_requested']=self.memory.get('last_command')=='heat'
         row['heat_command_at']=self.memory.get('command_at') if row['heating_requested'] else None
@@ -972,7 +972,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 else:self.memory.pop('thermostat_bias_at',None)
         pending=self.memory.setdefault("predictions",[])
         matured=[p for p in pending if p["ts"]<=stamp]
-        if room is not None and source=="Вітальня" and quality and row['grid']=='on' and not row['power_estimated']:
+        if room is not None and source=="Вітальня" and quality and row['grid']=='on' and not row['power_estimated'] and not self.memory.get('manual_extra_only'):
             errors=self.memory.setdefault("hour_errors",[])
             for p in matured:
                 energy=self.val("energy")
@@ -1436,6 +1436,29 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.run_diagnostic('health_publish',self.publish_diagnostic_health)
         finally:
             if hasattr(self,'_tick_read_local'):self._tick_read_local.states=None
+    def manual_energy_demand(self, allowed, stamp, power):
+        """Optional native-only request; AppDaemon has no new actuator path."""
+        return False
+
+    def manual_energy_intent(self, requested, other, action):
+        self._manual_energy_requested=bool(requested and action=='heat')
+        if action=='heat' and (requested or self.memory.get('manual_extra_only')):
+            manual_only=bool(requested and not other)
+            if manual_only and not self.memory.get('manual_extra_only'):
+                # Pending automatic predictions did not assume the extra heat.
+                # Keep physical training samples and already verified results.
+                self.memory['predictions']=[]
+                self.memory['temperature_checks']=[]
+                for prediction in self.memory.get('reserve_predictions', []):
+                    if isinstance(prediction,dict):
+                        prediction['valid']=False
+                        reasons=prediction.get('reasons')
+                        if reasons is None:prediction['reasons']=reasons=[]
+                        if isinstance(reasons,list) and 'manual_extra' not in reasons:reasons.append('manual_extra')
+                self.memory['manual_extra_epoch']=self.memory.get('manual_extra_epoch',0)+1
+            self.memory['manual_extra_only']=manual_only
+        return self._manual_energy_requested and not other
+
     def tick_inner(self):
         now=self.now()
         self.ventilation_tick(now.timestamp())
@@ -1488,7 +1511,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings["morning_min_minutes"] = self.cfg.get("morning_min_minutes",30)
         command_at=number(self.memory.get("command_at"))
         automatic=(self.raw('mode')=='Автоматичне керування' and permitted and
-                   self.memory.get('owned',False) and self.memory.get('last_command')=='heat')
+                   self.memory.get('owned',False) and self.memory.get('last_command')=='heat' and
+                   not self.memory.get('manual_extra_only'))
         settings.update(confirmed_morning(self.memory,now,settings,measured_power,self.val('energy'),grid,
                                          automatic,getattr(self,'power_source','unknown'),
                                          control_reserve=(reserve_active or getattr(self,'power_source','') in ('fallback_inlet_stage','fallback_group_balance')) and power>=500 and
@@ -1682,6 +1706,11 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['actuator']=dict(action=self.memory.get('last_command'),changed_at=command_at or 0.,
             safety_stop=grid!='on' or not permitted or self.raw('mode')!='Автоматичне керування' or
                         room is not None and room>=upper or coast_overheat and not once)
+        manual_extra=self.manual_energy_demand(
+            permitted and self.raw('mode')=='Автоматичне керування' and grid=='on' and
+            quality and valid and self.model.get('validated',False) and not self.memory.get('temporary_fallback') and
+            not outage_now and room<upper and not coast_overheat and
+            self.raw('thermostat') not in ('unknown','unavailable',None),now.timestamp(),measured_power)
         committed_heat=self.minimum_heat_commit(now.timestamp(),grid,outage_now,room,coast_overheat and not once)
         background=getattr(self,'runtime_ready',False) and callable(getattr(self,'submit_to_executor',None))
         ready=None
@@ -1699,15 +1728,17 @@ class HeatingClimate(HeatingRecovery,Hass):
         if time.time()<self.next_compute or background and forecast_quality and valid and ready is None:
             segments=self.memory.get("planned_heat_segments",[])
             demand=any(s["start"] <= now.timestamp() < s["end"] for s in segments)
-            if once or committed_heat:
+            other_demand=demand or once or committed_heat
+            if other_demand or manual_extra:
                 demand=True
             if outage_now or (room is not None and room>=upper) or coast_overheat and not once:
                 demand=False
             action=decide(self.raw("mode"),self.raw("armed")=="on",bool(self.cfg.get("allow_actuation",False)),
                           room,probe_ok,grid,self.raw("thermostat") not in ("unknown","unavailable",None),
                           power is not None,self.model.get("validated",False),demand,valid)
+            manual_only=self.manual_energy_intent(manual_extra,other_demand,action)
             if getattr(self,'decision_context',None):
-                self.decision_context.update(planned_demand=bool(any(s['start']<=now.timestamp()<s['end'] for s in segments)),
+                self.decision_context.update(manual_extra_demand=manual_extra,planned_demand=bool(any(s['start']<=now.timestamp()<s['end'] for s in segments)),
                     coast_peak=peak,coast_upper_peak=upper_peak,coast_overheat=coast_overheat and not once,
                     demand=demand,action=action,
                     reason='Немає мережі' if grid=='off' else 'Стан мережі не підтверджено' if grid=='unknown' else
@@ -1723,6 +1754,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                     'Планове відключення' if outage_now else
                     'Недостатньо актуальних вимірювань' if not quality else
                     'Мінімальний сеанс — утримуємо 10 хв' if committed_heat and demand else
+                    'Додатковий нагрів' if manual_only else
                     'Заплановано нагрів' if demand else 'Очікування за поточним планом')
             self.publish_control_decision(action,reason,demand,thermostat,**control_attrs,
                 minimum_heat_commit=committed_heat)
@@ -1812,7 +1844,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          power_prior_kw=3.,power_estimate_provisional=True,
                          actual_session_kwh=self.actual_session_energy(),session_energy_estimated=self.cfg.get('power_accounting_method')=='inlet')
             one_hour=next((r for r in forecast["curve"] if r["ts"]>=time.time()+3500),None)
-            if one_hour:
+            if one_hour and not manual_extra and not self.memory.get('manual_extra_only'):
                 expected_energy=sum(r["kwh"] for r in forecast["curve"][:2])
                 self.memory.setdefault("predictions",[]).append({**one_hour,"version":self.model["version"],
                     "start_energy":self.val("energy"),"expected_energy":expected_energy})
@@ -1846,9 +1878,12 @@ class HeatingClimate(HeatingRecovery,Hass):
             demand=False
         if committed_heat and not outage_now:
             demand=True
+        other_demand=demand
+        demand=demand or manual_extra
         action=decide(self.raw("mode"),self.raw("armed")=="on",bool(self.cfg.get("allow_actuation",False)),
                       room,probe_ok,grid,self.raw("thermostat") not in ("unknown","unavailable",None),
                       power is not None,self.model.get("validated",False),demand,valid)
+        manual_only=self.manual_energy_intent(manual_extra,other_demand,action)
         reserve=(forecast or {}).get('morning_reserve') or {}
         reason=("Немає мережі" if grid=="off" else "Стан мережі не підтверджено" if grid=="unknown" else
                 "Некоректні межі температури або часу" if not valid else
@@ -1861,6 +1896,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 'Запас до наступного вікна умовний: недостатньо перевірених даних' if not demand and reserve.get('reserve_sufficient') is None and reserve else
                 "Нагрів не потрібен / запас тепла" if peak is not None and peak>=target and room>=lower and not demand else
                 "Одноразовий нагрів після повернення мережі" if once else
+                "Додатковий нагрів" if manual_only else
                 "Заплановано нагрів" if demand else "Накопиченого тепла достатньо / очікування вікна")
         self.publish("sensor.heating_temperature",room if room is not None else "unavailable",
                      friendly_name="Клімат — температура керування",unit_of_measurement="°C",
@@ -1873,7 +1909,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      room_source_check=room_check['status'])
         if forecast:self.memory['plan_execution'].update(
             status='advisory' if action in ('observe','release') else 'fallback' if action=='fallback' else 'intended',
-            intended_action=action)
+            intended_action='off' if manual_only else action)
         self.publish_control_decision(action,reason,demand,thermostat,**control_attrs,
                      outage_preheat=preheat,outage_shifted=bool(forecast and forecast["outage_shifted"]),
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,
@@ -1899,7 +1935,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory["demand"]=demand
         self.decision_context=dict(settings=settings,forecast=forecast,action=action,reason=reason,
             coast_overheat=coast_overheat and not once,
-            planned_demand=planned_heat,demand=demand,coast_peak=peak,coast_upper_peak=upper_peak,
+            planned_demand=planned_heat,manual_extra_demand=manual_extra,demand=demand,coast_peak=peak,coast_upper_peak=upper_peak,
             measurements=dict(room=room,raw_return=probe,estimated_floor=floor,outside=outside,fire=fire,
                               external_gain=((settings.get('environment') or {}).get('solar') or {}).get('observed_gain')),
             previous_reserve=(previous_reference or {}).get('morning_reserve'),

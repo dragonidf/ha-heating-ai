@@ -304,8 +304,21 @@ export class HeatingAIPanel extends HTMLElement {
       }
     } catch { this.helpersPromise=null;for(const slot of slots)if(slot.isConnected)slot.textContent='Не вдалося завантажити графік Home Assistant. Оновіть сторінку.'; }
   }
+  async requestManualEnergy(action) {
+    if(this.manualPending||!this.config?.entry_id||!this.hass?.callWS)return;
+    this.manualPending=true;this.manualMessage='';this.render();
+    try {
+      const payload={type:'heating_ai_legacy/manual_energy',entry_id:this.config.entry_id,version:[1,0],action};
+      if(action==='start')payload.target_kwh=this.manualTarget??6;
+      const result=await this.hass.callWS(payload);
+      if(result?.reason)this.manualMessage=this.manualEnergyReason(result.reason);
+    } catch(error) {
+      this.manualMessage=this.manualEnergyReason(error?.message)||'Запит не підтверджено. Перевірте стан контролера.';
+    } finally {this.manualPending=false;this.render();}
+  }
   async clicked(e) {
-    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo]'); if(!el)return;
+    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo],[data-manual-energy]'); if(!el)return;
+    if(el.dataset.manualEnergy){if(el.disabled)return;const a=el.dataset.manualEnergy;if(a==='minus'||a==='plus'){this.manualTarget=Math.min(9,Math.max(1,(this.manualTarget??6)+(a==='plus'?1:-1)));this.render();}else await this.requestManualEnergy(a);return;}
     if(el.hasAttribute('data-system-help')){this.systemHelp=el.dataset.systemHelp;this.render();return;}
     if(el.hasAttribute('data-system-close')){this.closeSystemHelp();return;}
     if(el.hasAttribute('data-system-save')){await this.saveSystemSettings();return;}

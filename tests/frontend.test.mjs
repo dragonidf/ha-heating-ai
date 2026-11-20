@@ -520,3 +520,21 @@ test('forecast preserves a distinct residual-fireplace lane without duplicating 
   const chart=p.forecastChart();assert.match(chart,/data-forecast-lane="fireplace"/);
   assert.match(chart,/оцінка залишкового тепла/);assert.doesNotMatch(chart,/class="legend"/);
 });
+
+test('manual energy controls are bounded and preserve the plan UI',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={entry_id:'native'};
+  const data={manual_energy:{supported:true,status:'idle'},grid_status:{raw:'on'},system_settings:{values:{boiler_power_mode:'fixed_6'}}};
+  p.attrs=k=>data[k]||{};p.state=k=>({permitted:'on',mode:'Автоматичне керування',power_confirmed:'0'})[k];
+  assert.match(p.manualEnergyControl(),/6 кВт·год/);assert.match(p.manualEnergyControl(),/Увімкнути зараз/);
+  p.manualTarget=1;assert.match(p.manualEnergyControl(),/data-manual-energy="minus"[^>]*disabled/);
+  data.manual_energy={supported:true,status:'active',target_kwh:6,consumed_kwh:2.4,heating:true};
+  assert.match(p.manualEnergyControl(),/Зупинити/);assert.match(p.manualEnergyControl(),/value="2.4"/);
+  assert.doesNotMatch(p.manualEnergyControl(),/Увімкнути зараз/);
+  data.manual_energy={supported:false};assert.equal(p.manualEnergyControl(),'');
+});
+test('manual energy start and stop route only to the native controller API',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.config={entry_id:'native'};p.manualTarget=7;p.render=()=>{};
+  const requests=[];p._hass={callWS:async payload=>{requests.push(payload);return {status:'active'};}};
+  await p.requestManualEnergy('start');await p.requestManualEnergy('stop');
+  assert.deepEqual(requests,[{type:'heating_ai_legacy/manual_energy',entry_id:'native',version:[1,0],action:'start',target_kwh:7},{type:'heating_ai_legacy/manual_energy',entry_id:'native',version:[1,0],action:'stop'}]);
+});

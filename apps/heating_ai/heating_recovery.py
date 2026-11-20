@@ -42,6 +42,7 @@ def cycle_quality_summary(entry,stamp):
     energy_basis='kws_counter_delta' if entry.get('energy_basis')=='kws_counter_delta' else 'calculated_meter_balance'
     error=known-expected if known is not None and expected is not None else None
     reported_error=error if entry.get('complete') or error is not None and error>0 else None
+    manual_seen=bool(entry.get('manual_extra_seen'))
     thermal=entry.get('thermal_quality') or {}
     observed=max(0.,min(stamp,entry['end'])-entry['start'])
     sessions=entry.get('initial_sessions');execution=entry.get('execution_quality')
@@ -63,7 +64,8 @@ def cycle_quality_summary(entry,stamp):
                           else 'balance_without_independent_boiler_meter'),
         unknown_seconds=entry.get('unknown_seconds'),automatic_kwh=entry.get('automatic_kwh'),
         other_kwh=entry.get('other_kwh'),transition_kwh=entry.get('transition_kwh'),
-        attribution='Причина не встановлена' if error is not None and error>0 else 'Перевищення не підтверджено',
+        attribution='Додатковий ручний нагрів; відхилення не є оцінкою автоматики' if manual_seen else 'Причина не встановлена' if error is not None and error>0 else 'Перевищення не підтверджено',
+        manual_extra_seen=manual_seen,manual_extra_kwh=entry.get('manual_extra_kwh',0.),automatic_assessment_eligible=not manual_seen,
         comfort_violation_minutes=thermal.get('violation_minutes'),comfort_degree_hours=thermal.get('degree_hours'),
         overheat_minutes=thermal.get('overheat_minutes'),overheat_degree_hours=thermal.get('overheat_degree_hours'),
         sensor_coverage=round(thermal.get('known_seconds',0)/observed,4) if observed and thermal else None,
@@ -486,6 +488,7 @@ class HeatingRecovery:
                 parent_plan_id=forecast.get('parent_plan_id'),cycle_id=reserve.get('cycle_id'),
                 reason=reason or context.get('reason') or event,
                 action=action or context.get('action'),planned_demand=context.get('planned_demand'),
+                manual_extra_demand=context.get('manual_extra_demand',False),
                 demand=context.get('demand'),inhibitions=context.get('inhibitions',[]),
                 mode=mode,armed=armed,permitted=bool(self.cfg.get('allow_actuation')) and armed,
                 grid=self.grid_state(),grid_evidence='existing inverter connection, input voltage and heartbeat guards',
@@ -498,7 +501,7 @@ class HeatingRecovery:
                 power_quality=getattr(self,'power_quality','unknown'),
                 source_timestamp=sources.get('power_balance',{}).get('reported_at'),
                 physical_heating=actual is not None and actual>=1500,
-                execution='automatic' if mode=='Автоматичне керування' and armed and self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if actual is not None and actual>=1500 else 'idle',
+                execution='manual_extra' if self.memory.get('manual_extra_only') and self.memory.get('last_command')=='heat' else 'automatic' if mode=='Автоматичне керування' and armed and self.memory.get('owned') and self.memory.get('last_command')=='heat' else 'manual_or_native' if actual is not None and actual>=1500 else 'idle',
                 measurements=context.get('measurements',{}),sources=sources,
                 policy={k:settings.get(k) for k in ('target','lower','upper','night_target','night_lower','night_upper','sleep_start','sleep_end','start','end','strategy','morning_min_minutes')},
                 reserve=reserve,coast_peak=context.get('coast_peak'),cycle_energy=forecast.get('cycle_energy'),
@@ -598,6 +601,7 @@ class HeatingRecovery:
                 ('control_mode_changed' if self.raw('mode')!='Автоматичне керування' or self.raw('armed')!='on' or self.memory.get('temporary_fallback') else
                  'model_changed' if prediction['model']!=self.model else
                  'equipment_changed' if prediction.get('equipment_version',0)!=self.memory.get('equipment_version',0) else
+                 'manual_extra' if self.memory.get('manual_extra_only') else
                  'execution_changed' if planned!=(requested if requested is not None else actual) else None))
             if reason:
                 prediction['valid']=False
@@ -645,7 +649,7 @@ class HeatingRecovery:
                 power_error=(actual_energy/actual_hours-expected/planned_hours if actual_energy is not None and
                     actual_hours and planned_hours and 'control_mode_changed' not in reasons else None)
                 results.append(dict(common,kind='frozen_plan',error=prediction['temperature']-room,
-                    valid=source_ok and prediction.get('timeline_valid',True),reserve_eligible=prediction['valid'] and matched,
+                    valid=source_ok and prediction.get('timeline_valid',True) and 'manual_extra' not in reasons,reserve_eligible=prediction['valid'] and matched,
                     planned_kwh=expected,actual_kwh=actual_energy,
                     energy_error_kwh=actual_energy-expected if actual_energy is not None else None,
                     planned_request_minutes=planned_hours*60,actual_request_minutes=actual_hours*60 if actual_hours is not None else None,
@@ -664,7 +668,7 @@ class HeatingRecovery:
         results[:]=[r for r in results[-720:] if r['at']>stamp-30*86400]
         if forecast is not None and not isinstance(forecast,dict):
             self.reject_validation('invalid_validation_forecast',forecast,stamp);return
-        if forecast and stamp-(self.memory.get('reserve_validation_at') or 0)>=3600:
+        if forecast and not self.memory.get('manual_extra_only') and stamp-(self.memory.get('reserve_validation_at') or 0)>=3600:
             self.memory['reserve_validation_at']=stamp
             rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
             if (not isinstance(rows,list) or any(not isinstance(r,dict) or number(r.get('ts')) is None or
@@ -749,7 +753,7 @@ class HeatingRecovery:
                     rejected=self.memory.setdefault('forecast_validation_rejections',{})
                     rejected[reason]=rejected.get(reason,0)+1
                 self.memory.pop('peak_watch',None)
-        if previous and previous['request']=='heat' and requested=='off' and quality and power==0:
+        if previous and not previous.get('manual_extra') and previous['request']=='heat' and requested=='off' and quality and power==0:
             peak=number(getattr(self,'decision_context',{}).get('coast_peak'))
             if peak is not None:
                 self.memory['peak_watch']=dict(start=stamp,end=stamp+3*3600,last_at=stamp,maximum=room,
@@ -757,7 +761,7 @@ class HeatingRecovery:
                     room_source_disagreement=(self.memory.get('room_source_check') or {}).get('status')=='room_source_disagreement',
                     room_sources_suspect=(self.memory.get('room_source_check') or {}).get('status')=='pending',
                     model_version=self.model.get('version'))
-        self.memory['peak_observation']=dict(at=stamp,request=requested)
+        self.memory['peak_observation']=dict(at=stamp,request=requested,manual_extra=bool(self.memory.get('manual_extra_only')))
 
     def observe_cycle_energy(self,now,settings,power,energy,grid,automatic,temperature=None,temperature_valid=False):
         cycle=heating_cycle(now,settings)
@@ -766,7 +770,9 @@ class HeatingRecovery:
         previous=self.memory.get('cycle_energy_observation')
         kws=getattr(self,'cfg',{}).get('power_accounting_method')=='kws'
         counter_previous=self.memory.get('kws_cycle_counter') if kws else previous
+        manual_extra=bool(self.memory.get('manual_extra_only') and self.memory.get('last_command')=='heat')
         current=dict(at=stamp,energy=energy,cycle=cycle,automatic=automatic,grid=grid,power=power,
+            manual_extra=manual_extra,manual_extra_epoch=self.memory.get('manual_extra_epoch',0),
             calculated=power is not None and grid in ('on','off') and getattr(self,'power_source','') in ('fallback_inlet_stage','fallback_group_balance'),
             temperature=temperature,temperature_valid=temperature_valid,
             known=power is not None and grid in ('on','off') and
@@ -777,6 +783,9 @@ class HeatingRecovery:
             key=c['cycle_id']+'@'+str(c['cycle_start'])
             entry=ledger.setdefault(key,dict(start=c['cycle_start'],end=c['cycle_end'],observed_kwh=0.,
                 automatic_kwh=0.,other_kwh=0.,transition_kwh=0.,unknown_seconds=0.,complete=stamp<=c['cycle_start']))
+            if manual_extra or previous and (previous.get('manual_extra') or
+                    previous.get('manual_extra_epoch',0)!=current['manual_extra_epoch']):
+                entry['manual_extra_seen']=True
             if stamp==c['cycle_start'] and number(energy) is not None:
                 entry.setdefault('counter_start',energy)
             if not previous:
@@ -810,10 +819,12 @@ class HeatingRecovery:
             if b>a and 0<seconds<=45 and previous['automatic'] and automatic:
                 entry['requested_seconds']=entry.get('requested_seconds',0.)+b-a
             if b>a and 0<seconds<=45 and previous['known'] and current['known']:
-                if power>=1500 and 'first_confirmed_heat_at' not in entry:
+                if (manual_extra and previous.get('manual_extra') and previous['power']>=1500 and power>=1500):
+                    entry['manual_extra_seconds']=entry.get('manual_extra_seconds',0.)+b-a
+                if not manual_extra and not previous.get('manual_extra') and power>=1500 and 'first_confirmed_heat_at' not in entry:
                     entry['first_confirmed_heat_at']=stamp if previous['power']<1500 else a
                     entry['first_heat_edge_known']=previous['power']<1500
-                if previous['power']>=1500 and power>=1500:entry['measured_heat_seconds']=entry.get('measured_heat_seconds',0.)+b-a
+                if not manual_extra and not previous.get('manual_extra') and previous['power']>=1500 and power>=1500:entry['measured_heat_seconds']=entry.get('measured_heat_seconds',0.)+b-a
                 entry['execution_quality']=dict(requested_minutes=round(entry.get('requested_seconds',0)/60,2),
                     confirmed_heating_minutes=round(entry.get('measured_heat_seconds',0)/60,2),
                     timing_resolution_seconds=45,unknown_seconds=entry['unknown_seconds'])
@@ -839,7 +850,10 @@ class HeatingRecovery:
                 entry.pop('counter_start',None);entry.pop('meter_kwh',None);entry['counter_reset']=True
             if counter_ok and (kws or previous['known'] and current['known']):
                 kwh=(after-before)*(b-a)/seconds;entry['observed_kwh']+=kwh
-                kind=('transition' if kws and seconds>45 else 'automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
+                manual_interval=(manual_extra and previous.get('manual_extra') and
+                    previous.get('manual_extra_epoch')==current['manual_extra_epoch'])
+                if manual_interval:entry['manual_extra_kwh']=entry.get('manual_extra_kwh',0.)+kwh
+                kind='other' if manual_interval else ('transition' if kws and seconds>45 else 'automatic' if previous['automatic'] and automatic else 'other' if not previous['automatic'] and not automatic else 'transition')
                 entry[kind+'_kwh']+=kwh
             elif counter_ok and previous.get('calculated') and current.get('calculated'):
                 kwh=(after-before)*(b-a)/seconds
@@ -1012,7 +1026,7 @@ class HeatingRecovery:
                         plan_id=issued['plan_id'],model_version=issued['model_version']),stamp=issued_at)
                     candidates.append(dict(at=issued_at,snapshot_id=digest))
                 else:candidates.append(issued)
-                if issued_at-self.memory.get('temperature_validation_issued_at',0)>=3600:
+                if not self.memory.get('manual_extra_only') and issued_at-self.memory.get('temperature_validation_issued_at',0)>=3600:
                     self.memory['temperature_validation_issued_at']=issued_at
                     source=dict(at=issued_at,snapshot_id=digest) if journal else copy.deepcopy(issued)
                     for horizon in (1,3,6,12,24,36,48):
@@ -1077,7 +1091,7 @@ class HeatingRecovery:
             protocol=2,request_id=request_id,selected=selected,comparison=summary,
             periods=[dict(cycle_id=k,started_at=history[k]['started_at'],has_forecast=bool(history[k].get('forecast'))) for k in keys],
             energy_cycles=[{**{field:v.get(field) for field in ('start','end','initial_plan','baseline','last_prestart',
-                'latest_plan','energy_basis','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh')},
+                'latest_plan','energy_basis','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh','complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh','manual_extra_kwh','manual_extra_seen')},
                 'cycle_id':k} for k,v in sorted(energy.items(),
                 key=lambda pair:pair[1]['start'],reverse=True)[:3]])))
 
@@ -1142,7 +1156,7 @@ class HeatingRecovery:
             energy=history.pop('__energy_cycles',{})
             result=self.decision_journal.temperature_comparison(start,end,history)
             fields=('start','end','initial_plan','baseline','last_prestart','latest_plan','energy_basis','observed_kwh','calculated_kwh','calculated_seconds','calculated_automatic_kwh','calculated_other_kwh','calculated_transition_kwh','meter_kwh',
-                'complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh','quality_report','overrun_review','plan_reviews')
+                'complete','unknown_seconds','automatic_kwh','other_kwh','transition_kwh','manual_extra_kwh','manual_extra_seen','quality_report','overrun_review','plan_reviews')
             result['energy_cycles']=[dict(cycle_id=k,**{f:v[f] for f in fields if f in v}) for k,v in energy.items()
                 if v['end']>start and v['start']<end]
         except Exception:
@@ -1288,7 +1302,7 @@ class HeatingRecovery:
     def minimum_heat_commit(self,stamp,grid,scheduled_off,room,coast_overheat=False):
         """Keep a requested heat cycle for 10 minutes unless a hard veto occurs."""
         started=number(self.memory.get('command_at'))
-        if (not self.memory.get('owned') or self.memory.get('last_command')!='heat' or
+        if (self.memory.get('manual_extra_only') or not self.memory.get('owned') or self.memory.get('last_command')!='heat' or
                 started is None or not 0<=stamp-started<600 or grid!='on' or
                 scheduled_off or room is None or room>=self.active_upper() or coast_overheat or
                 self.raw('armed')!='on' or self.raw('mode')!='Автоматичне керування'):
@@ -1339,13 +1353,15 @@ class HeatingRecovery:
         plan_forecast=(getattr(self,'decision_context',None) or {}).get('forecast')
         committed=self.minimum_heat_commit(time.time(),grid,scheduled_off,room,
             (getattr(self,'decision_context',None) or {}).get('coast_overheat',False))
-        if action=='heat' and not once and isinstance(plan_forecast,dict) and 'heat_segments' in plan_forecast:
+        manual_request=getattr(self,'_manual_energy_requested',False)
+        manual_only=bool(self.memory.get('manual_extra_only'))
+        if action=='heat' and not once and not manual_request and isinstance(plan_forecast,dict) and 'heat_segments' in plan_forecast:
             if not committed and not any(s['start']<=time.time()<s['end'] for s in plan_forecast['heat_segments']):action='off'
         outside_window=(action=='off' and not once and
             self.raw('strategy')=='Тільки в дозволені години' and not
             in_window(self.now(),self.raw('start') or '23:00',self.raw('end') or '07:00'))
         urgent=release or action=="fallback" or (action=="off" and (
-            scheduled_off or grid!='on' or room is None or room>=self.active_upper() or
+            manual_only or scheduled_off or grid!='on' or room is None or room>=self.active_upper() or
             (getattr(self,'decision_context',None) or {}).get('coast_overheat',False) or
             (not once and outside_window and not committed)))
         action=held_action(last,self.memory.get('command_at',0),time.time(),action,urgent)
@@ -1401,12 +1417,13 @@ class HeatingRecovery:
             if time.time()-fallback.get('last_attempt_at',0)<30:
                 return
         command=self.memory.get('command_diagnostic') or {}
-        plan=self.memory.get('plan_execution') or {}
+        plan={} if manual_only else self.memory.get('plan_execution') or {}
         new_plan=(command.get('plan_id'),command.get('plan_calculated_at'))!=(plan.get('plan_id'),plan.get('calculated_at'))
         if new_plan or (command.get('action'),command.get('requested_mode'),command.get('requested_setpoint'))!=(action,mode,target):
             command=dict(requested_at=time.time(),requested_action=requested_action,action=action,
                 requested_mode=mode,requested_setpoint=target,status='requested',
                 plan_id=plan.get('plan_id'),plan_calculated_at=plan.get('calculated_at'))
+            if manual_only:command['execution_source']='manual_extra'
             self.memory['command_diagnostic']=command
         self.memory["expected_mode"]=mode
         self.memory["expected_setpoint"]=target
@@ -1473,6 +1490,7 @@ class HeatingRecovery:
             if action=="heat":
                 self.run_in(self.verify_boiler_response,180)
         self.memory.update(owned=not release,last_command=action)
+        if action!='heat' and not manual_request:self.memory.pop('manual_extra_only',None)
         if not changed and not release and command.get('status')=='requested':
             self.memory['command_generation']=self.memory.get('command_generation',0)+1
             self.verify_command(dict(expected=mode,target=target,generation=self.memory['command_generation']))
@@ -1490,7 +1508,7 @@ class HeatingRecovery:
         command.update(status='confirmed' if accepted else 'not_confirmed',confirmed_at=time.time(),
                        accepted_mode=self.raw('thermostat'),accepted_setpoint=confirmed)
         plan=self.memory.get('plan_execution') or {}
-        if (plan and (command.get('plan_id'),command.get('plan_calculated_at'))==
+        if (plan and command.get('execution_source')!='manual_extra' and (command.get('plan_id'),command.get('plan_calculated_at'))==
                 (plan.get('plan_id'),plan.get('calculated_at'))):
             plan.update(status='applied' if accepted and expected=='heat' else 'confirmed_fallback' if accepted else 'unconfirmed',
                 confirmed_at=time.time())

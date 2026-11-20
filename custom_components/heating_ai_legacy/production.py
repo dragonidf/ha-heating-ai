@@ -28,6 +28,7 @@ from .production_migration import load_installation
 from .const import DOMAIN, SOURCE_HINTS
 from .critical_ledger import CriticalLedger, LedgerConflict, FILENAME
 from .kws_readiness import KWSReadiness
+from . import manual_energy
 
 
 def source_writer_active(hass, now=None):
@@ -60,6 +61,8 @@ class NativeController(HeatingClimate):
         self._recovery_attempts = 0
         self._recovery_next_at = 0
         self._fence_recovery_attempted = False
+        self._manual_session = {}
+        self._manual_energy_published = None
 
     def attach_command_ledger(self, ledger, status):
         self.command_ledger = ledger
@@ -84,7 +87,142 @@ class NativeController(HeatingClimate):
             self._reconcile_writer_fence()
         except Exception as exc:
             self.record_failure("ledger_recovery", exc)
-        return super().tick(kwargs, **extra)
+        try:
+            return super().tick(kwargs, **extra)
+        finally:
+            self._manual_energy_requested = False
+            if self.memory.get('temporary_fallback'):
+                self._cancel_manual_energy('safety_blocked')
+            self._publish_manual_energy()
+
+    @callback
+    def async_manual_energy_inputs(self):
+        """Read the raw meter, never the recovered/estimated energy total."""
+        row = self.hass.states.get('sensor.energy_meter_kotel_energiia')
+        if row is None or row.attributes.get('unit_of_measurement') != 'kWh':
+            return None, None, None
+        value, at = number(row.state), row.last_reported.timestamp()
+        # Power evidence is collected by the existing tick (including KWS
+        # voltage-supported zero readings). Very small standby watts are not HEAT.
+        idle_since = getattr(self, '_manual_idle_since', None)
+        if idle_since is not None:
+            watts = 0.
+            for phase in 'abc':
+                row = self.hass.states.get('sensor.energy_meter_kotel_potuzhnist_'+phase)
+                voltage = self.hass.states.get('sensor.energy_meter_kotel_napruga_'+phase)
+                kw = number(row.state) if row is not None else None
+                if (kw is None or kw < 0 or row.attributes.get('unit_of_measurement') != 'kW' or
+                        not (-5 <= time.time()-row.last_reported.timestamp() <= 180 or
+                             kw == 0 and voltage is not None and number(voltage.state) is not None and
+                             -5 <= time.time()-voltage.last_reported.timestamp() <= 180)):
+                    idle_since = None
+                    break
+                watts += kw*1000
+            if watts>10:idle_since = None
+        return value, at, idle_since
+
+    def _observe_manual_idle(self, stamp, power):
+        if (self.cfg.get('power_accounting_method') != 'kws' or not self.memory.get('owned') or
+                self.memory.get('last_command') != 'off' or power is None or not 0 <= power <= 10 or
+                self.grid_state() != 'on' or getattr(self, 'power_source', '') not in ('kws_phases', 'fallback_kws_zero')):
+            self._manual_idle_since = None
+            return
+        prior = getattr(self, '_manual_idle_observed', None)
+        if not getattr(self, '_manual_idle_since', None) or prior is None or not 0 <= stamp-prior <= 45:
+            # Recover idle continuity from the bounded physical telemetry on
+            # reload only; never reconstruct a missing or heating interval.
+            since = stamp
+            command = number(self.memory.get('command_at')) or stamp
+            for sample in reversed(getattr(self, 'samples', [])):
+                at, kw = number(sample.get('ts')), number(sample.get('power'))
+                if (at is None or at < command or not 0 <= since-at <= 420 or
+                        kw is None or not 0 <= kw <= .01 or sample.get('grid') != 'on' or
+                        sample.get('power_source') not in ('kws_phases', 'fallback_kws_zero')):
+                    break
+                since = at
+            self._manual_idle_since = max(command, since)
+        self._manual_idle_observed = stamp
+
+    def manual_energy_snapshot(self):
+        session = self._manual_session
+        active = session.get('status') == 'active'
+        observation = getattr(self, 'power_observation', {})
+        heating = (active and self.memory.get('last_command') == 'heat' and
+                   observation.get('quality') == 'measured' and
+                   0 <= time.time()-observation.get('at', 0) <= 180 and
+                   (observation.get('watts') or 0) >= 500)
+        return {**session, 'status': session.get('status', 'idle'),
+                'heating': bool(heating), 'supported': self.cfg.get('power_accounting_method') == 'kws'}
+
+    def _publish_manual_energy(self):
+        snapshot = self.manual_energy_snapshot()
+        if snapshot != self._manual_energy_published:
+            self.publish('sensor.heating_manual_energy', snapshot['status'], **snapshot)
+            self._manual_energy_published = snapshot
+
+    def _cancel_manual_energy(self, reason):
+        if self._manual_session.get('status') == 'active':
+            manual_energy.finish(self._manual_session, reason, time.time())
+            self._publish_manual_energy()
+
+    def manual_energy_command(self, action, target=None):
+        """Called only in the existing serialized controller callback."""
+        if not self._running or not self._writer:
+            raise ValueError('unavailable')
+        if action == 'stop':
+            if self._manual_session.get('status') == 'active':
+                now = time.time()
+                value, at, _ = self._on_loop(self.async_manual_energy_inputs)
+                manual_energy.advance(self._manual_session, value, at, now)
+                self._cancel_manual_energy('user_stop')
+                self.tick()
+            return self.manual_energy_snapshot()
+        if action != 'start':
+            raise ValueError('invalid_action')
+        if self._manual_session.get('status') == 'active':
+            raise ValueError('already_active')
+        if self.cfg.get('power_accounting_method') != 'kws':
+            raise ValueError('kws_required')
+        permissions = self._on_loop(self.async_manual_snapshot)
+        if (not self.cfg.get('allow_actuation') or permissions['armed'] != 'on' or
+                permissions['mode'] != 'Автоматичне керування' or self.grid_state() != 'on' or
+                not self._on_loop(self.async_voltage_status)['voltage_qualified'] or
+                not self._on_loop(self.async_kws_status)['ready'] or
+                (self.command_ledger_status or {}).get('fenced', True)):
+            raise ValueError('safety_blocked')
+        now = time.time()
+        command_at = number(self.memory.get('command_at'))
+        if self.memory.get('last_command') == 'off' and command_at is not None and now-command_at < 900:
+            raise ValueError('minimum_off')
+        value, at, idle_since = self._on_loop(self.async_manual_energy_inputs)
+        if (not self.memory.get('owned') or self.memory.get('last_command') != 'off' or
+                not 0 <= now-getattr(self, '_manual_idle_observed', 0) <= 45):
+            idle_since = None
+        self._manual_session = manual_energy.start(target, value, at, time.time(),
+            self.val('session_limit', 180), idle_since)
+        # No wait for a forecast job. The regular tick arbitrates all demand.
+        self.tick()
+        self._publish_manual_energy()
+        return self.manual_energy_snapshot()
+
+    def manual_energy_demand(self, allowed, stamp, power):
+        self._observe_manual_idle(stamp, power)
+        session = self._manual_session
+        if session.get('status') != 'active':
+            return False
+        if (not allowed or not self._writer or self.cfg.get('power_accounting_method') != 'kws' or
+                not self._on_loop(self.async_kws_status)['ready'] or
+                not self._on_loop(self.async_voltage_status)['voltage_qualified'] or
+                (self.command_ledger_status or {}).get('fenced', True)):
+            self._cancel_manual_energy('safety_blocked')
+            return False
+        value, at, _ = self._on_loop(self.async_manual_energy_inputs)
+        manual_energy.advance(session, value, at, time.time())
+        return session['status'] == 'active'
+
+    def manual_meter_changed(self, *args):
+        if self._manual_session.get('status') == 'active':
+            self.tick()
 
     def listen_event(self, function, event_name, **kwargs):
         # Production settings are accepted only through the authenticated
@@ -145,6 +283,8 @@ class NativeController(HeatingClimate):
         for entity in self.args["voltage_entities"]:
             self.listen_state(self.voltage_changed, entity, attribute="all")
         self.listen_state(self.voltage_changed, self.args["grid_presence_helper"])
+        self.listen_state(self.manual_meter_changed, 'sensor.energy_meter_kotel_energiia')
+        self._publish_manual_energy()
         # Recovery is attempted from the existing periodic control tick only.
 
     @callback
@@ -221,7 +361,9 @@ class NativeController(HeatingClimate):
         self.save()
 
     def manual_intent_changed(self, *args):
-        self._remember_manual_snapshot()
+        snapshot = self._remember_manual_snapshot()
+        if snapshot['armed'] != 'on' or snapshot['mode'] != 'Автоматичне керування':
+            self._cancel_manual_energy('safety_blocked')
         self.next_compute = 0
         self.save()
         self._reconcile_writer_fence()
@@ -709,6 +851,7 @@ class NativeController(HeatingClimate):
                 self.next_compute = 0
                 self.save()
             return False
+        self._cancel_manual_energy("voltage")
         active = (self.cfg.get("allow_actuation") and self.raw("armed") == "on"
                   and self.raw("mode") in ("Автоматичне керування", "Штатний auto"))
         if not active:
@@ -766,6 +909,7 @@ class NativeController(HeatingClimate):
         fenced = (self.command_ledger_status or {}).get("fenced", True)
         automatic_fence = (fenced and self.raw("mode") == "Автоматичне керування" and self.raw("armed") == "on")
         if automatic_fence or not equipment["ready"] or (fenced and action in ("heat", "fallback")):
+            self._cancel_manual_energy("safety_blocked")
             reason = "Журнал команд: очікується підтверджене вимкнення" if fenced else equipment.get("reason_text", equipment["reason"])
             self.publish("sensor.heating_controller", "Нагрів заблоковано",
                          reason=reason, control_state="blocked", equipment_readiness=equipment,

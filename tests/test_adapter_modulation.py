@@ -48,6 +48,17 @@ class AdapterModulationTests(unittest.TestCase):
         with patch('heating_climate.time.time',return_value=at.timestamp()):
             app.tick_inner()
         return actions
+    def test_manual_extra_starts_without_waiting_for_forecast(self):
+        at=datetime(2026,10,13,6,30,tzinfo=ZoneInfo('Europe/Kiev'))
+        def setup(app):
+            app.manual_energy_demand=lambda allowed,stamp,power: allowed
+        self.assertEqual(self.fast_tick(at,[],before_tick=setup),['heat'])
+    def test_manual_extra_stop_releases_only_manual_hold(self):
+        at=datetime(2026,10,13,6,30,tzinfo=ZoneInfo('Europe/Kiev'))
+        def setup(app):
+            app.memory.update(manual_extra_only=True,owned=True,last_command='heat',command_at=at.timestamp()-60)
+        self.assertEqual(self.fast_tick(at,[],before_tick=setup),['off'])
+        self.assertEqual(self.fast_tick(at,[dict(start=at.timestamp(),end=at.timestamp()+60)],before_tick=setup),['heat'])
     def test_expired_session_stops_even_without_outage_data(self):
         at=datetime(2026,10,13,7,0,tzinfo=ZoneInfo('Europe/Kiev'))
         self.assertEqual(self.fast_tick(at,[dict(start=at.timestamp()-1800,end=at.timestamp())]),['off'])
