@@ -64,6 +64,7 @@ class NativeController(HeatingClimate):
         self._fence_recovery_attempted = False
         self._manual_energy_ending = False
         self.manual_energy_demand = False
+        self._kws_idle_since = None
 
     def attach_command_ledger(self, ledger, status):
         self.command_ledger = ledger
@@ -89,7 +90,22 @@ class NativeController(HeatingClimate):
         except Exception as exc:
             self.record_failure("ledger_recovery", exc)
         try:
-            return super().tick(kwargs, **extra)
+            result = super().tick(kwargs, **extra)
+            # Only continuous observed idle, spanning the meter report,
+            # authorizes a previously reported KWS baseline.
+            observed_idle = (getattr(self, "power_source", "") == "kws_phases"
+                and getattr(self, "power_quality", "") == "measured"
+                and getattr(self, "current_power_w", None) is not None
+                and self.current_power_w < 500
+                and self.memory.get("last_command") != "heat"
+                and self.grid_state() == "on"
+                and time.time() - getattr(self, "power_update_at", 0) <= 30)
+            if observed_idle:
+                if self._kws_idle_since is None:
+                    self._kws_idle_since = time.time()
+            else:
+                self._kws_idle_since = None
+            return result
         finally:
             self._manual_energy_ending = False
 
@@ -105,13 +121,11 @@ class NativeController(HeatingClimate):
             except (ValueError, TypeError):
                 value = None
             idle_since = None
-            if (power is not None and power.state not in ("unknown", "unavailable")
-                    and power.attributes.get("measurement_basis") == "kws_phases"
+            if (power is not None and power.attributes.get("measurement_basis") == "kws_phases"
                     and power.attributes.get("power_quality") == "measured"
                     and number(power.state) is not None and number(power.state) < 500
-                    and self.memory.get("last_command") != "heat"
-                    and self.memory.get("command_at", 0) <= row.last_reported.timestamp()):
-                idle_since = self.memory.get("command_at", 0)
+                    and self.memory.get("last_command") != "heat"):
+                idle_since = self._kws_idle_since
             return value, row.last_reported.timestamp(), idle_since
         return self._on_loop(read)
 
@@ -147,6 +161,7 @@ class NativeController(HeatingClimate):
                                      self.val("session_limit", 180), idle_since)
         session["origin_was_idle"] = self.memory.get("last_command") != "heat"
         self.memory["manual_energy"] = session
+        self._kws_idle_since = None
         # Preserve historical queues and predictions, but do not score a
         # pre-existing automatic forecast against a user-requested session.
         for pending in self.memory.get("predictions", []):

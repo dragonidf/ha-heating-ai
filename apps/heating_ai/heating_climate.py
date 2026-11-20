@@ -911,7 +911,11 @@ class HeatingClimate(HeatingRecovery,Hass):
         if getattr(self,'temperature_quality',{}).get('primary_status','normal')!='normal':row['quality']=False
         row['room_valid']=bool(source=='Вітальня' and primary is not None and
             getattr(self,'temperature_quality',{}).get('primary_status','normal')=='normal')
-        manual_live=self.memory.get('manual_energy',{}).get('status')=='active'
+        manual_session=self.memory.get('manual_energy') or {}
+        manual_live=(manual_session.get('status')=='active' or
+            (manual_session.get('ended_at') and
+             0<=stamp-manual_session['ended_at']<=120 and
+             self.memory.get('last_command')=='heat'))
         manual_planned=any(s['start']<=stamp<s['end'] for s in self.memory.get('planned_heat_segments',[]))
         row['manual_extra_active']=manual_live
         row['execution']='automatic' if self.memory.get('owned') and self.memory.get('last_command')=='heat' and (not manual_live or manual_planned) else 'manual_or_native' if power is not None and power>=1.5 else 'idle'
@@ -1491,7 +1495,11 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings["split_comfort"] = True
         settings["morning_min_minutes"] = self.cfg.get("morning_min_minutes",30)
         command_at=number(self.memory.get("command_at"))
-        manual_live=self.memory.get('manual_energy',{}).get('status')=='active'
+        manual_session=self.memory.get('manual_energy') or {}
+        manual_live=(manual_session.get('status')=='active' or
+            (manual_session.get('ended_at') and
+             0<=time.time()-manual_session['ended_at']<=120 and
+             self.memory.get('last_command')=='heat'))
         planned_now=any(s['start']<=now.timestamp()<s['end']
                         for s in self.memory.get('planned_heat_segments',[]))
         automatic=(self.raw('mode')=='Автоматичне керування' and permitted and
