@@ -208,6 +208,23 @@ class FinalDispatchGuardTests(unittest.TestCase):
         self.assertEqual(app.memory['last_command'],'off')
         self.assertLessEqual(app.attrs['temperature'],21)
 
+    def test_immediate_manual_start_does_not_bypass_grid_upper_or_manual_mode(self):
+        for guard in ('grid_off','grid_unknown','upper','disarm','observe'):
+            with self.subTest(guard=guard):
+                app=self.app(17,grid={'grid_off':'off','grid_unknown':'unknown'}.get(guard,'on'))
+                stamp=app.at.timestamp()
+                app.memory.update(last_command='off',command_at=stamp-30,
+                                  manual_energy=dict(status='active'))
+                app.manual_energy_demand=True
+                app.decision_context=dict(forecast=dict(heat_segments=[]))
+                app.attrs['temperature']=21
+                if guard=='upper':app.source_temperature=lambda:(23.,'Вітальня',23.,23.)
+                if guard=='disarm':app.values['armed']='off'
+                if guard=='observe':app.values['mode']='Спостереження'
+                self.run_action(app,'heat')
+                self.assertEqual(app.memory['last_command'],'off')
+                self.assertLessEqual(app.attrs['temperature'],21)
+
     def test_manual_only_heat_then_plan_handoff_does_not_issue_stop(self):
         app=self.app(23)
         stamp=app.at.timestamp()

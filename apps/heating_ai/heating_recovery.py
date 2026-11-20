@@ -1348,7 +1348,12 @@ class HeatingRecovery:
             scheduled_off or grid!='on' or room is None or room>=self.active_upper() or
             (getattr(self,'decision_context',None) or {}).get('coast_overheat',False) or
             (not once and outside_window and not committed)))
-        action=held_action(last,self.memory.get('command_at',0),time.time(),action,urgent)
+        # Explicit energy requests skip only the planner's OFF-to-HEAT dwell.
+        # All prior vetoes and the native equipment gateway remain in force.
+        manual_start=(action=='heat' and last=='off' and
+                      getattr(self,'manual_energy_demand',False) and
+                      (self.memory.get('manual_energy') or {}).get('status')=='active')
+        action=held_action(last,self.memory.get('command_at',0),time.time(),action,urgent or manual_start)
         current=self.val("thermostat",attribute="current_temperature")
         if action!="fallback" and (current is None or not 5<=current<=40 or
                                      self.raw('thermostat') in ('unknown','unavailable',None)):

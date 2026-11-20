@@ -236,6 +236,26 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(app._manual_energy_ending)
                         self.assertFalse(app.manual_energy_demand)
 
+    async def test_immediate_manual_request_cannot_bypass_native_voltage_or_kws(self):
+        with package(self.root / "package") as (component, _):
+            for fault in ('voltage','kws'):
+                with self.subTest(fault=fault):
+                    hass,app=self.controller(component)
+                    app.memory.update(last_command='off',command_at=970,owned=True,
+                                      manual_energy=dict(status='active',target_kwh=1))
+                    app.manual_energy_demand=True
+                    if fault=='voltage':
+                        hass.rows['sensor.l2'].state='196'
+                        with patch.object(component.time,'time',return_value=1000):
+                            await asyncio.to_thread(app.apply_action,'heat',False)
+                    else:
+                        with patch.object(app,'apply_voltage_stop',return_value=False), \
+                             patch.object(app,'async_kws_status',return_value={'ready':False,'reason':'test','reason_text':'KWS blocked'}):
+                            await asyncio.to_thread(app.apply_action,'heat',False)
+                    self.assertEqual(hass.rows['climate.boiler'].state,'off')
+                    self.assertFalse(any(c.kwargs.get('service_data',{}).get('hvac_mode')=='heat'
+                                         for c in hass.services.async_call.await_args_list))
+
     async def test_voltage_trip_bypasses_minimum_on_and_blocks_auto_dispatch(self):
         with package(self.root / "package") as (component, _):
             for voltage in (196, 255):
