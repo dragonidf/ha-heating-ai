@@ -99,7 +99,7 @@ class NativeController(HeatingClimate):
                 and self.current_power_w < 500
                 and self.memory.get("last_command") != "heat"
                 and self.grid_state() == "on"
-                and time.time() - getattr(self, "power_update_at", 0) <= 30)
+                and time.time() - (getattr(self, "power_observation", {}) or {}).get("at", 0) <= 30)
             if observed_idle:
                 if self._kws_idle_since is None:
                     self._kws_idle_since = time.time()
