@@ -38,6 +38,48 @@ class ManualEnergyTest(unittest.TestCase):
         self.m.advance(self.s, 420.87, self.t+900, self.t+915)
         self.assertEqual(self.s['consumed_kwh'], 1.5)
 
+    def test_repeated_unchanged_reports_do_not_shrink_counter_jump_window(self):
+        s=self.m.start(6,100,self.t,self.t,180)
+        for n in range(1,60):
+            self.m.advance(s,100,self.t+n*15,self.t+n*15)
+        self.m.advance(s,101.5,self.t+900,self.t+900)
+        self.assertEqual((s['status'],s['consumed_kwh']),('active',1.5))
+
+    def test_live_measured_power_progress_stops_small_request_before_counter_report(self):
+        s=self.m.start(1,100,self.t,self.t,180)
+        for n in range(41):
+            at=self.t+n*15
+            self.m.advance(s,100,at,at)
+            self.m.observe_power(s,6000,at,at)
+            if n<40:
+                self.assertEqual(s['status'],'active')
+                self.assertAlmostEqual(s['progress_kwh'],n*.025)
+        self.assertEqual(s['status'],'completed')
+        self.assertEqual(s['completion_basis'],'kws_power')
+        self.assertAlmostEqual(s['progress_kwh'],1)
+        self.assertEqual(s['consumed_kwh'],0)
+
+    def test_power_and_counter_are_alternative_totals_not_added(self):
+        s=self.m.start(6,100,self.t,self.t,180)
+        for n in range(61):
+            at=self.t+n*15
+            self.m.advance(s,101.5 if n==60 else 100,at,at)
+            self.m.observe_power(s,6000,at,at)
+        self.assertEqual(s['consumed_kwh'],1.5)
+        self.assertAlmostEqual(s['progress_kwh'],1.5)
+        self.assertEqual(s['status'],'active')
+
+    def test_power_observations_never_integrate_missing_duplicate_or_stale_intervals(self):
+        s=self.m.start(6,100,self.t,self.t,180)
+        self.m.observe_power(s,6000,self.t,self.t)
+        self.m.observe_power(s,6000,self.t+15,self.t+15)
+        self.m.observe_power(s,6000,self.t+15,self.t+16)
+        self.m.observe_power(s,None,self.t+30,self.t+30)
+        self.m.observe_power(s,6000,self.t+300,self.t+300)
+        self.m.observe_power(s,6000,self.t+315,self.t+400)
+        self.assertAlmostEqual(s['integrated_kwh'],.025)
+        self.assertEqual(s['status'],'active')
+
     def test_late_counter_can_overshoot_and_reports_actual_fact(self):
         s = self.m.start(1, 100, self.t, self.t, 180)
         self.m.advance(s, 101.5, self.t+900, self.t+900)

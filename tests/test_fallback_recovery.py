@@ -166,6 +166,65 @@ class FinalDispatchGuardTests(unittest.TestCase):
                     self.run_action(app,action)
                     self.assertFalse(any(c[0]=='climate/set_hvac_mode' and c[1].get('hvac_mode')=='auto' for c in app.calls))
                     self.assertLessEqual(app.attrs['temperature'],21.)
+    def test_manual_request_starts_immediately_after_stop(self):
+        app=self.app(17)
+        stamp=app.at.timestamp()
+        app.memory.update(last_command='off',command_at=stamp-30,
+                          manual_energy=dict(status='active',target_kwh=1))
+        app.manual_energy_demand=True
+        app.decision_context=dict(forecast=dict(heat_segments=[]))
+        app.attrs['temperature']=21
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'heat')
+        self.assertEqual(app.attrs['temperature'],25)
+
+    def test_automatic_and_inactive_manual_request_keep_restart_pause(self):
+        for status in (None,'cancelled','completed'):
+            with self.subTest(status=status):
+                app=self.app(23)
+                stamp=app.at.timestamp()
+                app.memory.update(last_command='off',command_at=stamp-30,
+                                  manual_energy=dict(status=status))
+                # Even an old manual flag cannot bypass the automatic pause.
+                app.manual_energy_demand=bool(status)
+                app.decision_context=dict(forecast=dict(heat_segments=[dict(start=stamp,end=stamp+1800)]))
+                app.attrs['temperature']=21
+                self.run_action(app,'heat')
+                self.assertEqual(app.memory['last_command'],'off')
+                self.assertLessEqual(app.attrs['temperature'],21)
+
+    def test_immediate_manual_start_respects_pre_outage_stop(self):
+        app=self.app(23)
+        stamp=app.at.timestamp()
+        # Scheduled outage starts in 10 minutes: existing hard cutoff applies.
+        app.read_outage_schedule=lambda:dict(valid=True,mode='scheduled',
+            outages=[dict(start=stamp+600,end=stamp+7200)],slots=[])
+        app.memory.update(last_command='off',command_at=stamp-30,
+                          manual_energy=dict(status='active'))
+        app.manual_energy_demand=True
+        app.decision_context=dict(forecast=dict(heat_segments=[]))
+        app.attrs['temperature']=21
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertLessEqual(app.attrs['temperature'],21)
+
+    def test_immediate_manual_start_does_not_bypass_grid_upper_or_manual_mode(self):
+        for guard in ('grid_off','grid_unknown','upper','disarm','observe'):
+            with self.subTest(guard=guard):
+                app=self.app(17,grid={'grid_off':'off','grid_unknown':'unknown'}.get(guard,'on'))
+                stamp=app.at.timestamp()
+                app.memory.update(last_command='off',command_at=stamp-30,
+                                  manual_energy=dict(status='active'))
+                app.manual_energy_demand=True
+                app.decision_context=dict(forecast=dict(heat_segments=[]))
+                app.attrs['temperature']=21
+                if guard=='upper':app.source_temperature=lambda:(23.,'Вітальня',23.,23.)
+                if guard=='disarm':app.values['armed']='off'
+                if guard=='observe':app.values['mode']='Спостереження'
+                self.run_action(app,'heat')
+                self.assertEqual(app.memory['last_command'],'off')
+                self.assertLessEqual(app.attrs['temperature'],21)
+
     def test_manual_only_heat_then_plan_handoff_does_not_issue_stop(self):
         app=self.app(23)
         stamp=app.at.timestamp()

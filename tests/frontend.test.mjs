@@ -545,6 +545,17 @@ test('manual KWS UI presents measured progress and only a stop action while acti
   assert.doesNotMatch(html,/data-manual-energy="start"/);
 });
 
+test('manual progress labels its live KWS power integral separately from counter',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.manualEnergyKwh=1;p.manualEnergyPending=false;p.manualEnergyMessage='';
+  p.state=k=>k==='manual_energy'?'active':'on';
+  p.attrs=k=>k==='manual_energy'?{target_kwh:1,consumed_kwh:0,progress_kwh:.56,progress_basis:'kws_power'}:{};
+  p.boilerActual=()=>({power:6200,heating:true});
+  const html=p.manualEnergyControls();
+  assert.match(html,/≈ 0,56 \/ 1 кВт·год/);
+  assert.match(html,/Лічильник KWS: 0,00 кВт·год/);
+  assert.match(html,/aria-valuenow="56"/);
+});
 test('manual KWS selector exposes every integer from 1 to 40 and clamps buttons',async()=>{
   const p=Object.create(HeatingAIPanel.prototype);
   p.manualEnergyKwh=39;p.manualEnergyPending=false;p.manualEnergyMessage='';
