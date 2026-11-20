@@ -8,7 +8,7 @@
     "heating_recovery.py": "d08165a4b1b00ee04d95206e0b06f13009e031819e0361ec05ab60c028f4b1f5",
     "heating_stability.py": "9d7772e606bd9c6dda5f109f6fc88df543135852dee752d75263143fefe8e86a",
     "heating_ui.py": "306d524d47cad72beed50c9b9f7f94dc71569b13d633cc022d3eea3ae950fbeb",
-    "heating_ui_assets.py": "08e56b9cb73c8c856a5314360281dc2e4f151c5097f7887e522f2da57a638977"
+    "heating_ui_assets.py": "6f3442b31ac097e69426a82c90450927556029a428a0c96270843c81dcd398e9"
   },
   "version": "0.5.12"
 }
