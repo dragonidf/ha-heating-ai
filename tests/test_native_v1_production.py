@@ -188,7 +188,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
         return hass, app
 
     async def test_manual_request_uses_native_serialized_control_only(self):
-        with package(self.root / "package" / "custom_components" / "heating_ai_legacy") as (component, _):
+        with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
             app.model["validated"] = True
             app.cfg.update(power_accounting_method="kws", session_limit="180")
