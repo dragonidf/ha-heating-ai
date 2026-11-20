@@ -102,6 +102,7 @@ const patchDOM = (current,next) => {
 };
 const defaults = {
   power_model:'sensor.heating_power_model',ventilation:'sensor.heating_ventilation',diagnostics:'sensor.heating_diagnostics',process:'binary_sensor.appdaemon_running',controller:'sensor.heating_controller', alive:'binary_sensor.heating_controller_alive', permitted:'binary_sensor.heating_actuation_permitted',
+  manual_energy:'sensor.heating_manual_energy',
   heartbeat:'sensor.heating_heartbeat', temperature:'sensor.heating_temperature', power_confirmed:'sensor.heating_power_confirmed', boiler_active:'binary_sensor.heating_boiler_active',boiler_stage:'sensor.heating_boiler_stage',
   grid_status:'sensor.heating_grid', fireplace_status:'sensor.heating_fireplace', fireplace_active:'binary_sensor.heating_fireplace_active',
   energy_24h:'sensor.heating_energy_24h', energy_monthly:'sensor.heating_energy_monthly', energy_accounted_monthly:'sensor.heating_accounted_monthly', forecast:'sensor.heating_forecast', forecast_outlook:'sensor.heating_forecast_outlook',
