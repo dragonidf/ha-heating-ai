@@ -166,6 +166,38 @@ class FinalDispatchGuardTests(unittest.TestCase):
                     self.run_action(app,action)
                     self.assertFalse(any(c[0]=='climate/set_hvac_mode' and c[1].get('hvac_mode')=='auto' for c in app.calls))
                     self.assertLessEqual(app.attrs['temperature'],21.)
+    def test_manual_only_heat_then_plan_handoff_does_not_issue_stop(self):
+        app=self.app(23)
+        stamp=app.at.timestamp()
+        app.manual_energy_demand=True
+        app.decision_context=dict(forecast=dict(heat_segments=[]))
+        self.run_action(app,'heat')
+        self.assertEqual(app.memory['last_command'],'heat')
+        self.assertEqual(app.attrs['temperature'],25)
+        app.calls.clear()
+        app.manual_energy_demand=False
+        app._manual_energy_ending=True
+        app.decision_context=dict(forecast=dict(heat_segments=[dict(start=stamp,end=stamp+600)]))
+        self.run_action(app,'heat',stamp+30)
+        self.assertEqual(app.memory['last_command'],'heat')
+        self.assertFalse(app.calls)
+        # Explicit manual-only release must beat the normal 10 minute hold.
+        app.decision_context=dict(forecast=dict(heat_segments=[]))
+        self.run_action(app,'off',stamp+60)
+        self.assertEqual(app.memory['last_command'],'off')
+        self.assertLessEqual(app.attrs['temperature'],21)
+
+    def test_manual_energy_cannot_override_final_grid_or_temperature_interlock(self):
+        for grid,room in [('off',21.8),('unknown',21.8),('on',23.)]:
+            with self.subTest(grid=grid,room=room):
+                app=self.app(23,grid=grid)
+                app.manual_energy_demand=True
+                app.source_temperature=lambda:(room,'Вітальня',room,23.)
+                app.decision_context=dict(forecast=dict(heat_segments=[]))
+                self.run_action(app,'heat')
+                self.assertEqual(app.memory['last_command'],'off')
+                self.assertLessEqual(app.attrs['temperature'],21.)
+
     def test_manual_pause_with_missing_thermostat_temperature_never_enters_auto(self):
         app=self.app(23);app.values['armed']='off';app.attrs['current_temperature']=None
         self.run_action(app,'fallback')
