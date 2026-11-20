@@ -108,7 +108,7 @@ class NativeController(HeatingClimate):
             if (power is not None and power.state not in ("unknown", "unavailable")
                     and power.attributes.get("measurement_basis") == "kws_phases"
                     and power.attributes.get("power_quality") == "measured"
-                    and float(power.state) < 500
+                    and number(power.state) is not None and number(power.state) < 500
                     and self.memory.get("last_command") != "heat"
                     and self.memory.get("command_at", 0) <= row.last_reported.timestamp()):
                 idle_since = self.memory.get("command_at", 0)
