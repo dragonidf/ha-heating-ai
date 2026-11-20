@@ -107,7 +107,13 @@ class NativeController(HeatingClimate):
                 self._kws_idle_since = None
             return result
         finally:
-            self._manual_energy_ending = False
+            # An unconfirmed manual-only STOP must be retried on subsequent
+            # ticks, not accidentally held by the normal minimum-on timer.
+            now = time.time()
+            scheduled = any(s["start"] <= now < s["end"] for s in
+                            self.memory.get("planned_heat_segments", []))
+            if self.memory.get("last_command") != "heat" or scheduled:
+                self._manual_energy_ending = False
 
     def _manual_kws_snapshot(self):
         """Read raw KWS without touching energy counters."""
