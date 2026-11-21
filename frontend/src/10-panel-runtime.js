@@ -368,8 +368,16 @@ export class HeatingAIPanel extends HTMLElement {
     this.manualEnergyPending=true;this.manualEnergyMessage='';this.render();
     try {
       if(!this.hass?.callWS)throw new Error('Немає зв’язку з Home Assistant');
+      // HA may instantiate the custom element without passing panel.config.
+      // Resolve the registered production panel, never guess an installation ID.
+      let entryId=this.config?.entry_id;
+      if(typeof entryId!=='string'||!entryId.trim()){
+        const panels=await this.hass.callWS({type:'get_panels'});
+        entryId=panels?.['heating-ai-v1']?.config?.entry_id;
+      }
+      if(typeof entryId!=='string'||!entryId.trim())throw new Error('Ідентифікатор контролера недоступний. Оновіть сторінку.');
       const result=await this.hass.callWS({type:'heating_ai_legacy/manual_energy',
-        entry_id:this.config.entry_id,version:[1,0],action,
+        entry_id:entryId,version:[1,0],action,
         ...(action==='start'?{kwh:this.manualEnergyKwh}:{})});
       if(result?.status==='active'&&action==='start')this.manualEnergyMessage='Запит прийнято. Очікуємо підтвердження котла.';
       else if(action==='stop')this.manualEnergyMessage='Ручний запит зупинено; план збережено.';

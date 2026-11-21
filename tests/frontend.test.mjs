@@ -571,3 +571,41 @@ test('manual KWS selector exposes every integer from 1 to 40 and clamps buttons'
   await p.changed({target:{value:'41',hasAttribute:k=>k==='data-manual-kwh'}});
   assert.equal(p.manualEnergyKwh,1);
 });
+
+test('manual energy sends the explicit entry ID for start and stop without lookup',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype),calls=[];
+  p.config={entry_id:'explicit-native'};p.manualEnergyKwh=6;p.render=()=>{};
+  p._hass={callWS:async payload=>{calls.push(payload);return {status:'active'};}};
+  await p.manualEnergyClick('start');await p.manualEnergyClick('stop');
+  assert.deepEqual(calls,[
+    {type:'heating_ai_legacy/manual_energy',entry_id:'explicit-native',version:[1,0],action:'start',kwh:6},
+    {type:'heating_ai_legacy/manual_energy',entry_id:'explicit-native',version:[1,0],action:'stop'}
+  ]);
+  assert.equal(p.manualEnergyPending,false);
+});
+test('manual energy resolves missing entry ID from registered HA production panel for start and stop',async()=>{
+  const p=Object.create(HeatingAIPanel.prototype),calls=[];
+  p.config={};p.manualEnergyKwh=6;p.render=()=>{};
+  p._hass={callWS:async payload=>{calls.push(payload);return payload.type==='get_panels'?{
+    'heating-ai-v1':{config:{entry_id:'live-native'}},
+    'other-panel':{config:{entry_id:'wrong-native'}}
+  }:{status:'active'};}};
+  await p.manualEnergyClick('start');await p.manualEnergyClick('stop');
+  assert.deepEqual(calls,[
+    {type:'get_panels'},
+    {type:'heating_ai_legacy/manual_energy',entry_id:'live-native',version:[1,0],action:'start',kwh:6},
+    {type:'get_panels'},
+    {type:'heating_ai_legacy/manual_energy',entry_id:'live-native',version:[1,0],action:'stop'}
+  ]);
+  assert.equal(p.manualEnergyPending,false);
+});
+test('manual energy fails closed if the production panel has no entry ID or lookup fails',async()=>{
+  for(const fail of [false,true]){
+    const p=Object.create(HeatingAIPanel.prototype),calls=[];
+    p.config={};p.manualEnergyKwh=6;p.render=()=>{};
+    p._hass={callWS:async payload=>{calls.push(payload);if(fail)throw new Error('network');return {'other-panel':{config:{entry_id:'wrong-native'}}};}};
+    await p.manualEnergyClick('start');
+    assert.deepEqual(calls,[{type:'get_panels'}]);assert.equal(p.manualEnergyPending,false);
+    assert.match(p.manualEnergyMessage,/Не вдалося виконати/);
+  }
+});
