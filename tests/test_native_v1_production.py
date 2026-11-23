@@ -743,3 +743,54 @@ class BundleTests(unittest.TestCase):
                 (path/"private/original-state.json").write_text("{}")
                 with self.assertRaises(ValueError):
                     migration.load_installation(path/"private")
+
+    async def test_manual_power_only_start_recovers_from_missing_counter_without_bypassing_safety(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.model["validated"] = True
+            app.cfg.update(power_accounting_method="kws", session_limit="180")
+            with patch.object(app,"async_kws_status",return_value={"ready":True}), \
+                 patch.object(app,"async_voltage_status",return_value={"voltage_qualified":True}), \
+                 patch.object(app,"source_temperature",return_value=(21,"Вітальня",21,21)), \
+                 patch.object(app,"val",return_value=180), \
+                 patch.object(app,"outage_execution_schedule",return_value={"valid":False}), \
+                 patch.object(app,"active_upper",return_value=22), \
+                 patch.object(app,"save"),patch.object(app,"publish"):
+                app._manual_kws_snapshot=lambda:(None,None,None)
+                app.power_observation=dict(at=10000.,watts=6000,quality="measured",policy="kws",
+                    source_quality={"sensor.energy_meter_kotel_potuzhnist_"+phase:
+                        dict(quality="measured",value_reported_at=10000.) for phase in "abc"})
+                with patch.object(component.time,"time",return_value=10000.):
+                    app.start_manual_energy(1)
+                session=app.memory["manual_energy"]
+                self.assertTrue(session["power_only"])
+                for n in range(41):
+                    at=10000.+n*15
+                    app.power_observation["at"]=at
+                    for source in app.power_observation["source_quality"].values():
+                        source["value_reported_at"]=at
+                    self.assertEqual(app.manual_extra_demand(at,"on",False,21.,22.5,False,True),n<40)
+                self.assertEqual(session["reason"],"target_reached")
+                self.assertAlmostEqual(session["progress_kwh"],1)
+                self.assertEqual(session["consumed_kwh"],0)
+
+    async def test_power_only_is_denied_without_independent_healthy_three_phase_power(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.model["validated"] = True
+            app.cfg.update(power_accounting_method="kws", session_limit="180")
+            with patch.object(app,"async_kws_status",return_value={"ready":True}), \
+                 patch.object(app,"async_voltage_status",return_value={"voltage_qualified":True}), \
+                 patch.object(app,"source_temperature",return_value=(21,"Вітальня",21,21)), \
+                 patch.object(app,"val",return_value=180), \
+                 patch.object(app,"outage_execution_schedule",return_value={"valid":False}), \
+                 patch.object(app,"active_upper",return_value=22), \
+                 patch.object(app,"save"),patch.object(app,"publish"):
+                app._manual_kws_snapshot=lambda:(None,None,None)
+                app.power_observation=dict(at=10000.,watts=6000,quality="measured",policy="kws",
+                    source_quality={"sensor.energy_meter_kotel_potuzhnist_"+phase:
+                        dict(quality="measured",value_reported_at=9900.) for phase in "abc"})
+                with patch.object(component.time,"time",return_value=10000.):
+                    with self.assertRaisesRegex(ValueError,"counter_invalid"):
+                        app.start_manual_energy(1)
+                self.assertNotEqual(app.memory.get("manual_energy",{}).get("status"),"active")

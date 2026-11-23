@@ -52,6 +52,47 @@ def start(target, value, at, now, limit_minutes, idle_since=None):
                 progress_kwh=0., progress_basis='counter', reason=None)
 
 
+def start_power_only(target, watts, measured_at, now, limit_minutes):
+    """Fallback ONLY for verified three-phase KWS power when total counter is absent.
+
+    The production gateway verifies independent, fresh A/B/C channels and
+    retains the normal equipment interlocks. No historical or nominal power.
+    """
+    if not valid_target(target):
+        raise ValueError('invalid_target')
+    if (not _finite(watts) or not 0 <= watts <= 12000 or
+            not _finite(measured_at) or not _finite(now) or
+            not -5 <= now-measured_at <= MAX_POWER_AGE):
+        raise ValueError('power_unavailable')
+    if not _finite(limit_minutes) or limit_minutes <= 0:
+        raise ValueError('invalid_time_limit')
+    return dict(status='active', target_kwh=target, baseline_kwh=None,
+                last_kwh=None, last_report_at=None, last_change_at=None,
+                started_at=now, deadline=now+limit_minutes*60,
+                consumed_kwh=0., integrated_kwh=0., progress_kwh=0.,
+                progress_basis='kws_power', power_only=True,
+                last_power_verified_at=now, reason=None)
+
+
+def advance_power_only(session, watts, measured_at, now):
+    """Fail closed on missing phase power, never extrapolate stale samples."""
+    if session.get('status') != 'active' or not session.get('power_only'):
+        return session
+    if not _finite(now):
+        return finish(session, 'power_unavailable', now)
+    if now >= session['deadline']:
+        return finish(session, 'time_limit', now)
+    if (not _finite(watts) or not 0 <= watts <= 12000 or
+            not _finite(measured_at) or
+            not -5 <= now-measured_at <= MAX_POWER_AGE or
+            measured_at < session['started_at']):
+        session.pop('power_sample', None)
+        if now-session.get('last_power_verified_at', session['started_at']) >= MAX_POWER_AGE:
+            return finish(session, 'power_unavailable', now)
+        return session
+    session['last_power_verified_at'] = now
+    return observe_power(session, watts, measured_at, now)
+
 def finish(session, reason, now):
     if session.get('status') == 'active':
         session.update(status='completed' if reason == 'target_reached' else 'cancelled',

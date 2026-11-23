@@ -147,3 +147,39 @@ class ManualEnergyTest(unittest.TestCase):
         for invalid in (None, 0, 481, True, float('nan')):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.m.watchdog_minutes(40,invalid)
+
+    def test_power_only_requires_fresh_independent_measured_power(self):
+        for watts,at in ((None,self.t),(float('nan'),self.t),(12001,self.t),
+                         (6000,None),(6000,self.t-61),(6000,self.t+6)):
+            with self.subTest(watts=watts, at=at), self.assertRaisesRegex(ValueError,'power_unavailable'):
+                self.m.start_power_only(1,watts,at,self.t,180)
+        s=self.m.start_power_only(1,6000,self.t,self.t,180)
+        self.assertIsNone(s['baseline_kwh'])
+        self.assertTrue(s['power_only'])
+        self.assertEqual(s['progress_basis'],'kws_power')
+
+    def test_power_only_progress_uses_only_consecutive_measured_power(self):
+        s=self.m.start_power_only(1,6000,self.t,self.t,180)
+        for n in range(41):
+            now=self.t+15*n
+            self.m.advance_power_only(s,6000,now,now)
+        self.assertEqual(s['status'],'completed')
+        self.assertEqual(s['completion_basis'],'kws_power')
+        self.assertAlmostEqual(s['progress_kwh'],1)
+        self.assertEqual(s['consumed_kwh'],0)
+        self.assertIsNone(s['baseline_kwh'])
+
+    def test_power_only_does_not_integrate_gaps_and_cancels_if_measurements_lost(self):
+        s=self.m.start_power_only(2,6000,self.t,self.t,180)
+        self.m.advance_power_only(s,6000,self.t+15,self.t+15)
+        self.m.advance_power_only(s,None,None,self.t+30)
+        self.assertEqual(s['status'],'active')
+        self.m.advance_power_only(s,6000,self.t+60,self.t+60)
+        self.assertAlmostEqual(s['integrated_kwh'],0)
+        self.m.advance_power_only(s,None,None,self.t+121)
+        self.assertEqual((s['status'],s['reason']),('cancelled','power_unavailable'))
+
+    def test_power_only_deadline_is_not_waived(self):
+        s=self.m.start_power_only(40,6000,self.t,self.t,180)
+        self.m.advance_power_only(s,6000,self.t+10800,self.t+10800)
+        self.assertEqual(s['reason'],'time_limit')

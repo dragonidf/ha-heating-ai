@@ -135,6 +135,20 @@ class NativeController(HeatingClimate):
             return value, row.last_reported.timestamp(), idle_since
         return self._on_loop(read)
 
+    def _manual_verified_power(self, stamp):
+        """Qualified independent KWS A/B/C power; never nominal/fallback watts."""
+        observation = getattr(self, "power_observation", {}) or {}
+        sources = observation.get("source_quality") or {}
+        fresh = all(
+            sources.get("sensor.energy_meter_kotel_potuzhnist_"+phase, {}).get("quality") == "measured"
+            and type(sources.get("sensor.energy_meter_kotel_potuzhnist_"+phase, {}).get("value_reported_at")) in (int, float)
+            and -5 <= stamp-sources["sensor.energy_meter_kotel_potuzhnist_"+phase]["value_reported_at"] <= manual_energy.MAX_POWER_AGE
+            for phase in "abc")
+        if not (fresh and observation.get("policy") == "kws" and
+                observation.get("quality") == "measured"):
+            return None, None
+        return observation.get("watts"), observation.get("at")
+
     def manual_energy_snapshot(self):
         return dict(self.memory.get("manual_energy") or {"status": "idle"})
 
@@ -163,9 +177,19 @@ class NativeController(HeatingClimate):
         if outage.get("valid") and blocked(time.time(), time.time()+15, outage["outages"]):
             raise ValueError("scheduled_outage")
         value, reported_at, idle_since = self._manual_kws_snapshot()
-        session = manual_energy.start(target, value, reported_at, time.time(),
-                                     manual_energy.watchdog_minutes(target, self.val("session_limit", 180)),
-                                     idle_since)
+        now = time.time()
+        limit = manual_energy.watchdog_minutes(target, self.val("session_limit", 180))
+        try:
+            session = manual_energy.start(target, value, reported_at, now, limit, idle_since)
+        except ValueError as exc:
+            if str(exc) not in ("counter_invalid", "counter_baseline_stale"):
+                raise
+            # Same independently measured phase power already used for live KWS
+            # progress; never accept unknown, stale, or estimated phase data.
+            watts, measured_at = self._manual_verified_power(now)
+            if watts is None:
+                raise
+            session = manual_energy.start_power_only(target, watts, measured_at, now, limit)
         session["origin_was_idle"] = self.memory.get("last_command") != "heat"
         self.memory["manual_energy"] = session
         self._kws_idle_since = None
@@ -206,20 +230,15 @@ class NativeController(HeatingClimate):
                 or not self._on_loop(self.async_kws_status).get("ready")):
             manual_energy.finish(session, "safety_stop", stamp)
         else:
-            value, at, _ = self._manual_kws_snapshot()
-            manual_energy.advance(session, value, at, stamp)
-            observation = getattr(self, "power_observation", {}) or {}
-            sources = observation.get("source_quality") or {}
-            # Each phase must be genuinely measured and recently reported;
-            # estimated zero or a stale/fallback source cannot add energy.
-            fresh = all(
-                sources.get("sensor.energy_meter_kotel_potuzhnist_"+phase, {}).get("quality") == "measured"
-                and isinstance(sources.get("sensor.energy_meter_kotel_potuzhnist_"+phase, {}).get("value_reported_at"), (int, float))
-                and -5 <= stamp-sources["sensor.energy_meter_kotel_potuzhnist_"+phase]["value_reported_at"] <= manual_energy.MAX_POWER_AGE
-                for phase in "abc")
-            watts = (observation.get("watts") if fresh and observation.get("policy") == "kws"
-                     and observation.get("quality") == "measured" else None)
-            manual_energy.observe_power(session, watts, observation.get("at"), stamp)
+            watts, measured_at = self._manual_verified_power(stamp)
+            if session.get("power_only"):
+                # Session started without a valid counter: only fresh three-phase
+                # watts may advance it; lost measurements fail closed in 60 s.
+                manual_energy.advance_power_only(session, watts, measured_at, stamp)
+            else:
+                value, at, _ = self._manual_kws_snapshot()
+                manual_energy.advance(session, value, at, stamp)
+                manual_energy.observe_power(session, watts, measured_at, stamp)
         self.manual_energy_demand = session.get("status") == "active"
         if not self.manual_energy_demand:
             self._manual_energy_ending = True
