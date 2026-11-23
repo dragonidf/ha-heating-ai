@@ -3,13 +3,15 @@
 Pure functions: no HA writes and no override of the controller's runtime guards.
 The adapter persists the returned reference beside existing plan memory.
 """
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 import math
 from uuid import uuid4
 from heating_model import (held_action,number,plan as optimise, step, outdoor_at, in_window,
                            modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
                            reserve_context,attach_reserve,coast_reserve_needed,local_boundary,
-                           SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics,power_profile)
+                           SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics,power_profile,
+                           ForecastContext)
 from heating_outages import blocked, availability, schedule_covered
 from heating_environment import forecast_step,gain_at,safe_upper,has_upper_risk,ENVIRONMENT_POLICY_VERSION
 
@@ -96,6 +98,15 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 boundary=local_boundary(now.date()+timedelta(days=day),value,now.tzinfo).timestamp()
                 if start<boundary<finish:
                     boundaries.add(boundary)
+    boundaries=sorted(boundaries)
+    # Prefix maximum also handles overlapping and out-of-order sessions.
+    segment_starts,segment_ends=[],[]
+    for a,b in sorted((s['start'],s['end']) for s in segments):
+        segment_starts.append(a)
+        segment_ends.append(max(b,segment_ends[-1]) if segment_ends else b)
+    forecast=ForecastContext(now,weather,outside,model,settings)
+    profile=settings.get('modulation_profile')
+    anchor=settings.get('modulation_anchor')
     rows=[]; r,f=room,floor; ur,uf=room,floor;low=high=room; energy=0.; all_segments=[]
     risk_enabled=has_upper_risk(settings)
     risk_heat=(settings.get('environment') or {}).get('last_heated_at') or start-10801
@@ -103,17 +114,16 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     for block in range(count):
         a=start+1800*block; b=a+1800
         cuts=sorted({a,b,*[a+300*j for j in range(1,6)],
-                     *[t for t in boundaries if a<t<b]})
+                     *boundaries[bisect_right(boundaries,a):bisect_left(boundaries,b)]})
         heats=[]; used=0.; fine=[]
         for begin,finish in zip(cuts,cuts[1:]):
             deadline=(number(command_at) or 0)+(600 if command=='heat' else 900)
             pieces=[begin,deadline,finish] if actuator and begin<deadline<finish else [begin,finish]
             for t,u in zip(pieces,pieces[1:]):
-                active=any(s['start']<=t and s['end']>=u for s in segments)
+                index=bisect_right(segment_starts,t)-1
+                active=index>=0 and segment_ends[index]>=u
                 tm=datetime.fromtimestamp(t,now.tzinfo); dt=(u-t)/3600
-                kw=(modulation_power(f,settings.get('modulation_profile'),3.,
-                                    settings.get('modulation_anchor'),(t-start)/60)
-                    if settings.get('modulation_profile') is not None else power_kw)
+                kw=modulation_power(f,profile,3.,anchor,(t-start)/60) if profile is not None else power_kw
                 wanted,lo,hi,zone=comfort_at(tm,settings)
                 hi=safe_upper(hi,zone,settings)
                 if actuator:
@@ -127,12 +137,13 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                     active=applied=='heat' and permitted
                 if active and (r>=hi or f>=50):
                     return None
-                r,f=forecast_step(r,f,outdoor_at(weather,tm,outside),kw if active else 0.,
-                         fire*math.exp(-(t-start)/7200),model,dt,tm,weather,settings)
+                _,_,out,gains=forecast.at(tm)
+                fire_gain=model['fire_gain']*max(0.,fire*math.exp(-(t-start)/7200))
+                delivered_kw=kw if active else 0.
+                r,f=forecast.integrate(r,f,out,delivered_kw,fire_gain,dt,gains[0])
                 if active:risk_heat=u
-                ur,uf=(forecast_step(ur,uf,outdoor_at(weather,tm,outside),kw if active else 0.,
-                         fire*math.exp(-(t-start)/7200),model,dt,tm,weather,settings,upper=True)
-                         if risk_enabled and t-risk_heat<=10800 else (r,f))
+                ur,uf=(forecast.integrate(ur,uf,out,delivered_kw,fire_gain,dt,gains[1],upper=True)
+                       if risk_enabled and t-risk_heat<=10800 else (r,f))
                 low=min(low,r); high=max(high,r)
                 fine.append(dict(ts=u,temperature=r,upper_temperature=max(r,ur),**{'return':f}))
                 if max(r,ur)>max(room,hi)+.01 and (active or all_segments or heats):
@@ -151,7 +162,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                          heat_segments=heats,outside_minutes=sum((s['end']-s['start'])/60 for s in heats
                              if not in_window(datetime.fromtimestamp(s['start'],now.tzinfo),settings['start'],settings['end'])),_fine=fine,
                          schedule_known=schedule_covered(data,a,b),
-                         weather_known=bool(weather and max(x['ts'] for x in weather)+3600>=b)))
+                         weather_known=forecast.known_until is not None and forecast.known_until>=b))
     if not priority and not morning_runs_valid(rows,now,settings.get('morning_min_minutes',30),
                               settings.get('morning_elapsed_minutes',0)):
         return None
@@ -303,11 +314,12 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
 def recommend_power(now,room,floor,outside,fire,model,weather,settings,calibrations=None):
     """Three bounded searches on identical inputs, never three command writers."""
     alternatives=[]
+    forecast=ForecastContext(now,weather,outside,model,settings)
     for kw in (3,6,9):
         mode='fixed_'+str(kw)
         calibration=power_profile(mode,calibrations,{},settings.get('equipment_version'))
         scenario=dict(settings,modulation_profile=calibration,modulation_anchor=None)
-        result=optimise(now,room,floor,outside,fire,model,weather,scenario,kw)
+        result=optimise(now,room,floor,outside,fire,model,weather,scenario,kw,forecast_context=forecast)
         reserve=(result or {}).get('morning_reserve') or {}
         feasible=bool(result and (reserve.get('predicted_sufficient') if reserve else not result.get('comfort_shortfall')))
         alternatives.append(dict(mode=mode,nominal_kw=kw,found=bool(result),feasible=feasible,
