@@ -609,3 +609,14 @@ test('manual energy fails closed if the production panel has no entry ID or look
     assert.match(p.manualEnergyMessage,/Не вдалося виконати/);
   }
 });
+
+test('manual heating without cumulative KWS baseline labels verified phase-power progress',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.manualEnergyKwh=1;p.manualEnergyPending=false;p.manualEnergyMessage='';
+  p.state=k=>k==='manual_energy'?'active':'on';
+  p.attrs=k=>k==='manual_energy'?{target_kwh:1,consumed_kwh:0,progress_kwh:.25,progress_basis:'kws_power',power_only:true}:{};
+  p.boilerActual=()=>({power:6000,heating:true});
+  const html=p.manualEnergyControls();
+  assert.match(html,/трьох фаз/);
+  assert.doesNotMatch(html,/Лічильник KWS: 0,00 кВт·год/);
+});
