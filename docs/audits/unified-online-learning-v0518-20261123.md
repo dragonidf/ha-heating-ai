@@ -58,8 +58,8 @@ The release follow-up interleaves baseline, a second baseline package and the
 candidate in one warm worker, balancing all six orders in each six-block set.
 It preserves the original observations, checks every output, and resamples
 whole timing pairs to estimate a 95% interval on the relative p95 change.
-Calibration requires A/A point and interval within ±5%. Non-regression
-requires its A/B upper bound at or below +5%.
+Calibration requires the A/A point and interval within ±5%. Non-regression
+requires the A/B point and upper bound at or below +5%.
 
 The first controlled run was noisy on CPU 2. Its 36 blocks gave A/A changes
 of +12.4% for planning and −18.6% for power advice. The p95 CPU times
@@ -68,9 +68,32 @@ for baseline/control/candidate were 1.300 / 1.462 / 1.813 s and
 24,896 → 24,900 KiB and all outputs were identical. This run does not
 establish a regression or a pass.
 
+A second local run on CPU 7 (30 blocks) had A/A CPU p95 changes of
+−4.23% and −0.88%, but the paired intervals still extended beyond ±5%.
+Its observed A/B p95s were 1.272 → 1.239 s and 2.742 → 2.677 s.
+It therefore remains a noisy run.
+
+An independent [Ubuntu 24.04 runner](https://github.com/dragonidf/ha-heating-ai/actions/runs/45268824899)
+passed both gates with 30 timed blocks after warm-up, CPython 3.12 and one
+pinned logical CPU (Intel Xeon 6975P-C). The table shows seconds and
+paired bootstrap intervals on the relative CPU p95 change.
+
+| Scheduled workload | A CPU median / p95 | A-control CPU p95 | B CPU median / p95 | A/A p95 change (95% interval) | A/B p95 change (95% interval) | A → B wall p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| Stable plan | 0.9639 / 0.9726 | 0.9708 | 0.9596 / 0.9743 | −0.18% [−0.78%, +0.08%] | +0.18% [−0.73%, +0.45%] | 0.9726 → 0.9744 |
+| Power advice | 2.0903 / 2.1212 | 2.1083 | 2.0812 / 2.1058 | −0.61% [−0.86%, +0.15%] | −0.72% [−0.98%, +0.06%] | 2.1213 → 2.1060 |
+
+Per-version peak worker RSS from separate warm processes was 31,588 →
+31,584 KiB. All 30 blocks and warm-up runs matched exact outputs across
+all three carriers. The production calculation worker and the planner,
+model and outage modules are byte-identical to v0.5.17 in the review
+archives. [Raw paired samples](https://github.com/dragonidf/ha-heating-ai/actions/runs/45268824899/artifacts/14865010819)
+are available until the Actions artifact expires. The measurement workflow
+was temporary and is excluded from the release diff.
+
 The production model retains its validated coefficients unless the evidence gates pass. The synthetic archive is a policy test. No authorization for merge, release, installation or restart was exercised.
 
-The 0.5.18 candidate passed 752 Python tests, 67 JavaScript tests and both smoke runs with HA 2026.11.0 in a disposable environment. All four planner cases retained exact outputs. The native fixture retained the same command sequence. Its tick CPU p95 was 3.999 → 4.066 ms, peak RSS 39,212 → 39,152 KiB and resident growth attributable to configuring and exercising the candidate was 212 KiB. Learning CPU p95 was 61.1 ms and the evidence fixture was 216,914 bytes. The locally built review archive had matching carrier and internal version 0.5.18. Its SHA-256 was `5c2c03535786af4f21ce64009dcad38e9697afd2ff5a342774e9b411e1b918ec`.
+The 0.5.18 candidate passed 752 Python tests, 67 JavaScript tests and both smoke runs with HA 2026.11.0 in a disposable environment. The full HA smoke also starts and reopens the controller with a corrupted archive, verifies the retained valid observation and v6, and observes zero device calls on restart. All four planner cases retained exact outputs. The native fixture retained the same command sequence. Its tick CPU p95 was 3.999 → 4.066 ms, peak RSS 39,212 → 39,152 KiB and the candidate's process grew by 212 KiB after configuration and exercise. Learning CPU p95 was 61.1 ms and the evidence fixture was 216,914 bytes. The locally built review archive had matching carrier and internal version 0.5.18. Its SHA-256 was `5c2c03535786af4f21ce64009dcad38e9697afd2ff5a342774e9b411e1b918ec`.
 
 ## Reproduce
 

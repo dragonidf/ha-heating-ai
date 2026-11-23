@@ -223,7 +223,7 @@ def controlled_gate(baseline, candidate, repeat, output, progress):
                       and abs(a_a["p95_change"]) <= .05)
         if not calibrated:
             gate = "inconclusive_noise"
-        elif a_b["upper_95"] <= .05:
+        elif a_b["p95_change"] <= .05 and a_b["upper_95"] <= .05:
             gate = "pass"
         elif a_b["lower_95"] > .05:
             gate = "regression"
