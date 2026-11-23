@@ -66,6 +66,198 @@ class NativeController(HeatingClimate):
         self.manual_energy_demand = False
         self._kws_idle_since = None
 
+    def initialize(self):
+        self.configure_adaptive_observer()
+        return super().initialize()
+
+    def configure_adaptive_observer(self):
+        requested = getattr(self,"cfg",self.args).get("adaptive_learning_v2_mode", "disabled")
+        if requested == "disabled":
+            return
+        from collections import deque
+        from .native_controller import heating_learning_windows as adaptive
+        mode, warning = adaptive.mode_for(requested)
+        if warning:
+            self.log("Adaptive learning disabled: %s", warning, level="WARNING")
+            return
+        self._adaptive = adaptive
+        self._adaptive_mode = mode
+        self._adaptive_epoch = uuid4().hex
+        self._adaptive_rows = deque(maxlen=400)
+        self._adaptive_forecasts = deque(maxlen=4)
+        self._adaptive_breaks = set()
+        self._adaptive_last_tick = None
+        self._adaptive_previous_kw = None
+        self._adaptive_kw_seconds = 0.
+        self._adaptive_kw_integral = 0.
+        self._adaptive_control_mode = None
+        self._adaptive_last_report = 0.
+        self._adaptive_last_value = None
+        self._adaptive_last_issue = 0.
+        self._adaptive_candidate = None
+        self._adaptive_pending = False
+        # Install the sidecar hooks only for explicitly enabled observation.
+        self.sample = self._adaptive_sample
+        self.daily_learn = self._adaptive_daily_learn
+        self.remember_plan_inputs = self._adaptive_remember_plan_inputs
+
+    def _adaptive_sample(self, room, probe, outside, power, fire, source, primary, thermostat, quality, settings=None):
+        before = self.last_sample
+        result = super().sample(room, probe, outside, power, fire, source, primary, thermostat, quality, settings)
+        try:
+            self._adaptive_tick(power, fire, source, quality, before)
+        except Exception as exc:
+            self._adaptive_breaks.add("capture_error")
+            self.log("Adaptive sample skipped: %s", type(exc).__name__, level="WARNING")
+        return result
+
+    def _adaptive_tick(self, power, fire, source, quality, before):
+        stamp = time.time()
+        previous = self._adaptive_last_tick
+        self._adaptive_last_tick = stamp
+        reasons = self._adaptive_breaks
+        kw = number(power)
+        previous_kw = self._adaptive_previous_kw
+        self._adaptive_previous_kw = kw
+        if previous is None or not 0 < stamp-previous<=45:
+            reasons.add("tick_gap_or_restart")
+        elif kw is not None and previous_kw is not None:
+            duration = stamp-previous
+            self._adaptive_kw_seconds += duration
+            self._adaptive_kw_integral += (kw+previous_kw)*duration/2
+        if getattr(self, "planning_grid_state", None) != "on":
+            reasons.add("unqualified_outage")
+        voltage = (self.voltage_status or {}).get("voltage_qualified") is True
+        if not voltage:
+            reasons.add("unknown_or_unqualified_voltage")
+        if (getattr(self, "power_source", None), getattr(self, "power_quality", None)) != ("kws_phases", "measured"):
+            reasons.add("unqualified_kws")
+        if not (getattr(self, "equipment_status", None) or {}).get("ready"):
+            reasons.add("equipment_not_ready")
+        if not quality or source != "Вітальня":
+            reasons.add("unavailable_physical_input")
+        try:
+            control_mode = self.raw("mode")
+        except KeyError:
+            control_mode = None
+        if control_mode != self._adaptive_control_mode:
+            reasons.add("control_mode_changed")
+            self._adaptive_control_mode = control_mode
+        if (power is not None and power>=1.5 and
+                (control_mode != "Автоматичне керування" or not self.memory.get("owned")
+                 or self.memory.get("last_command")!="heat")):
+            reasons.add("unplanned_heat")
+        manual = self.memory.get("manual_energy") or {}
+        if manual.get("status")=="active" or (manual.get("ended_at") or 0)>before:
+            reasons.add("manual_extra_request")
+        if self.memory.get("temporary_fallback"):
+            reasons.add("temporary_fallback")
+        if ((number(fire) or 0.)>.2 or self.memory.get("fire_phase")=="Датчик недоступний"
+                or (self.memory.get("fire_circulation") or {}).get("active")):
+            reasons.add("fireplace")
+        fan = self.raw("fan") if self.cfg.get("fan") else None
+        if fan!="off":
+            reasons.add("circulation_or_unknown")
+        sensed = getattr(self, "ventilation_states", {})
+        if any(sensed.get(k,{}).get("relay") not in ("on","off") or
+               sensed.get(k,{}).get("supply") not in ("on","off") for k in ("recuperator","bath")):
+            reasons.add("unknown_ventilation")
+        if before == self.last_sample:
+            return
+        try:
+            interval_kw = (self._adaptive_kw_integral/self._adaptive_kw_seconds
+                           if self._adaptive_kw_seconds>=.95*(self.last_sample-before) else None)
+            self._adaptive_append(self.samples[-1], voltage, reasons, interval_kw)
+        finally:
+            self._adaptive_kw_integral = self._adaptive_kw_seconds = 0.
+            reasons.clear()
+
+    def _adaptive_append(self, row, voltage, reasons, interval_kw):
+        adaptive = self._adaptive
+        fields = ("ts","room","return","outside","power","fire","source","room_valid",
+            "room_reported_at","power_source","power_quality","power_estimated","voltage_qualified",
+            "grid","execution","manual_extra_active","thermal_model_version","equipment_version",
+            "boiler_power_mode","fire_valid","fire_active","external_gain","residual_gain",
+            "room_source_disagreement","room_sources_suspect","energy")
+        compact = {key:row.get(key) for key in fields}
+        stamp = row["ts"]
+        record = self.raw("room", attribute="all") or {}
+        # HA last_reported also advances for duplicate publications. Require a
+        # numeric state transition from the known primary, not just a timestamp.
+        try:
+            changed = datetime.fromisoformat(record["last_changed"]).timestamp()
+        except (KeyError,ValueError,TypeError):
+            changed = None
+        reported = number(row.get("room_reported_at"))
+        temperature = number(record.get("state"))
+        verified = (temperature is not None and temperature!=self._adaptive_last_value and changed is not None and reported is not None and changed<=reported<=stamp
+                    and changed>self._adaptive_last_report and 0<=stamp-changed<=300
+                    and temperature==number(row.get("room"))
+                    and row.get("room_valid") is True)
+        if verified:
+            self._adaptive_last_report = changed
+            self._adaptive_last_value = temperature
+            compact["room_reported_at"] = changed
+        ventilation = []
+        for key in ("recuperator","bath"):
+            evidence = (row.get("ventilation") or {}).get(key,{})
+            duty = evidence.get("powered_relay_on_fraction")
+            if (evidence.get("unknown_fraction") != 0 or evidence.get("supply_unknown_fraction") != 0
+                    or duty not in (0.,1.) or evidence.get("on_fraction") not in (0.,1.)
+                    or evidence.get("supply_on_fraction") not in (0.,1.)
+                    or evidence.get("seconds",0)<240):
+                ventilation = None
+                break
+            ventilation.append(duty)
+        issue = number(self.memory.get("weather_at"))
+        solar = adaptive.solar_context_at(stamp,self.climate_tz,self.weather,issue,
+                                         getattr(self,"solar_geometry",{}))
+        compact.update(report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
+            voltage_qualified=voltage,
+            shadow_ventilation=ventilation, epoch=self._adaptive_epoch, weather_issue_at=issue,
+            solar_factor=solar, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
+            room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
+        self._adaptive_rows.append(compact)
+
+    def _adaptive_remember_plan_inputs(self, now, room, floor, outside, fire, weather, settings, forecast, previous):
+        result = super().remember_plan_inputs(now,room,floor,outside,fire,weather,settings,forecast,previous)
+        candidate = self._adaptive_candidate
+        if now.timestamp()-self._adaptive_last_issue>=21660:
+            if candidate is not None and candidate["baseline"]!=self.model:
+                candidate = None
+            try:
+                snapshot = self._adaptive.freeze_forecast(now,room,floor,outside,fire,weather,
+                    number(self.memory.get("weather_at")),settings,forecast,self.model,candidate,self._adaptive_epoch)
+                if snapshot:
+                    self._adaptive_forecasts.append(snapshot)
+                    self._adaptive_last_issue = now.timestamp()
+            except Exception as exc:
+                self.log("Adaptive forecast skipped: %s",type(exc).__name__,level="WARNING")
+        return result
+
+    def _adaptive_daily_learn(self, kwargs=None, **extra):
+        result = super().daily_learn(kwargs,**extra)
+        if (self._adaptive_rows
+                and not self._adaptive_pending and not self.memory.get("state_load_error")):
+            self._adaptive_pending = True
+            try:
+                self.submit_to_executor(self._adaptive.run_shadow,
+                    self.directory/"learning_windows_v1.json", tuple(self._adaptive_rows),
+                    tuple(self._adaptive_forecasts), tuple(self.samples), dict(self.model),
+                    dict(self.memory.get("ventilation_model") or {}), self._adaptive_mode,self.now(),
+                    callback=self._adaptive_job_finished)
+            except Exception as exc:
+                self._adaptive_pending = False
+                self.log("Adaptive learning skipped: %s",type(exc).__name__,level="WARNING")
+        return result
+
+    def _adaptive_job_finished(self, kwargs=None, **extra):
+        value = (kwargs or extra).get("result",{})
+        self._adaptive_pending = False
+        self._adaptive_candidate = value.get("candidate")
+        if value.get("warning"):
+            self.log("Adaptive learning: %s",value["warning"],level="WARNING")
+
     def attach_command_ledger(self, ledger, status):
         self.command_ledger = ledger
         self.command_ledger_status = status
@@ -1139,6 +1331,7 @@ async def async_setup_production(hass, entry):
     except BaseException:
         lease.close()
         raise
+    cfg['adaptive_learning_v2_mode'] = entry.options.get('adaptive_learning_v2_mode','disabled')
     controller = NativeController(hass, cfg)
     controller.attach_command_ledger(ledger, ledger_status)
     runtime = ProductionRuntime(controller, lease)

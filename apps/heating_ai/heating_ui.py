@@ -191,7 +191,7 @@ def verify_installation(directory=None):
     root=Path(directory) if directory is not None else Path(__file__).resolve().parent
     manifest=json.loads((root/'release.json').read_text())
     modules={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in root.glob('heating_*.py')}
-    if manifest.get('version')!=VERSION or len(modules)!=9 or modules!=manifest.get('module_hashes'):
+    if manifest.get('version')!=VERSION or len(modules)!=10 or modules!=manifest.get('module_hashes'):
         raise ValueError('Heating AI release is incomplete or has mixed module versions')
     return modules
 

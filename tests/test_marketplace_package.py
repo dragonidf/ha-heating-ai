@@ -22,7 +22,7 @@ class MarketplaceCarrierTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 51)
+            self.assertEqual(result["files"], 52)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 wanted = {

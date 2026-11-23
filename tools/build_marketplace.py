@@ -1,6 +1,6 @@
 """Build and verify the native Heating AI V1 Marketplace release ZIP.
 
-The nine authoritative V1 source modules are checksum-verified and adapted
+The authoritative V1 source modules are checksum-verified and adapted
 into native_controller/. The optional shadow uses native_engine/.
 Neither source duplication nor private installation data enters the ZIP.
 """
@@ -21,6 +21,7 @@ EXPECTED = (
     "heating_climate.py",
     "heating_environment.py",
     "heating_fallback.py",
+    "heating_learning_windows.py",
     "heating_model.py",
     "heating_outages.py",
     "heating_recovery.py",
@@ -77,7 +78,7 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
         raise ValueError("Legacy release.json and VERSION differ")
     hashes = published.get("module_hashes")
     if not isinstance(hashes, dict) or set(hashes) != set(EXPECTED):
-        raise ValueError("Nine-module release manifest is incomplete")
+        raise ValueError("V1 release manifest is incomplete")
     contents: dict[str, bytes] = {}
     originals: dict[str, bytes] = {}
     for name in EXPECTED:

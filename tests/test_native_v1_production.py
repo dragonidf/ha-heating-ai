@@ -187,6 +187,54 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             boot_id="fixture-boot",owner_epoch=1,fenced=False))
         return hass, app
 
+    async def test_adaptive_hooks_do_not_change_the_legacy_learning_result(self):
+        with package(self.root / "package") as (component, _):
+            for mode in ("disabled", "observe", "candidate", "invalid"):
+                _, app = self.controller(component)
+                app.cfg["adaptive_learning_v2_mode"] = mode
+                app.samples = []
+                app.directory = self.root
+                app.now = lambda: datetime(2026,11,1,tzinfo=timezone.utc)
+                app.log = Mock()
+                active = mode in ("observe","candidate")
+                original_sample = app.sample
+                app.configure_adaptive_observer()
+                self.assertEqual(app.sample==original_sample,not active)
+                app.submit_to_executor = Mock()
+                if active:
+                    app._adaptive_rows.append({"ts":1.})
+                with patch.object(component.HeatingClimate,"daily_learn",return_value="legacy") as legacy:
+                    self.assertEqual(app.daily_learn(),"legacy")
+                    legacy.assert_called_once()
+                self.assertEqual(app.submit_to_executor.call_count,int(active))
+                if active:
+                    function,path,*_ = app.submit_to_executor.call_args.args
+                    self.assertEqual(function.__name__,"run_shadow")
+                    self.assertEqual(path.name,"learning_windows_v1.json")
+                    app._adaptive_job_finished({"result":{"candidate":{"coefficients":{"room_loss":.01}}}})
+                self.assertEqual(app.model,{"version":6})
+                self.assertEqual(app.memory,{})
+                self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_adaptive_capture_requires_numeric_change_at_primary(self):
+        with package(self.root / "package") as (component, _):
+            _, app = self.controller(component)
+            app.cfg["adaptive_learning_v2_mode"] = "observe"
+            app.configure_adaptive_observer()
+            app.climate_tz = timezone.utc
+            stamp = 3000.
+            source = {"state":"21.0","last_changed":datetime.fromtimestamp(stamp,timezone.utc).isoformat()}
+            app.raw = lambda *args,**kwargs: source
+            app._adaptive_append(dict(ts=stamp,room=21.,room_valid=True,room_reported_at=stamp),True,(),0.)
+            self.assertTrue(app._adaptive_rows[-1]["report_verified"])
+            for value,expected in (("21.00",False),("20.9",True)):
+                stamp += 300
+                source.update(state=value,last_changed=datetime.fromtimestamp(stamp,timezone.utc).isoformat())
+                app._adaptive_append(dict(ts=stamp,room=float(value),room_valid=True,room_reported_at=stamp),True,(),0.)
+                self.assertIs(app._adaptive_rows[-1]["report_verified"],expected)
+            self.assertEqual(app.memory,{})
+            self.assertEqual(app.command_ledger.calls,[])
+
     async def test_manual_request_uses_native_serialized_control_only(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)

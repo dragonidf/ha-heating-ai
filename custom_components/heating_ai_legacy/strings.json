@@ -56,7 +56,8 @@
         "data": {
           "min_voltage_v": "Нижня межа захисту KWS (В)",
           "max_voltage_v": "Верхня межа захисту KWS (В)",
-          "voltage_recovery_seconds": "Стабільний час після відновлення (с)"
+          "voltage_recovery_seconds": "Стабільний час після відновлення (с)",
+          "adaptive_learning_v2_mode": "Адаптивне навчання (лише спостереження)"
         }
       }
     },
