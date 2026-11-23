@@ -683,6 +683,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             app.cfg.update(power_accounting_method="kws", session_limit="180")
             with patch.object(app,"async_kws_status",return_value={"ready":True}), \
                  patch.object(app,"async_voltage_status",return_value={"voltage_qualified":True}), \
+                 patch.object(app,"grid_state",return_value="on"), \
                  patch.object(app,"source_temperature",return_value=(21,"Вітальня",21,21)), \
                  patch.object(app,"val",return_value=180), \
                  patch.object(app,"outage_execution_schedule",return_value={"valid":False}), \
@@ -713,6 +714,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             app.cfg.update(power_accounting_method="kws", session_limit="180")
             with patch.object(app,"async_kws_status",return_value={"ready":True}), \
                  patch.object(app,"async_voltage_status",return_value={"voltage_qualified":True}), \
+                 patch.object(app,"grid_state",return_value="on"), \
                  patch.object(app,"source_temperature",return_value=(21,"Вітальня",21,21)), \
                  patch.object(app,"val",return_value=180), \
                  patch.object(app,"outage_execution_schedule",return_value={"valid":False}), \
