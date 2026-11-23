@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from collections import deque
+from copy import deepcopy
+import json
+import os
+from tempfile import NamedTemporaryFile
+from datetime import datetime, timedelta
 import fcntl
 from math import isfinite
 from hashlib import sha256
@@ -20,6 +25,7 @@ from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .native_controller.heating_climate import HeatingClimate
+from .native_controller import heating_learning_windows as learning
 from .native_controller.heating_model import comfort_at, number
 from .native_controller.heating_ui import system_fields
 from .native_controller.heating_recovery import wire_values
@@ -66,65 +72,49 @@ class NativeController(HeatingClimate):
         self.manual_energy_demand = False
         self._kws_idle_since = None
 
-    def initialize(self):
-        self.configure_adaptive_observer()
-        return super().initialize()
+        self._learning_epoch = uuid4().hex
+        self._learning_rows = deque(maxlen=340)
+        self._learning_forecasts = deque(maxlen=6)
+        self._learning_breaks = set()
+        self._learning_last_tick = None
+        self._learning_previous_kw = None
+        self._learning_kw_seconds = 0.
+        self._learning_kw_integral = 0.
+        self._learning_control_mode = None
+        self._learning_last_report = 0.
+        self._learning_last_value = None
+        self._learning_last_issue = 0.
+        self._learning_generation = 0
+        self._learning_current_ok = False
+        self._learning_job = None
+        self._learning_status = dict(status="collecting",reason="qualified_inputs_required")
 
-    def configure_adaptive_observer(self):
-        requested = getattr(self,"cfg",self.args).get("adaptive_learning_v2_mode", "disabled")
-        if requested == "disabled":
-            return
-        from collections import deque
-        from .native_controller import heating_learning_windows as adaptive
-        mode, warning = adaptive.mode_for(requested)
-        if warning:
-            self.log("Adaptive learning disabled: %s", warning, level="WARNING")
-            return
-        self._adaptive = adaptive
-        self._adaptive_mode = mode
-        self._adaptive_epoch = uuid4().hex
-        self._adaptive_rows = deque(maxlen=400)
-        self._adaptive_forecasts = deque(maxlen=4)
-        self._adaptive_breaks = set()
-        self._adaptive_last_tick = None
-        self._adaptive_previous_kw = None
-        self._adaptive_kw_seconds = 0.
-        self._adaptive_kw_integral = 0.
-        self._adaptive_control_mode = None
-        self._adaptive_last_report = 0.
-        self._adaptive_last_value = None
-        self._adaptive_last_issue = 0.
-        self._adaptive_candidate = None
-        self._adaptive_pending = False
-        # Install the sidecar hooks only for explicitly enabled observation.
-        self.sample = self._adaptive_sample
-        self.daily_learn = self._adaptive_daily_learn
-        self.remember_plan_inputs = self._adaptive_remember_plan_inputs
-
-    def _adaptive_sample(self, room, probe, outside, power, fire, source, primary, thermostat, quality, settings=None):
+    def sample(self, room, probe, outside, power, fire, source, primary, thermostat, quality, settings=None):
         before = self.last_sample
         result = super().sample(room, probe, outside, power, fire, source, primary, thermostat, quality, settings)
         try:
-            self._adaptive_tick(power, fire, source, quality, before)
+            self._learning_tick(power, fire, source, quality, before)
         except Exception as exc:
-            self._adaptive_breaks.add("capture_error")
+            self._learning_breaks.add("capture_error")
+            self._learning_current_ok = False
+            self._learning_generation += 1
             self.log("Adaptive sample skipped: %s", type(exc).__name__, level="WARNING")
         return result
 
-    def _adaptive_tick(self, power, fire, source, quality, before):
+    def _learning_tick(self, power, fire, source, quality, before):
         stamp = time.time()
-        previous = self._adaptive_last_tick
-        self._adaptive_last_tick = stamp
-        reasons = self._adaptive_breaks
+        previous = self._learning_last_tick
+        self._learning_last_tick = stamp
+        reasons = set()
         kw = number(power)
-        previous_kw = self._adaptive_previous_kw
-        self._adaptive_previous_kw = kw
+        previous_kw = self._learning_previous_kw
+        self._learning_previous_kw = kw
         if previous is None or not 0 < stamp-previous<=45:
             reasons.add("tick_gap_or_restart")
         elif kw is not None and previous_kw is not None:
             duration = stamp-previous
-            self._adaptive_kw_seconds += duration
-            self._adaptive_kw_integral += (kw+previous_kw)*duration/2
+            self._learning_kw_seconds += duration
+            self._learning_kw_integral += (kw+previous_kw)*duration/2
         if getattr(self, "planning_grid_state", None) != "on":
             reasons.add("unqualified_outage")
         voltage = (self.voltage_status or {}).get("voltage_qualified") is True
@@ -136,13 +126,15 @@ class NativeController(HeatingClimate):
             reasons.add("equipment_not_ready")
         if not quality or source != "Вітальня":
             reasons.add("unavailable_physical_input")
+        if (self.memory.get("room_source_check") or {}).get("status") in ("pending","room_source_disagreement"):
+            reasons.add("room_conflict")
         try:
             control_mode = self.raw("mode")
         except KeyError:
             control_mode = None
-        if control_mode != self._adaptive_control_mode:
+        if control_mode != self._learning_control_mode:
             reasons.add("control_mode_changed")
-            self._adaptive_control_mode = control_mode
+            self._learning_control_mode = control_mode
         if (power is not None and power>=1.5 and
                 (control_mode != "Автоматичне керування" or not self.memory.get("owned")
                  or self.memory.get("last_command")!="heat")):
@@ -162,18 +154,22 @@ class NativeController(HeatingClimate):
         if any(sensed.get(k,{}).get("relay") not in ("on","off") or
                sensed.get(k,{}).get("supply") not in ("on","off") for k in ("recuperator","bath")):
             reasons.add("unknown_ventilation")
+        self._learning_current_ok = not reasons
+        if reasons:
+            self._learning_generation += 1
+            self._learning_breaks.update(reasons)
         if before == self.last_sample:
             return
         try:
-            interval_kw = (self._adaptive_kw_integral/self._adaptive_kw_seconds
-                           if self._adaptive_kw_seconds>=.95*(self.last_sample-before) else None)
-            self._adaptive_append(self.samples[-1], voltage, reasons, interval_kw)
+            interval_kw = (self._learning_kw_integral/self._learning_kw_seconds
+                           if self._learning_kw_seconds>0
+                           and self._learning_kw_seconds>=.95*(self.last_sample-before) else None)
+            self._learning_append(self.samples[-1], voltage, self._learning_breaks, interval_kw)
         finally:
-            self._adaptive_kw_integral = self._adaptive_kw_seconds = 0.
-            reasons.clear()
+            self._learning_kw_integral = self._learning_kw_seconds = 0.
+            self._learning_breaks.clear()
 
-    def _adaptive_append(self, row, voltage, reasons, interval_kw):
-        adaptive = self._adaptive
+    def _learning_append(self, row, voltage, reasons, interval_kw):
         fields = ("ts","room","return","outside","power","fire","source","room_valid",
             "room_reported_at","power_source","power_quality","power_estimated","voltage_qualified",
             "grid","execution","manual_extra_active","thermal_model_version","equipment_version",
@@ -190,13 +186,13 @@ class NativeController(HeatingClimate):
             changed = None
         reported = number(row.get("room_reported_at"))
         temperature = number(record.get("state"))
-        verified = (temperature is not None and temperature!=self._adaptive_last_value and changed is not None and reported is not None and changed<=reported<=stamp
-                    and changed>self._adaptive_last_report and 0<=stamp-changed<=300
+        verified = (temperature is not None and temperature!=self._learning_last_value and changed is not None and reported is not None and changed<=reported<=stamp
+                    and changed>self._learning_last_report and 0<=stamp-changed<=300
                     and temperature==number(row.get("room"))
                     and row.get("room_valid") is True)
         if verified:
-            self._adaptive_last_report = changed
-            self._adaptive_last_value = temperature
+            self._learning_last_report = changed
+            self._learning_last_value = temperature
             compact["room_reported_at"] = changed
         ventilation = []
         for key in ("recuperator","bath"):
@@ -210,53 +206,196 @@ class NativeController(HeatingClimate):
                 break
             ventilation.append(duty)
         issue = number(self.memory.get("weather_at"))
-        solar = adaptive.solar_context_at(stamp,self.climate_tz,self.weather,issue,
+        solar = learning.solar_context_at(stamp,self.climate_tz,self.weather,issue,
                                          getattr(self,"solar_geometry",{}))
         compact.update(report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
             voltage_qualified=voltage,
-            shadow_ventilation=ventilation, epoch=self._adaptive_epoch, weather_issue_at=issue,
+            shadow_ventilation=ventilation, epoch=self._learning_epoch, weather_issue_at=issue,
             solar_factor=solar, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
-        self._adaptive_rows.append(compact)
+        self._learning_rows.append(compact)
+        if verified:
+            self._monitor_learning(changed)
 
-    def _adaptive_remember_plan_inputs(self, now, room, floor, outside, fire, weather, settings, forecast, previous):
+    def _monitor_learning(self, reported):
+        checkpoint=self.memory.get("online_learning") or {}
+        monitoring=checkpoint.get("monitoring")
+        if (not monitoring or monitoring["version"]!=self.model.get("version")
+                or not self._learning_eligible()):
+            return
+        candidates=[record for record in self._learning_forecasts
+                    if record["model"]==self.model and record["start"]>=monitoring["at"]
+                    and any(abs(reported-point[0])<=60 for key,point in record["points"].items()
+                            if key in ("1","3"))]
+        if not candidates:
+            return
+        measurements=list(self._learning_rows)
+        checked={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
+        for snapshot in candidates:
+            for row in learning.compare_frozen(snapshot,measurements,self.climate_tz):
+                if row["horizon"] in (1,3) and row["valid"]:
+                    checked.setdefault((row["start"],row["horizon"]),{
+                        key:row[key] for key in ("start","end","day","horizon","old_error",
+                                                 "shadow_error","valid","stratum","violation")})
+        monitoring["checks"]=list(checked.values())[-64:]
+        reason=learning.rollback_reason(monitoring["checks"],monitoring["strata"])
+        if reason:
+            self._rollback_learning(reason)
+
+
+    def remember_plan_inputs(self, now, room, floor, outside, fire, weather, settings, forecast, previous):
         result = super().remember_plan_inputs(now,room,floor,outside,fire,weather,settings,forecast,previous)
-        candidate = self._adaptive_candidate
-        if now.timestamp()-self._adaptive_last_issue>=21660:
-            if candidate is not None and candidate["baseline"]!=self.model:
-                candidate = None
+        stamp = now.timestamp()
+        if self._learning_current_ok and stamp-self._learning_last_issue>=10920:
             try:
-                snapshot = self._adaptive.freeze_forecast(now,room,floor,outside,fire,weather,
-                    number(self.memory.get("weather_at")),settings,forecast,self.model,candidate,self._adaptive_epoch)
+                snapshot = learning.freeze_forecast(now,room,floor,outside,fire,weather,
+                    number(self.memory.get("weather_at")),settings,forecast,self.model,None,self._learning_epoch)
                 if snapshot:
-                    self._adaptive_forecasts.append(snapshot)
-                    self._adaptive_last_issue = now.timestamp()
+                    self._learning_forecasts.append(snapshot)
+                    self._learning_last_issue = stamp
             except Exception as exc:
-                self.log("Adaptive forecast skipped: %s",type(exc).__name__,level="WARNING")
+                self.log("Learning evidence skipped: %s",type(exc).__name__,level="WARNING")
         return result
 
-    def _adaptive_daily_learn(self, kwargs=None, **extra):
-        result = super().daily_learn(kwargs,**extra)
-        if (self._adaptive_rows
-                and not self._adaptive_pending and not self.memory.get("state_load_error")):
-            self._adaptive_pending = True
-            try:
-                self.submit_to_executor(self._adaptive.run_shadow,
-                    self.directory/"learning_windows_v1.json", tuple(self._adaptive_rows),
-                    tuple(self._adaptive_forecasts), tuple(self.samples), dict(self.model),
-                    dict(self.memory.get("ventilation_model") or {}), self._adaptive_mode,self.now(),
-                    callback=self._adaptive_job_finished)
-            except Exception as exc:
-                self._adaptive_pending = False
-                self.log("Adaptive learning skipped: %s",type(exc).__name__,level="WARNING")
-        return result
+    def consider(self, candidate, source, apply=False, rejection=None):
+        # Preserve proposal diagnostics. All parameter changes now pass one gate.
+        return super().consider(candidate,source,apply=False,rejection=rejection)
 
-    def _adaptive_job_finished(self, kwargs=None, **extra):
-        value = (kwargs or extra).get("result",{})
-        self._adaptive_pending = False
-        self._adaptive_candidate = value.get("candidate")
-        if value.get("warning"):
-            self.log("Adaptive learning: %s",value["warning"],level="WARNING")
+    def _learning_eligible(self):
+        manual = self.memory.get("manual_energy") or {}
+        stamp=time.time()
+        weather_issue=number(self.memory.get("weather_at"))
+        return bool(self._writer and not self._closing and self.cfg.get("allow_actuation")
+                    and not self.memory.get("state_load_error") and not self.memory.get("temporary_fallback")
+                    and not getattr(self,"settings_transaction",False) and manual.get("status")!="active"
+                    and self.raw("armed")=="on" and self.raw("mode")=="Автоматичне керування"
+                    and not (self.command_ledger_status or {}).get("fenced",True)
+                    and (self.voltage_status or {}).get("voltage_qualified") is True
+                    and (getattr(self,"equipment_status",None) or {}).get("ready")
+                    and self.weather and weather_issue is not None
+                    and 0<=stamp-weather_issue<=learning.MAX_WEATHER_AGE
+                    and self._learning_current_ok and self._learning_last_tick is not None
+                    and 0<=stamp-self._learning_last_tick<=45)
+
+    def daily_learn(self, kwargs=None, **extra):
+        if self._learning_job is not None:
+            if time.monotonic()-self._learning_job["started"]>120:
+                self._learning_status.update(status="frozen",reason="learning_job_timeout")
+            return
+        if self.memory.get("state_load_error") or not self._learning_rows:
+            return
+        now=self.now()
+        self.memory["last_analysis"]=now.isoformat()
+        issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
+                    generation=self._learning_generation,equipment=self.memory.get("equipment_version",0))
+        self._learning_job=issued
+        self._learning_status.update(status="evaluating",reason="scheduled_evaluation")
+        try:
+            self.submit_to_executor(learning.run_learning,self.directory/"online_learning_v1.json",
+                tuple(self._learning_rows),tuple(self._learning_forecasts),issued["model"],
+                deepcopy(self.memory.get("ventilation_model") or {}),
+                deepcopy(self.memory.get("online_learning") or {}),now,self._learning_eligible(),
+                callback=self._learning_finished,job_id=issued["id"])
+        except Exception as exc:
+            self._learning_job=None
+            self._learning_status.update(status="frozen",reason="learning_submit_failed")
+            self.log("Scheduled learning unavailable: %s",type(exc).__name__,level="WARNING")
+
+    def _learning_finished(self, data):
+        issued=self._learning_job
+        if not issued or data.get("job_id")!=issued["id"]:
+            return
+        self._learning_job=None
+        result=data["result"]
+        self._learning_status={k:v for k,v in result.items()
+                               if k in ("status","reason","metrics","independent_windows","qualified_minutes")}
+        if not (result.get("proposed") or result.get("rollback")):
+            return
+        checkpoint=self.memory.get("online_learning") or {}
+        now=self.now()
+        if (time.monotonic()-issued["started"]>120 or issued["model"]!=self.model
+                or issued["generation"]!=self._learning_generation
+                or issued["equipment"]!=self.memory.get("equipment_version",0)
+                or not self._learning_eligible()):
+            self._learning_status.update(status="frozen",reason="learning_inputs_changed")
+            return
+        if result.get("rollback"):
+            self._rollback_learning(result["reason"])
+        elif (result.get("evidence_fingerprint")!=checkpoint.get("last_rejected_evidence")
+              and learning.promotion_allowed(self.model,issued["model"],result["proposed"],
+                                             result["evidence"],checkpoint,now,
+                                             legacy_day=self.memory.get("learning_day"))):
+            old=dict(self.model)
+            version=max(old["version"],checkpoint.get("generation",0))+1
+            new={**old,**result["proposed"],"version":version}
+            next_checkpoint={**checkpoint,"generation":version,"promotion_day":now.date().isoformat(),
+                "daily_baseline":old,"prior_model":old,"fingerprint":result["evidence_fingerprint"],
+                "restored_learning_success":deepcopy(self.memory.get("learning_success")),
+                "monitoring":dict(version=version,at=now.timestamp(),strata=result["evidence"]["strata"]),
+                "metrics":result["metrics"],"last_successful_learning":now.isoformat(),
+                "previous_plan_id":(self.memory.get("plan_reference") or {}).get("plan_id"),
+                "rollback_reason":None}
+            self._commit_learning_model(new,next_checkpoint,"accepted","independent_holdout_passed")
+        else:
+            self._learning_status.update(status="rejected",reason="promotion_limits_or_prior_evidence")
+
+    def _commit_learning_model(self, model, checkpoint, status, reason):
+        """Commit the model and its rollback evidence at one filesystem boundary."""
+        values={**self.memory,"model":model,"weather":self.weather,"online_learning":checkpoint,
+                "previous_model":dict(self.model),"predictions":[],"hour_errors":[]}
+        values.pop("pending_model",None)
+        if status=="accepted":
+            values["learning_success"]=dict(time=checkpoint["last_successful_learning"],
+                model_version=model["version"],source="timestamp_aligned")
+        else:
+            values["learning_success"]=checkpoint.get("restored_learning_success")
+            values.pop("previous_model",None)
+        # Pending physical command and energy ledgers remain untouched.
+        temporary=None
+        try:
+            with NamedTemporaryFile(mode="w",dir=self.statefile.parent,prefix=".learning-state-",delete=False) as stream:
+                temporary=Path(stream.name)
+                json.dump(values,stream,ensure_ascii=False,allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary,self.statefile)
+        except (OSError,TypeError,ValueError,MemoryError) as exc:
+            self._learning_status.update(status="frozen",reason="model_commit_failed")
+            self.log("Learning state could not be committed: %s",type(exc).__name__,level="WARNING")
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self.model=model
+        self.last_saved_at=time.time()
+        self.memory.update(values)
+        self.memory.pop("pending_model",None)
+        if status=="rolled_back":
+            self.memory.pop("previous_model",None)
+        self._learning_status.update(status=status,reason=reason)
+        self.next_compute=0
+        return True
+
+    def _rollback_learning(self, reason):
+        checkpoint=self.memory.get("online_learning") or {}
+        previous=checkpoint.get("prior_model") or self.memory.get("previous_model")
+        if not previous or previous.get("validated") is not True or self.memory.get("state_load_error"):
+            self._learning_status.update(status="frozen",reason="rollback_baseline_unavailable")
+            return
+        updated={**checkpoint,"prior_model":None,"monitoring":None,
+                 "rollback_reason":reason,"frozen_until":self.now().timestamp()+7*86400,
+                 "generation":max(self.model["version"],checkpoint.get("generation",0)),
+                 "last_rejected_evidence":checkpoint.get("fingerprint"),
+                 "evidence_after":self.now().timestamp(),
+                 "last_successful_learning":(checkpoint.get("restored_learning_success") or {}).get("time")}
+        if self._commit_learning_model(dict(previous),updated,"rolled_back",reason):
+            self._learning_generation+=1
+
+    def rollback(self, entity, attribute, old, new, kwargs=None, **extra):
+        self._rollback_learning("manual_rollback")
 
     def attach_command_ledger(self, ledger, status):
         self.command_ledger = ledger
@@ -478,6 +617,11 @@ class NativeController(HeatingClimate):
 
     def initialize(self):
         super().initialize()
+        self.memory.pop("pending_model",None)
+        self._native_solar_fit=False
+        checkpoint=self.memory.get("online_learning") or {}
+        if checkpoint.get("rollback_reason"):
+            self._learning_status=dict(status="rolled_back",reason=checkpoint["rollback_reason"])
         # Preserve all learned data and counters; old in-flight commands cannot
         # confer ownership after a process and platform migration.
         if not self.memory.get("native_runtime_initialized"):
@@ -1232,6 +1376,23 @@ class NativeController(HeatingClimate):
             self._fan_dispatch_epoch = None
 
     def publish(self, entity, state, **attributes):
+        if entity=="sensor.heating_model":
+            report=self._learning_status
+            checkpoint=self.memory.get("online_learning") or {}
+            now=self.now()
+            morning=now.replace(hour=10,minute=0,second=0,microsecond=0)
+            evening=now.replace(hour=20,minute=45,second=0,microsecond=0)
+            upcoming=morning if now<morning else evening if now<evening else morning+timedelta(days=1)
+            metrics=report.get("metrics",{})
+            attributes.update(learning_status=report["status"],learning_gate=report["reason"],
+                last_successful_learning=(checkpoint.get("last_successful_learning") or
+                                          (self.memory.get("learning_success") or {}).get("time")),
+                independent_windows=report.get("independent_windows",0),
+                qualified_minutes=report.get("qualified_minutes",0.),
+                candidate_holdout_mae_1h=metrics.get("1",{}).get("new",{}).get("mae"),
+                candidate_holdout_mae_3h=metrics.get("3",{}).get("new",{}).get("mae"),
+                active_version=self.model.get("version"),rollback_reason=checkpoint.get("rollback_reason"),
+                next_learning=upcoming.isoformat())
         if entity == "sensor.heating_diagnostics":
             now = time.time()
             observation = getattr(self, "power_observation", {})
@@ -1331,7 +1492,6 @@ async def async_setup_production(hass, entry):
     except BaseException:
         lease.close()
         raise
-    cfg['adaptive_learning_v2_mode'] = entry.options.get('adaptive_learning_v2_mode','disabled')
     controller = NativeController(hass, cfg)
     controller.attach_command_ledger(ledger, ledger_status)
     runtime = ProductionRuntime(controller, lease)

@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/"tests"),str(ROOT/"apps"/"heating_ai")]
 
 from benchmark_planner import summary
-from replay_adaptive_learning import MODEL, TZ, fixture
+from replay_adaptive_learning import MODEL, TZ, fixture, frozen_fixture
 from test_background_control import BackgroundTickSafetyTests
 from test_native_v1_production import FakeHA, package
 
@@ -36,7 +36,6 @@ def measure_core(app, tick, mode, root):
     # Legacy sample ring is 4032 rows. The sidecar job processes its 400-row
     # live ring and up to 60 prior days in the bounded private file.
     recent=tuple(history[-400:])
-    legacy=tuple(history[-4032:])
     sample=history[0]
     now=datetime.fromtimestamp(history[-1]["ts"]+300,TZ)
     timings={"tick":[],"aggregation":[],"training":[]}
@@ -56,11 +55,8 @@ def measure_core(app, tick, mode, root):
     app.power_source="kws_phases"
     app.power_quality="measured"
     app._writer=True
-    app.cfg["adaptive_learning_v2_mode"]=mode
     output["resident_before_configuration"]=rss_kib()
     app.ventilation_states={k:dict(relay="off",supply="on",grid="on") for k in ("recuperator","bath")}
-    if hasattr(app,"configure_adaptive_observer"):
-        app.configure_adaptive_observer()
     output["resident_after_configuration"]=rss_kib()
     action_output=[]
     app.apply_action=lambda action,once:action_output.append(action)
@@ -69,18 +65,19 @@ def measure_core(app, tick, mode, root):
     app.now=lambda: datetime.fromtimestamp(stamp,TZ)
     app.grid_state=lambda:"on"
     app.update_heating_power=lambda:0.
-    active=mode in ("observe","candidate")
-    sidecar=root/"learning_windows_v1.json"
+    active=mode=="online"
+    sidecar=root/"online_learning_v1.json"
     if active:
-        adaptive=app._adaptive
+        app._native_solar_fit=False
+        adaptive=sys.modules[type(app).__module__].learning
         windows=adaptive.build_observation_windows(history,TZ)["windows"][-200:]
         # Seed enough persisted windows to exercise the bounded fitter and
         # the path that decodes the sidecar at a learning time.
-        state=dict(windows=windows,forecasts=[],comparisons=[],report={})
+        state=dict(windows=windows,forecasts=frozen_fixture(None,capture=True),comparisons=[],report={})
         adaptive.save_evidence(sidecar,state)
         del windows,state
         # Retain the recent sample ring, exercise fitting and recording at cap.
-        app._adaptive_rows.extend(recent)
+        app._learning_rows.extend(recent)
     output["resident_after_ring"]=rss_kib()
     app.samples=[]
     time_module=sys.modules[tick.__module__].time
@@ -110,7 +107,7 @@ def measure_core(app, tick, mode, root):
             # Isolate the added aggregation from the full legacy control slot.
             if due and active:
                 wall,cpu=perf_counter(),process_time()
-                app._adaptive_append(sample,True,(),0.)
+                app._learning_append(sample,True,(),0.)
                 elapsed_aggregation=(process_time()-cpu,perf_counter()-wall)
                 if batch:
                     timings["aggregation"].append(elapsed_aggregation)
@@ -119,10 +116,10 @@ def measure_core(app, tick, mode, root):
     output["resident_after_tick"]=rss_kib()
     for i in range(11) if active else ():
         wall,cpu=perf_counter(),process_time()
-        result=adaptive.run_shadow(sidecar,recent,(),legacy,MODEL,{},mode,now)
+        result=adaptive.run_learning(sidecar,recent,(),MODEL,{},{},now,True)
         elapsed=(process_time()-cpu,perf_counter()-wall)
-        if result["warning"]:
-            raise RuntimeError(result["warning"])
+        if result["status"]=="frozen":
+            raise RuntimeError(result["reason"])
         if i:
             timings["training"].append(elapsed)
     if active:
@@ -165,12 +162,11 @@ def main():
             with ZipFile(archive) as zf:
                 zf.extractall(target)
         results={}
-        for name,mode in (("baseline","disabled"),("candidate","disabled"),
-                          ("candidate","observe"),("candidate","candidate")):
+        for name,mode in (("baseline","legacy"),("candidate","online")):
             result=json.loads(subprocess.check_output(
                 [sys.executable,__file__,str(baseline),"--child",str(root/name),mode],text=True))
-            if mode in ("observe","candidate"):
-                (root/"learning_windows_v1.json").unlink()
+            if mode=="online":
+                (root/"online_learning_v1.json").unlink()
             actions=result.pop("command_golden")
             if not results:
                 golden=actions

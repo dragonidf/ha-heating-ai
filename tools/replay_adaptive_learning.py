@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/"apps"/"heating_ai"))
 
 from heating_learning_windows import (audit_transitions,build_observation_windows,
-    evaluate_solar,evaluate_windows,freeze_forecast,compare_frozen,prospective_gate)
+    evaluate_solar,evaluate_windows,freeze_forecast,compare_frozen,prospective_gate,
+    promotion_evidence,qualify_frozen)
 from heating_model import DEFAULT_MODEL, step
 
 TZ = ZoneInfo("Europe/Kyiv")
@@ -59,7 +60,7 @@ def fixture(days=16):
     return rows
 
 
-def frozen_fixture(candidate, days=16):
+def frozen_fixture(candidate, days=16, *, capture=False, perturb=True):
     """Issue-time weather and exact-H endpoints in later, untouched days."""
     initial = datetime(2026,11,18,tzinfo=TZ)
     results=[]
@@ -83,7 +84,7 @@ def frozen_fixture(candidate, days=16):
             at = start+300*i
             kw = 2.4 if heat and i<6 else 0.
             endpoint=i in (0,12,36,72)
-            observed = actual + (.004*math.sin(day*.7+i) if i else 0.)
+            observed = actual + (.004*math.sin(day*.7+i) if i and perturb else 0.)
             rows.append(dict(ts=at,room=observed,room_valid=True,source="Вітальня",
                 room_reported_at=at if endpoint else None,report_verified=endpoint,
                 grid="on",voltage_qualified=True,power=kw,interval_kw=2.4 if heat and i<=6 else 0.,
@@ -99,7 +100,10 @@ def frozen_fixture(candidate, days=16):
             actual,true_floor=step(actual,true_floor,outside,kw,0.,TRUE_MODEL,1/12)
         snapshot=freeze_forecast(now,room0,floor0,outside,0.,weather,start-60,settings,
                                   dict(curve=curve,heat_segments=segments),MODEL,candidate,"synthetic")
-        results.extend(compare_frozen(snapshot,rows,TZ))
+        if capture:
+            results.append(dict(snapshot=snapshot,checks=qualify_frozen(snapshot,rows,TZ)))
+        else:
+            results.extend(compare_frozen(snapshot,rows,TZ))
     return results
 
 
@@ -128,6 +132,7 @@ def main():
             candidate=dict(coefficients=thermal["coefficients"])
             comparisons=frozen_fixture(candidate)
             output["synthetic_frozen"]=prospective_gate(comparisons,issued_at=issued,now=issued+17*86400)
+            output["unified_promotion_gate"]=promotion_evidence(comparisons)
     print(json.dumps(output,ensure_ascii=False,indent=2,allow_nan=False))
 
 

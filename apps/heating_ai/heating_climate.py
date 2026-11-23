@@ -26,6 +26,22 @@ from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
 
 class HeatingClimate(HeatingRecovery,Hass):
+    @staticmethod
+    def telemetry_tail(path, limit):
+        """Read the most recent JSONL records without scanning the archive."""
+        with path.open("rb") as stream:
+            offset=stream.seek(0,os.SEEK_END)
+            chunks=[]
+            lines=0
+            while offset and lines<=limit:
+                size=min(offset,65536)
+                offset-=size
+                stream.seek(offset)
+                chunk=stream.read(size)
+                chunks.append(chunk)
+                lines+=chunk.count(b"\n")
+        return b"".join(reversed(chunks)).splitlines()[-limit:]
+
     def initialize(self):
         self.cfg=dict(self.args)
         if self.update_in_progress():
@@ -64,7 +80,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.memory.setdefault("energy_last",self.cfg.get("energy_seed"))
         self.samples=[]
         if self.telemetry.exists():
-            for line in self.telemetry.read_text().splitlines()[-4032:]:
+            for line in self.telemetry_tail(self.telemetry,4032):
                 try:
                     row=json.loads(line)
                     if row["ts"]>=time.time()-14*86400:
@@ -1633,7 +1649,8 @@ class HeatingClimate(HeatingRecovery,Hass):
                                outside,fire,reserve_active or power is None or power>=1500,self.model,self.climate_tz,condition,
                                secondary=thermostat,reported_at=reported,astronomy=astronomy,
                                cloud_coverage=(weather_state.get('attributes') or {}).get('cloud_coverage') if isinstance(weather_state,dict) and weather_fresh else None,
-                               settings=settings,quality=outside_fresh and source=='Вітальня' and reported is not None and 0<=now.timestamp()-reported<=300 and
+                               settings=settings,fit_coefficients=getattr(self,'_native_solar_fit',True),
+                               quality=outside_fresh and source=='Вітальня' and reported is not None and 0<=now.timestamp()-reported<=300 and
                                    room_check['status'] not in ('pending','room_source_disagreement') and quality and not reserve_active and
                                    grid=='on' and equipment.get('ready') is True and quiet_ventilation and
                                    self.memory.get('fire_phase')=='Неактивний')

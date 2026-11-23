@@ -74,7 +74,7 @@ def snapshot(case):
     return now, 21.0, 24.0, 5., 2.5, model, weather, settings
 
 
-def measure(package, case, profile_kind, progress=False):
+def measure(package, case, profile_kind, progress=False, primary_only=False):
     worker = importlib.import_module(f"{package}.calculation_worker")
     stability = importlib.import_module(f"{package}.native_engine.heating_stability")
     serial = iter(range(1, 100))
@@ -103,7 +103,7 @@ def measure(package, case, profile_kind, progress=False):
 
     if profile_kind in (None, "stable_plan", "replay", "stress_scenarios"):
         plan, ref = run("stable_plan", worker.calculate, "plan", "plan-0", args, dict(power_kw=3.))
-    if profile_kind is None:
+    if profile_kind is None and not primary_only:
         for i in (1, 2):
             at = args[0] + timedelta(minutes=5*i)
             room = stability.expected(ref, at.timestamp(), "temperature", "room")
@@ -119,15 +119,15 @@ def measure(package, case, profile_kind, progress=False):
                 for kw in (3, 6, 9)})
         run("recommend_power", worker.calculate, "power_advice", "advice", args,
             dict(calibrations=calibrations) if calibrations is not None else {})
-    if profile_kind in (None, "plan"):
+    if not primary_only and profile_kind in (None, "plan"):
         run("plan", stability.optimise, *args, power_kw=3.)
-    if profile_kind in (None, "replay"):
+    if not primary_only and profile_kind in (None, "replay"):
         run("replay", stability.replay, *args, plan["heat_segments"],
             plan["split_comfort_applied"], 3., reserve_checked=True,
             window_extensions=stability.approved_extensions(args[-1], plan))
-    if profile_kind in (None, "stress_scenarios"):
+    if not primary_only and profile_kind in (None, "stress_scenarios"):
         run("stress_scenarios", stability.stress_scenarios, *args, plan, 3.)
-    if profile_kind is None:
+    if profile_kind is None and not primary_only:
         timings["combined"] = tuple(sum(timings[k][i] for k in
                                     ("stable_plan", "refresh_1", "refresh_2", "recommend_power"))
                                     for i in range(2))
@@ -164,7 +164,11 @@ def main():
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--shared-worker", action="store_true",
                         help="Alternate revisions within one worker to control for process variance")
+    parser.add_argument("--a-a", action="store_true", help="Package the baseline under both names")
+    parser.add_argument("--primary-only", action="store_true", help="Measure only stable plan and power advice")
     opts = parser.parse_args()
+    if opts.a_a and opts.baseline_only:
+        parser.error("--a-a needs two variants")
     if opts.repeat < 0:
         parser.error("--repeat must be non-negative")
     variants = ("baseline",) if opts.baseline_only else ("baseline", "candidate")
@@ -172,7 +176,8 @@ def main():
         destination = Path(folder)
         package(opts.baseline.resolve(), destination, "baseline")
         if not opts.baseline_only:
-            package(Path(__file__).resolve().parents[1], destination, "candidate")
+            source = opts.baseline.resolve() if opts.a_a else Path(__file__).resolve().parents[1]
+            package(source, destination, "candidate")
         sys.path.insert(0, folder)
         with ExitStack() as stack:
             pool_names = ("shared",) if opts.shared_worker else variants
@@ -188,7 +193,7 @@ def main():
                 samples = {variant: [] for variant in variants}
                 for i in range(opts.repeat+1):
                     for variant in variants[::1 if i % 2 == 0 else -1]:
-                        output, timings, _, peak_rss[variant] = worker_for[variant].submit(measure, variant, case, None, opts.progress).result()
+                        output, timings, _, peak_rss[variant] = worker_for[variant].submit(measure, variant, case, None, opts.progress, opts.primary_only).result()
                         outputs.setdefault("baseline", output)
                         if i:
                             samples[variant].append(timings)
@@ -201,8 +206,8 @@ def main():
                     passes = golden["stable_plan"][0].get("search_passes", [])
                     print("Exact output match, search widths:",
                           [p["beam_width"] for p in passes],
-                          "| replay:", golden["replay"] is not None,
-                          "| stress cases:", len(golden["stress_scenarios"]), flush=True)
+                          "| replay:", golden.get("replay") is not None,
+                          "| stress cases:", len(golden.get("stress_scenarios", ())), flush=True)
                 if not opts.repeat:
                     continue
                 print("variant operation                  CPU median/p95 s   wall median/p95 s")

@@ -111,7 +111,7 @@ def weather_factor(condition,cloud_coverage=None):
 
 def observe_gain(previous, stamp, room, floor, outside, fire, heating,
                  model, timezone, condition=None,secondary=None,reported_at=None,
-                 astronomy=None,cloud_coverage=None,quality=True,settings=None):
+                 astronomy=None,cloud_coverage=None,quality=True,settings=None,fit_coefficients=True):
     state=dict(previous or {})
     state.setdefault('days',0);state.setdefault('coefficient',0.)
     if not quality:
@@ -158,6 +158,9 @@ def observe_gain(previous, stamp, room, floor, outside, fire, heating,
             state['last']=current
     observations=[x for x in observations if stamp-x['at']<14*86400][-240:]
     state['observations']=observations
+    if not fit_coefficients:
+        state.setdefault('validated',False)
+        return state
     eligible=[x for x in observations if x['factor']>=.15 and x.get('stable') and x.get('factor_policy')==ENVIRONMENT_POLICY_VERSION]
     days=len({x['day'] for x in eligible})
     state['days']=days

@@ -167,7 +167,7 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
-    """Configure voltage qualification and private learning observation."""
+    """Configure only the read-only voltage qualification band."""
 
     def __init__(self, config_entry):
         self._entry = config_entry
@@ -187,7 +187,6 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
                 "min_voltage_v": minimum,
                 "max_voltage_v": maximum,
                 "voltage_recovery_seconds": recovery,
-                "adaptive_learning_v2_mode": user_input.get("adaptive_learning_v2_mode","disabled"),
             })
         return self.async_show_form(
             step_id="init",
@@ -196,12 +195,7 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
 
     @staticmethod
     def _schema(current):
-        adaptive = current.get("adaptive_learning_v2_mode")
-        if adaptive not in ("disabled","observe","candidate"):
-            adaptive = "disabled"
         return vol.Schema({
-            vol.Optional("adaptive_learning_v2_mode", default=adaptive):
-                vol.In(("disabled","observe","candidate")),
             vol.Required("min_voltage_v", default=current.get("min_voltage_v", 190)):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=140, max=235, step=1,

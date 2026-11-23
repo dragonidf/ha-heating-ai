@@ -5,8 +5,8 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from heating_learning_windows import (audit_transitions, build_observation_windows,
-    evaluate_windows, load_evidence, mode_for, prospective_gate, review_limits,
-    run_shadow, save_evidence, solar_context_at)
+    evaluate_windows, load_evidence, prospective_gate, review_limits,
+    run_learning, save_evidence, solar_context_at)
 from heating_model import DEFAULT_MODEL, transitions
 
 
@@ -99,11 +99,6 @@ class WindowsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_evidence(path)
 
-    def test_invalid_mode_fails_closed(self):
-        self.assertEqual(mode_for("active"), ("disabled", "invalid_adaptive_learning_mode"))
-        self.assertEqual(mode_for("candidate"), ("candidate", None))
-
-
     def test_history_separates_heldout_days_and_refuses_promotion(self):
         from tools.replay_adaptive_learning import MODEL, TZ, fixture, frozen_fixture
         rows = fixture()
@@ -153,21 +148,21 @@ class WindowsTest(unittest.TestCase):
         now=datetime.fromtimestamp(rows[-1]["ts"]+300,TZ)
         with TemporaryDirectory() as folder:
             root=Path(folder)
-            path=root/"learning_windows_v1.json"
+            path=root/"online_learning_v1.json"
             state=root/"state.json"
             ledger=root/"energy.json"
             for file in (state,ledger): file.write_bytes(b"legacy")
-            result=run_shadow(path,rows,[],rows,MODEL,{},"observe",now)
-            self.assertIsNone(result["warning"])
+            result=run_learning(path,rows,[],MODEL,{},{},now,False)
+            self.assertEqual(result["status"],"frozen")
             count=len(load_evidence(path)["windows"])
-            run_shadow(path,rows,[],rows,MODEL,{},"observe",now)
+            run_learning(path,rows,[],MODEL,{},{},now,False)
             self.assertEqual(len(load_evidence(path)["windows"]),count)
             self.assertGreater(count,0)
             self.assertEqual(state.read_bytes(),b"legacy")
             self.assertEqual(ledger.read_bytes(),b"legacy")
             path.write_bytes(b"broken")
-            self.assertEqual(run_shadow(path,rows,[],rows,MODEL,{},"candidate",now)["warning"],
-                             "adaptive_evidence_corrupt")
+            self.assertEqual(run_learning(path,rows,[],MODEL,{},{},now,True)["reason"],
+                             "learning_storage_or_data_error")
             self.assertEqual(path.read_bytes(),b"broken")
 
     def test_future_review_is_explicit_bounded_and_never_actuates(self):

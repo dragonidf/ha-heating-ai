@@ -1,4 +1,4 @@
-"""Private evidence for adaptive learning. This module has no control interface."""
+"""Private evidence and bounded policy for the single scheduled learner."""
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime
@@ -22,12 +22,6 @@ MAX_WEATHER_AGE = 3 * 3600
 IDENTITY = ("epoch", "source", "thermal_model_version", "equipment_version", "boiler_power_mode")
 FIT_FIELDS = ("floor_air", "room_loss")
 _JOB_LOCK = Lock()
-
-
-def mode_for(value):
-    if value in ("disabled", "observe", "candidate"):
-        return value, None
-    return "disabled", "invalid_adaptive_learning_mode"
 
 
 def report_time(row):
@@ -348,6 +342,7 @@ def evaluate_windows(windows, model, ventilation=None):
     return dict(status="holdout_passed" if qualified else "holdout_rejected",
                 blockers=[] if qualified else ["held_out_no_improvement"],
                 coverage=coverage, train_windows=len(train), holdout_days=len({w["day"] for w in holdout}),
+                holdout_start=min(w["day"] for w in holdout),
                 old=baseline,shadow=shadow, coefficients={k:best[k] for k in FIT_FIELDS} if qualified else None,
                 equipment=latest)
 
@@ -529,11 +524,17 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
     # Forecast/reference settings are immutable to the controller after issue.
     # Round-trip the small selected fields to keep the sidecar independent.
     climate = json.loads(_encode(climate))
+    guards = []
+    for point in fine:
+        if start<point["ts"]<=min(last,start+10860):
+            at=datetime.fromtimestamp(point["ts"]-.001,now.tzinfo)
+            _,low,high,_=comfort_at(at,settings)
+            guards.append([point["ts"],point["temperature"],point.get("upper_temperature"),low,high])
     return dict(start=start, issue_at=issue, provider="heating_weather_forecast",
                 weather=relevant, weather_known_until=known,
                 room=room,floor=floor,outside=outside,fire=fire, settings=climate,
                 model=dict(model),candidate=candidate,epoch=epoch,points=points,
-                segments=segments,identity=[epoch,"Вітальня",model.get("version"),
+                segments=segments,guards=guards,identity=[epoch,"Вітальня",model.get("version"),
                     settings.get("equipment_version"),(settings.get("modulation_profile") or {}).get("physical_mode")])
 
 
@@ -541,7 +542,8 @@ def _frozen_predictions(snapshot, tz, finish):
     start, segments = snapshot["start"], snapshot["segments"]
     weather, settings = snapshot["weather"], snapshot["settings"]
     horizon_targets = {v[0] for v in snapshot["points"].values() if v[0]<=finish}
-    boundaries = sorted({start,finish,*horizon_targets,
+    guard_targets = {v[0] for v in snapshot.get("guards",()) if v[0]<=finish}
+    boundaries = sorted({start,finish,*horizon_targets,*guard_targets,
                          *(start+i*300 for i in range(1,math.ceil((finish-start)/300))),
                          *(t for a,b,_ in segments for t in (a,b) if start<t<finish)})
     room, floor = snapshot["room"], snapshot["floor"]
@@ -556,12 +558,12 @@ def _frozen_predictions(snapshot, tz, finish):
         for i,(model, (r,f)) in enumerate(zip(models,states)):
             states[i] = forecast_step(r,f,outside,kw,fire,model,(b-a)/3600,when,weather,settings)
             peaks[i] = max(peaks[i],states[i][0])
-        if b in horizon_targets:
+        if b in horizon_targets or b in guard_targets:
             predictions[b] = states[1][0]-states[0][0], peaks[1]-peaks[0]
     return predictions
 
 
-def compare_frozen(snapshot, rows, tz):
+def qualify_frozen(snapshot, rows, tz):
     """Evaluate the frozen plan against qualified reports and measured execution."""
     times = [r["ts"] for r in rows]
     start = snapshot["start"]
@@ -597,12 +599,30 @@ def compare_frozen(snapshot, rows, tz):
             cursor=right
         checks.append((int(horizon), due, old, upper, low, high, zone, row["room"], reasons,
                        planned_kwh,actual_kwh,planned_minutes,actual_minutes))
+    return [row[:-5]+(sorted(row[-5]),)+row[-4:] for row in checks]
+
+
+def compare_frozen(snapshot, rows, tz):
+    return score_frozen(snapshot, qualify_frozen(snapshot,rows,tz), tz)
+
+
+def score_frozen(snapshot, checks, tz):
     if not checks:
         return []
-    predictions = _frozen_predictions(snapshot,tz,max(check[1] for check in checks))
+    start = snapshot["start"]
+    predictions = (_frozen_predictions(snapshot,tz,max(check[1] for check in checks))
+                   if snapshot["candidate"] else {})
     results=[]
     for h,due,old,upper,low,high,zone,actual,reasons,plan_kwh,actual_kwh,plan_min,actual_min in checks:
-        delta,peak_delta = predictions[due]
+        delta,peak_delta = predictions.get(due,(0.,0.))
+        guards = [g for g in snapshot.get("guards",()) if g[0]<=due]
+        trajectory_ok = bool(guards and guards[-1][0]==due
+            and all(0<b-a<=301 for a,b in zip([start]+[g[0] for g in guards], [g[0] for g in guards])))
+        if trajectory_ok and predictions:
+            trajectory_ok=all(high_risk is not None
+                and max(0.,high_risk+max(predictions[t])-hi)<=max(0.,high_risk-hi)
+                and max(0.,lo-(nom+predictions[t][0]))<=max(0.,lo-nom)
+                for t,nom,high_risk,lo,hi in guards)
         shadow = old+delta
         categories=[]
         if zone=="Сон" and actual_min==0:
@@ -614,8 +634,15 @@ def compare_frozen(snapshot, rows, tz):
         if (actual_min and snapshot["segments"] and
                 not any(a<due<=b for a,b,_ in snapshot["segments"])):
             categories.append("after_stop")
+        outside=snapshot["outside"]
+        stratum=":".join((zone,str(math.floor(outside/4)), "heat" if actual_min else "idle",
+                         "after_stop" if "after_stop" in categories else "steady"))
+        # Match the active plan and observed temperatures. A missed prediction,
+        # on its own, does not establish a planning-related comfort violation.
+        violation=(old>high and actual>high+.1) or (old<low and actual<low-.1)
         results.append(dict(start=start,end=due,day=_local_day(start,tz),horizon=h,
             old_error=old-actual,shadow_error=shadow-actual,valid=not reasons,reasons=sorted(reasons),
+            trajectory_guard_ok=trajectory_ok,stratum=stratum,violation=violation,
             guard_ok=(max(0.,upper+max(delta,peak_delta)-high)<=max(0.,upper-high) and
                       max(0.,low-shadow)<=max(0.,low-old)),
             categories=categories,planned_kwh=plan_kwh,actual_kwh=actual_kwh,
@@ -625,100 +652,172 @@ def compare_frozen(snapshot, rows, tz):
     return results
 
 
-def run_shadow(path, rows, forecasts, legacy_rows, model, ventilation, mode, now):
-    """Existing HA executor job. Serialize private writes across config reloads."""
-    if mode not in ("observe","candidate"):
-        return dict(candidate=None,warning=None)
+
+
+def independent_checks(rows, horizon):
+    end=-math.inf
+    for row in sorted(rows,key=lambda r:(r["end"],r["start"])):
+        if (row["horizon"]==horizon and row.get("valid") is True and row["start"]>end
+                and all(number(row.get(k)) is not None for k in ("old_error","shadow_error"))):
+            yield row
+            end=row["end"]
+
+
+def promotion_evidence(rows):
+    """Both physical horizons and all available guarded trajectories must pass."""
+    metrics, strata = {}, {}
+    for horizon,minimum,days in ((1,12,3),(3,6,2)):
+        qualified=list(independent_checks(rows,horizon))
+        if len(qualified)<minimum or len({r["day"] for r in qualified})<days:
+            return dict(status="insufficient_data",reason=f"holdout_{horizon}h",metrics=metrics)
+        old,new=(_metrics([r[key] for r in qualified]) for key in ("old_error","shadow_error"))
+        metrics[str(horizon)]={"old":old,"new":new}
+        if (not old["mae"] or new["mae"]>.98*old["mae"] or abs(new["bias"])>abs(old["bias"])
+                or any(r.get("guard_ok") is not True or r.get("trajectory_guard_ok",True) is not True
+                       for r in qualified)):
+            return dict(status="rejected",reason=f"quality_{horizon}h",metrics=metrics)
+        for group in {r["stratum"] for r in qualified}:
+            members=[r for r in qualified if r["stratum"]==group]
+            strata[f"{horizon}:{group}"]=dict(mae=_metrics([r["old_error"] for r in members])["mae"],
+                                             violation=any(r["violation"] for r in members))
+    return dict(status="accepted",metrics=metrics,strata=strata)
+
+
+def promotion_allowed(active, fitted_base, proposed, evidence, state, now, *, legacy_day=None):
+    date=now.date().isoformat()
+    baseline=(legacy_day or {}).get("baseline",active) if (legacy_day or {}).get("date")==date else active
+    return (active==fitted_base and active.get("validated") is True and bool(proposed)
+            and evidence.get("status")=="accepted"
+            and any(proposed[k]!=active.get(k) for k in proposed)
+            and state.get("promotion_day")!=date
+            and now.timestamp()>=state.get("frozen_until",0)
+            and all(k in FIT_FIELDS and not isinstance(proposed[k],bool) and number(proposed[k]) is not None
+                    and BOUNDS[k][0]<=proposed[k]<=BOUNDS[k][1]
+                    and abs(proposed[k]-active[k])<=.01*abs(active[k])+1e-12
+                    and abs(proposed[k]-baseline[k])<=.02*abs(baseline[k])+1e-12
+                    and abs(proposed[k]-baseline[k])<=.05*abs(baseline[k])+1e-12
+                    for k in proposed))
+
+
+def rollback_reason(rows, strata):
+    qualified={h:[(r,strata[f"{h}:{r['stratum']}"]) for r in independent_checks(rows,h)
+                  if f"{h}:{r['stratum']}" in strata] for h in (1,3)}
+    events=sorted((r for cohort in qualified.values() for r,b in cohort
+                   if r["violation"] and not b["violation"]),key=lambda r:r["end"])
+    end=-math.inf
+    count=0
+    for row in events:
+        if row["start"]>end:
+            count+=1
+            end=row["end"]
+            if count>=2:
+                return "confirmed_comfort_violations"
+    hour=qualified[1]
+    if len(hour)>=12 and len({r["day"] for r,b in hour})>=3:
+        expected=sum(b["mae"] for r,b in hour)/len(hour)
+        observed=sum(abs(r["old_error"]) for r,b in hour)/len(hour)
+        if observed>1.15*expected and observed-expected>.10:
+            return "forecast_degradation"
+    return None
+
+
+def run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible):
+    """One bounded executor task; return a proposal and never touch HA state."""
     with _JOB_LOCK:
         try:
-            return _run_shadow(path, rows, forecasts, legacy_rows, model, ventilation, mode, now)
-        except (ValueError, TypeError, KeyError, OSError, IndexError, AttributeError):
-            return dict(candidate=None, warning="adaptive_evidence_failed")
+            return _run_learning(path,rows,forecasts,model,ventilation,checkpoint,now,eligible)
+        except Exception as exc:
+            return dict(status="frozen",reason="learning_storage_or_data_error",fault=type(exc).__name__)
 
 
-def _run_shadow(path, rows, forecasts, legacy_rows, model, ventilation, mode, now):
-    now_stamp, tz = now.timestamp(), now.tzinfo
-    empty = dict(windows=[],forecasts=[],comparisons=[],report={})
+def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible):
     try:
-        previous = load_evidence(path)
+        saved=load_evidence(path)
     except FileNotFoundError:
-        previous = empty
-    except (ValueError, TypeError, KeyError, OSError):
-        # Keep damaged evidence for diagnosis. Never infer a candidate on it.
-        return dict(candidate=None, warning="adaptive_evidence_corrupt")
-    prior_windows = [w for w in previous["windows"] if w["end"]>=now_stamp-RETENTION]
-    latest = prior_windows[-1]["end"] if prior_windows else 0.
-    # Keep physical brackets, but consume each verified endpoint only once.
-    fresh = [dict(r,report_verified=False) if (report_time(r) or math.inf)<=latest else r for r in rows]
-    recent = build_observation_windows(fresh,tz)
-    windows = (prior_windows+recent.pop("windows"))[-2000:]
-    audit=audit_transitions(legacy_rows,include_pairs=False)
-    audit.pop("pairs")
-    old_candidate=(previous["report"].get("candidate") if mode=="candidate" else None)
-    identity = windows[-1]["equipment"] if windows else None
-    candidate = old_candidate if (old_candidate and old_candidate.get("baseline")==model
-                                  and old_candidate.get("equipment")==identity) else None
-    available = {s["start"]:s for s in (*previous["forecasts"],*forecasts)}
-    comparisons = previous["comparisons"] if candidate else []
-    accepted = {(r["start"],r["horizon"]):r for r in comparisons if r["end"]>=now_stamp-RETENTION}
-    baseline = {(r["start"],r["horizon"]):r for r in previous["report"].get("baseline_results",[])
-                if r["end"]>=now_stamp-RETENTION and r.get("model_version")==model.get("version")}
-    retained = {}
-    for snapshot in sorted(available.values(),key=lambda s:s["start"]):
-        start = snapshot["start"]
-        if start<now_stamp-RETENTION:
-            continue
-        if snapshot["candidate"] is not None and (snapshot["candidate"]!=candidate or
-                                                   start<candidate["issued_at"]):
-            continue
-        retained[start]=snapshot
-        if not rows or snapshot["epoch"]!=rows[-1]["epoch"] or start<rows[0]["ts"]:
-            continue
-        targets = baseline if snapshot["candidate"] is None else accepted
-        for result in compare_frozen(snapshot,rows,tz):
-            result["model_version"] = snapshot["model"].get("version")
-            targets.setdefault((result["start"],result["horizon"]),result)
-    baseline_results = list(baseline.values())[-80:]
-    baseline_summary = {str(h):_metrics([r["old_error"] for r in baseline_results
-                                         if r["horizon"]==h and r["valid"]]) for h in (1,3,6)}
-    # Bound CPU and decoded memory before fitting, with headroom for scores.
-    windows = windows[-500:]
-    steps = sum(len(w["steps"]) for w in windows)
-    trim = 0
+        saved=dict(windows=[],forecasts=[],comparisons=[],report={})
+    stamp=now.timestamp()
+    cutoff=stamp-RETENTION
+    windows=[w for w in saved["windows"] if w["end"]>=cutoff]
+    latest=windows[-1]["end"] if windows else cutoff
+    fresh=[dict(r,report_verified=False) if (report_time(r) or math.inf)<=latest else r for r in rows]
+    window_report=build_observation_windows(fresh,now.tzinfo)
+    windows=(windows+window_report["windows"])[-500:]
+    steps=sum(len(w["steps"]) for w in windows)
+    trim=0
     while steps>4800:
-        steps -= len(windows[trim]["steps"])
-        trim += 1
-    windows = windows[trim:]
-    thermal = evaluate_windows(windows,model,ventilation) if mode=="candidate" else dict(status="observe")
-    solar = (evaluate_solar([w for w in windows if w["equipment"]==identity],model,ventilation=ventilation)
-             if mode=="candidate" else dict(status="observe",comfort_credit=False,
-                                           model_certificate_validated=False))
-    if thermal.get("coefficients") and candidate is None:
-        candidate = dict(baseline=dict(model),coefficients=thermal["coefficients"],
-                         equipment=thermal["equipment"],issued_at=now_stamp)
-    comparisons=list(accepted.values())[-360:]
-    observed_days = set(previous["report"].get("observation_days",())) if candidate==old_candidate else set()
-    if candidate:
-        observed_days.update(_local_day(at,tz) for r in rows if
-            (at:=report_time(r)) is not None and at>=candidate["issued_at"] and not row_reasons(r,strict=True))
-    prospective = (prospective_gate(comparisons,issued_at=candidate["issued_at"],now=now_stamp,
-                                   observation_days=observed_days)
-                   if candidate else dict(evidence_passed=False,promotion_allowed=False,blockers=["no_candidate"]))
-    if candidate and thermal["status"]!="holdout_passed":
-        prospective.update(evidence_passed=False,blockers=prospective["blockers"]+["thermal_evidence_degraded"])
-    prospective["rejection_counts"] = dict(Counter(reason for row in comparisons
-                                                   for reason in row.get("reasons",())))
-    report = dict(mode=mode,policy=SCHEMA,updated_at=now_stamp,candidate=candidate,
-                  candidate_age_seconds=now_stamp-candidate["issued_at"] if candidate else None,
-                  last_promoted=None,baseline_results=baseline_results,baseline_frozen=baseline_summary,
-                  observation_days=sorted(observed_days)[-60:],primary_observation="HA state change, cached republish excluded",
-                  legacy=audit,recent=recent,retained_coverage=_coverage(windows),thermal=thermal,solar={**solar,"pending_gain":solar.get("coefficient")},
-                  prospective=prospective,blockers=list(dict.fromkeys(thermal.get("blockers",[])+prospective["blockers"])))
-    state=dict(windows=windows,forecasts=list(retained.values())[-8:],comparisons=comparisons,report=report)
-    try:
-        save_evidence(path,state)
-    except ValueError:
-        # Bounded by encoded size as well as the step/query counts.
-        state["windows"]=windows[len(windows)//2:]
-        save_evidence(path,state)
-    return dict(candidate=candidate,warning=None)
+        steps-=len(windows[trim]["steps"])
+        trim+=1
+    windows=windows[trim:]
+    # Archive only original issues plus independently measured endpoints.
+    # Parameters are simulated exclusively inside this bounded scheduled job.
+    available={item["snapshot"]["start"]:item for item in saved["forecasts"]
+               if item["snapshot"]["start"]>=cutoff}
+    for snapshot in forecasts:
+        available.setdefault(snapshot["start"],dict(snapshot=snapshot,checks=[]))
+    archive=[]
+    for stamp_key,item in sorted(available.items())[-192:]:
+        snapshot=item["snapshot"]
+        checks={r[0]:r for r in item["checks"]}
+        if rows and snapshot["epoch"]==rows[-1]["epoch"] and rows[0]["ts"]<=stamp_key:
+            for row in qualify_frozen(snapshot,rows,now.tzinfo):
+                checks.setdefault(row[0],row)
+        if checks or (rows and snapshot["epoch"]==rows[-1]["epoch"]
+                      and stamp-max(p[0] for p in snapshot["points"].values())<600):
+            archive.append(dict(snapshot=snapshot,checks=list(checks.values())))
+    coverage=_coverage(windows)
+    cooldown=stamp<checkpoint.get("frozen_until",0)
+    result=dict(status="frozen" if not eligible or cooldown else "insufficient_data",
+                reason="rollback_cooldown" if cooldown else "qualified_inputs_required",independent_windows=len(windows),
+                qualified_minutes=round(coverage["seconds"]/60,1))
+    monitoring=checkpoint.get("monitoring")
+    if monitoring and monitoring["version"]==model.get("version"):
+        assessments={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
+        assessed=[r for item in archive
+                  if item["snapshot"]["model"]==model and item["snapshot"]["start"]>=monitoring["at"]
+                  for r in score_frozen(item["snapshot"],item["checks"],now.tzinfo)]
+        assessments.update({(r["start"],r["horizon"]):r for r in assessed if r["valid"]})
+        assessed=list(assessments.values())
+        reason=rollback_reason(assessed,monitoring["strata"]) if eligible else None
+        if reason:
+            result.update(status="rolled_back",reason=reason,rollback=True)
+        elif eligible:
+            result.update(status="collecting",reason="post_promotion_monitoring")
+            # Allow further updates only after accumulating comparable checks.
+            for horizon,min_count,days in ((1,12,3),(3,6,2)):
+                same=[r for r in independent_checks(assessed,horizon) if f"{horizon}:{r['stratum']}" in monitoring["strata"]]
+                if len(same)<min_count or len({r["day"] for r in same})<days:
+                    eligible=False
+    if (eligible and not result.get("rollback") and model.get("validated") is True
+            and stamp>=checkpoint.get("frozen_until",0)
+            and checkpoint.get("promotion_day")!=now.date().isoformat()):
+        thermal=evaluate_windows(windows,model,ventilation)
+        result.update(status=thermal["status"] if thermal["status"]=="insufficient_data" else "rejected",
+                      reason=",".join(thermal.get("blockers",[])) or "holdout_forecasts_required")
+        if thermal.get("coefficients"):
+            scored=[r for item in archive if item["snapshot"]["model"]==model
+                    and item["snapshot"]["start"]>=checkpoint.get("evidence_after",0)
+                    and _local_day(item["snapshot"]["start"],now.tzinfo)>=thermal["holdout_start"]
+                    and item["snapshot"]["identity"][2:]==thermal["equipment"]
+                    for r in score_frozen(dict(item["snapshot"],candidate={"coefficients":thermal["coefficients"]}),
+                                          [r for r in item["checks"] if r[0] in (1,3)],now.tzinfo)]
+            gate=promotion_evidence(scored)
+            result.update(status=gate["status"],reason=gate.get("reason","independent_holdout_passed"),
+                          metrics=gate.get("metrics",{}))
+            if gate["status"]=="accepted":
+                result.update(proposed=thermal["coefficients"],evidence=gate,
+                              evidence_fingerprint=sha256(_encode(scored)).hexdigest())
+        result["solar"]=evaluate_solar([w for w in windows if w["equipment"][0]==model.get("version")],
+                                      model,ventilation=ventilation)
+    payload=dict(windows=windows,forecasts=archive,comparisons=[],report={
+        "status":result["status"], "reason":result["reason"], "updated_at":stamp,
+        "independent_windows":len(windows), "qualified_minutes":result["qualified_minutes"]})
+    # Keep more than a week of compact issue snapshots where the byte cap permits.
+    while len(_encode(payload))>MAX_BYTES-256:
+        if payload["windows"] and (not payload["forecasts"] or len(payload["windows"])>70):
+            del payload["windows"][:min(20,max(1,len(payload["windows"])-70))]
+        elif payload["forecasts"]:
+            del payload["forecasts"][:8]
+        else:
+            raise ValueError("learning evidence limit")
+    save_evidence(path,payload)
+    return result
