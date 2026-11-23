@@ -186,9 +186,17 @@ def gain_at(when, weather, settings, upper=False):
     environment=settings.get('environment') or {}
     if not environment:
         return 0.
+    stamp=when.timestamp()
+    row=next((row for row in reversed(weather) if 0<=stamp-row['ts']<3600),None)
+    nominal,risk=_weather_gains(when,row,environment)
+    return risk if upper else nominal
+
+
+def _weather_gains(when, row, environment):
+    if not environment:
+        return 0.,0.
     solar=environment.get('solar') or {}
-    entries=[x for x in weather if 0<=when.timestamp()-x['ts']<3600]
-    factor=weather_factor(entries[-1].get('condition'),entries[-1].get('cloud_coverage')) if entries else 0.
+    factor=weather_factor(row.get('condition'),row.get('cloud_coverage')) if row is not None else 0.
     light=daylight(when,environment.get('astronomy'))
     learned=solar.get('coefficient',0.)*light*factor
     # Provisional future solar is never treated as guaranteed free heating.
@@ -200,7 +208,7 @@ def gain_at(when, weather, settings, upper=False):
     residual=residual_at(when,environment.get('residual') or {})
     # The same unexplained room rise must not count twice as solar and bias.
     # No comfort credit until independent 1h/3h field validation is available.
-    return min(.8,max(learned,observed,learned+residual)) if upper else min(.8,learned)
+    return min(.8,learned),min(.8,max(learned,observed,learned+residual))
 
 
 def room_source_check(previous,stamp,readings):
@@ -269,9 +277,26 @@ def observe_residual(previous,stamp,room,floor,outside,model,reported_at,quality
 
 def forecast_step(room,floor,outside,power,fire,model,hours,when,weather,settings,upper=False):
     gain=gain_at(when,weather,settings,upper=upper)
-    dr=model['floor_air']*(floor-room)-model['room_loss']*(room-outside)+model['fire_gain']*max(0.,fire)+gain-ventilation_loss(room,outside,model['room_loss'],settings,upper=upper)
+    loss=ventilation_loss(room,outside,model['room_loss'],settings,upper=upper)
+    return _integrate_forecast(room,floor,outside,power,model,hours,
+                               model['fire_gain']*max(0.,fire),gain,loss)
+
+
+def _integrate_forecast(room,floor,outside,power,model,hours,fire_gain,gain,loss):
+    dr=model['floor_air']*(floor-room)-model['room_loss']*(room-outside)+fire_gain+gain-loss
     df=model['heat_gain']*power-model['floor_decay']*(floor-room)
     return room+dr*hours,floor+df*hours
+
+
+def prepare_ventilation(base_loss,settings):
+    fit=settings.get('ventilation_model') or {}
+    if not fit.get('validated') or fit.get('model_version')!=settings.get('thermal_model_version'):
+        return None,None,None
+    expected=settings.get('ventilation_expected') or {}
+    nominal=(_ventilation_adjustment(fit,base_loss,expected)
+             if all(finite(expected.get(k)) is not None for k in ('recuperator','bath')) else None)
+    return (nominal,_ventilation_adjustment(fit,base_loss,dict(recuperator=0.,bath=0.)),
+            _ventilation_adjustment(fit,base_loss,dict(recuperator=1.,bath=1.)))
 
 
 def has_upper_risk(settings):
@@ -320,10 +345,14 @@ def ventilation_loss(room,outside,base_loss,settings,upper=False):
     if upper:
         expected={k:0. if room>=outside else 1. for k in ('recuperator','bath')}
     elif any(finite(expected.get(k)) is None for k in ('recuperator','bath')):return 0.
+    return _ventilation_adjustment(fit,base_loss,expected)*(room-outside)
+
+
+def _ventilation_adjustment(fit,base_loss,expected):
     # Wider scenarios use maximal/minimal duty; relay ON is not measured airflow.
     duty={k:max(0.,min(1.,expected[k])) for k in ('recuperator','bath')}
     effective=fit['base_room_loss']+sum(fit[k]*duty[k] for k in duty)
-    return (effective-base_loss)*(room-outside)
+    return effective-base_loss
 
 
 def fit_ventilation(samples,model,timezone=None):
