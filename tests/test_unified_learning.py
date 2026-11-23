@@ -90,3 +90,18 @@ class UnifiedLearningPolicyTest(unittest.TestCase):
             self.assertEqual(HeatingClimate.telemetry_tail(path,3),latest)
             path.write_bytes(prefix+b"\n".join(latest)+b"\n")
             self.assertEqual(HeatingClimate.telemetry_tail(path,3),latest)
+
+    def test_executed_plan_can_violate_comfort_despite_an_in_range_forecast(self):
+        from tools.replay_adaptive_learning import TZ, frozen_fixture
+        from heating_learning_windows import score_frozen
+        entry=frozen_fixture(None,days=1,capture=True)[0]
+        check=list(entry["checks"][0])
+        self.assertLess(check[2],check[5])
+        check[7]=check[5]+.2
+        result=score_frozen(entry["snapshot"],[check],TZ)[0]
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["violation"])
+        check[8]=["execution_timing_mismatch"]
+        result=score_frozen(entry["snapshot"],[check],TZ)[0]
+        self.assertFalse(result["valid"])
+        self.assertIsNone(rollback_reason([result],{f"1:{result['stratum']}":{"mae":0.,"violation":False}}))

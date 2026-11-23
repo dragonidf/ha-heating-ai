@@ -637,9 +637,9 @@ def score_frozen(snapshot, checks, tz):
         outside=snapshot["outside"]
         stratum=":".join((zone,str(math.floor(outside/4)), "heat" if actual_min else "idle",
                          "after_stop" if "after_stop" in categories else "steady"))
-        # Match the active plan and observed temperatures. A missed prediction,
-        # on its own, does not establish a planning-related comfort violation.
-        violation=(old>high and actual>high+.1) or (old<low and actual<low-.1)
+        # Count measured violations only in qualified, executed plans. A model
+        # can miss the violation itself, so its prediction is no extra veto.
+        violation=actual>high+.1 or actual<low-.1
         results.append(dict(start=start,end=due,day=_local_day(start,tz),horizon=h,
             old_error=old-actual,shadow_error=shadow-actual,valid=not reasons,reasons=sorted(reasons),
             trajectory_guard_ok=trajectory_ok,stratum=stratum,violation=violation,

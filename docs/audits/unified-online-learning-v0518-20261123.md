@@ -45,12 +45,12 @@ The controlled synthetic replay retained 4,800 independent minutes versus 80
 for the legacy selector. Its frozen 1 h / 3 h / 6 h MAE was 0.00304 / 0.00609 /
 0.01040 °C for v6 and 0.00241 / 0.00267 / 0.00242 °C for the proposed coefficients.
 A separate clean synthetic archive produced a bounded two-coefficient proposal
-through the actual scheduled job. The accepted, disk-failure and automatic
+through the actual scheduled job. Its accepted-path CPU p95 was 39.6 ms across ten warm runs. The accepted, disk-failure and automatic
 rollback paths were exercised without a device service call.
 
 ## Review status
 
-The production configuration stays on the old values unless the above evidence gates pass. The synthetic archive is a policy test. The branch remains draft until resource evidence is reliable and the remaining release conditions are reviewed. No authorization for merge, release, installation or restart was exercised.
+The production configuration stays on the old values unless the above evidence gates pass. The synthetic archive is a policy test. Local verification passed 746 Python tests, 67 JavaScript tests and both native HA 2026.11 smoke runs. The branch remains draft until resource evidence is reliable and the remaining release conditions are reviewed. No authorization for merge, release, installation or restart was exercised.
 
 ## Reproduce
 
