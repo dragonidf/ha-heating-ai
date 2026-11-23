@@ -56,7 +56,7 @@ Ten warm, serial, alternating runs after warm-up, CPU via `process_time` and wal
 | Power advice | 2.7298 / 4.6067 | 2.7692 / 2.9909 | 2.7301 / 4.6073 | 2.7705 / 2.9910 |
 | Three plans plus one advice | 5.2703 / 7.4974 | 5.3232 / 5.7162 | 5.2724 / 7.5001 | 5.3301 / 5.7180 |
 
-Worker peak RSS 29,280 → 29,284 KiB. The worker and its imported numerical modules are byte-identical. The unpinned repeat also missed the strict plan p95 threshold (1.2834 → 1.5023 s). The pinned plan p95 was +18.3%, despite similar medians. With ten observations p95 is the maximum. The ±5% resource gate remains unproven on this runner. The test workload and timing are separate from the live HA readings.
+Worker peak RSS 29,280 → 29,284 KiB. The worker and its imported numerical modules are byte-identical. The unpinned repeat also missed the strict plan p95 threshold (1.2834 → 1.5023 s). The pinned plan p95 was +18.3%, despite similar medians. With ten observations p95 is the maximum. The follow-up below uses longer runs to reduce sensitivity to a single sample. The test workload and timing are separate from the live HA readings.
 
 ### Native 15-second control fixture and sidecar
 
@@ -75,6 +75,42 @@ Times below are milliseconds, with ten groups of twenty warm ticks, plus ten war
 
 The largest within-process additional resident memory after ticks was 4,028 KiB and the measured peak increase was 4,232 KiB. The candidate sidecar used 159,708 bytes. The configured cap is 524,288 bytes. Earlier separate-process tick runs had materially noisier p95 values, so these isolated timing results should be repeated on a representative stable host before inferring a field overhead bound.
 
+## Follow-up measurement
+
+The benchmark now supports `--shared-worker` to alternate both packaged revisions
+inside a single spawned process. The existing invocation still measures separate
+workers with independent RSS. The shared peak RSS reflects both revisions loaded
+in one process.
+
+Twenty timed runs per revision after warm-up, pinned to CPU 2. The scheduled
+fixture matched exactly, including both width-192 passes. Times are seconds.
+
+| Operation | Base CPU median / p95 | Draft CPU median / p95 | CPU p95 change | Base wall p95 → draft |
+|---|---:|---:|---:|---:|
+| Stable plan | 1.1849 / 1.5714 | 1.1796 / 1.4255 | −9.3% | 1.5716 → 1.4256 |
+| Power advice | 2.6545 / 3.2030 | 2.6502 / 3.3069 | +3.2% | 3.2039 → 3.3255 |
+| Three plans plus one advice | 5.2951 / 6.2660 | 5.1840 / 6.3308 | +1.0% | 6.2674 → 6.3580 |
+
+Twenty further timed runs per revision on CPU 2 used separate workers. With 20 samples, nearest-rank p95 is the second-highest measurement.
+
+| Operation | Base CPU median / p95 | Draft CPU median / p95 | CPU p95 change | Base wall p95 → draft |
+|---|---:|---:|---:|---:|
+| Stable plan | 1.1621 / 1.2566 | 1.2062 / 1.3758 | +9.5% | 1.2583 → 1.3759 |
+| Power advice | 2.6445 / 2.8562 | 2.6474 / 2.8677 | +0.4% | 2.8584 → 2.8678 |
+| Three plans plus one advice | 5.1024 / 5.2813 | 5.1548 / 5.8226 | +10.2% | 5.2847 → 5.8304 |
+
+Peak RSS in separate workers (KiB) was `{'baseline': 29280, 'candidate': 29280}`.
+
+The shared-worker test met the threshold for both primary operations. The new separate-worker run exceeded the +5% threshold for stable plan by 4.5 percentage points. The resource gate remains unproven on this host.
+
+The read-only follow-up confirmed the live fixed-6 v6 frozen baseline from the
+controller's aggregate values. Recorder returned indoor temperature history but
+no historical `sensor.heating_forecast` rows in the queried six-hour window,
+even though the current forecast was available. The controller reported a
+healthy archive. Field comparison still needs the private telemetry and
+selected issue-time forecast snapshots from that archive. Aggregate controller
+errors cannot reconstruct the paired old/shadow results.
+
 ## Reproduction and rollback
 
 ```sh
@@ -84,6 +120,8 @@ PYTHONPATH=tools python tools/test_production_ha2026.py
 PYTHONPATH=tools python tools/test_native_v1_ha2026.py
 python tools/replay_adaptive_learning.py
 PYTHONHASHSEED=0 taskset -c 2 python tools/benchmark_planner.py ../base517 --repeat 10 --case scheduled
+PYTHONHASHSEED=0 taskset -c 2 python tools/benchmark_planner.py ../base517 --case scheduled --repeat 20 --shared-worker
+PYTHONHASHSEED=0 taskset -c 2 python tools/benchmark_planner.py ../base517 --case scheduled --repeat 20
 python tools/benchmark_planner.py ../base517 --repeat 0 --case unknown spring_dst autumn_dst
 PYTHONHASHSEED=0 taskset -c 2 python tools/benchmark_adaptive_runtime.py ../base517
 ```

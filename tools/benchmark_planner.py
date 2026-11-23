@@ -162,6 +162,8 @@ def main():
                         "stress_scenarios", "recommend_power"])
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--shared-worker", action="store_true",
+                        help="Alternate revisions within one worker to control for process variance")
     opts = parser.parse_args()
     if opts.repeat < 0:
         parser.error("--repeat must be non-negative")
@@ -173,10 +175,12 @@ def main():
             package(Path(__file__).resolve().parents[1], destination, "candidate")
         sys.path.insert(0, folder)
         with ExitStack() as stack:
-            # Isolated workers, always measured serially, so RSS is per variant.
-            pools = {variant: stack.enter_context(ProcessPoolExecutor(
+            pool_names = ("shared",) if opts.shared_worker else variants
+            pools = {name: stack.enter_context(ProcessPoolExecutor(
                 max_workers=1, mp_context=multiprocessing.get_context("spawn")))
-                for variant in variants}
+                for name in pool_names}
+            worker_for = {variant: pools["shared" if opts.shared_worker else variant]
+                          for variant in variants}
             for case in opts.case:
                 print(f"\n{case}", flush=True)
                 outputs = {}
@@ -184,7 +188,7 @@ def main():
                 samples = {variant: [] for variant in variants}
                 for i in range(opts.repeat+1):
                     for variant in variants[::1 if i % 2 == 0 else -1]:
-                        output, timings, _, peak_rss[variant] = pools[variant].submit(measure, variant, case, None, opts.progress).result()
+                        output, timings, _, peak_rss[variant] = worker_for[variant].submit(measure, variant, case, None, opts.progress).result()
                         outputs.setdefault("baseline", output)
                         if i:
                             samples[variant].append(timings)
@@ -207,10 +211,13 @@ def main():
                         cpu, cpu95 = summary([row[label][0] for row in samples[variant]])
                         wall, wall95 = summary([row[label][1] for row in samples[variant]])
                         print(f"{variant:9} {label:22} {cpu:8.4f} {cpu95:8.4f} {wall:8.4f} {wall95:8.4f}")
-                print("Worker peak RSS (Linux KiB):", peak_rss, flush=True)
+                if opts.shared_worker:
+                    print("Shared worker peak RSS (Linux KiB):", max(peak_rss.values()), flush=True)
+                else:
+                    print("Worker peak RSS (Linux KiB):", peak_rss, flush=True)
                 for label in opts.profile or ():
                     for variant in variants:
-                        _, _, profiles, _ = pools[variant].submit(measure, variant, case, label).result()
+                        _, _, profiles, _ = worker_for[variant].submit(measure, variant, case, label).result()
                         print(variant, label, profiles[label], flush=True)
 
 
