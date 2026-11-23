@@ -9,15 +9,18 @@ import importlib
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import pstats
 import resource
+import random
 import statistics
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from time import perf_counter, process_time
 from uuid import UUID
+from itertools import permutations
 from zoneinfo import ZoneInfo
 from zipfile import ZipFile
 
@@ -152,6 +155,89 @@ def summary(samples):
     return statistics.median(ordered), ordered[math.ceil(.95*len(ordered))-1]
 
 
+def paired_statistics(pairs, seed=518, resamples=5000):
+    """Resample complete pairs so nearby observations retain their covariance."""
+    def relative(rows):
+        left, right = zip(*rows)
+        return summary(right)[1] / summary(left)[1] - 1
+
+    rng = random.Random(seed)
+    n = len(pairs)
+    draws = sorted(relative(rng.choices(pairs, k=n)) for _ in range(resamples))
+    return dict(p95_change=relative(pairs), median_paired_change=statistics.median(
+        right / left - 1 for left, right in pairs),
+        lower_95=draws[math.floor(.025 * resamples)],
+        upper_95=draws[math.ceil(.975 * resamples)-1])
+
+
+def controlled_gate(baseline, candidate, repeat, output, progress):
+    if len(os.sched_getaffinity(0)) != 1 or os.getenv("PYTHONHASHSEED") != "0":
+        raise ValueError("Run on one pinned CPU with PYTHONHASHSEED=0")
+    if repeat < 30 or repeat % 6:
+        raise ValueError("Use at least 30 samples, in complete blocks of six orders")
+    variants = ("baseline", "control", "candidate")
+    orders = list(permutations(variants))
+    rng = random.Random(518)
+    blocks = []
+    for _ in range(repeat // 6):
+        rng.shuffle(orders)
+        blocks.extend(orders)
+    with TemporaryDirectory() as folder, ExitStack() as stack:
+        for variant in variants:
+            package(candidate if variant == "candidate" else baseline, Path(folder), variant)
+        sys.path.insert(0, folder)
+        pool = stack.enter_context(ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn")))
+        reference = None
+        rows = []
+        mixed_rss = 0
+        for i, order in enumerate([variants, variants[::-1], variants, *blocks]):
+            block = {}
+            for variant in order:
+                result, timing, _, rss = pool.submit(measure, variant, "scheduled", None,
+                                                    False, True).result()
+                encoded = json.dumps(result, sort_keys=True)
+                if reference is None:
+                    reference = encoded
+                if encoded != reference:
+                    raise AssertionError(f"Exact output mismatch for {variant}")
+                block[variant] = timing
+                mixed_rss = max(mixed_rss, rss)
+            if i >= 3:
+                rows.append(block)
+                if progress:
+                    print(f"Timed block {len(rows)}/{repeat}", flush=True)
+        # Per-version process high-water marks, with identical fresh worker setup.
+        rss_by_variant = {}
+        for variant in ("baseline", "candidate"):
+            with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as fresh:
+                rss_by_variant[variant] = max(fresh.submit(measure, variant, "scheduled",
+                    None, False, True).result()[3] for _ in range(3))
+    operations = {}
+    for label in rows[0]["baseline"]:
+        a_a = paired_statistics([(r["baseline"][label][0], r["control"][label][0]) for r in rows])
+        a_b = paired_statistics([(r["baseline"][label][0], r["candidate"][label][0]) for r in rows])
+        summary_by_variant = {v: dict(cpu=summary([r[v][label][0] for r in rows]),
+                                      wall=summary([r[v][label][1] for r in rows])) for v in variants}
+        calibrated = (a_a["lower_95"] >= -.05 and a_a["upper_95"] <= .05
+                      and abs(a_a["p95_change"]) <= .05)
+        if not calibrated:
+            gate = "inconclusive_noise"
+        elif a_b["upper_95"] <= .05:
+            gate = "pass"
+        elif a_b["lower_95"] > .05:
+            gate = "regression"
+        else:
+            gate = "inconclusive_effect"
+        operations[label] = dict(variants=summary_by_variant, a_a=a_a, a_b=a_b, gate=gate)
+    result = dict(cpu=sorted(os.sched_getaffinity(0)), exact_output_match=True,
+                  mixed_rss_kib=mixed_rss, isolated_rss_kib=rss_by_variant,
+                  operations=operations, orders=blocks, samples=rows)
+    output.write_text(json.dumps(result, indent=2)+"\n")
+    print(json.dumps({k:v for k,v in result.items() if k not in ("orders","samples")}, indent=2))
+    return all(item["gate"] == "pass" for item in operations.values())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
@@ -166,7 +252,13 @@ def main():
                         help="Alternate revisions within one worker to control for process variance")
     parser.add_argument("--a-a", action="store_true", help="Package the baseline under both names")
     parser.add_argument("--primary-only", action="store_true", help="Measure only stable plan and power advice")
+    parser.add_argument("--controlled-gate", type=Path,
+                        help="Run interleaved A/A/B on the scheduled workload and write raw data")
     opts = parser.parse_args()
+    if opts.controlled_gate:
+        passed = controlled_gate(opts.baseline.resolve(), Path(__file__).resolve().parents[1],
+                                 opts.repeat, opts.controlled_gate, opts.progress)
+        raise SystemExit(0 if passed else 2)
     if opts.a_a and opts.baseline_only:
         parser.error("--a-a needs two variants")
     if opts.repeat < 0:

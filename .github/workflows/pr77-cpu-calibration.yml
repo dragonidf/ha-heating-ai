@@ -1,0 +1,33 @@
+name: PR 77 CPU environment calibration
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  paired-cpu:
+    if: github.event.pull_request.number == 77
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pair production calculation workloads
+        env:
+          PYTHONHASHSEED: '0'
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/heating-base" e731883e96f8fc6756639425ee3b652aa15df15f
+          lscpu | head -25
+          python -c 'import os; print("Available CPUs:", sorted(os.sched_getaffinity(0)))'
+          cpu="$(python -c 'import os; print(max(os.sched_getaffinity(0)))')"
+          taskset -c "$cpu" python tools/benchmark_planner.py "$RUNNER_TEMP/heating-base" --repeat 30 --controlled-gate "$RUNNER_TEMP/heating-cpu.json" --progress
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: heating-cpu-paired-observations
+          path: ${{ runner.temp }}/heating-cpu.json
+          retention-days: 7

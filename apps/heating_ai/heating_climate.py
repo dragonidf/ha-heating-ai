@@ -26,21 +26,94 @@ from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
 
 class HeatingClimate(HeatingRecovery,Hass):
+    TELEMETRY_MAX_BYTES = 32 * 1024 * 1024
+    TELEMETRY_RETAIN_BYTES = 24 * 1024 * 1024
+
     @staticmethod
     def telemetry_tail(path, limit):
         """Read the most recent JSONL records without scanning the archive."""
         with path.open("rb") as stream:
             offset=stream.seek(0,os.SEEK_END)
+            lower=max(0,offset-8*1024*1024)
             chunks=[]
             lines=0
-            while offset and lines<=limit:
-                size=min(offset,65536)
+            while offset>lower and lines<=limit:
+                size=min(offset-lower,65536)
                 offset-=size
                 stream.seek(offset)
                 chunk=stream.read(size)
                 chunks.append(chunk)
                 lines+=chunk.count(b"\n")
-        return b"".join(reversed(chunks)).splitlines()[-limit:]
+            rows=b"".join(reversed(chunks)).splitlines()
+            if offset:
+                stream.seek(offset-1)
+                if stream.read(1)!=b"\n":
+                    rows=rows[1:]
+        return rows[-limit:]
+
+    def load_telemetry_samples(self, since):
+        try:
+            lines=self.telemetry_tail(self.telemetry,4032)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            self.log("Telemetry archive unavailable: %s",type(exc).__name__,level="WARNING")
+            return []
+        rows=[]
+        for line in lines:
+            try:
+                row=json.loads(line)
+                stamp=row["ts"]
+                if type(stamp) not in (int,float) or number(stamp) is None or stamp<since:
+                    continue
+                if "room" not in row or any(
+                    value is not None and (type(value) not in (int,float) or number(value) is None)
+                    for value in (row.get(key) for key in
+                                  ("room","return","outside","power","fire","energy","thermostat","heat_command_at"))
+                ):
+                    continue
+            except (KeyError,ValueError,TypeError,OverflowError):
+                continue
+            if row.get("measurement_version")!=3:
+                row["quality"]=False
+            rows.append(row)
+        return rows
+
+    def append_telemetry(self, row, *, maximum=TELEMETRY_MAX_BYTES, retain=TELEMETRY_RETAIN_BYTES):
+        """Keep the newest whole records. The controller owns the only writer."""
+        payload=(json.dumps(row,ensure_ascii=False,allow_nan=False)+"\n").encode("utf-8")
+        if len(payload)+1>retain:
+            raise ValueError("Telemetry row exceeds retention budget")
+        with self.telemetry.open("ab+") as archive:
+            size=archive.seek(0,os.SEEK_END)
+            if size:
+                archive.seek(-1,os.SEEK_END)
+            separator=b"\n" if size and archive.read(1)!=b"\n" else b""
+            if size+len(separator)+len(payload)<=maximum:
+                archive.write(separator+payload)
+                return
+
+            # Keep a fixed staging name so repeated interruptions cannot
+            # accumulate files. The archive is authoritative until replace.
+            temporary=self.telemetry.with_suffix(".retention.tmp")
+            temporary.unlink(missing_ok=True)
+            try:
+                with open(temporary,"xb",opener=lambda name,flags:os.open(name,flags,0o600)) as target:
+                    start=max(0,size-retain+len(separator)+len(payload))
+                    archive.seek(max(0,start-1))
+                    if start and archive.read(1)!=b"\n":
+                        while not archive.readline(65536).endswith(b"\n"):
+                            if archive.tell()>=size:
+                                break
+                    if archive.tell()<size:
+                        shutil.copyfileobj(archive,target,65536)
+                        target.write(separator)
+                    target.write(payload)
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.replace(temporary,self.telemetry)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def initialize(self):
         self.cfg=dict(self.args)
@@ -78,17 +151,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['planned_heat_segments']=[]
         self.memory.setdefault("energy_bins",list(self.cfg.get("energy_history",[])))
         self.memory.setdefault("energy_last",self.cfg.get("energy_seed"))
-        self.samples=[]
-        if self.telemetry.exists():
-            for line in self.telemetry_tail(self.telemetry,4032):
-                try:
-                    row=json.loads(line)
-                    if row["ts"]>=time.time()-14*86400:
-                        if row.get("measurement_version")!=3:
-                            row["quality"]=False
-                        self.samples.append(row)
-                except (KeyError,ValueError):
-                    continue
+        self.samples=self.load_telemetry_samples(time.time()-14*86400)
         self.power_estimator=HeatingPowerEstimator(window=10. if self.cfg.get('power_measurement_policy')=='audited' else 20.,confirm=10.,threshold=500. if self.cfg.get('power_measurement_policy')=='audited' else 2000.)
         self.memory['modulation_profile']=learn_modulation(self.samples)
         self.run_diagnostic('power_calibration',self.refresh_equipment_models)
@@ -979,8 +1042,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.samples=self.samples[-4032:]
         self.memory['modulation_profile']=learn_modulation(self.samples)
         self.run_diagnostic('power_calibration',self.refresh_equipment_models)
-        with self.telemetry.open("a") as file:
-            file.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+"\n")
+        try:
+            self.append_telemetry(row)
+            self._telemetry_write_failed=False
+        except (OSError,ValueError) as exc:
+            if not getattr(self,"_telemetry_write_failed",False):
+                self.log("Telemetry archive write failed: %s",type(exc).__name__,level="WARNING")
+            self._telemetry_write_failed=True
         pairs=[r for r in self.samples[-288:] if r.get("source")=="Вітальня" and
                r.get('room_valid',r.get('quality')) and number(r.get("thermostat")) is not None and number(r.get("room")) is not None and
                number(r.get('thermostat_reported_at')) is not None and

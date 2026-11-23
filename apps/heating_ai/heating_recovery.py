@@ -1689,21 +1689,24 @@ class DecisionJournal:
         return json.loads(raw)
 
     def _recent_telemetry_lines(self,path,minimum_ts):
-        """Read only the bounded append-only telemetry tail needed for a history window."""
-        max_bytes=16*1024*1024;rows=[];stop=False
-        size=path.stat().st_size
+        """Stream the bounded tail from one descriptor, even during a rotation."""
+        max_bytes=24*1024*1024
         with path.open('rb') as stream:
-            stream.seek(max(0,size-max_bytes))
-            data=stream.read(min(size,max_bytes))
-        for raw in reversed(data.splitlines()):
-            try:
-                row=json.loads(raw);timestamp=number(row.get('ts'))
-            except (ValueError,TypeError,AttributeError):
-                continue
-            if timestamp is not None and timestamp<minimum_ts:
-                stop=True;break
-            if timestamp is not None:rows.append(raw.decode('utf-8'))
-        yield from reversed(rows)
+            size=stream.seek(0,os.SEEK_END)
+            start=max(0,size-max_bytes)
+            stream.seek(max(0,start-1))
+            if start and stream.read(1)!=b'\n':
+                stream.readline()
+            while stream.tell()<size:
+                raw=stream.readline(size-stream.tell())
+                try:
+                    line=raw.decode('utf-8')
+                    row=json.loads(line)
+                    timestamp=number(row.get('ts'))
+                except (ValueError,TypeError,AttributeError,OverflowError):
+                    continue
+                if timestamp is not None and timestamp>=minimum_ts:
+                    yield line
 
     def temperature_comparison(self,start,end,stored=None):
         """Read original issued snapshots and observations; never run a thermal model.
