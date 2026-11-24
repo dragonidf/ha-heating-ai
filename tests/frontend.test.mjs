@@ -660,7 +660,9 @@ test('unified learning renders confirmed improvements, rollback, and safe missin
   p.attrs=()=>({});assert.match(p.learningProgress(),/Стан навчання недоступний/);
   assert.doesNotMatch(p.learningProgress(),/undefined|NaN|Invalid Date/);
 });
-test('model view does not show obsolete auto-apply switch for unified learner',()=>{
-  assert.doesNotMatch(HeatingAIPanel.prototype.model.toString(),/this\.field\('ai_auto_apply'/);
-  assert.match(HeatingAIPanel.prototype.model.toString(),/Штатне самонавчання/);
+test('unified learner does not mistake legacy AI auto-apply control for its own promotion gate',()=>{
+  const source=HeatingAIPanel.prototype.model.toString();
+  assert.match(source,/Штатне самонавчання/);
+  assert.match(source,/Спадковий параметр ШІ · не для самонавчання/);
+  assert.match(source,/this\.field\('ai_auto_apply','Автозастосування старих пропозицій'\)/);
 });
