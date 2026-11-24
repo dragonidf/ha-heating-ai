@@ -66,7 +66,7 @@ def build(check=False):
     release=target.parent/'release.json'
     if check:
         if not release.exists() or release.read_text(encoding='utf-8')!=manifest:
-            raise SystemExit('Run python tools/build_ui.py to refresh the nine-module release manifest')
+            raise SystemExit('Run python tools/build_ui.py to refresh the V1 release manifest')
     else:
         write_text(release, manifest)
 

@@ -30,7 +30,7 @@ class PanelTests(unittest.TestCase):
         from heating_ui_assets import VERSION
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
-            for index in range(9):
+            for index in range(10):
                 (root/f'heating_{index}.py').write_text('pass\n')
             modules={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in root.glob('*.py')}
             (root/'release.json').write_text(json.dumps(dict(version=VERSION,module_hashes=modules)))

@@ -29,6 +29,10 @@ async def exercise(directory):
     Path(cfg["data_dir"]).mkdir()
     state = dict(model=dict(DEFAULT_MODEL, version=6, validated=True), weather=[], energy_bins=[])
     Path(cfg["data_dir"], "state.json").write_text(json.dumps(state))
+    telemetry = Path(cfg["data_dir"], "telemetry.jsonl")
+    archived = dict(ts=time.time()-300, room=21.8, **{"return":25.},
+                    outside=5., power=0., quality=True, measurement_version=3)
+    telemetry.write_bytes(json.dumps(archived).encode() + b'\n[]\n\xff\n{"ts":')
     for value in cfg.values():
         if isinstance(value, str) and "." in value and "/" not in value and " " not in value:
             hass.states.async_set(value, "0")
@@ -88,6 +92,7 @@ async def exercise(directory):
         await controller.async_start(writer=True)
         assert controller.runtime_ready
         assert controller.model["version"] == 6
+        assert controller.samples == [archived], controller.samples
         assert hass.states.get("sensor.heating_ui").attributes["release_verified"] is True
         assert hass.states.get("sensor.heating_ui").attributes["runtime"] == "native_v1"
         # Exercise the packaged spawn import under real HA, not only a stub.
@@ -136,12 +141,25 @@ async def exercise(directory):
         # rejected by the final gateway.
         await controller._dispatch(controller.apply_action,"heat",False)
         assert commands[-1]["hvac_mode"] == "heat"
+        await controller.async_close()
+        hass.states.async_set(cfg["mode"], "Спостереження")
+        hass.states.async_set(cfg["armed"], "off")
+        command_count = len(commands)
+        restarted = NativeController(hass,cfg)
+        try:
+            await restarted.async_start(writer=False)
+            assert restarted.runtime_ready and restarted.model == state["model"]
+            assert restarted.samples[0] == archived
+            assert not restarted._learning_rows
+            assert len(commands) == command_count
+        finally:
+            await restarted.async_close()
     finally:
         await controller.async_close()
         assert not controller._handles
         assert not controller._writer
         await hass.async_stop()
-    print("PASS: complete V1 startup on real HA, verified native bundle, preserved model, manual pause, physical-service boundary and voltage recovery (synthetic services only)")
+    print("PASS: V1 startup and restart on real HA, damaged archive, preserved model, manual pause, physical-service boundary and voltage recovery (synthetic services only)")
 
 
 def main():

@@ -187,6 +187,83 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             boot_id="fixture-boot",owner_epoch=1,fenced=False))
         return hass, app
 
+    async def test_single_scheduled_learning_job_keeps_v6_without_evidence(self):
+        with package(self.root / "package") as (component, _):
+            _, app = self.controller(component)
+            app.directory = self.root
+            app.now = lambda: datetime(2026,11,1,tzinfo=timezone.utc)
+            app.submit_to_executor = Mock()
+            app._learning_rows.append({"ts":1.})
+            with patch.object(component.HeatingClimate,"daily_learn") as legacy:
+                app.daily_learn()
+                app.daily_learn()
+                legacy.assert_not_called()
+            app.submit_to_executor.assert_called_once()
+            function,path,*_ = app.submit_to_executor.call_args.args
+            self.assertEqual(function.__name__,"run_learning")
+            self.assertEqual(path.name,"online_learning_v1.json")
+            app._learning_finished({"job_id":app._learning_job["id"],
+                                    "result":{"status":"insufficient_data"}})
+            self.assertEqual(app.model,{"version":6})
+            self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_learning_commit_and_rollback_are_atomic_and_leave_control_ledgers(self):
+        with package(self.root / "package") as (component, _):
+            _, app = self.controller(component)
+            app.directory = self.root
+            app.now = lambda: datetime(2026,11,1,tzinfo=timezone.utc)
+            app.model = {"version":6,"validated":True,"floor_air":.035}
+            source=dict(app.model)
+            app.memory.update(model=source,manual_energy={"status":"completed"},energy_cursor=3.)
+            app._learning_rows.append({"ts":1.})
+            app.submit_to_executor=Mock()
+            app._learning_eligible=Mock(return_value=True)
+            app.daily_learn()
+            outcome={"status":"accepted","proposed":{"floor_air":.0351},
+                "evidence":{"status":"accepted","strata":{"1:night_idle":{"mae":.3,"violation":False}}},
+                "metrics":{},"evidence_fingerprint":"fixture"}
+            job=app._learning_job["id"]
+            original=app.statefile.read_bytes() if app.statefile.exists() else None
+            with patch.object(component.os,"replace",side_effect=OSError("disk")):
+                app._learning_finished({"job_id":job,"result":outcome})
+            self.assertEqual(app.model,source)
+            self.assertEqual(app.statefile.read_bytes() if app.statefile.exists() else None,original)
+            app.daily_learn()
+            self.assertIsNotNone(app._learning_job)
+            app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
+            self.assertEqual(app.model["version"],7)
+            self.assertEqual(json.loads(app.statefile.read_text())["model"],app.model)
+            self.assertEqual(app.memory["energy_cursor"],3.)
+            from test_unified_learning import pairs
+            issued=app.now().timestamp()
+            app._learning_forecasts.append({"model":dict(app.model),"start":issued,
+                                            "points":{"1":[issued+3600]}})
+            app.climate_tz=timezone.utc
+            with patch.object(component.learning,"compare_frozen",return_value=pairs(old_error=.5)):
+                app._monitor_learning(issued+3600)
+            self.assertEqual(app.model,source)
+            self.assertEqual(json.loads(app.statefile.read_text())["model"],source)
+            self.assertGreater(app.memory["online_learning"]["frozen_until"],app.now().timestamp())
+            self.assertEqual(app.memory["manual_energy"],{"status":"completed"})
+            self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_adaptive_capture_requires_numeric_change_at_primary(self):
+        with package(self.root / "package") as (component, _):
+            _, app = self.controller(component)
+            app.climate_tz = timezone.utc
+            stamp = 3000.
+            source = {"state":"21.0","last_changed":datetime.fromtimestamp(stamp,timezone.utc).isoformat()}
+            app.raw = lambda *args,**kwargs: source
+            app._learning_append(dict(ts=stamp,room=21.,room_valid=True,room_reported_at=stamp),True,(),0.)
+            self.assertTrue(app._learning_rows[-1]["report_verified"])
+            for value,expected in (("21.00",False),("20.9",True)):
+                stamp += 300
+                source.update(state=value,last_changed=datetime.fromtimestamp(stamp,timezone.utc).isoformat())
+                app._learning_append(dict(ts=stamp,room=float(value),room_valid=True,room_reported_at=stamp),True,(),0.)
+                self.assertIs(app._learning_rows[-1]["report_verified"],expected)
+            self.assertEqual(app.memory,{})
+            self.assertEqual(app.command_ledger.calls,[])
+
     async def test_manual_request_uses_native_serialized_control_only(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
