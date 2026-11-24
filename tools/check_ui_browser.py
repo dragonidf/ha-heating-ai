@@ -324,11 +324,24 @@ def check_compact_tabs(page):
     page.locator('.modulation-details>summary').click()
     page.evaluate("""setHeatingScenario({'sensor.heating_model':{attributes:{
         parameters:{validated:true,version:4},last_result:'legacy',
+        learning_status:'collecting',learning_gate:'qualified_inputs_required',
+        independent_windows:0,qualified_minutes:0,active_version:4,
+        next_learning:'2026-11-24T10:00:00+02:00',
         learning_attempt:{time:'2026-10-21T20:45:00+03:00',status:'rejected',reason:'Немає поліпшення holdout'}}}})""")
-    message=page.locator('.learning-result').inner_text()
-    assert 'кандидат відхилено; чинна модель працює' in message and '20:45' in message
-    page.evaluate("setHeatingScenario({'sensor.heating_model':{attributes:{learning_attempt:{time:'2026-10-21T20:45:00+03:00',status:'pending',reason:'Потрібні підтверджені виміри'}}}})")
-    assert 'кандидат перевіряється; чинна модель працює' in page.locator('.learning-result').inner_text()
+    assert 'Збирає дані' in page.locator('.learning-progress-head').inner_text()
+    assert 'Активна модель v4' in page.locator('.learning-progress-head').inner_text()
+    assert 'Очікуємо незалежних придатних вимірювань' in page.locator('.learning-progress-reason').inner_text()
+    assert 'Незалежні вікна' in page.locator('.learning-progress-metrics').inner_text()
+    assert 'Наступний аналіз' in page.locator('.learning-progress-dates').inner_text()
+    assert 'Немає поліпшення holdout' not in page.locator('.learning-progress-head').inner_text()
+    page.locator('.learning-legacy summary').click()
+    assert 'Немає поліпшення holdout' in page.locator('.learning-legacy').inner_text()
+    page.evaluate("""setHeatingScenario({'sensor.heating_model':{attributes:{
+        learning_status:'accepted',learning_gate:'independent_holdout_passed',
+        active_version:5,independent_windows:12,qualified_minutes:480,
+        candidate_holdout_mae_1h:0.125,candidate_holdout_mae_3h:0.325}}})""")
+    assert 'Коефіцієнти оновлено' in page.locator('.learning-progress-head').inner_text()
+    assert 'MAE 3 год' in page.locator('.learning-progress-metrics').inner_text()
     page.evaluate('panel.hass=mockHass')
     assert page.locator('.model-advanced details').get_attribute('open') is None
     page.locator('.model-advanced summary').click()
