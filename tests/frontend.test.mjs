@@ -620,3 +620,47 @@ test('manual heating without cumulative KWS baseline labels verified phase-power
   assert.match(html,/трьох фаз/);
   assert.doesNotMatch(html,/Лічильник KWS: 0,00 кВт·год/);
 });
+
+test('unified learning card displays current collection status rather than the old candidate rejection',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  const a={learning_status:'collecting',learning_gate:'qualified_inputs_required',
+    independent_windows:0,qualified_minutes:0,active_version:6,
+    candidate_holdout_mae_1h:null,candidate_holdout_mae_3h:null,
+    last_successful_learning:'2026-10-24T06:54:54+03:00',next_learning:'2026-11-24T10:00:00+02:00',
+    learning_attempt:{time:'2026-11-23T20:45:12+02:00',status:'rejected',reason:'Old legacy gate'}};
+  p.attrs=()=>a;p.time=value=>value.slice(0,16);
+  p.compactMetric=(label,value,unit)=>`<span>${label}: ${value} ${unit}</span>`;
+  p.section=(title,body)=>`<section><h2>${title}</h2>${body}</section>`;
+  const text=p.learningProgress();
+  assert.match(text,/Самонавчання моделі/);
+  assert.match(text,/Збирає дані/);assert.match(text,/Активна модель v6/);
+  assert.match(text,/Незалежні вікна: 0/);assert.match(text,/Придатні вимірювання: 0 хв/);
+  assert.match(text,/Кандидат · MAE 1 год: —/);assert.match(text,/Кандидат · MAE 3 год: —/);
+  assert.match(text,/Наступний аналіз/);assert.match(text,/2026-11-24T10:00/);
+  assert.match(text,/Останнє успішне застосування/);assert.match(text,/2026-10-24T06:54/);
+  assert.match(text,/Попередній алгоритм · історія спроб/);
+  assert.match(text,/Old legacy gate/);
+  assert.doesNotMatch(text,/Остання спроба навчання/);
+});
+test('unified learning renders confirmed improvements, rollback, and safe missing-data fallbacks',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  const a={learning_status:'accepted',learning_gate:'independent_holdout_passed',
+    independent_windows:12,qualified_minutes:480,active_version:7,
+    candidate_holdout_mae_1h:.1234,candidate_holdout_mae_3h:.3456,
+    last_successful_learning:'2026-11-24T10:00:00+02:00',next_learning:'2026-11-24T20:45:00+02:00'};
+  p.attrs=()=>a;p.time=value=>value.slice(0,16);
+  p.compactMetric=(label,value,unit)=>`<span>${label}: ${value} ${unit}</span>`;
+  p.section=(title,body)=>body;
+  const accepted=p.learningProgress();
+  assert.match(accepted,/Коефіцієнти оновлено/);assert.match(accepted,/Активна модель v7/);
+  assert.match(accepted,/0,123/);assert.match(accepted,/0,346/);
+  a.learning_status='rolled_back';a.learning_gate='rollback_cooldown';a.rollback_reason='quality_3h';
+  const rolled=p.learningProgress();assert.match(rolled,/Відновлено попередню модель/);
+  assert.match(rolled,/Відкат моделі/);assert.match(rolled,/прогноз на 3 години/);
+  p.attrs=()=>({});assert.match(p.learningProgress(),/Стан навчання недоступний/);
+  assert.doesNotMatch(p.learningProgress(),/undefined|NaN|Invalid Date/);
+});
+test('model view does not show obsolete auto-apply switch for unified learner',()=>{
+  assert.doesNotMatch(HeatingAIPanel.prototype.model.toString(),/this\.field\('ai_auto_apply'/);
+  assert.match(HeatingAIPanel.prototype.model.toString(),/Штатне самонавчання/);
+});
