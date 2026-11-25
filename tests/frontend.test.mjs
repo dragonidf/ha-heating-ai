@@ -420,6 +420,20 @@ test('merged heat sessions preserve their total energy and show absolute dates',
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.attrs=()=>({created_at:new Date().toISOString(),heat_segments:rows});
   const markup=p.heatingPlan();assert.match(markup,/0,75 кВт·год/);assert.match(markup,/4,5 кВт/);
 });
+test('plan details distinguish 24-hour comfort from the extended reserve improvement',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.config={};
+  p.attrs=()=>({created_at:new Date().toISOString(),heat_segments:[],morning_reserve:{
+    local_deficit_reduction_degree_hours:1.25,
+    comfort_24h:{predicted_maximum:21.65,minimum_before_next_heat:19.85,
+      predicted_maximum_at:1795644000,comfort_minutes:600,first_comfort_violation_at:null},
+  }});
+  const markup=p.heatingPlan(true);
+  assert.match(markup,/Пік за 24 год/);
+  assert.match(markup,/21,65/);
+  assert.match(markup,/Мінімум за 24 год/);
+  assert.match(markup,/скорочено на 1,25 °C·год/);
+});
 test('controller health prioritizes fallback error over generic measurement warning',()=>{
   const panel=Object.create(HeatingAIPanel.prototype);
   const attrs={controller:{control_method:'temporary_native_auto',reason:"Помилка циклу: null record"},diagnostics:{control_health:'fallback'},forecast:{created_at:new Date().toISOString()}};
