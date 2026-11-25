@@ -1588,6 +1588,9 @@ class DecisionJournal:
         self.last_rotation=0
         self.last_compaction=0
         self.used_bytes=None
+        self.snapshot_bytes=None
+        self.daily_log_bytes=None
+        self.snapshot_count=None
         self.lock=RLock()
 
     def health(self):
@@ -1599,6 +1602,8 @@ class DecisionJournal:
             except OSError:cached=dict(at=stamp,free_bytes=None,disk_total_bytes=None)
             self.space_health=cached
         return dict(cached,used_bytes=self.used_bytes,max_bytes=self.max_bytes,
+            snapshot_bytes=self.snapshot_bytes,daily_log_bytes=self.daily_log_bytes,
+            snapshot_count=self.snapshot_count,
             pressure=self.used_bytes is not None and self.used_bytes>=self.max_bytes*.9,
             retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error,
             capacity_policy='retention_headroom' if self.auto_capacity else 'fixed',
@@ -1630,10 +1635,16 @@ class DecisionJournal:
                 if p.is_file() and p.stat().st_mtime<stamp-self.retention:
                     p.unlink()
             self.last_rotation=stamp
-            files=[p.stat() for p in self.directory.iterdir() if p.is_file()]
-            self.used_bytes=sum(p.st_size for p in files)
-            self.oldest_at=min((p.st_mtime for p in files),default=stamp)
-        if self.used_bytes>=self.max_bytes*.9 and stamp-self.last_compaction>60:
+            files=[(p,p.stat()) for p in self.directory.iterdir() if p.is_file()]
+            self.used_bytes=sum(info.st_size for _,info in files)
+            self.snapshot_bytes=sum(info.st_size for p,info in files if p.name.endswith('.json.gz'))
+            self.snapshot_count=sum(p.name.endswith('.json.gz') for p,_ in files)
+            self.daily_log_bytes=sum(info.st_size for p,info in files if p.name.endswith(('.jsonl','.jsonl.gz')))
+            self.oldest_at=min((info.st_mtime for _,info in files),default=stamp)
+        # Lossless closed-day compression before the critical 90% threshold.
+        # Only closed .jsonl days are processed; snapshot digests and records
+        # remain byte-identical. No extra threads, jobs or scheduled polls.
+        if self.used_bytes>=self.max_bytes*.6 and stamp-self.last_compaction>6*3600:
             self.last_compaction=stamp
             day=datetime.fromtimestamp(stamp,timezone.utc).strftime('%Y-%m-%d')
             for path in sorted(self.directory.glob('????-??-??.jsonl')):
@@ -1653,7 +1664,11 @@ class DecisionJournal:
                             if hashlib.file_digest(source,'sha256').digest()!=hashlib.file_digest(restored,'sha256').digest():
                                 raise OSError('Existing diagnostic archive differs; original retained')
                     path.unlink();self.used_bytes-=info.st_size
-                    if not existing:self.used_bytes+=archive.stat().st_size
+                    if self.daily_log_bytes is not None:self.daily_log_bytes-=info.st_size
+                    if not existing:
+                        compressed_size=archive.stat().st_size
+                        self.used_bytes+=compressed_size
+                        if self.daily_log_bytes is not None:self.daily_log_bytes+=compressed_size
                 finally:
                     temporary.unlink(missing_ok=True)
         self._capacity_headroom(stamp)
@@ -1677,6 +1692,8 @@ class DecisionJournal:
             temporary.write_bytes(compressed)
             temporary.replace(path)
             self.used_bytes+=len(compressed)
+            if self.snapshot_bytes is not None:self.snapshot_bytes+=len(compressed)
+            if self.snapshot_count is not None:self.snapshot_count+=1
         os.utime(path,(stamp,stamp))
         return digest
 
@@ -1859,6 +1876,7 @@ class DecisionJournal:
                 with (self.directory/(day+'.jsonl')).open('ab') as stream:
                     stream.write(raw+b'\n')
                 self.used_bytes+=len(raw)+1
+                if self.daily_log_bytes is not None:self.daily_log_bytes+=len(raw)+1
                 os.utime(self.directory/(day+'.jsonl'),(stamp,stamp))
                 self.error=snapshot_failure
             except (OSError,ValueError,TypeError) as exc:
