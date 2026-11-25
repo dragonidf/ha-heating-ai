@@ -34,6 +34,42 @@ def report_time(row):
     return None
 
 
+def ventilation_current_qualified(devices):
+    """An OFF relay proves zero commanded airflow without a supply sensor.
+
+    An ON relay is qualified only when its independent supply is known.
+    Missing device bindings and unknown relays are never considered valid.
+    """
+    if not isinstance(devices, dict):
+        return False
+    return all(isinstance(devices.get(key), dict) and (
+        devices[key].get("relay") == "off" or (
+            devices[key].get("relay") == "on" and devices[key].get("supply") in ("on", "off"))
+    ) for key in ("recuperator", "bath"))
+
+
+def ventilation_interval_duty(evidence):
+    """Return observed 5-minute duty, or None for an uncertain interval."""
+    if not isinstance(evidence, dict):
+        return None
+    seconds = number(evidence.get("seconds"))
+    on = number(evidence.get("on_fraction"))
+    unknown = number(evidence.get("unknown_fraction"))
+    if seconds is None or seconds < 240 or unknown != 0 or on is None:
+        return None
+    # A relay that is always OFF contributes zero ventilation regardless
+    # of supply evidence. An ON relay must have independently known supply.
+    if on == 0:
+        return 0.
+    powered = number(evidence.get("powered_relay_on_fraction"))
+    supply_unknown = number(evidence.get("supply_unknown_fraction"))
+    if supply_unknown != 0 or powered is None or powered > on + 0.001:
+        return None
+    # The existing fitter assumes constant duty across an observation.
+    # Reject mixed intervals rather than pretending to know their airflow.
+    return powered if powered in (0., 1.) else None
+
+
 def row_reasons(row, *, strict):
     reasons = set(row.get("shadow_reasons") or ())
     power = number(row.get("power"))
@@ -767,8 +803,15 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
     coverage=_coverage(windows)
     cooldown=stamp<checkpoint.get("frozen_until",0)
     result=dict(status="frozen" if not eligible or cooldown else "insufficient_data",
-                reason="rollback_cooldown" if cooldown else "qualified_inputs_required",independent_windows=len(windows),
-                qualified_minutes=round(coverage["seconds"]/60,1))
+                reason="rollback_cooldown" if cooldown else
+                       "current_conditions_unqualified" if not eligible else "qualified_inputs_required",
+                independent_windows=len(windows),
+                qualified_minutes=round(coverage["seconds"]/60,1),
+                verified_reports=window_report["unique_primary_reports"],
+                rejection_counts=dict(sorted(window_report["rejection_counts"].items(),
+                                             key=lambda item:(-item[1],item[0]))[:12]),
+                current_reasons=window_report["current_observation_quality"]["reasons"],
+                analysis_status="pending", analysis_blockers=[])
     monitoring=checkpoint.get("monitoring")
     if monitoring and monitoring["version"]==model.get("version"):
         assessments={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
@@ -787,12 +830,17 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                 same=[r for r in independent_checks(assessed,horizon) if f"{horizon}:{r['stratum']}" in monitoring["strata"]]
                 if len(same)<min_count or len({r["day"] for r in same})<days:
                     eligible=False
-    if (eligible and not result.get("rollback") and model.get("validated") is True
+    if (not result.get("rollback") and model.get("validated") is True
             and stamp>=checkpoint.get("frozen_until",0)
             and checkpoint.get("promotion_day")!=now.date().isoformat()):
+        # Scheduled analysis can examine historical data during a blackout.
+        # Promotion still needs the unchanged real-time eligibility gate.
         thermal=evaluate_windows(windows,model,ventilation)
-        result.update(status=thermal["status"] if thermal["status"]=="insufficient_data" else "rejected",
-                      reason=",".join(thermal.get("blockers",[])) or "holdout_forecasts_required")
+        blockers=thermal.get("blockers",[])
+        result.update(analysis_status=thermal["status"],analysis_blockers=blockers)
+        if eligible:
+            result.update(status=thermal["status"] if thermal["status"]=="insufficient_data" else "rejected",
+                          reason=",".join(blockers) or "holdout_forecasts_required")
         if thermal.get("coefficients"):
             scored=[r for item in archive if item["snapshot"]["model"]==model
                     and item["snapshot"]["start"]>=checkpoint.get("evidence_after",0)
@@ -801,9 +849,12 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                     for r in score_frozen(dict(item["snapshot"],candidate={"coefficients":thermal["coefficients"]}),
                                           [r for r in item["checks"] if r[0] in (1,3)],now.tzinfo)]
             gate=promotion_evidence(scored)
-            result.update(status=gate["status"],reason=gate.get("reason","independent_holdout_passed"),
-                          metrics=gate.get("metrics",{}))
-            if gate["status"]=="accepted":
+            result["metrics"]=gate.get("metrics",{})
+            result["analysis_status"]=gate["status"]
+            result["analysis_blockers"]=[] if gate["status"]=="accepted" else [gate.get("reason","holdout_forecasts_required")]
+            if eligible:
+                result.update(status=gate["status"],reason=gate.get("reason","holdout_forecasts_required"))
+            if gate["status"]=="accepted" and eligible:
                 result.update(proposed=thermal["coefficients"],evidence=gate,
                               evidence_fingerprint=sha256(_encode(scored)).hexdigest())
         result["solar"]=evaluate_solar([w for w in windows if w["equipment"][0]==model.get("version")],

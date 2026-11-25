@@ -146,6 +146,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline",type=Path)
     parser.add_argument("--child",nargs=2)
+    parser.add_argument("--both-online",action="store_true",help="Paired A/A and A/B of active learning against a release")
     opts=parser.parse_args()
     if opts.child:
         path,mode=opts.child
@@ -154,7 +155,8 @@ def main():
     with TemporaryDirectory() as folder:
         root=Path(folder)
         baseline=opts.baseline.resolve()
-        for name,source in (("baseline",baseline),("candidate",ROOT)):
+        sources=(("baseline",baseline),("control",baseline),("candidate",ROOT)) if opts.both_online else (("baseline",baseline),("candidate",ROOT))
+        for name,source in sources:
             target=root/name
             archive=root/(name+".zip")
             subprocess.run([sys.executable,str(source/"tools/build_marketplace.py"),
@@ -162,7 +164,8 @@ def main():
             with ZipFile(archive) as zf:
                 zf.extractall(target)
         results={}
-        for name,mode in (("baseline","legacy"),("candidate","online")):
+        variants=(("baseline","online"),("control","online"),("candidate","online")) if opts.both_online else (("baseline","legacy"),("candidate","online"))
+        for name,mode in variants:
             result=json.loads(subprocess.check_output(
                 [sys.executable,__file__,str(baseline),"--child",str(root/name),mode],text=True))
             if mode=="online":
@@ -173,7 +176,21 @@ def main():
             elif actions!=golden:
                 raise AssertionError("Production command sequence changed")
             results[name+":"+mode]=result
-        print(json.dumps(results,indent=2))
+        if opts.both_online:
+            baseline=results["baseline:online"];control=results["control:online"];candidate=results["candidate:online"]
+            comparison={}
+            for operation in ("tick","aggregation","training"):
+                base=baseline["cpu_wall"][operation][0][1]
+                reference=control["cpu_wall"][operation][0][1]
+                changed=candidate["cpu_wall"][operation][0][1]
+                comparison[operation]=dict(cpu_p95_baseline=base,cpu_p95_control=reference,
+                    cpu_p95_candidate=changed,aa_percent=round((reference/base-1)*100,2),
+                    ab_percent=round((changed/base-1)*100,2))
+            comparison["rss_kib"]=dict(baseline=baseline["peak_rss"],control=control["peak_rss"],
+                                        candidate=candidate["peak_rss"])
+            print(json.dumps(dict(comparison=comparison,exact_command_match=True),indent=2))
+        else:
+            print(json.dumps(results,indent=2))
 
 
 if __name__=="__main__":

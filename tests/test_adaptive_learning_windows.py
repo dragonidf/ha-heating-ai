@@ -34,6 +34,42 @@ def samples(minutes=120, report_every=60, *, day=0, power=0.):
 
 
 class WindowsTest(unittest.TestCase):
+    def test_off_ventilation_without_supply_can_be_observed(self):
+        from heating_learning_windows import ventilation_current_qualified, ventilation_interval_duty
+        off={"recuperator":{"relay":"off","supply":"unknown"},
+             "bath":{"relay":"off","supply":"unknown"}}
+        self.assertTrue(ventilation_current_qualified(off))
+        self.assertFalse(ventilation_current_qualified({
+            **off,"recuperator":{"relay":"on","supply":"unknown"}}))
+        self.assertTrue(ventilation_current_qualified({
+            **off,"recuperator":{"relay":"on","supply":"on"}}))
+        idle=dict(seconds=300,on_fraction=0.,unknown_fraction=0.,supply_unknown_fraction=1.,
+                  powered_relay_on_fraction=None,supply_on_fraction=0.)
+        self.assertEqual(ventilation_interval_duty(idle),0.)
+        for changed in ({"on_fraction":1.},{"unknown_fraction":.05},
+                        {"on_fraction":.5},{"seconds":100}):
+            self.assertIsNone(ventilation_interval_duty({**idle,**changed}))
+        active=dict(seconds=300,on_fraction=1.,unknown_fraction=0.,supply_unknown_fraction=0.,
+                    powered_relay_on_fraction=1.,supply_on_fraction=1.)
+        self.assertEqual(ventilation_interval_duty(active),1.)
+        self.assertIsNone(ventilation_interval_duty({**active,"supply_unknown_fraction":.2}))
+        self.assertIsNone(ventilation_interval_duty({**active,"powered_relay_on_fraction":.5}))
+
+    def test_blackout_evaluates_history_without_promoting_model(self):
+        from tools.replay_adaptive_learning import MODEL, TZ, fixture
+        rows=fixture(8)
+        now=datetime.fromtimestamp(rows[-1]["ts"]+300,TZ)
+        with TemporaryDirectory() as folder:
+            path=Path(folder)/"online_learning_v1.json"
+            result=run_learning(path,rows,[],MODEL,{},{},now,False)
+            self.assertEqual(result["status"],"frozen")
+            self.assertEqual(result["reason"],"current_conditions_unqualified")
+            self.assertNotIn("proposed",result)
+            self.assertGreater(result["verified_reports"],0)
+            self.assertIn("rejection_counts",result)
+            self.assertIn("analysis_status",result)
+            self.assertGreater(len(load_evidence(path)["windows"]),0)
+
     def test_60_and_120_minute_reports_survive_cached_temperature_ticks(self):
         for cadence in (60, 120):
             with self.subTest(cadence=cadence):

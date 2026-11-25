@@ -151,8 +151,7 @@ class NativeController(HeatingClimate):
         if fan!="off":
             reasons.add("circulation_or_unknown")
         sensed = getattr(self, "ventilation_states", {})
-        if any(sensed.get(k,{}).get("relay") not in ("on","off") or
-               sensed.get(k,{}).get("supply") not in ("on","off") for k in ("recuperator","bath")):
+        if not learning.ventilation_current_qualified(sensed):
             reasons.add("unknown_ventilation")
         self._learning_current_ok = not reasons
         if reasons:
@@ -197,11 +196,8 @@ class NativeController(HeatingClimate):
         ventilation = []
         for key in ("recuperator","bath"):
             evidence = (row.get("ventilation") or {}).get(key,{})
-            duty = evidence.get("powered_relay_on_fraction")
-            if (evidence.get("unknown_fraction") != 0 or evidence.get("supply_unknown_fraction") != 0
-                    or duty not in (0.,1.) or evidence.get("on_fraction") not in (0.,1.)
-                    or evidence.get("supply_on_fraction") not in (0.,1.)
-                    or evidence.get("seconds",0)<240):
+            duty = learning.ventilation_interval_duty(evidence)
+            if duty is None:
                 ventilation = None
                 break
             ventilation.append(duty)
@@ -308,7 +304,9 @@ class NativeController(HeatingClimate):
         self._learning_job=None
         result=data["result"]
         self._learning_status={k:v for k,v in result.items()
-                               if k in ("status","reason","metrics","independent_windows","qualified_minutes")}
+                               if k in ("status","reason","metrics","independent_windows","qualified_minutes",
+                                        "verified_reports","rejection_counts","current_reasons",
+                                        "analysis_status","analysis_blockers")}
         if not (result.get("proposed") or result.get("rollback")):
             return
         checkpoint=self.memory.get("online_learning") or {}
@@ -1384,11 +1382,25 @@ class NativeController(HeatingClimate):
             evening=now.replace(hour=20,minute=45,second=0,microsecond=0)
             upcoming=morning if now<morning else evening if now<evening else morning+timedelta(days=1)
             metrics=report.get("metrics",{})
-            attributes.update(learning_status=report["status"],learning_gate=report["reason"],
+            accepted_metrics=checkpoint.get("metrics",{})
+            previous=checkpoint.get("prior_model") or {}
+            changes=[dict(parameter=key,before=previous[key],after=self.model[key])
+                     for key in ("floor_air","room_loss")
+                     if key in previous and key in self.model and previous[key]!=self.model[key]]
+            attributes.update(last_accepted_changes=changes,
+                last_accepted_mae_1h=accepted_metrics.get("1",{}).get("new",{}).get("mae"),
+                last_accepted_mae_3h=accepted_metrics.get("3",{}).get("new",{}).get("mae"),
+                learning_status=report["status"],learning_gate=report["reason"],
                 last_successful_learning=(checkpoint.get("last_successful_learning") or
                                           (self.memory.get("learning_success") or {}).get("time")),
+                last_adaptive_promotion=checkpoint.get("last_successful_learning"),
                 independent_windows=report.get("independent_windows",0),
                 qualified_minutes=report.get("qualified_minutes",0.),
+                verified_reports=report.get("verified_reports",0),
+                rejection_counts=report.get("rejection_counts",{}),
+                current_reasons=report.get("current_reasons",[]),
+                analysis_status=report.get("analysis_status","pending"),
+                analysis_blockers=report.get("analysis_blockers",[]),
                 candidate_holdout_mae_1h=metrics.get("1",{}).get("new",{}).get("mae"),
                 candidate_holdout_mae_3h=metrics.get("3",{}).get("new",{}).get("mae"),
                 active_version=self.model.get("version"),rollback_reason=checkpoint.get("rollback_reason"),

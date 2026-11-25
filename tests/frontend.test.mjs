@@ -638,6 +638,7 @@ test('unified learning card displays current collection status rather than the o
   assert.match(text,/Кандидат · MAE 1 год: —/);assert.match(text,/Кандидат · MAE 3 год: —/);
   assert.match(text,/Наступний аналіз/);assert.match(text,/2026-11-24T10:00/);
   assert.match(text,/Останнє успішне застосування/);assert.match(text,/2026-10-24T06:54/);
+  assert.match(text,/жодних нових коефіцієнтів ще не застосовано/);
   assert.match(text,/Попередній алгоритм · історія спроб/);
   assert.match(text,/Old legacy gate/);
   assert.doesNotMatch(text,/Остання спроба навчання/);
@@ -665,4 +666,39 @@ test('unified learner does not mistake legacy AI auto-apply control for its own 
   assert.match(source,/Штатне самонавчання/);
   assert.match(source,/Спадковий параметр ШІ · не для самонавчання/);
   assert.match(source,/this\.field\('ai_auto_apply','Автозастосування старих пропозицій'\)/);
+});
+
+test('online learner explains rejected evidence and retains last accepted results across restart',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  const a={learning_status:'frozen',learning_gate:'current_conditions_unqualified',
+    independent_windows:0,qualified_minutes:0,active_version:6,
+    verified_reports:23,rejection_counts:{unknown_ventilation:12,unknown_or_unqualified_voltage:4},
+    current_reasons:['unqualified_outage','unknown_ventilation'],
+    analysis_status:'insufficient_data',analysis_blockers:['independent_days','heating_coverage'],
+    last_accepted_changes:[{parameter:'room_loss',before:0.008,after:0.0079}],
+    last_accepted_mae_1h:0.15,last_accepted_mae_3h:0.31};
+  p.attrs=()=>a;p.time=()=> '—';
+  p.compactMetric=(name,value,unit)=>'<span>'+name+': '+value+' '+unit+'</span>';
+  p.section=(title,body)=>body;
+  const html=p.learningProgress();
+  assert.match(html,/Архівні вимірювання все одно аналізуються/);
+  assert.match(html,/Незалежних температурних звітів.*23/);
+  assert.match(html,/Невідомий стан вентиляції — 12/);
+  assert.match(html,/Замало незалежних днів/);
+  assert.match(html,/Тепловтрати 0,00800 → 0,00790/);
+  assert.match(html,/не поточний кандидат/);
+  assert.match(html,/<details class="learning-evidence" open>/);
+});
+
+test('journal breakdown uses cached metrics and never equates archive budget with disk',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.attrs=()=>({archive_health:{used_bytes:700*1048576,max_bytes:1024*1048576,
+    snapshot_bytes:600*1048576,daily_log_bytes:100*1048576,free_bytes:33*1073741824}});
+  p.compactMetric=(label,value,unit)=>'<span>'+label+': '+value+' '+unit+'</span>';
+  p.section=(title,body)=>body;
+  p.time=()=> '—';
+  const html=p.controllerQuality();
+  assert.match(html,/Знімки: 600,0 МіБ/);
+  assert.match(html,/журнали: 100,0 МіБ/);
+  assert.match(html,/Ліміт архіву не є розміром диска/);
 });

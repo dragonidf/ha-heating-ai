@@ -1588,6 +1588,9 @@ class DecisionJournal:
         self.last_rotation=0
         self.last_compaction=0
         self.used_bytes=None
+        self.snapshot_bytes=None
+        self.daily_log_bytes=None
+        self.snapshot_count=None
         self.lock=RLock()
 
     def health(self):
@@ -1599,6 +1602,8 @@ class DecisionJournal:
             except OSError:cached=dict(at=stamp,free_bytes=None,disk_total_bytes=None)
             self.space_health=cached
         return dict(cached,used_bytes=self.used_bytes,max_bytes=self.max_bytes,
+            snapshot_bytes=self.snapshot_bytes,daily_log_bytes=self.daily_log_bytes,
+            snapshot_count=self.snapshot_count,
             pressure=self.used_bytes is not None and self.used_bytes>=self.max_bytes*.9,
             retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error,
             capacity_policy='retention_headroom' if self.auto_capacity else 'fixed',
@@ -1630,12 +1635,43 @@ class DecisionJournal:
                 if p.is_file() and p.stat().st_mtime<stamp-self.retention:
                     p.unlink()
             self.last_rotation=stamp
-            files=[p.stat() for p in self.directory.iterdir() if p.is_file()]
-            self.used_bytes=sum(p.st_size for p in files)
-            self.oldest_at=min((p.st_mtime for p in files),default=stamp)
-        if self.used_bytes>=self.max_bytes*.9 and stamp-self.last_compaction>60:
+            # Single streaming scan: do not retain thousands of Path/stat pairs
+            # in RAM just to publish archive composition once per hour.
+            self.used_bytes=self.snapshot_bytes=self.daily_log_bytes=self.snapshot_count=0
+            self.oldest_at=stamp
+            for path in self.directory.iterdir():
+                if not path.is_file():
+                    continue
+                info=path.stat()
+                self.used_bytes+=info.st_size
+                self.oldest_at=min(self.oldest_at,info.st_mtime)
+                if path.name.endswith('.json.gz'):
+                    self.snapshot_bytes+=info.st_size
+                    self.snapshot_count+=1
+                elif path.name.endswith(('.jsonl','.jsonl.gz')):
+                    self.daily_log_bytes+=info.st_size
+        # On a restart the archive may already exceed the 256 MiB initial
+        # budget. Restore a safe disk-backed headroom limit *before* treating
+        # that transient budget as critical; otherwise all closed days get
+        # recompressed in the first control tick and cause a CPU spike.
+        # If physical disk reserve is low, preserve the old emergency
+        # compaction path and keep the existing fail-closed disk check below.
+        if self.auto_capacity:
+            space=self.health()
+            free,total=space.get('free_bytes'),space.get('disk_total_bytes')
+            if free is not None and total is not None and free>max(
+                    self.MIN_FREE_BYTES,int(total*.1)):
+                self._capacity_headroom(stamp)
+        # Compact at most one closed day per six hours before critical pressure.
+        # At >=90% keep the original urgent full-compaction behavior and
+        # 60-second retry. No extra thread, timer or HA state mutation.
+        critical=self.used_bytes>=self.max_bytes*.9
+        early=self.used_bytes>=self.max_bytes*.6
+        if (critical and stamp-self.last_compaction>60 or
+                early and stamp-self.last_compaction>6*3600):
             self.last_compaction=stamp
             day=datetime.fromtimestamp(stamp,timezone.utc).strftime('%Y-%m-%d')
+            compacted=0
             for path in sorted(self.directory.glob('????-??-??.jsonl')):
                 if path.stem>=day:continue
                 info=path.stat();archive=path.with_suffix('.jsonl.gz');temporary=archive.with_suffix('.tmp');existing=archive.exists()
@@ -1653,7 +1689,13 @@ class DecisionJournal:
                             if hashlib.file_digest(source,'sha256').digest()!=hashlib.file_digest(restored,'sha256').digest():
                                 raise OSError('Existing diagnostic archive differs; original retained')
                     path.unlink();self.used_bytes-=info.st_size
-                    if not existing:self.used_bytes+=archive.stat().st_size
+                    if self.daily_log_bytes is not None:self.daily_log_bytes-=info.st_size
+                    if not existing:
+                        compressed_size=archive.stat().st_size
+                        self.used_bytes+=compressed_size
+                        if self.daily_log_bytes is not None:self.daily_log_bytes+=compressed_size
+                    compacted+=1
+                    if not critical and compacted>=1:break
                 finally:
                     temporary.unlink(missing_ok=True)
         self._capacity_headroom(stamp)
@@ -1677,6 +1719,8 @@ class DecisionJournal:
             temporary.write_bytes(compressed)
             temporary.replace(path)
             self.used_bytes+=len(compressed)
+            if self.snapshot_bytes is not None:self.snapshot_bytes+=len(compressed)
+            if self.snapshot_count is not None:self.snapshot_count+=1
         os.utime(path,(stamp,stamp))
         return digest
 
@@ -1859,6 +1903,7 @@ class DecisionJournal:
                 with (self.directory/(day+'.jsonl')).open('ab') as stream:
                     stream.write(raw+b'\n')
                 self.used_bytes+=len(raw)+1
+                if self.daily_log_bytes is not None:self.daily_log_bytes+=len(raw)+1
                 os.utime(self.directory/(day+'.jsonl'),(stamp,stamp))
                 self.error=snapshot_failure
             except (OSError,ValueError,TypeError) as exc:
