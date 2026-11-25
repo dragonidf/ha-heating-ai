@@ -20,6 +20,29 @@ class ArchiveCapacityTests(unittest.TestCase):
         stamp=time.time();os.utime(path,(stamp-3*86400,stamp-3*86400))
         return path,raw,stamp
 
+    def test_early_compaction_is_single_day_and_pressure_falls_back_to_original_full_pass(self):
+        import gzip
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory() as directory:
+            now=time.time()
+            journal=DecisionJournal(directory,max_bytes=10000)
+            journal.directory.mkdir()
+            raw=(b'{"x":"stable"}\n'*290)
+            paths=[]
+            for days in (2,1):
+                name=datetime.fromtimestamp(now-days*86400,timezone.utc).strftime('%Y-%m-%d')+'.jsonl'
+                path=journal.directory/name
+                path.write_bytes(raw)
+                os.utime(path,(now-days*86400,now-days*86400))
+                paths.append(path)
+            journal._prepare(now)
+            self.assertEqual(sum(p.exists() for p in paths),1)
+            self.assertEqual(sum(p.with_suffix('.jsonl.gz').exists() for p in paths),1)
+            journal._prepare(now+6*3600+1)
+            self.assertEqual(sum(p.exists() for p in paths),0)
+            for p in paths:
+                self.assertEqual(gzip.decompress(p.with_suffix('.jsonl.gz').read_bytes()),raw)
+
     def test_midrange_journal_compresses_closed_day_losslessly_without_new_polling(self):
         import gzip
         from datetime import datetime, timezone
