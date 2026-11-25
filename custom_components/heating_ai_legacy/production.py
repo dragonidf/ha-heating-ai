@@ -187,7 +187,12 @@ class NativeController(HeatingClimate):
         entity = self.cfg.get("room")
         if not entity:
             return
-        entry = entity_registry.async_get(self.hass).async_get(entity)
+        try:
+            entry = entity_registry.async_get(self.hass).async_get(entity)
+        except AttributeError:
+            # The optional report source must not prevent the writer from
+            # starting before the entity registry has finished loading.
+            return
         if not entry or entry.platform != "tuya" or entry.original_device_class != "temperature":
             return
         prefix = "tuya."

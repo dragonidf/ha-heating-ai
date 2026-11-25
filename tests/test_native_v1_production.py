@@ -318,6 +318,17 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(app._learning_rows[-1]["report_verified"],expected)
             self.assertEqual(app.command_ledger.calls,[])
 
+    async def test_room_report_subscription_is_optional_until_registry_loads(self):
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            app.cfg["room"]="sensor.primary"
+            registry=Mock()
+            registry.async_get.side_effect=AttributeError("Entity registry is not loaded")
+            with patch.object(component.entity_registry,"async_get",return_value=registry):
+                app._async_listen_room_reports()
+            component.async_dispatcher_connect.assert_not_called()
+            self.assertEqual(app.command_ledger.calls,[])
+
     async def test_manual_request_uses_native_serialized_control_only(self):
         with package(self.root / "package") as (component, _):
             hass, app = self.controller(component)
