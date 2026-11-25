@@ -93,7 +93,7 @@ class KWSRestorePolicyTests(unittest.TestCase):
                               "kws_relay_state": "on", "kws_status": "on"}, True)
         policy.observe(1015, {"grid_state": "off", "ready": False,
                               "kws_relay_state": "off", "kws_fault_state": "on",
-                              "kws_fault": 2}, True)
+                              "kws_fault": 2, "kws_fault_at": 1015}, True)
         return policy
 
     @staticmethod
@@ -159,6 +159,24 @@ class KWSRestorePolicyTests(unittest.TestCase):
         p = self.outage()
         p.observe(1031, {"grid_state": "unknown"}, True)
         self.assertFalse(p.eligible(1150, self.restored(), self.voltage, 120))
+
+    def test_no_reclose_without_witnessed_undervoltage_trip(self):
+        p = KWSRestorePolicy()
+        p.observe(1000, {"grid_state": "on", "ready": True,
+                         "kws_relay_state": "on"}, True)
+        p.observe(1015, {"grid_state": "off", "ready": False,
+                         "kws_relay_state": "off", "kws_fault_state": "off"}, True)
+        self.assertFalse(p.eligible(1150, self.restored(), self.voltage, 120))
+        self.assertFalse(p.claim())
+
+    def test_expired_recovery_epoch_and_stale_fault_do_not_authorize(self):
+        p = self.outage()
+        self.assertFalse(p.eligible(1800, self.restored(
+            kws_relay_at=1799, kws_status_at=1799, kws_fault_at=1799),
+            self.voltage, 120))
+        self.assertFalse(p.eligible(1400, self.restored(
+            kws_relay_at=1399, kws_status_at=1399, kws_fault_at=1100),
+            self.voltage, 120))
 
     def test_native_auto_restore_needs_no_command(self):
         p = self.outage()
