@@ -22,7 +22,7 @@ class MarketplaceCarrierTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 53)
+            self.assertEqual(result["files"], 54)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 wanted = {
@@ -40,7 +40,11 @@ class MarketplaceCarrierTests(unittest.TestCase):
                     *(f"native_engine/{name}" for name in PURE_MODULES),
                     *(f"native_controller/{name}" for name in EXPECTED),
                 }
+                digest = hashlib.sha256(archive.read("assets/full-panel.js")).hexdigest()[:16]
+                immutable_asset = f"assets/full-panel-{digest}.js"
+                wanted.add(immutable_asset)
                 self.assertEqual(names, wanted)
+                self.assertEqual(archive.read(immutable_asset), archive.read("assets/full-panel.js"))
                 self.assertEqual(json.loads(archive.read("assets/full-panel-version.json")), {
                     "digest": hashlib.sha256(archive.read("assets/full-panel.js")).hexdigest()[:16],
                 })

@@ -726,7 +726,9 @@ test('frontend loader keeps HA registration stable while fetching a new local as
     const loader=await readFile(new URL('../custom_components/heating_ai_legacy/assets/full-panel-loader.js',import.meta.url),'utf8');
     await writeFile(join(dir,'loader.mjs'),loader);
     await writeFile(join(dir,'package.json'),'{"type":"module"}');
-    await writeFile(join(dir,'full-panel.js'),'export class HeatingAIPanel { static digest = new URL(import.meta.url).searchParams.get("v") }');
+    const stub='export class HeatingAIPanel { static digest = new URL(import.meta.url).searchParams.get("v") || new URL(import.meta.url).pathname.match(/full-panel-([a-f0-9]{16})\\.js$/)?.[1] }';
+    await writeFile(join(dir,'full-panel.js'),stub);
+    await writeFile(join(dir,'full-panel-'+next+'.js'),stub);
     globalThis.customElements={get:name=>definitions.get(name),define:(name,component)=>definitions.set(name,component)};
     globalThis.fetch=async(url,options)=>{requests.push([url.pathname,options]);return {ok:true,json:async()=>({digest:next})}};
     const url=pathToFileURL(join(dir,'loader.mjs'));url.searchParams.set('v',registered);
