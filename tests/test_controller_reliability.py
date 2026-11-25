@@ -450,6 +450,34 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.async_command_allowed('climate','set_hvac_mode', {'hvac_mode':'auto'}))
             hass.services.async_call.assert_not_called()
 
+    async def test_voltage_backup_requires_complete_fresh_kws_and_never_masks_bad_input(self):
+        with package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            for stamp in range(1000, 1151, 15):
+                self.configure_kws(hass, app, stamp)
+                with patch.object(component.time, 'time', return_value=stamp):
+                    app.async_kws_status()
+            with patch.object(component.time, 'time', return_value=1150):
+                self.assertTrue(app.async_voltage_status()['voltage_qualified'])
+                self.assertEqual(app.async_voltage_status()['voltage_source'], 'input')
+                hass.rows['sensor.l1'].state = 'unavailable'
+                backup = app.async_voltage_status()
+                self.assertTrue(backup['voltage_qualified'], backup)
+                self.assertEqual(backup['voltage_source'], 'kws')
+                hass.rows['binary_sensor.deye_link'].state = 'off'
+                self.assertTrue(app.async_kws_status()['ready'])
+                hass.rows['sensor.l2'].state = '195'
+                report = app.async_voltage_status()
+                self.assertFalse(report['voltage_qualified'])
+                self.assertEqual(report['voltage_source'], 'input_unsafe_or_incomplete')
+                hass.rows['sensor.l2'].state = '230'
+                hass.rows['sensor.energy_meter_kotel_napruga_c'].last_reported = datetime.fromtimestamp(900, timezone.utc)
+                self.assertFalse(app.async_voltage_status()['voltage_qualified'])
+                hass.rows['sensor.energy_meter_kotel_napruga_c'].last_reported = datetime.fromtimestamp(1150, timezone.utc)
+                hass.rows['sensor.grid'].state = 'Відсутня мережа'
+                self.assertFalse(app.async_voltage_status()['voltage_qualified'])
+            hass.services.async_call.assert_not_called()
+
     async def test_restored_kws_setting_and_existing_post_return_relay_survive_reload(self):
         with package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
