@@ -54,6 +54,10 @@ def package(directory):
         "homeassistant.components.http.server": module("homeassistant.components.http.server", StaticPathConfig=Mock()),
         "homeassistant.components.weather.const": module("homeassistant.components.weather.const", DATA_COMPONENT="weather"),
         "homeassistant.exceptions": module("homeassistant.exceptions", ConfigEntryNotReady=RuntimeError),
+        "homeassistant.helpers": module("homeassistant.helpers", entity_registry=SimpleNamespace(
+            async_get=lambda hass: SimpleNamespace(async_get=lambda entity: None))),
+        "homeassistant.helpers.dispatcher": module("homeassistant.helpers.dispatcher",
+            async_dispatcher_connect=Mock()),
         "homeassistant.helpers.event": module("homeassistant.helpers.event",
             async_track_state_change_event=lambda hass, ids, cb: hass.listen(ids, cb)),
         "homeassistant.helpers.template": module("homeassistant.helpers.template", Template=Mock()),
@@ -208,6 +212,24 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.model,{"version":6})
             self.assertEqual(app.command_ledger.calls,[])
 
+    async def test_native_schedule_catches_up_and_retries_only_after_new_reports(self):
+        with package(self.root / "package") as (component, _):
+            _, app=self.controller(component)
+            date=datetime(2026,11,1,14,tzinfo=timezone.utc)
+            with patch.object(app,"daily_learn") as learn:
+                app.schedule_learning(date)
+                learn.assert_called_once()
+                app.memory["adaptive_schedule"]={"day":date.date().isoformat(),"slot":"daily",
+                                                 "room_report":1000.}
+                learn.reset_mock()
+                app._learning_last_report=1000.
+                app.schedule_learning(date.replace(hour=21))
+                learn.assert_not_called()
+                app._learning_last_report=2000.
+                app.schedule_learning(date.replace(hour=21))
+                learn.assert_called_once()
+            self.assertEqual(app.command_ledger.calls,[])
+
     async def test_learning_commit_and_rollback_are_atomic_and_leave_control_ledgers(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)
@@ -263,6 +285,37 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 app._learning_append(dict(ts=stamp,room=float(value),room_valid=True,room_reported_at=stamp),True,(),0.)
                 self.assertIs(app._learning_rows[-1]["report_verified"],expected)
             self.assertEqual(app.memory,{})
+            self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_direct_primary_reports_with_unchanged_temperature_are_independent(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.climate_tz = timezone.utc
+            app.cfg["room"] = "sensor.primary"
+            hass.rows["sensor.primary"] = State("sensor.primary", 21., at=3000.)
+            primary = hass.rows["sensor.primary"]
+            entry=SimpleNamespace(platform="tuya",original_device_class="temperature",
+                                  unique_id="tuya.test123va_temperature")
+            with patch.object(component.entity_registry,"async_get",
+                              return_value=SimpleNamespace(async_get=lambda key: entry)):
+                app._async_listen_room_reports()
+            _, signal, dispatch = component.async_dispatcher_connect.call_args.args
+            self.assertEqual(signal,"tuya_entry_update_test123")
+            for stamp, report, datapoint, observed, expected in (
+                (3000., 3000., None, None, False),  # cached at startup
+                (3300., 3000., None, None, False),  # same cached report
+                (6600., 6599., "va_temperature", 6598., True),
+                (6790., 6789., "va_temperature", 6598., False),  # same hardware packet
+                (6900., 6899., None, None, False),  # availability republish
+                (7200., 7199., "va_humidity", 7198., False),
+            ):
+                primary.last_reported = datetime.fromtimestamp(report, timezone.utc)
+                with patch.object(component.time,"time",return_value=report):
+                    dispatch([datapoint] if datapoint else None,
+                             {datapoint:observed} if datapoint else None)
+                app._learning_append(dict(ts=stamp,room=21.,room_valid=True,
+                    room_reported_at=report),True,(),0.)
+                self.assertIs(app._learning_rows[-1]["report_verified"],expected)
             self.assertEqual(app.command_ledger.calls,[])
 
     async def test_manual_request_uses_native_serialized_control_only(self):

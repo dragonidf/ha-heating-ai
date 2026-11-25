@@ -9,7 +9,7 @@ from heating_environment import (forecast_step,safe_upper,has_upper_risk,ENVIRON
 import statistics
 from heating_outages import blocked, covered, availability, schedule_covered
 
-SEARCH_POLICY_VERSION = 2
+SEARCH_POLICY_VERSION = 3
 
 DEFAULT_MODEL = {"floor_air": .035, "room_loss": .025, "floor_decay": .12,
                  "heat_gain": .50, "fire_gain": .025, "version": 1, "validated": False}
@@ -139,7 +139,16 @@ def nominal_mode(power, previous):
     return "3 кВт" if power < 4500 else "6 кВт" if power < 7500 else "9 кВт"
 
 
-def learn_modulation(samples):
+def boiler_power_interval(a,b,power_source):
+    if power_source=='kws_phases':
+        return number(b.get('measured_interval_kw'))
+    before, after = number(a.get('energy')), number(b.get('energy'))
+    if before is not None and after is not None and after>=before:
+        return (after-before)*3600/(b['ts']-a['ts'])
+    return None
+
+
+def learn_modulation(samples, *, power_source='balance', prior_kw=3.):
     """Fit effective demand power in 2°C return bands from trustworthy intervals.
 
     Rebuilt from the rolling telemetry, so reloads cannot double-count evidence.
@@ -152,14 +161,14 @@ def learn_modulation(samples):
         dt=(b['ts']-a['ts'])/60
         if not 3<=dt<=7:
             continue
-        if any(not r.get('quality') or r.get('measurement_version')!=3 or
-               r.get('power_source')!='balance' or r.get('power_estimated') or
+        if any((r.get('power_quality')!='measured' if power_source=='kws_phases' else not r.get('quality'))
+               or r.get('measurement_version')!=3 or
+               r.get('power_source')!=power_source or r.get('power_estimated') or
                r.get('recovery_id') for r in (a,b)):
             continue
         ra,rb=number(a.get('return')),number(b.get('return'))
         pa,pb=number(a.get('power')),number(b.get('power'))
-        ea,eb=number(a.get('energy')),number(b.get('energy'))
-        if None in (ra,rb,pa,pb,ea,eb) or not (0<ra<65 and 0<rb<65) or abs(rb-ra)>3 or eb<ea:
+        if None in (ra,rb,pa,pb) or not (0<ra<65 and 0<rb<65) or abs(rb-ra)>3:
             continue
         tracked='heating_requested' in a and 'heating_requested' in b
         if tracked:
@@ -171,8 +180,8 @@ def learn_modulation(samples):
                 continue
         elif min(pa,pb)<2:
             continue
-        kw=(eb-ea)*60/dt
-        if not 0<=kw<=10.5 or (not tracked and kw<2):
+        kw=boiler_power_interval(a,b,power_source)
+        if kw is None or not 0<=kw<=10.5 or (not tracked and kw<2):
             continue
         key=int(math.floor((ra+rb)/4))*2
         band=bands.setdefault(key,dict(minutes=0.,kwh=0.,intervals=0,stages={'3':0.,'6':0.,'9':0.}))
@@ -187,7 +196,7 @@ def learn_modulation(samples):
     groups=[]
     for key,band in sorted(bands.items()):
         confidence=min(1.,band['minutes']/60)
-        estimate=3*(1-confidence)+band['kwh']*60/band['minutes']*confidence
+        estimate=prior_kw*(1-confidence)+band['kwh']*60/band['minutes']*confidence
         groups.append(([key],estimate*band['minutes'],band['minutes']))
         while len(groups)>1 and groups[-2][1]/groups[-2][2]<groups[-1][1]/groups[-1][2]:
             right=groups.pop();left=groups.pop()
@@ -203,7 +212,7 @@ def learn_modulation(samples):
                          confidence=round(confidence,3),stage_minutes=band['stages']))
     return dict(version=1,bands=rows,intervals=sum(r['intervals'] for r in rows),
                 minutes=round(sum(r['minutes'] for r in rows),1),
-                prior_kw=3.,method='return_bands_energy_isotonic',
+                prior_kw=prior_kw,method='return_bands_energy_isotonic',power_source=power_source,
                 last_sample_at=samples[-1]['ts'] if samples else None)
 
 
@@ -348,7 +357,7 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
     """Compare every interval with its own day/sleep limits, never a scalar low."""
     rows=[point for row in rows for point in row.get('_fine',[row])]
     previous=now.timestamp(); first=None; deficit=0.; minutes=0.; minimum=room
-    maximum=room
+    maximum=room;peak_at=previous;comfort_minutes=overheat=night_deficit=0.
     day_deficit=0.;day_minutes=0.;day_depth=0.;first_value=first_lower=first_shortfall=None
     for row in rows:
         stop=min(row['ts'],until)
@@ -356,6 +365,12 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
             break
         value=row['temperature']
         _,lo,hi,zone=comfort_at(datetime.fromtimestamp((previous+stop)/2,now.tzinfo),settings)
+        duration=(stop-previous)/60
+        if lo<=value<=hi:
+            comfort_minutes+=duration
+        overheat+=max(0.,value-hi)*duration/60
+        if zone=='Сон':
+            night_deficit+=max(0.,lo-value)*duration/60
         # The uncertainty allowance cannot move a night target up to the day band.
         threshold=lo+min(margin,max(0.,comfort_at(datetime.fromtimestamp(previous,now.tzinfo),settings)[0]-lo)/2)
         short=max(0.,threshold-value)
@@ -368,7 +383,9 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
             if zone=='День' and day_short>.001:
                 day_deficit+=day_short*(stop-previous)/3600;day_minutes+=(stop-previous)/60
                 day_depth=max(day_depth,day_short)
-        minimum=min(minimum,value);maximum=max(maximum,value)
+        minimum=min(minimum,value)
+        if value>maximum:
+            maximum=value;peak_at=stop
         previous=stop
         if stop>=until:
             break
@@ -378,6 +395,9 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
                 first_violation_shortfall=round(first_shortfall,3) if first_shortfall is not None else None,
                 covered_until=previous,coverage_complete=previous>=until-.001,
                 first_comfort_violation_at=first,deficit_degree_hours=round(deficit,5),
+                night_deficit_degree_hours=round(night_deficit,5),
+                overheat_degree_hours=round(overheat,5),comfort_minutes=round(comfort_minutes,2),
+                predicted_maximum_at=peak_at,
                 deficit_minutes=round(minutes,2),day_deficit_degree_hours=round(day_deficit,5),
                 day_deficit_minutes=round(day_minutes,2),day_max_shortfall=round(day_depth,3),predicted_maximum=round(maximum,3))
 
@@ -493,19 +513,24 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
         uncertainty_margin=margin,uncertainty_status='validated_horizon' if margin is not None else 'insufficient_horizon_validation',
         conditional=not known,impossibility_reason=reason,cancellation_reason=cancellation,
         calculation_horizon_hours=round(max(24.,hours),2),scenario='planned_heat_with_response_delay')
+    result['morning_reserve']['comfort_24h']=trajectory_metrics(
+        now,room,rows,settings,now.timestamp()+86400)
     return result
 
 
 SEARCH_FIELDS=('search_policy_version','search_status','alternatives_evaluated','search_passes',
     'expanded_search_performed','early_heat_rejected_reason','terminal_reserve_checked',
-    'initial_deficit_degree_hours','alternative_deficit_degree_hours','search_check_key')
+    'initial_deficit_degree_hours','alternative_deficit_degree_hours','search_check_key',
+    'local_search_status','local_alternatives_evaluated','local_deficit_reduction_degree_hours')
 
 
 def search_input_key(now,room,floor,outside,fire,model,weather,settings):
     cycle=heating_cycle(now,settings)
     keys=('target','lower','upper','night_target','night_lower','night_upper','start','end','sleep_start',
           'sleep_end','strategy','split_comfort','morning_min_minutes','upper_margin','day_price','night_price',
-          'budget_multiplier','reserve_errors','cycle_energy_budget')
+          'budget_multiplier','reserve_errors','cycle_energy_budget','outage_advance_limit',
+          'morning_elapsed_minutes','confirmed_completed_minutes','confirmed_morning_kwh',
+          'manual_completed_minutes')
     outage=settings.get('outage_schedule') or {}
     solar=(settings.get('environment') or {}).get('solar',{})
     data=dict(version=SEARCH_POLICY_VERSION,environment_policy_version=ENVIRONMENT_POLICY_VERSION,
@@ -549,8 +574,13 @@ def apply_search_diagnostics(now,settings,result):
         search_limitation='Bounded beam search; candidate rejection is not proof that every feasible plan was checked')
     if reserve['deficit_degree_hours']>.00001:
         checked='виконаний' if result.get('expanded_search_performed') else 'не виконаний'
-        reserve['impossibility_reason']=('Знайдений план має дефіцит; розширений пошук '+checked+
-                                        ', фізичну неможливість не доведено')
+        local = {'improved':'локальний пошук скоротив дефіцит',
+                 'no_improvement':'локальний пошук не знайшов кращого безпечного плану',
+                 'timeout':'локальний пошук вичерпав ліміт часу',
+                 'failed':'помилка локального пошуку'}.get(result.get('local_search_status'))
+        reserve['impossibility_reason']=', '.join(filter(None,(
+            'Знайдений план має дефіцит; розширений пошук '+checked,
+            local,'фізичну неможливість не доведено')))
     return result
 
 
@@ -569,8 +599,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     start_stamp=now.timestamp()
     actuator=settings.get('actuator') or {};actuator_enabled=bool(actuator)
     risk_enabled=has_upper_risk(settings)
-    last_heat=(settings.get('environment') or {}).get('last_heated_at') or now.timestamp()-10801
-    beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.),0.,room,floor,last_heat,0.,0.)]
+    beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.),0.,room,floor,0.,0.)]
     budget=settings.get('cycle_energy_budget') or {}
     def rank(value):
         excess=max(0.,value[11]-budget['remaining_kwh']) if budget else 0.
@@ -678,12 +707,11 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
         late_heat=split and 'night_target' in settings
         prepared=[(begin,finish,inputs(begin),finish.timestamp()) for begin,finish in substeps]
         candidates = []
-        for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at, cycle_used, risk_room, risk_floor, risk_heat, prior_evening, prior_morning in beams:
+        for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at, cycle_used, risk_room, risk_floor, prior_evening, prior_morning in beams:
             for heat in choices:
                 evaluated+=1
                 nr, nf, penalty = r, f, 0.
                 ur,uf=risk_room,risk_floor
-                last_risk_heat=risk_heat
                 command,command_at=last,changed_at
                 shortage=deficit; fine=[]
                 used, outside_minutes, unsafe = 0., 0., False
@@ -732,9 +760,8 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                         effective_kw=modulation_power(nf,profile,3.,anchor,elapsed_minutes) if profile is not None else power_kw
                         delivered_kw=effective_kw if active else 0.
                         nr,nf=integrate(nr,nf,out,delivered_kw,fire_gain,dt,gains[0])
-                        if active:last_risk_heat=stop_stamp
                         ur,uf=(integrate(ur,uf,out,delivered_kw,fire_gain,dt,gains[1],upper=True)
-                               if risk_enabled and stamp-last_risk_heat<=10800 else (nr,nf))
+                               if risk_enabled else (nr,nf))
                         # A session remains unsafe if its stored heat overshoots
                         # later, after the boiler has stopped (including daytime).
                         if max(nr,ur)>max(room,limit_high)+.01 and (active or any(decisions) or heat_segments):
@@ -791,7 +818,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                                    "temperature":round(nr,2),"return":round(nf,2),"heat":bool(heat_segments),
                                    "kwh":round(used,4),"heat_segments":heat_segments,
                                    "outside_minutes":outside_minutes,"_fine":fine}],
-                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage,command,command_at,cycle_used+cycle_added,ur,uf,last_risk_heat,evening_kwh,morning_kwh))
+                                   energy+used, min(low,min(t["temperature"] for t in fine)), max(high,max(t["temperature"] for t in fine)),shortage,command,command_at,cycle_used+cycle_added,ur,uf,evening_kwh,morning_kwh))
         if not candidates:
             return None
         candidates.sort(key=rank)
@@ -802,7 +829,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
             if actuator_enabled:
                 key+=(candidate[9],round(max(0.,candidate[10]+(600 if candidate[9]=='heat' else 900)-when_stamp-1800)/60))
             if split:
-                key+=(candidate[15]>0,candidate[16]>0,round(candidate[5]*2))
+                key+=(candidate[14]>0,candidate[15]>0,round(candidate[5]*2))
             if key not in seen:
                 seen.add(key)
                 beams.append(candidate)
@@ -828,7 +855,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
         end=now+timedelta(hours=count/2)
         pair_complete=cycle+timedelta(hours=8)<=end
         if pair_complete and energy_limit is not None and energy_limit>=1.5 and 'night_target' not in settings:
-            beams=[b for b in beams if b[15]>0 and b[16]>0]
+            beams=[b for b in beams if b[14]>0 and b[15]>0]
         if not beams:
             return None
     # Apply the no-worse-comfort constraint to all surviving candidates before
@@ -1241,25 +1268,29 @@ def learn_power_modes(samples,model=None):
            (not b.get('heating_requested') or a.get('heat_command_at')!=b.get('heat_command_at'))}
     for mode in ('fixed_3','fixed_6','fixed_9','auto'):
         rows=[r for r in samples if r.get('boiler_power_mode')==mode and r.get('boiler_mode_confirmed') and
-              r.get('power_quality')=='measured' and r.get('quality') and not r.get('power_estimated') and
+              r.get('power_quality')=='measured' and
+              (r.get('quality') or r.get('power_source')=='kws_phases')
+              and not r.get('power_estimated') and
               r.get('heat_command_at') in ended]
         versions={r.get('equipment_version') for r in rows}
         latest=max((v for v in versions if isinstance(v,int)),default=None)
         rows=[r for r in rows if r.get('equipment_version')==latest]
+        source=next((r.get('power_source') for r in reversed(rows)
+                     if r.get('power_source') in ('balance','kws_phases')),'balance')
+        rows=[r for r in rows if r.get('power_source')==source]
         sessions=sorted({r.get('heat_command_at') for r in rows if number(r.get('heat_command_at')) is not None})
         if len(sessions)<3:continue
         split=sessions[-1];train=[r for r in rows if r.get('heat_command_at')!=split];test=[r for r in rows if r.get('heat_command_at')==split]
         evaluation_model=(test[0].get('thermal_model') or model) if test else model
-        candidate=learn_modulation(train);baseline=3. if mode=='auto' else float(mode[-1])
+        baseline=3. if mode=='auto' else float(mode[-1])
+        candidate=learn_modulation(train,power_source=source,prior_kw=baseline if source=='kws_phases' else 3.)
         errors=[];base=[];thermal=[];base_thermal=[]
         simulated=None;reference=None
         for a,b in zip(test,test[1:]):
             dt=(b['ts']-a['ts'])/3600
             if not 3/60<=dt<=7/60 or not a.get('heating_requested') or a.get('heat_command_at')!=b.get('heat_command_at'):continue
-            ea,eb=number(a.get('energy')),number(b.get('energy'))
-            if ea is None or eb is None or eb<ea:continue
-            actual=(eb-ea)/dt
-            if not 0<=actual<=10.5:continue
+            actual=boiler_power_interval(a,b,source)
+            if actual is None or not 0<=actual<=10.5:continue
             predicted=modulation_power(a['return'],candidate)
             errors.append(abs(predicted-actual));base.append(abs(baseline-actual))
             # Replay the held-out complete session from one measured thermal state;
@@ -1271,7 +1302,7 @@ def learn_power_modes(samples,model=None):
                 thermal.append(abs(simulated[0]-b['room']));base_thermal.append(abs(reference[0]-b['room']))
         days=len({datetime.fromtimestamp(r['ts']).date() for r in rows})
         accepted=(days>=2 and len(errors)>=6 and candidate['minutes']>=60 and statistics.mean(errors)<statistics.mean(base)*.95 and
-                  bool(thermal) and statistics.mean(thermal)<=statistics.mean(base_thermal))
+                  source!='kws_phases' and bool(thermal) and statistics.mean(thermal)<=statistics.mean(base_thermal))
         stage_seconds={k:sum((r.get('instantaneous_stage_seconds') or {}).get(k,0.) for r in train if r.get('heating_requested')) for k in ('off','3','6','9','unknown')}
         known=sum(stage_seconds[k] for k in ('off','3','6','9'))
         probabilities={k:stage_seconds[k]/known for k in ('off','3','6','9')} if known else None

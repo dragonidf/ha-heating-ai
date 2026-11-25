@@ -23,6 +23,8 @@ from homeassistant.components.weather.const import DATA_COMPONENT as WEATHER_ENT
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .native_controller.heating_climate import HeatingClimate
 from .native_controller import heating_learning_windows as learning
@@ -84,6 +86,8 @@ class NativeController(HeatingClimate):
         self._learning_control_mode = None
         self._learning_last_report = 0.
         self._learning_last_value = None
+        self._learning_room_entity = None
+        self._learning_room_report = None
         self._learning_last_issue = 0.
         self._learning_generation = 0
         self._learning_current_ok = False
@@ -92,9 +96,10 @@ class NativeController(HeatingClimate):
 
     def sample(self, room, probe, outside, power, fire, source, primary, thermostat, quality, settings=None):
         before = self.last_sample
+        gap = self._capture_sample_power(power)
         result = super().sample(room, probe, outside, power, fire, source, primary, thermostat, quality, settings)
         try:
-            self._learning_tick(power, fire, source, quality, before)
+            self._learning_tick(power, fire, source, quality, before, gap)
         except Exception as exc:
             self._learning_breaks.add("capture_error")
             self._learning_current_ok = False
@@ -102,20 +107,30 @@ class NativeController(HeatingClimate):
             self.log("Adaptive sample skipped: %s", type(exc).__name__, level="WARNING")
         return result
 
-    def _learning_tick(self, power, fire, source, quality, before):
+    def _capture_sample_power(self,power):
         stamp = time.time()
         previous = self._learning_last_tick
         self._learning_last_tick = stamp
-        reasons = set()
-        kw = number(power)
+        measured = (getattr(self,"power_source",None),getattr(self,"power_quality",None)) == ("kws_phases","measured")
+        kw = number(power) if measured else None
+        if kw is not None and not 0<=kw<=10.5:
+            kw = None
         previous_kw = self._learning_previous_kw
         self._learning_previous_kw = kw
-        if previous is None or not 0 < stamp-previous<=45:
-            reasons.add("tick_gap_or_restart")
-        elif kw is not None and previous_kw is not None:
+        gap = previous is None or not 0 < stamp-previous<=45
+        if not gap and kw is not None and previous_kw is not None:
             duration = stamp-previous
             self._learning_kw_seconds += duration
             self._learning_kw_integral += (kw+previous_kw)*duration/2
+        return gap
+
+    def measured_sample_power(self,start,end):
+        if self._learning_kw_seconds>0 and self._learning_kw_seconds>=.95*(end-start):
+            return self._learning_kw_integral/self._learning_kw_seconds
+        return None
+
+    def _learning_tick(self, power, fire, source, quality, before, gap):
+        reasons = {"tick_gap_or_restart"} if gap else set()
         if getattr(self, "planning_grid_state", None) != "on":
             reasons.add("unqualified_outage")
         voltage = (self.voltage_status or {}).get("voltage_qualified") is True
@@ -161,13 +176,49 @@ class NativeController(HeatingClimate):
         if before == self.last_sample:
             return
         try:
-            interval_kw = (self._learning_kw_integral/self._learning_kw_seconds
-                           if self._learning_kw_seconds>0
-                           and self._learning_kw_seconds>=.95*(self.last_sample-before) else None)
+            interval_kw = self.measured_sample_power(before,self.last_sample)
             self._learning_append(self.samples[-1], voltage, self._learning_breaks, interval_kw)
         finally:
             self._learning_kw_integral = self._learning_kw_seconds = 0.
             self._learning_breaks.clear()
+
+    @callback
+    def _async_listen_room_reports(self):
+        entity = self.cfg.get("room")
+        if not entity:
+            return
+        entry = entity_registry.async_get(self.hass).async_get(entity)
+        if not entry or entry.platform != "tuya" or entry.original_device_class != "temperature":
+            return
+        prefix = "tuya."
+        if not entry.unique_id.startswith(prefix):
+            return
+        # Home Assistant Tuya uses tuya.<device id><description key>.
+        # Only a temperature datapoint with its own timestamp is accepted.
+        datapoint = next((key for key in ("va_temperature","temp_current")
+                          if entry.unique_id.endswith(key)),None)
+        if not datapoint:
+            return
+        device = entry.unique_id[len(prefix):-len(datapoint)]
+        if not device:
+            return
+
+        @callback
+        def room_report(properties=None, timestamps=None):
+            if entity != self.cfg.get("room") or datapoint not in (properties or ()):
+                return
+            observed = number((timestamps or {}).get(datapoint))
+            if observed is None:
+                return
+            if observed > 100_000_000_000:
+                observed /= 1000
+            received = time.time()
+            previous = self._learning_room_report
+            if 0<=received-observed<=300 and (previous is None or observed>previous[1]):
+                self._learning_room_report = entity,observed,received
+
+        self._handles[uuid4().hex] = async_dispatcher_connect(
+            self.hass,f"tuya_entry_update_{device}",room_report)
 
     def _learning_append(self, row, voltage, reasons, interval_kw):
         fields = ("ts","room","return","outside","power","fire","source","room_valid",
@@ -178,22 +229,33 @@ class NativeController(HeatingClimate):
         compact = {key:row.get(key) for key in fields}
         stamp = row["ts"]
         record = self.raw("room", attribute="all") or {}
-        # HA last_reported also advances for duplicate publications. Require a
-        # numeric state transition from the known primary, not just a timestamp.
+        entity = self.cfg.get("room")
         try:
-            changed = datetime.fromisoformat(record["last_changed"]).timestamp()
+            observed = datetime.fromisoformat(record["last_changed"]).timestamp()
         except (KeyError,ValueError,TypeError):
-            changed = None
+            observed = None
         reported = number(row.get("room_reported_at"))
+        source_report = self._learning_room_report
+        direct = bool(source_report and source_report[0]==entity and reported is not None
+                      and abs(reported-source_report[2])<=5 and 0<=stamp-source_report[1]<=300)
+        if direct:
+            observed = source_report[1]
         temperature = number(record.get("state"))
-        verified = (temperature is not None and temperature!=self._learning_last_value and changed is not None and reported is not None and changed<=reported<=stamp
-                    and changed>self._learning_last_report and 0<=stamp-changed<=300
+        source_changed = entity != self._learning_room_entity
+        if source_changed:
+            self._learning_room_entity = entity
+            self._learning_epoch = uuid4().hex
+            self._learning_last_report = observed or 0.
+            self._learning_last_value = temperature
+        verified = (temperature is not None and (direct or temperature!=self._learning_last_value)
+                    and observed is not None and reported is not None and observed<=reported<=stamp
+                    and observed>self._learning_last_report and 0<=stamp-observed<=300
                     and temperature==number(row.get("room"))
                     and row.get("room_valid") is True)
         if verified:
-            self._learning_last_report = changed
+            self._learning_last_report = observed
             self._learning_last_value = temperature
-            compact["room_reported_at"] = changed
+            compact["room_reported_at"] = observed
         ventilation = []
         for key in ("recuperator","bath"):
             evidence = (row.get("ventilation") or {}).get(key,{})
@@ -212,7 +274,7 @@ class NativeController(HeatingClimate):
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
         self._learning_rows.append(compact)
         if verified:
-            self._monitor_learning(changed)
+            self._monitor_learning(observed)
 
     def _monitor_learning(self, reported):
         checkpoint=self.memory.get("online_learning") or {}
@@ -274,7 +336,21 @@ class NativeController(HeatingClimate):
                     and self._learning_current_ok and self._learning_last_tick is not None
                     and 0<=stamp-self._learning_last_tick<=45)
 
-    def daily_learn(self, kwargs=None, **extra):
+    def schedule_learning(self,now):
+        if now.hour<10:
+            return
+        today=now.date().isoformat()
+        previous=self.memory.get("adaptive_schedule") or {}
+        if previous.get("day")!=today:
+            slot="daily"
+        elif (now.hour,now.minute)>=(20,45) and previous.get("slot")=="daily" and (
+                self._learning_last_report>previous.get("room_report",0.)):
+            slot="retry"
+        else:
+            return
+        self.run_diagnostic("learning",self.daily_learn,slot=slot)
+
+    def daily_learn(self, kwargs=None, *, slot=None, **extra):
         if self._learning_job is not None:
             if time.monotonic()-self._learning_job["started"]>120:
                 self._learning_status.update(status="frozen",reason="learning_job_timeout")
@@ -284,7 +360,9 @@ class NativeController(HeatingClimate):
         now=self.now()
         self.memory["last_analysis"]=now.isoformat()
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
-                    generation=self._learning_generation,equipment=self.memory.get("equipment_version",0))
+                    generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
+                    schedule=dict(day=now.date().isoformat(),slot=slot,
+                                  room_report=self._learning_last_report))
         self._learning_job=issued
         self._learning_status.update(status="evaluating",reason="scheduled_evaluation")
         try:
@@ -304,6 +382,9 @@ class NativeController(HeatingClimate):
             return
         self._learning_job=None
         result=data["result"]
+        schedule=issued.get("schedule") or {}
+        if schedule.get("slot"):
+            self.memory["adaptive_schedule"]=dict(schedule,completed_at=self.now().isoformat())
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
                                         "verified_reports","rejection_counts","current_reasons",
@@ -664,6 +745,7 @@ class NativeController(HeatingClimate):
         self.listen_state(self.voltage_changed, self.args["grid_presence_helper"])
         # Recovery is attempted from the existing periodic control tick only.
         self._on_loop(self._async_listen_kws_manual_intent)
+        self._on_loop(self._async_listen_room_reports)
 
     @callback
     def _async_listen_kws_manual_intent(self):
@@ -1574,6 +1656,7 @@ class NativeController(HeatingClimate):
                      for key in ("floor_air","room_loss")
                      if key in previous and key in self.model and previous[key]!=self.model[key]]
             attributes.update(last_accepted_changes=changes,
+                last_completed_analysis=(self.memory.get("adaptive_schedule") or {}).get("completed_at"),
                 last_accepted_mae_1h=accepted_metrics.get("1",{}).get("new",{}).get("mae"),
                 last_accepted_mae_3h=accepted_metrics.get("3",{}).get("new",{}).get("mae"),
                 learning_status=report["status"],learning_gate=report["reason"],

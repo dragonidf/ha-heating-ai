@@ -70,8 +70,8 @@ class WindowsTest(unittest.TestCase):
             self.assertIn("analysis_status",result)
             self.assertGreater(len(load_evidence(path)["windows"]),0)
 
-    def test_60_and_120_minute_reports_survive_cached_temperature_ticks(self):
-        for cadence in (60, 120):
+    def test_real_reports_survive_cached_temperature_ticks(self):
+        for cadence in (5, 10, 15, 30, 60, 120):
             with self.subTest(cadence=cadence):
                 rows = samples(cadence, cadence)
                 result = build_observation_windows(rows, timezone.utc)
@@ -79,7 +79,8 @@ class WindowsTest(unittest.TestCase):
                 self.assertEqual(result["eligible_minutes"], cadence)
                 self.assertEqual(result["unique_primary_reports"], 2)
                 self.assertEqual(result["windows"][0]["room_end"], rows[-1]["room"])
-                self.assertFalse(transitions(rows))
+                if cadence > 5:
+                    self.assertFalse(transitions(rows))
 
     def test_republish_or_bad_intermediate_evidence_breaks_window(self):
         invalid = [
@@ -112,6 +113,25 @@ class WindowsTest(unittest.TestCase):
         evidence = build_observation_windows(samples(120, 120), timezone.utc)["windows"]
         report = evaluate_windows(evidence, dict(DEFAULT_MODEL, version=6))
         self.assertEqual(report["status"], "insufficient_data")
+
+    def test_independent_cooling_days_can_identify_only_room_heat_loss(self):
+        from heating_model import step
+        from tools.replay_adaptive_learning import MODEL
+
+        actual=dict(MODEL,room_loss=MODEL["room_loss"]*1.01)
+        windows=[]
+        for day in range(8):
+            rows=samples(120,120,day=day)
+            room,floor=21.,21.
+            outside=2.+day%4
+            for row in rows:
+                row.update(outside=outside,room=room if row["report_verified"] else 21.)
+                row["return"]=floor
+                room,floor=step(room,floor,outside,0.,0.,actual,1/12)
+            windows.extend(build_observation_windows(rows,timezone.utc)["windows"])
+        result=evaluate_windows(windows,MODEL)
+        self.assertEqual(result["status"],"holdout_passed")
+        self.assertEqual(result["coefficients"],{"room_loss":actual["room_loss"]})
 
     def test_prospective_gate_requires_both_horizons_and_coverage(self):
         issue = BASE

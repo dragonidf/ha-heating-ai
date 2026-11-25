@@ -132,6 +132,22 @@ class BackgroundPlanAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         args,kwargs=app.submitted[-1]
         await kwargs['callback']({'result':args[0](*args[1:])})
 
+    async def test_deficient_worker_diagnostics_survive_replay_and_persistence(self):
+        app,settings=self.app()
+        settings.update(split_comfort=True,night_target=21.,night_lower=20.5,night_upper=21.5,
+                        sleep_start='23:00',sleep_end='06:30',target=22.,lower=21.,upper=23.)
+        now=app.now()
+        self.assertIsNone(app.background_plan(now,21.,22.,-10.,0.,[],settings,app.outage_signature))
+        await self.finish(app)
+        forecast,reference=app.background_plan(now,21.,22.,-10.,0.,[],settings,app.outage_signature)
+        self.assertEqual(forecast['search_status'],'deficit_after_expanded_search')
+        for key in ('expanded_search_performed','search_passes','alternatives_evaluated','search_check_key'):
+            self.assertIsNotNone(forecast[key])
+            self.assertEqual(forecast['morning_reserve'][key],forecast[key])
+            self.assertEqual(reference['search'][key],forecast[key])
+        self.assertTrue(forecast['expanded_search_performed'])
+        self.assertIn('розширений пошук виконаний',forecast['morning_reserve']['impossibility_reason'])
+
     async def test_real_result_is_replayed_at_current_absolute_time(self):
         app,settings=self.app();now=app.now()
         self.assertIsNone(app.background_plan(now,21.5,22.,11.,0.,[],settings,app.outage_signature))

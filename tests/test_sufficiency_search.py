@@ -40,6 +40,30 @@ class SufficiencySearchTests(unittest.TestCase):
                 self.assertGreaterEqual(point['temperature'],lo-.001)
                 self.assertLessEqual(point['temperature'],hi+.001)
 
+    def test_local_search_checks_safe_heat_inside_free_night_window(self):
+        from heating_stability import refine_night_plan
+
+        now=self.now.replace(day=21,hour=23,minute=0,second=0)
+        start=now.timestamp()
+        settings=dict(self.settings,outage_schedule=dict(valid=True,mode='normal',outages=[]))
+        model=self.x['model']
+        baseline=replay(now,21.,22.,10.,0.,model,[],settings,
+                        [dict(start=start+5*3600,end=start+6*3600)],
+                        True,3.,reserve_checked=True)
+        improved=refine_night_plan(now,21.,22.,10.,0.,model,[],settings,3.,baseline)
+        before=baseline['morning_reserve']['comfort_deficit']
+        after=improved['morning_reserve']['comfort_deficit']
+        self.assertLess(after['deficit_degree_hours'],before['deficit_degree_hours'])
+        self.assertLessEqual(after['day_max_shortfall'],before['day_max_shortfall'])
+        self.assertGreater(improved['energy'],baseline['energy'])
+        self.assertTrue(all(23<=datetime.fromtimestamp(s['start'],now.tzinfo).hour or
+                            datetime.fromtimestamp(s['start'],now.tzinfo).hour<7
+                            for s in improved['heat_segments']))
+        with patch('heating_stability.monotonic',side_effect=(100.,101.)):
+            fallback=refine_night_plan(now,21.,22.,10.,0.,model,[],settings,3.,baseline)
+        self.assertEqual(fallback['heat_segments'],baseline['heat_segments'])
+        self.assertEqual(fallback['morning_reserve']['local_search_status'],'timeout')
+
     def stable(self,previous=None,settings=None):
         x=self.x
         return stable_plan(self.now,x['room'],x['floor'],x['outside'],x['fire'],x['model'],[],

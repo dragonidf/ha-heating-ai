@@ -88,6 +88,20 @@ class SettingsAndLatency(unittest.TestCase):
             self.assertEqual(r['watts'],0.)
 
 class CalibrationContracts(unittest.TestCase):
+    def test_kws_calibration_uses_measured_intervals_without_room_reports(self):
+        from heating_model import learn_modulation
+
+        rows = [dict(ts=1000+i*300,quality=False,room=None,measurement_version=3,
+                     power_source='kws_phases',power_quality='measured',power=4.5,
+                     measured_interval_kw=4.5,energy=20.,grid='on',
+                     heating_requested=True,heat_command_at=800,
+                     **{'return':27.}) for i in range(13)]
+        rows[2]['measured_interval_kw'] = 0.
+        rows[4]['measured_interval_kw'] = None
+        result=learn_modulation(rows,power_source='kws_phases',prior_kw=6.)
+        self.assertEqual(result['intervals'],11)
+        self.assertAlmostEqual(result['bands'][0]['measured_kw'],4.5*10/11,places=3)
+
     def test_validated_ventilation_can_advance_within_daily_bounds(self):
         from test_system_settings import SystemSettingsTests
         from unittest.mock import patch

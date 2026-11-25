@@ -6,6 +6,7 @@ The adapter persists the returned reference beside existing plan memory.
 from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 import math
+from time import monotonic
 from uuid import uuid4
 from heating_model import (held_action,number,plan as optimise, step, outdoor_at, in_window,
                            modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
@@ -61,16 +62,17 @@ def expected(previous,stamp,key,initial):
     return points[-1][1]
 
 
-def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False,context_override=None,window_extensions=()):
+def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False,context_override=None,window_extensions=(), *, forecast_context=None, reserve_needed=None, strict_upper=False):
     """Integrate at <=5 min, splitting at exact session and forecast boundaries."""
     start=now.timestamp(); public_finish=start+86400
     context=context_override or reserve_context(now,settings,model)
     priority=bool(settings.get('split_comfort') and 'night_target' in settings)
     count=max(48,math.ceil((context['assessment_until']-start)/1800)) if (priority or context_override) and context else 48
     finish=start+count*1800
-    settings=dict(settings,_reserve_context=context,_reserve_needed=bool(context and
-        coast_reserve_needed(now,room,floor,outside,fire,model,weather,settings,context,power_kw)))
-    priority=bool(settings.get('split_comfort') and 'night_target' in settings)
+    if reserve_needed is None:
+        reserve_needed=bool(context and coast_reserve_needed(now,room,floor,outside,fire,model,
+                                                            weather,settings,context,power_kw))
+    settings=dict(settings,_reserve_context=context,_reserve_needed=reserve_needed)
     if priority and not split and not reserve_checked:
         # A safety fallback without a morning reservation must be reconsidered.
         return None
@@ -104,12 +106,11 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     for a,b in sorted((s['start'],s['end']) for s in segments):
         segment_starts.append(a)
         segment_ends.append(max(b,segment_ends[-1]) if segment_ends else b)
-    forecast=ForecastContext(now,weather,outside,model,settings)
+    forecast=forecast_context or ForecastContext(now,weather,outside,model,settings)
     profile=settings.get('modulation_profile')
     anchor=settings.get('modulation_anchor')
     rows=[]; r,f=room,floor; ur,uf=room,floor;low=high=room; energy=0.; all_segments=[]
     risk_enabled=has_upper_risk(settings)
-    risk_heat=(settings.get('environment') or {}).get('last_heated_at') or start-10801
     actuator=settings.get('actuator') or {};command=actuator.get('action');command_at=actuator.get('changed_at',0.)
     for block in range(count):
         a=start+1800*block; b=a+1800
@@ -141,12 +142,11 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 fire_gain=model['fire_gain']*max(0.,fire*math.exp(-(t-start)/7200))
                 delivered_kw=kw if active else 0.
                 r,f=forecast.integrate(r,f,out,delivered_kw,fire_gain,dt,gains[0])
-                if active:risk_heat=u
                 ur,uf=(forecast.integrate(ur,uf,out,delivered_kw,fire_gain,dt,gains[1],upper=True)
-                       if risk_enabled and t-risk_heat<=10800 else (r,f))
+                       if risk_enabled else (r,f))
                 low=min(low,r); high=max(high,r)
                 fine.append(dict(ts=u,temperature=r,upper_temperature=max(r,ur),**{'return':f}))
-                if max(r,ur)>max(room,hi)+.01 and (active or all_segments or heats):
+                if max(r,ur)>(hi if strict_upper else max(room,hi)+.01) and (active or all_segments or heats):
                     return None
                 if active:
                     if r>hi or f>50:
@@ -208,6 +208,115 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     return result
 
 
+def heat_runs(segments):
+    runs = []
+    for start, end in sorted((s['start'], s['end']) for s in segments):
+        if runs and start <= runs[-1][1]+.001:
+            runs[-1] = runs[-1][0], max(end, runs[-1][1])
+        else:
+            runs.append((start, end))
+    return tuple(runs)
+
+
+def night_variants(runs, left, right, step):
+    for index, (start, end) in enumerate(runs):
+        for first, last in ((start-step,end),(start,end+step),(start-step,end-step),
+                            (start+step,end+step)):
+            if left <= first <= last <= right:
+                yield (*runs[:index], (first,last), *runs[index+1:])
+    cursor = left
+    gaps = []
+    for start, end in (*runs, (right, right)):
+        cut = min(start, right)
+        if cut > cursor:
+            gaps.append((cursor,cut))
+        cursor = max(cursor,end)
+    for start, end in reversed(gaps):
+        if end-start <= 2*step:
+            yield (*runs, (start,end))
+        if end-start >= step:
+            yield (*runs, (end-step,end))
+            yield (*runs, (start,start+step))
+
+
+def refine_night_plan(now, room, floor, outside, fire, model, weather, settings, power_kw, baseline,
+                      *, forecast_context=None):
+    """Bounded search on the same physical forecast and confirmed execution rules."""
+    reserve = baseline.get('morning_reserve') or {}
+    before = reserve.get('comfort_deficit') or {}
+    until = reserve.get('assessment_until')
+    start = now.timestamp()
+    if (not until or before.get('deficit_degree_hours',0.) <= .01
+            or not settings.get('split_comfort') or 'night_target' not in settings
+            or (settings.get('actuator') or {}).get('safety_stop')):
+        return baseline
+    left, right = max(start,reserve['cycle_start']), reserve['cycle_end']
+    if right-left < 900:
+        return baseline
+    runs = heat_runs(s for row in baseline.get('_calculation_curve',baseline['curve'])
+                     for s in row['heat_segments'])
+    budget = settings.get('cycle_energy_budget')
+    extensions = baseline.get('approved_window_extensions') or []
+    forecast_context = forecast_context or ForecastContext(now,weather,outside,model,settings)
+    deadline = monotonic()+.25
+    seen = {runs}
+    checked = 0
+    best, best_runs, best_metrics = baseline, runs, before
+    for step, limit in ((900,16),(300,8)):
+        changed = 0
+        for variant in night_variants(best_runs,left,right,step):
+            if monotonic() >= deadline:
+                fallback=dict(baseline,morning_reserve=dict(reserve),local_search_status='timeout',
+                              local_alternatives_evaluated=checked)
+                return apply_search_diagnostics(now,settings,fallback)
+            proposal = heat_runs(dict(start=a,end=b) for a,b in variant)
+            if proposal in seen:
+                continue
+            seen.add(proposal)
+            if (any(b-a<600 and (a,b) not in runs for a,b in proposal)
+                    or any(c-b<900 and ((a,b) not in runs or (c,d) not in runs)
+                           for (a,b),(c,d) in zip(proposal,proposal[1:]))
+                    or (runs and runs[0][0] <= start and (not proposal or proposal[0]!=runs[0]))):
+                continue
+            checked += 1
+            changed += 1
+            candidate = replay(now,room,floor,outside,fire,model,weather,settings,
+                               [dict(start=a,end=b) for a,b in proposal],
+                               baseline['split_comfort_applied'],power_kw,reserve_checked=True,
+                               context_override=reserve,window_extensions=extensions,
+                               forecast_context=forecast_context,
+                               reserve_needed=reserve['morning_required_minutes']>0,strict_upper=True)
+            if candidate is not None:
+                candidate_reserve = candidate['morning_reserve']
+                metrics = candidate_reserve['comfort_deficit']
+                simulated = [s for row in candidate['_calculation_curve'] for s in row['heat_segments']]
+                retained = heat_runs(simulated)==proposal
+                if budget:
+                    used = sum(s['power_kw']*max(0.,min(s['end'],budget['end'])
+                                               -max(s['start'],budget['start']))/3600 for s in simulated)
+                    retained = retained and used<=budget['remaining_kwh']+.001
+                if (retained and candidate_reserve['minimum_unmet_minutes']<=reserve['minimum_unmet_minutes']
+                        and metrics['deficit_degree_hours'] < best_metrics['deficit_degree_hours']-.01
+                        and metrics['day_deficit_degree_hours'] <= before['day_deficit_degree_hours']+.001
+                        and metrics['night_deficit_degree_hours'] <= before['night_deficit_degree_hours']+.001
+                        and metrics['comfort_minutes'] >= before['comfort_minutes']-.01
+                        and metrics['day_max_shortfall'] <= before['day_max_shortfall']+.001
+                        and metrics['minimum_before_next_heat'] >= before['minimum_before_next_heat']-.001):
+                    best,best_runs,best_metrics = candidate,proposal,metrics
+            if changed>=limit or best_metrics['deficit_degree_hours']<=.001:
+                break
+    status = 'no_improvement' if best is baseline else 'improved'
+    result = dict(baseline,local_search_status=status,local_alternatives_evaluated=checked)
+    if best is not baseline:
+        result.update(best, outage_shifted=baseline.get('outage_shifted',False),
+                      outage_preheat=baseline.get('outage_preheat',False))
+        result['local_deficit_reduction_degree_hours'] = round(
+            before['deficit_degree_hours']-best_metrics['deficit_degree_hours'],5)
+    else:
+        result['morning_reserve'] = dict(reserve)
+    return apply_search_diagnostics(now,settings,result)
+
+
 def stress_scenarios(now,room,floor,outside,fire,model,weather,settings,nominal,power_kw=3.):
     """Frozen-plan sensitivity, never an outage prediction or an actuation request."""
     rows=[]
@@ -246,6 +355,19 @@ def stress_scenarios(now,room,floor,outside,fire,model,weather,settings,nominal,
 
 
 def stable_plan(now, room, floor, outside, fire, model, weather, settings, power_kw=9., previous=None):
+    args = now,room,floor,outside,fire,model,weather,settings,power_kw
+
+    def search():
+        forecast_context = ForecastContext(now,weather,outside,model,settings)
+        baseline = optimise(*args,forecast_context=forecast_context)
+        try:
+            return refine_night_plan(*args,baseline,forecast_context=forecast_context)
+        except Exception:
+            fallback = dict(baseline,local_search_status='failed')
+            if baseline.get('morning_reserve'):
+                fallback['morning_reserve'] = dict(baseline['morning_reserve'])
+            return apply_search_diagnostics(now,settings,fallback)
+
     reason='Перший план'
     improved=None
     if previous:
@@ -285,7 +407,7 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
                 for name in ('outage_shifted','outage_preheat'):
                     result[name]=previous.get(name,False)
                 if settings.get('split_comfort') and 'night_target' in settings and reserve.get('deficit_degree_hours',0)>.00001 and not checked:
-                    alternative=optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
+                    alternative=search()
                     other=alternative.get('morning_reserve',{}).get('deficit_degree_hours',0)
                     if other<reserve['deficit_degree_hours']-.00001:
                         improved=alternative
@@ -304,7 +426,7 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
                     previous=dict(previous,plan_id=result['plan_id'])
                     return result,previous
         reason='Нові умови, зміна запасу тепла або обмежень — план перебудовано'
-    result=improved if improved is not None else optimise(now,room,floor,outside,fire,model,weather,settings,power_kw)
+    result=improved if improved is not None else search()
     result.update(plan_stable=False,stability_reason=reason,plan_id=uuid4().hex,
                   parent_plan_id=previous.get('plan_id') if previous else None)
     return result,reference(now,room,floor,outside,fire,model,weather,settings,result)

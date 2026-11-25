@@ -248,10 +248,10 @@ def build_observation_windows(samples, tz):
             anchor = end, row
             continue
         start, first = anchor
-        if end-start < 900:
+        if end-start < 300:
             continue
         anchor = end, row
-        if end-start > 9000:
+        if end-start > 7200:
             counts["anchor_expired"] += 1
             continue
         day = _local_day(start, tz)
@@ -274,7 +274,7 @@ def build_observation_windows(samples, tz):
                             equipment=list(identity[2:]),vent=first["shadow_ventilation"]))
         anchor = None  # an independent physical report belongs to at most one window
     anchor_at = None
-    if anchor and rows and rows[-1]["ts"]-anchor[0]<=9000:
+    if anchor and rows and rows[-1]["ts"]-anchor[0]<=7200:
         at, row = anchor
         _, issues = _continuous(rows,times,at,rows[-1]["ts"],tuple(row.get(k) for k in IDENTITY))
         if not issues and not row_reasons(row,strict=True):
@@ -347,6 +347,14 @@ def evaluate_windows(windows, model, ventilation=None):
     qualified_vent = ventilation and ventilation.get("validated") and ventilation.get("model_version")==model.get("version")
     thermal = [w for w in windows if w["sun"]<=.02 and
                (qualified_vent or max(w["vent"])==0.)]
+    # Over short intervals sensor rounding can dominate the thermal response.
+    # Prefer longer observations when they already cover both regimes and days.
+    longer = [w for w in thermal if w["end"]-w["start"] >= 900]
+    support = _coverage(longer)
+    if (support["seconds"] >= 8*3600 and support["days"] >= 5
+            and support["heat"] >= 2*3600 and support["heat_days"] >= 2
+            and support["idle"] >= 3*3600 and support["idle_days"] >= 2):
+        thermal = longer
     coverage = _coverage(thermal)
     returns = [step[4] for w in thermal for step in w["steps"]]
     blockers = [key for key, ok in (
@@ -358,13 +366,23 @@ def evaluate_windows(windows, model, ventilation=None):
     if (not train or not holdout or not any(w["heat"] for w in train) or not any(w["idle"] for w in train)
             or not any(w["heat"] for w in holdout) or not any(w["idle"] for w in holdout)):
         blockers.append("independent_holdout")
+    fields = FIT_FIELDS
     if blockers:
-        return dict(status="insufficient_data", blockers=blockers, coverage=coverage)
+        cooling = [w for w in thermal if w["idle"]>=w["end"]-w["start"]
+                   and abs(w["floor"]-w["room_start"])<=1.5
+                   and all(w["room_start"]-step[1]>=5. for step in w["steps"])]
+        train,holdout = _split(cooling)
+        outside = [w["steps"][0][1] for w in cooling]
+        support = _coverage(train)
+        if (qualified_vent or not holdout or support["seconds"]<8*3600 or support["days"]<2
+                or not outside or max(outside)-min(outside)<2.):
+            return dict(status="insufficient_data", blockers=blockers, coverage=coverage)
+        fields = ("room_loss",)
     # Bound both the grid and per-candidate displacement; widening belongs to a
     # separate qualification for equipment gain and decay.
     old = _score(train,model,ventilation=ventilation)
     best, objective = model, old["mae"]
-    for a in (-.01,0.,.01):
+    for a in (-.01,0.,.01) if "floor_air" in fields else (0.,):
         for b in (-.01,0.,.01):
             candidate = {**model,"floor_air":model["floor_air"]*(1+a),"room_loss":model["room_loss"]*(1+b)}
             if not all(BOUNDS[k][0]<=candidate[k]<=BOUNDS[k][1] for k in FIT_FIELDS):
@@ -379,7 +397,7 @@ def evaluate_windows(windows, model, ventilation=None):
                 blockers=[] if qualified else ["held_out_no_improvement"],
                 coverage=coverage, train_windows=len(train), holdout_days=len({w["day"] for w in holdout}),
                 holdout_start=min(w["day"] for w in holdout),
-                old=baseline,shadow=shadow, coefficients={k:best[k] for k in FIT_FIELDS} if qualified else None,
+                old=baseline,shadow=shadow, coefficients={k:best[k] for k in fields} if qualified else None,
                 equipment=latest)
 
 
@@ -812,6 +830,14 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                                              key=lambda item:(-item[1],item[0]))[:12]),
                 current_reasons=window_report["current_observation_quality"]["reasons"],
                 analysis_status="pending", analysis_blockers=[])
+    evidence_key = sha256(_encode([now.date().isoformat(),model,
+                                  [(w['start'],w['end']) for w in windows],
+                                  [(f['snapshot']['start'],f['checks']) for f in archive]])).hexdigest()
+    previous_report = saved["report"]
+    if previous_report.get("evidence_key")==evidence_key:
+        return dict(result,status=previous_report["status"],reason=previous_report["reason"],
+                    analysis_status=previous_report.get("analysis_status","pending"),
+                    analysis_blockers=previous_report.get("analysis_blockers",[]))
     monitoring=checkpoint.get("monitoring")
     if monitoring and monitoring["version"]==model.get("version"):
         assessments={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
@@ -861,6 +887,8 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                                       model,ventilation=ventilation)
     payload=dict(windows=windows,forecasts=archive,comparisons=[],report={
         "status":result["status"], "reason":result["reason"], "updated_at":stamp,
+        "evidence_key":None if result.get("proposed") or result.get("rollback") else evidence_key,
+        "analysis_status":result["analysis_status"],"analysis_blockers":result["analysis_blockers"],
         "independent_windows":len(windows), "qualified_minutes":result["qualified_minutes"]})
     # Keep more than a week of compact issue snapshots where the byte cap permits.
     while len(_encode(payload))>MAX_BYTES-256:

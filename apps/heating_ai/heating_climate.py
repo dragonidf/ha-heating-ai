@@ -17,7 +17,7 @@ from heating_fallback import (fallback_power,repair_samples,estimated_power,alig
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
-                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,outdoor_at)
+                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics
 from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at,
@@ -784,12 +784,12 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.calculation_rejection('plan','replay_rejected',job_id=job['id'])
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
             return None
-        # Replay returns fresh physical times but omits the energy reference metadata.
-        apply_search_diagnostics(now,settings,fresh)
         # Record the replay baseline for analysis, not as a new control budget.
         fresh['plan_fact_reporting_only']=True
-        for name in ('plan_id','parent_plan_id','plan_stable','search_policy_version','search_status','outage_shifted','outage_preheat','split_reason'):
+        for name in (*SEARCH_FIELDS,'candidate_rejections','plan_id','parent_plan_id',
+                     'plan_stable','outage_shifted','outage_preheat','split_reason'):
             if name in original:fresh[name]=original[name]
+        apply_search_diagnostics(now,settings,fresh)
         fresh.update(calculation_started_at=job['at'],calculation_seconds=job['seconds'],
                      stability_reason='План розраховано у фоні та перевірено за поточними вимірами')
         self.calculation_rejection('plan')
@@ -803,12 +803,19 @@ class HeatingClimate(HeatingRecovery,Hass):
             if isinstance(value,list):return [wire(v) for v in value]
             if value is False:return 'false'
             return '0' if isinstance(value,(int,float)) and value==0 else value
-        profile=power_profile(self.cfg.get('boiler_power_mode','unconfirmed'),self.memory.get('power_calibrations'),self.memory.get('modulation_profile'),self.memory.get('equipment_version',0))
+        mode=self.cfg.get('boiler_power_mode','unconfirmed')
+        calibrations=self.memory.get('power_calibrations') or {}
+        profile=power_profile(mode,calibrations,self.memory.get('modulation_profile'),self.memory.get('equipment_version',0))
+        observed=(calibrations.get('candidates') or {}).get(mode) or {}
         self.publish('sensor.heating_power_model',self.cfg.get('boiler_power_mode','unconfirmed'),
             **wire(dict(friendly_name='Котел — фізичний режим і прогноз',equipment_version=self.memory.get('equipment_version',0),
             history=[dict(at=h['at'],changed=list(h['values'])) for h in (self.memory.get('equipment_history') or [])[-3:]],
             profile={k:v for k,v in profile.items() if k not in ('bands','stage_minutes')},
             bands=[{k:b.get(k) for k in ('return_min','return_max','power_kw','minutes')} for b in profile.get('bands',[])[:16]],
+            measured_calibration=dict(intervals=observed.get('intervals'),minutes=observed.get('minutes'),
+                bands=[{k:b.get(k) for k in ('return_min','return_max','measured_kw','minutes')}
+                       for b in observed.get('bands',[])[:16]])
+                if observed.get('power_source')=='kws_phases' else None,
             mode_contradiction=self.memory.get('mode_contradiction',False),
             recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
             energy=self.memory.get('kws_energy') if self.cfg.get('power_accounting_method')=='kws' else self.memory.get('inlet_energy') if self.cfg.get('power_accounting_method')=='inlet' else self.memory.get('power_observation_ledger'),
@@ -953,6 +960,10 @@ class HeatingClimate(HeatingRecovery,Hass):
                 grid_unknown_fraction=round(row['grid_unknown']/seconds,4) if seconds else None)
         self.ventilation_totals={}
         return result
+
+    def measured_sample_power(self,start,end):
+        return None
+
     def sample(self,room,probe,outside,power,fire,source,primary,thermostat,quality,settings=None):
         stamp=time.time()
         if stamp-self.last_sample<290:
@@ -1038,6 +1049,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             if (seconds>0 and before is not None and after is not None and after>=before
                     and previous["ts"]>=self.measurement_valid_since):
                 row["interval_power"]=(after-before)*3600/seconds
+        if row['power_source']=='kws_phases' and previous:
+            row['measured_interval_kw']=self.measured_sample_power(previous['ts'],stamp)
         self.samples.append(row)
         self.samples=self.samples[-4032:]
         self.memory['modulation_profile']=learn_modulation(self.samples)
@@ -1528,15 +1541,18 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.run_diagnostic('health_publish',self.publish_diagnostic_health)
         finally:
             if hasattr(self,'_tick_read_local'):self._tick_read_local.states=None
-    def tick_inner(self):
-        now=self.now()
-        self.ventilation_tick(now.timestamp())
+    def schedule_learning(self,now):
         if now.hour==10 and self.memory.get("learn_morning_date")!=now.date().isoformat():
             self.memory["learn_morning_date"]=now.date().isoformat()
             self.run_diagnostic('learning',self.daily_learn)
         if now.hour==20 and now.minute>=45 and self.memory.get("learn_date")!=now.date().isoformat():
             self.memory["learn_date"]=now.date().isoformat()
             self.run_diagnostic('learning',self.daily_learn)
+
+    def tick_inner(self):
+        now=self.now()
+        self.ventilation_tick(now.timestamp())
+        self.schedule_learning(now)
         room,source,primary,thermostat=self.source_temperature()
         probe=self.val("return")
         probe_ok=probe is not None and 0<probe<65 and self.heartbeat_fresh(self.cfg["return_heartbeat"],self.cfg.get('return_max_age',1200))
