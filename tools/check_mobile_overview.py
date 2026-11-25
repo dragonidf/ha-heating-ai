@@ -67,6 +67,13 @@ def main():
                 assert page.evaluate('entityOpens.length')==before+1
                 assert page.evaluate('entityOpens.at(-1)')==expected
             assert page.evaluate('calls.length')==0,'Read-only overview must not actuate equipment'
+            page.locator('[data-open-manual]').click()
+            assert page.locator('.next-action .manual-energy').is_visible()
+            assert page.evaluate('calls.length')==0, 'Opening manual heat must not issue a command'
+            page.locator('.next-action>summary').click()
+            page.locator('.fire-details>summary').click()
+            assert page.locator('.fire-details [data-control="fan_mode"]').is_visible()
+            page.locator('.fire-details>summary').click()
             page.locator('nav [data-tab="model"]').click()
             page.wait_for_function('panel.comparisonPending===null')
             page.screenshot(path=str(ARTIFACTS/'heating-mobile-history-390.png'),full_page=True)

@@ -123,6 +123,7 @@ def source_and_manifest() -> tuple[dict[str, bytes], bytes]:
         **published, "module_hashes": native_hashes,
     }, sort_keys=True).encode()
     contents["assets/full-panel.js"] = (ROOT / "frontend/heating-panel.js").read_bytes()
+    contents["assets/full-panel-version.json"] = json.dumps({"digest": checksum(contents["assets/full-panel.js"])[:16]}, sort_keys=True).encode()
 
     root_manifest = (ROOT / "manifest.json").read_bytes()
     nested_manifest = (CARRIER / "manifest.json").read_bytes()

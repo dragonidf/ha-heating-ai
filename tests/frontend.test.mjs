@@ -702,3 +702,16 @@ test('journal breakdown uses cached metrics and never equates archive budget wit
   assert.match(html,/журнали: 100,0 МіБ/);
   assert.match(html,/Ліміт архіву не є розміром диска/);
 });
+
+ test('source controls reuse guarded KWS and circulation settings rather than inventing a pump',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.pending=new Set();p.systemDraft={};
+  p.attrs=k=>k==='system_settings'?{values:{kws_auto_restore:'disabled',boiler_power_mode:'fixed_6'}}:k==='fireplace_status'?{temperature:21.1}:{};
+  p.state=k=>({fireplace_status:'Неактивний',fan:'off',fan_mode:'Авто',manual_energy:'idle',return:'22.8'})[k]||'off';
+  p.id=k=>({fan_mode:'input_select.heating_fan_mode',fan_control:'input_boolean.heating_fan_control'})[k]||'sensor.'+k;
+  p.entity=k=>k==='fan_mode'?{state:'Авто',attributes:{options:['Авто','Зупинити','Ручний запуск']}}:k==='fan_control'?{state:'on',attributes:{}}:undefined;
+  p.boilerActual=()=>({meta:{},stale:false,power:0,heating:false});p.controllerHealth=()=>({});
+  p.equipmentReadiness=()=>({configured:true,ready:true,relayState:'on',relayControl:true,relayId:'switch.energy_meter_kotel',label:'Готовий',restoreLabel:'Вимкнено'});
+  const boiler=p.boilerOverview(),fire=p.fireplaceOverview();
+  assert.match(boiler,/data-system-key="kws_auto_restore"/);assert.match(boiler,/data-open-manual/);assert.match(boiler,/data-info="switch.energy_meter_kotel"/);
+  assert.match(fire,/data-control="fan_mode"/);assert.match(fire,/Ручний запуск/);assert.match(fire,/data-control="fan_control"/);assert.doesNotMatch(fire,/Насос/);
+});
