@@ -46,7 +46,7 @@ test('overview translates KWS readiness without confusing recovered ledger histo
   const p=Object.create(HeatingAIPanel.prototype),values={heartbeat:new Date().toISOString(),alive:'on',mode:'Автоматичне керування',permitted:'on'};
   const attrs={controller:{quality:true},diagnostics:{control_health:'healthy',control_error:null,reliability:{equipment:{ready:false,reason:'kws_reset_pending',reason_text:'KWS: очікування підтвердженого відновлення'},ledger_recovery:{state:'reconciliation_verified',at:Date.now()/1000}}},forecast:{created_at:new Date().toISOString(),heat_segments:[]},grid_status:{raw:'on'}};
   p.state=key=>values[key]??'off';p.attrs=key=>attrs[key]||{};p.boilerActual=()=>({heating:false,power:0});p.controllerHealth=()=>({message:'',severity:'info',stale:false});
-  assert.deepEqual(p.equipmentReadiness(),{ready:false,configured:true,reason:'kws_reset_pending',label:'Очікує відновлення'});
+  assert.deepEqual(p.equipmentReadiness(),{ready:false,configured:true,reason:'kws_reset_pending',label:'Очікує відновлення',holding:false,relayControl:null,relayId:null,relayState:'unknown',restoreLabel:'Очікує'});
   assert.equal(p.overviewStatus().label,'Нагрів заблоковано захистом');
   assert.match(p.overviewStatus().reason,/KWS/);
   attrs.diagnostics.reliability.equipment={ready:true,reason:'ready'};
@@ -240,7 +240,7 @@ test('expert settings search filters locally without dropping schema fields',()=
   assert.match(filtered,/data-settings-search/);assert.match(filtered,/data-system-key="fire_start_delta"/);
   assert.doesNotMatch(filtered,/data-system-key="room_loss"/);
   p.settingsQuery='';const all=p.systemSettings();
-  assert.equal(p.systemFields().length,46);assert.ok((all.match(/data-system-key=/g)||[]).length>=35);
+  assert.equal(p.systemFields().length,47);assert.match(all,/data-system-key="kws_auto_restore"/);assert.ok((all.match(/data-system-key=/g)||[]).length>=35);
 });
 test('paged history ignores duplicate and foreign pages and completes only after every point',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='mine';
