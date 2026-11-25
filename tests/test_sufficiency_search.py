@@ -47,6 +47,32 @@ class SufficiencySearchTests(unittest.TestCase):
                         baseline['morning_reserve']['day_deficit_degree_hours'])
         self.assertTrue(any(s['start']==begin and not s['conditional'] for s in plan['heat_segments']))
 
+    def test_fixed_unvalidated_power_fast_path_keeps_full_safety_forecast(self):
+        from heating_model import _plan
+        x=self.x
+        settings=dict(self.settings,modulation_profile=None,actuator={
+            "action":"off","changed_at":self.now.timestamp()-1800,"safety_stop":False})
+        args=(self.now,x["room"],x["floor"],x["outside"],x["fire"],x["model"],[])
+        expected=_plan(*args,settings,6.,hours_override=24.,split=True)
+        self.assertIsNotNone(expected)
+        fixed=dict(settings,modulation_profile={"physical_mode":"fixed_6","validated":False})
+        with patch("heating_model.modulation_power",side_effect=AssertionError("fixed rating is constant")):
+            actual=_plan(*args,fixed,6.,hours_override=24.,split=True)
+        self.assertEqual(actual,expected)
+
+    def test_off_intervals_do_not_evaluate_modulation(self):
+        from heating_model import _plan
+        now=self.now.replace(hour=12,minute=0,second=0)
+        x=self.x
+        settings=dict(self.settings,modulation_profile={"physical_mode":"auto","bands":[]},
+                      split_comfort=False,morning_min_minutes=0)
+        with patch("heating_model.modulation_power",side_effect=AssertionError("boiler is off")):
+            result=_plan(now,x["room"],x["floor"],x["outside"],x["fire"],x["model"],
+                         [],settings,3.,hours_override=3.)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["energy"],0.)
+        self.assertTrue(all(not r["heat_segments"] for r in result["curve"]))
+
     def setUp(self):
         self.x=json.loads(Path(__file__).with_name('insufficient_morning_case.json').read_text())
         self.now=datetime.fromisoformat(self.x['now']).astimezone(ZoneInfo('Europe/Kiev'))

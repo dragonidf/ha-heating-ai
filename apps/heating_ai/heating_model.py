@@ -117,9 +117,10 @@ def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours
     return False
 
 def held_action(last,changed_at,stamp,wanted,urgent=False):
+    if wanted==last or urgent:
+        return wanted
     elapsed=stamp-(number(changed_at) or 0.)
-    if wanted!=last and not urgent and ((last=='heat' and elapsed<600) or
-                                        (last=='off' and wanted=='heat' and elapsed<900)):
+    if (last=='heat' and elapsed<600) or (last=='off' and wanted=='heat' and elapsed<900):
         return last
     return wanted
 
@@ -372,7 +373,8 @@ def trajectory_metrics(now, room, rows, settings, until, margin=0.):
         if zone=='Сон':
             night_deficit+=max(0.,lo-value)*duration/60
         # The uncertainty allowance cannot move a night target up to the day band.
-        threshold=lo+min(margin,max(0.,comfort_at(datetime.fromtimestamp(previous,now.tzinfo),settings)[0]-lo)/2)
+        threshold=(lo+min(margin,max(0.,comfort_at(datetime.fromtimestamp(previous,now.tzinfo),settings)[0]-lo)/2)
+                   if margin else lo)
         short=max(0.,threshold-value)
         if short>.001:
             if first is None:
@@ -420,8 +422,8 @@ def coast_reserve_needed(now, room, floor, outside, fire, model, weather, settin
                 in_window(tm,settings['start'],settings['end']) and
                 in_window(datetime.fromtimestamp(stop-.001,now.tzinfo),settings['start'],settings['end']) and
                 not blocked(stamp,stop,outages))
-        kw=modulation_power(f,settings.get('modulation_profile'),3.,settings.get('modulation_anchor'),
-                            (stamp-now.timestamp())/60) if settings.get('modulation_profile') is not None else power_kw
+        kw=(modulation_power(f,settings.get('modulation_profile'),3.,settings.get('modulation_anchor'),
+                            (stamp-now.timestamp())/60) if settings.get('modulation_profile') is not None else power_kw) if active else 0.
         args=(outdoor_at(weather,tm,outside),fire*math.exp(-(stamp-now.timestamp())/7200),
               model,(stop-stamp)/3600,tm,weather,settings)
         nr,nf=forecast_step(r,f,args[0],kw if active else 0.,*args[1:])
@@ -480,7 +482,8 @@ def attach_reserve(now, room, model, weather, settings, result, context=None):
     hours=(context['assessment_until']-now.timestamp())/3600
     margin=uncertainty_reserve(settings,hours)
     metrics=trajectory_metrics(now,room,rows,settings,context['assessment_until'],margin or 0.)
-    actual_limits=trajectory_metrics(now,room,rows,settings,context['assessment_until'])
+    actual_limits=(trajectory_metrics(now,room,rows,settings,context['assessment_until'])
+                   if margin else metrics)
     cycle_segments=[s for row in rows for s in row['heat_segments']
                     if context['morning_start'] is not None and
                     s['start']>=context['morning_start'] and s['end']<=context['morning_end']]
@@ -607,6 +610,9 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     night_target=max(settings["lower"], settings["target"]-.5)
     profile=settings.get('modulation_profile')
     anchor=settings.get('modulation_anchor')
+    mode=(profile or {}).get('physical_mode')
+    fixed_kw=(power_kw if profile is None else float(mode[-1])
+              if mode in ('fixed_3','fixed_6','fixed_9') and not profile.get('validated') else None)
     reserved_exact=None
     # A new heat request must fit a complete minimum-on cycle before the
     # next hard outage/strict-window boundary. Already-running sessions are
@@ -708,6 +714,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
         prepared=[(begin,finish,inputs(begin),finish.timestamp()) for begin,finish in substeps]
         candidates = []
         for score, r, f, decisions, curve, energy, low, high, deficit, last, changed_at, cycle_used, risk_room, risk_floor, prior_evening, prior_morning in beams:
+            had_heat=any(decisions)
             for heat in choices:
                 evaluated+=1
                 nr, nf, penalty = r, f, 0.
@@ -739,35 +746,43 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                         active = (heat or reserved_here) and masks[j]
                         # Reject new short pulses near the hard cut; continued
                         # heating may finish normally until the safe boundary.
-                        prior_end=(heat_segments[-1]['end'] if heat_segments else
-                                   curve[-1]['heat_segments'][-1]['end']
-                                   if curve and curve[-1]['heat_segments'] else None)
-                        continuing=(command=='heat' if actuator_enabled else
-                                    prior_end is not None and abs(prior_end-stamp)<.01)
-                        if active and not continuing:
-                            if stamp not in minimum_can_start:
-                                minimum_can_start[stamp]=can_start_minimum(stamp)
-                            active=minimum_can_start[stamp]
+                        if active:
+                            if actuator_enabled:
+                                continuing=command=='heat'
+                            else:
+                                prior_end=(heat_segments[-1]['end'] if heat_segments else
+                                           curve[-1]['heat_segments'][-1]['end']
+                                           if curve and curve[-1]['heat_segments'] else None)
+                                continuing=prior_end is not None and abs(prior_end-stamp)<.01
+                            if not continuing:
+                                if stamp not in minimum_can_start:
+                                    minimum_can_start[stamp]=can_start_minimum(stamp)
+                                active=minimum_can_start[stamp]
                         if actuator_enabled:
                             stop=(not hard_masks[j] or nr>=limit_high or
                                   actuator.get('safety_stop') and stamp<start_stamp+300)
                             requested='heat' if active and not stop else 'off'
-                            applied=held_action(command,command_at,stamp,requested,urgent=stop)
-                            if applied!=command:command,command_at=applied,stamp
-                            active=applied=='heat' and hard_masks[j]
+                            if requested!=command:
+                                applied=held_action(command,command_at,stamp,requested,urgent=stop)
+                                if applied!=command:command,command_at=applied,stamp
+                            active=command=='heat' and hard_masks[j]
                         if active and nr >= limit_high:
                             unsafe = True
-                        effective_kw=modulation_power(nf,profile,3.,anchor,elapsed_minutes) if profile is not None else power_kw
-                        delivered_kw=effective_kw if active else 0.
+                            break
+                        effective_kw=(fixed_kw if fixed_kw is not None else
+                                      modulation_power(nf,profile,3.,anchor,elapsed_minutes)) if active else 0.
+                        delivered_kw=effective_kw
                         nr,nf=integrate(nr,nf,out,delivered_kw,fire_gain,dt,gains[0])
                         ur,uf=(integrate(ur,uf,out,delivered_kw,fire_gain,dt,gains[1],upper=True)
                                if risk_enabled else (nr,nf))
                         # A session remains unsafe if its stored heat overshoots
                         # later, after the boiler has stopped (including daytime).
-                        if max(nr,ur)>max(room,limit_high)+.01 and (active or any(decisions) or heat_segments):
+                        upper_risk=max(nr,ur)
+                        if upper_risk>max(room,limit_high)+.01 and (active or had_heat or heat_segments):
                             unsafe=True
+                            break
                         shortage+=max(0.,limit_low-nr)*dt
-                        fine.append(dict(ts=stop_stamp,temperature=nr,upper_temperature=max(nr,ur),**{'return':nf}))
+                        fine.append(dict(ts=stop_stamp,temperature=nr,upper_temperature=upper_risk,**{'return':nf}))
                         penalty += (max(0., limit_low-nr)**2 +
                                     max(0., nr-limit_high)**2)*500*dt*12
                         if preference:
@@ -793,10 +808,13 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                                 outside_minutes += dt*60
                             if nr > limit_high or nf > 50:
                                 unsafe = True
+                                break
                             if late_heat:
                                 # Store daytime heat as late as feasible in the cheap window.
                                 # Earlier heat remains possible for the full day/response reserve.
                                 penalty += effective_kw*dt * min(1.,until_morning/480) * 20
+                    if unsafe:
+                        break
                 if unsafe:
                     rejections['upper_temperature']+=1
                     continue
