@@ -124,6 +124,7 @@ class KWSRestorePolicy:
         self.previous_grid = None
         self.previous_ready = False
         self.outage_at = None
+        self.outage_fault_seen = False
         self.attempted = False
         self.inflight = False
         self.manual_hold = False
@@ -131,6 +132,7 @@ class KWSRestorePolicy:
 
     def cancel(self, reason):
         self.outage_at = None
+        self.outage_fault_seen = False
         self.inflight = False
         self.previous_ready = False
         self.status = reason
@@ -156,12 +158,20 @@ class KWSRestorePolicy:
         elif grid == 'off' and self.previous_grid != 'off':
             self.outage_at = now if self.previous_grid == 'on' and self.previous_ready else None
             self.attempted = self.inflight = False
+            self.outage_fault_seen = False
             self.status = 'waiting_grid' if self.outage_at is not None else 'no_previous_on_proof'
         if self.outage_at is not None:
             # The only tolerated historical trip is a witnessed undervoltage
             # during the blackout. Any other trip cancels this epoch.
             if report.get('kws_fault_state') == 'on' and fault not in (2, '2'):
                 self.cancel('other_protection')
+            elif grid == 'off' and report.get('kws_fault_state') == 'on' and fault in (2, '2'):
+                # A genuine hardware trip during the witnessed outage is
+                # required. OFF alone cannot distinguish a manual disconnect.
+                at = report.get('kws_fault_at')
+                if (relay == 'off' and isinstance(at, (int, float))
+                        and self.outage_at-30 <= at <= now+5 and now-at <= 180):
+                    self.outage_fault_seen = True
             elif grid == 'on' and relay == 'on' and report.get('kws_status') == 'on':
                 self.cancel('restored')
             elif grid == 'on' and not self.attempted:
@@ -170,7 +180,7 @@ class KWSRestorePolicy:
         self.previous_ready = bool(enabled and not self.manual_hold and grid == 'on' and report.get('ready'))
 
     def eligible(self, now, report, voltage, delay, *, claimed=False):
-        if (self.manual_hold or self.outage_at is None or
+        if (self.manual_hold or self.outage_at is None or not self.outage_fault_seen or
                 (self.attempted and not (claimed and self.inflight)) or
                 report.get('grid_state') != 'on' or
                 not report.get('voltage_qualified') or not report.get('kws_link_fresh') or
@@ -181,13 +191,14 @@ class KWSRestorePolicy:
             return False
         grid_at, stable_at = report.get('grid_since'), report.get('stable_since')
         if (not isinstance(grid_at, (int, float)) or not isinstance(stable_at, (int, float)) or
-                grid_at <= self.outage_at or now-grid_at < max(120, delay) or now-stable_at < 30):
+                grid_at <= self.outage_at or now-grid_at < max(120, delay) or now-stable_at < 30
+                or now-grid_at > max(600, delay+180)):
             return False
         # Fresh post-return OFF and cleared-fault reports are required, not
         # stale values from before a power failure or before a trip.
         for key in ('kws_relay_at', 'kws_status_at', 'kws_fault_at'):
             at = report.get(key)
-            if not isinstance(at, (int, float)) or not grid_at <= at <= now+5:
+            if not isinstance(at, (int, float)) or not grid_at <= at <= now+5 or now-at > 180:
                 return False
         low, high = voltage.get('recovery_low_v'), voltage.get('recovery_high_v')
         if not all(isinstance(v, (int, float)) and isfinite(v) for v in (low, high)) or low >= high:
@@ -199,7 +210,7 @@ class KWSRestorePolicy:
         return True
 
     def claim(self):
-        if self.outage_at is None or self.attempted or self.manual_hold:
+        if self.outage_at is None or not self.outage_fault_seen or self.attempted or self.manual_hold:
             return False
         self.attempted = self.inflight = True
         self.status = 'attempt_claimed'
