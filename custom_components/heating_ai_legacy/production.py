@@ -1382,7 +1382,15 @@ class NativeController(HeatingClimate):
             evening=now.replace(hour=20,minute=45,second=0,microsecond=0)
             upcoming=morning if now<morning else evening if now<evening else morning+timedelta(days=1)
             metrics=report.get("metrics",{})
-            attributes.update(learning_status=report["status"],learning_gate=report["reason"],
+            accepted_metrics=checkpoint.get("metrics",{})
+            previous=checkpoint.get("prior_model") or {}
+            changes=[dict(parameter=key,before=previous[key],after=self.model[key])
+                     for key in ("floor_air","room_loss")
+                     if key in previous and key in self.model and previous[key]!=self.model[key]]
+            attributes.update(last_accepted_changes=changes,
+                last_accepted_mae_1h=accepted_metrics.get("1",{}).get("new",{}).get("mae"),
+                last_accepted_mae_3h=accepted_metrics.get("3",{}).get("new",{}).get("mae"),
+                learning_status=report["status"],learning_gate=report["reason"],
                 last_successful_learning=(checkpoint.get("last_successful_learning") or
                                           (self.memory.get("learning_success") or {}).get("time")),
                 independent_windows=report.get("independent_windows",0),
