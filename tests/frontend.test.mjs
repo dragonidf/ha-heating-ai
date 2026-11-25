@@ -715,3 +715,30 @@ test('journal breakdown uses cached metrics and never equates archive budget wit
   assert.match(boiler,/data-system-key="kws_auto_restore"/);assert.match(boiler,/data-open-manual/);assert.match(boiler,/data-info="switch.energy_meter_kotel"/);
   assert.match(fire,/data-control="fan_mode"/);assert.match(fire,/Ручний запуск/);assert.match(fire,/data-control="fan_control"/);assert.doesNotMatch(fire,/Насос/);
 });
+
+test('frontend loader keeps HA registration stable while fetching a new local asset digest',async()=>{
+  const {mkdtemp,readFile,writeFile,rm}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os');const {join}=await import('node:path');const {pathToFileURL}=await import('node:url');
+  const dir=await mkdtemp(join(tmpdir(),'heating-loader-'));
+  const oldFetch=globalThis.fetch,oldRegistry=globalThis.customElements;
+  const registered='0123456789abcdef',next='fedcba9876543210',definitions=new Map(),requests=[];
+  try{
+    const loader=await readFile(new URL('../custom_components/heating_ai_legacy/assets/full-panel-loader.js',import.meta.url),'utf8');
+    await writeFile(join(dir,'loader.mjs'),loader);
+    await writeFile(join(dir,'package.json'),'{"type":"module"}');
+    await writeFile(join(dir,'full-panel.js'),'export class HeatingAIPanel { static digest = new URL(import.meta.url).searchParams.get("v") }');
+    globalThis.customElements={get:name=>definitions.get(name),define:(name,component)=>definitions.set(name,component)};
+    globalThis.fetch=async(url,options)=>{requests.push([url.pathname,options]);return {ok:true,json:async()=>({digest:next})}};
+    const url=pathToFileURL(join(dir,'loader.mjs'));url.searchParams.set('v',registered);
+    await import(url);
+    assert.equal(definitions.get('heating-ai-v1-'+registered).digest,next);
+    assert.equal(definitions.size,1);
+    assert.equal(requests.length,1);assert.ok(requests[0][0].endsWith('/full-panel-version.json'));assert.equal(requests[0][1].cache,'no-store');
+    globalThis.fetch=async()=>({ok:true,json:async()=>({digest:'../../untrusted.js'})});
+    url.searchParams.set('case','invalid');
+    await assert.rejects(import(url),/Invalid Heating AI asset manifest/);
+    globalThis.fetch=async()=>({ok:false,status:404});
+    definitions.clear();url.searchParams.set('case','legacy');
+    await import(url);assert.equal(definitions.get('heating-ai-v1-'+registered).digest,registered);
+  }finally{globalThis.fetch=oldFetch;globalThis.customElements=oldRegistry;await rm(dir,{recursive:true,force:true});}
+});
