@@ -89,7 +89,7 @@ test('a wholly unmeasured cycle is not displayed as zero actual consumption',()=
   assert.match(p.energyComparison(),/0,00/);
 });
 test('inlet nominal accounting is labelled as calculated in the boiler and cycle cards',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.pending=new Set();p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
   const now=Date.now()/1000;
   const data={power_confirmed:{measurement_basis:'nominal_inlet_stage',timestamp:new Date().toISOString()},
     plan_history:{energy_cycles:[{start:now-3600,end:now+3600,observed_kwh:1,calculated_kwh:2,calculated_other_kwh:2,complete:false,initial_plan:{kwh:2}}]}};
@@ -130,7 +130,7 @@ test('plan/fact names KWS measurements and explicitly unclassified meter increme
 });
 
 test('partial-meter reserve is visible without calling assumed watts actual boiler heating',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.pending=new Set();p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
   const data={controller:{quality:true,control_power_basis:'partial_meter_reserve'},
     forecast:{created_at:new Date().toISOString(),weather_complete:true},grid_status:{raw:'on'},
     power_confirmed:{assumed_control_w:6000,control_reserve:{valid:true,upper_w:6200}}};
@@ -343,7 +343,7 @@ test('device bindings use existing HA relay choices with friendly names',()=>{
   assert.match(html,/Рекуператор вітальні/);assert.match(html,/Витяжка ванної/);assert.doesNotMatch(html,/sensor.unrelated/);
 });
 test('boiler advice remains visible when no mode can fully meet comfort',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.state=k=>({power_model:'auto',power_confirmed:'0',boiler_active:'off'})[k];
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.pending=new Set();p.config={};p.state=k=>({power_model:'auto',power_confirmed:'0',boiler_active:'off'})[k];
   p.attrs=k=>k==='power_model'?{recommendation:{status:'model_bound_insufficient',alternatives:[
     {nominal_kw:3,mode:'fixed_3',found:true,deficit_degree_hours:4},
     {nominal_kw:6,mode:'fixed_6',found:true,deficit_degree_hours:3},
