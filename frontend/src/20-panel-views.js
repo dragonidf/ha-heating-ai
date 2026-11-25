@@ -540,6 +540,7 @@
     const windows=numeric(a.independent_windows),minutes=numeric(a.qualified_minutes);
     const next=date(a.next_learning);
     const last=date(a.last_successful_learning||a.learning_success?.time);
+    const adaptiveLast=date(a.last_adaptive_promotion);
     const active=a.active_version??a.parameters?.version??'—';
     const metric=(name,value,unit='')=>this.compactMetric(name,value,unit,'model');
     const shown=labels[status]||'Стан навчання недоступний';
@@ -552,6 +553,7 @@
         ${metric('Кандидат · MAE 3 год',numeric(a.candidate_holdout_mae_3h)===null?'—':fmt(a.candidate_holdout_mae_3h,3),'°C')}
       </div>
       <div class="learning-progress-dates"><span>Наступний аналіз <strong>${h(next)}</strong></span><span>Останнє успішне застосування <strong>${h(last)}</strong></span></div>
+      <p class="muted note">Нова модель · останнє застосування: <strong>${h(adaptiveLast)}</strong>${adaptiveLast==='—'?' · жодних нових коефіцієнтів ще не застосовано':''}.</p>
       ${a.rollback_reason?`<p class="warn note">Відкат моделі: ${h(reasonText(a.rollback_reason))}</p>`:''}
       ${a.learning_storage_error?`<p class="warn note">Помилка збереження: ${h(a.learning_storage_error)}</p>`:''}
       <p class="muted note">Активна модель керує опаленням. Коефіцієнти змінюються автоматично лише після незалежних перевірок 1 і 3 годин.</p>`;
