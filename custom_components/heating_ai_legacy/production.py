@@ -1058,6 +1058,28 @@ class NativeController(HeatingClimate):
             self._dispatch_manual_signature = None
             self._dispatch_manual_epoch = None
 
+    def grid_state(self):
+        # The main three-phase input remains the physical source. Deye is
+        # supplementary, not a mandatory heartbeat during a transport outage.
+        legacy = super().grid_state()
+        if legacy != "unknown" or self.cfg.get("power_accounting_method") != "kws":
+            return legacy
+        helper = self.args.get("grid_presence_helper")
+        phases = self.args.get("voltage_entities") or []
+        if not helper or self.get_state(helper) not in ("on", "Наявна мережа") or len(phases) != 3:
+            return legacy
+        # Preserve a live contradictory inverter observation. Do not treat
+        # unknown or stale inverter telemetry as a physical outage.
+        if self.raw("connection") == "on" and self.fresh(self.cfg["grid_voltage"], 90):
+            grid, volts = self.raw("grid"), self.val("grid_voltage")
+            if grid == "off" or (volts is not None and volts < 150):
+                return legacy
+        for entity in phases:
+            value = number(self.get_state(entity))
+            if value is None or not 150 <= value <= 350 or not self.fresh(entity, 90):
+                return legacy
+        return "on"
+
     @callback
     def async_voltage_status(self):
         now = time.time()
@@ -1124,9 +1146,20 @@ class NativeController(HeatingClimate):
             if state is not None and state.state in ("on", "Наявна мережа") and changed is not None:
                 epochs.append(changed.timestamp())
         grid_epoch = max(epochs) if len(epochs) == 2 else None
+        voltage_report = self.async_voltage_status()
+        if physical == "unknown" and voltage_report["voltage_qualified"]:
+            # The live independent input guard already established three safe
+            # phases and confirmed the main grid helper. A missing Deye
+            # connection is not an additional reason to cut power.
+            contradictory = (deye_fresh and connection.get("value") == "on" and
+                (grid.get("value") == "off" or
+                 (isinstance(deye_voltage.get("value"), (int, float)) and deye_voltage["value"] < 150)))
+            if not contradictory:
+                physical = "on"
         self.equipment_status = self.kws_readiness.evaluate(now, physical,
-            self.async_voltage_status()["voltage_qualified"], rows,
+            voltage_report["voltage_qualified"], rows,
             reset_delay=self.cfg.get("kws_reset_delay", 120), grid_epoch=grid_epoch)
+        self.equipment_status["kws_relay_entity"] = self.cfg.get("kws_relay", "switch.energy_meter_kotel")
         return self.equipment_status
 
     @callback
@@ -1275,12 +1308,59 @@ class NativeController(HeatingClimate):
             self.apply_voltage_stop()
         self.save()
 
+    def _can_hold_kws_link_gap(self, action, once):
+        """Keep a previously confirmed ordinary heating demand; never dispatch
+        a positive command or extend a manual-energy session on cached KWS.
+        """
+        if (action not in ("heat", "fallback") or once
+                or not self.memory.get("owned") or self.memory.get("last_command") != "heat"
+                or not self.cfg.get("allow_actuation") or self.raw("armed") != "on"
+                or self.raw("mode") != "Автоматичне керування"
+                or self.raw("thermostat") != "heat"
+                or self.memory.get("expected_mode") != "heat"
+                or self._pending_command_evidence
+                or self.memory.get("temporary_fallback")
+                or (self.memory.get("manual_energy") or {}).get("status") == "active"
+                or getattr(self, "_manual_energy_ending", False)):
+            return False
+        # Only missing metering is tolerated. Other sensor, model, permission,
+        # outage and comfort checks continue to run normally.
+        if set(getattr(self, "control_input_faults", ["unknown"])) - {"power"}:
+            return False
+        context = getattr(self, "decision_context", None) or {}
+        if context.get("coast_overheat") or context.get("demand") is not True:
+            return False
+        now = time.time()
+        grid = self.grid_state()
+        if grid != "on":
+            return False
+        outage = self.outage_execution_schedule(grid=grid, stamp=now)
+        if outage.get("valid") and blocked(now, now+15, outage.get("outages", [])):
+            return False
+        room = self.source_temperature()[0]
+        probe, current, target = self.val("return"), self.val("thermostat", attribute="current_temperature"), self.val("thermostat", attribute="temperature")
+        if (room is None or room >= self.active_upper() or probe is None or not 0 < probe < self.cfg.get("return_limit", 50)
+                or not self.fresh(self.args["return"], self.cfg.get("return_max_age", 1200))
+                or current is None or target is None or not 5 < current < 40
+                or not self.fresh(self.args["thermostat"], self.cfg.get("thermostat_temperature_max_age", 5400))
+                or target <= current or target != self.memory.get("expected_setpoint")):
+            return False
+        return (any(seg["start"] <= now < seg["end"] for seg in self.memory.get("planned_heat_segments", []))
+                or self.minimum_heat_commit(now, grid, False, room))
+
     def apply_action(self, action, once):
         if self.apply_voltage_stop():
             return
         equipment = self._on_loop(self.async_kws_status)
         fenced = (self.command_ledger_status or {}).get("fenced", True)
         automatic_fence = (fenced and self.raw("mode") == "Автоматичне керування" and self.raw("armed") == "on")
+        if (not fenced and equipment.get("continue_allowed") and
+                self._can_hold_kws_link_gap(action, once)):
+            self.publish("sensor.heating_controller", "Коротка втрата зв’язку KWS",
+                         reason="Утримуємо лише чинний підтверджений запит; нові команди заборонені",
+                         control_state="degraded", equipment_readiness=equipment,
+                         comfort_available=True, physical_heating_confirmed=False)
+            return
         if automatic_fence or not equipment["ready"] or (fenced and action in ("heat", "fallback")):
             reason = "Журнал команд: очікується підтверджене вимкнення" if fenced else equipment.get("reason_text", equipment["reason"])
             self.publish("sensor.heating_controller", "Нагрів заблоковано",
