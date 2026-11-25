@@ -502,7 +502,10 @@
     const metric=(label,value,unit='')=>this.compactMetric(label,value,unit,'controller_quality');
     const q=this.attrs('controller_quality'),last=q.last_completed_cycle,horizons=Array.isArray(q.horizons)?q.horizons:[];
     const archive=q.archive_health,used=numeric(archive?.used_bytes),limit=numeric(archive?.max_bytes);
-    const storage=used!==null&&limit>0?`<p class="${isTrue(archive.pressure)?'warn':'muted'} note">Архів: ${fmt(used/limit*100,1)}% ліміту · ${fmt(used/1048576,1)} / ${fmt(limit/1048576,1)} МіБ. ${isTrue(archive.pressure)?'Наближається ліміт журналу; захищена історія зберігається. ':''}Вільно на диску: ${fmt(numeric(archive.free_bytes)===null?null:archive.free_bytes/1073741824,1)} ГіБ.</p>`:'';
+    const snapshotBytes=numeric(archive?.snapshot_bytes),dailyBytes=numeric(archive?.daily_log_bytes);
+    const archiveBreakdown=snapshotBytes!==null&&dailyBytes!==null?
+      ` Знімки: ${fmt(snapshotBytes/1048576,1)} МіБ; журнали: ${fmt(dailyBytes/1048576,1)} МіБ.`:'';
+    const storage=used!==null&&limit>0?`<p class="${isTrue(archive.pressure)?'warn':'muted'} note">Архів: ${fmt(used/limit*100,1)}% ліміту · ${fmt(used/1048576,1)} / ${fmt(limit/1048576,1)} МіБ. ${isTrue(archive.pressure)?'Наближається ліміт журналу; захищена історія зберігається. ':''}Вільно на диску: ${fmt(numeric(archive.free_bytes)===null?null:archive.free_bytes/1073741824,1)} ГіБ.${archiveBreakdown} Ліміт архіву не є розміром диска.</p>`:'';
     const table=`<div class="table-scroll"><table><thead><tr><th>Горизонт</th><th>Похибка °C</th><th>Перевірок / днів</th><th>Похибка кВт·год</th></tr></thead><tbody>${(horizons.length?horizons:[1,3,6,12,24].map(hours=>({hours}))).map(r=>`<tr><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.hours,0)} год</button></td><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.temperature_mae,3)}</button></td><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.count??0,0)} / ${fmt(r.days??0,0)}${r.pending?` · очікує ${fmt(r.pending,0)}`:''}</button></td><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.energy_mae,2)}</button></td></tr>`).join('')}</tbody></table></div>`;
     const report=last?`<p class="muted note">Цикл ${h(this.time(Number(last.start),true))} — ${h(this.time(Number(last.end),true))}</p><div class="fact-grid">${metric('Відхилення енергії',(isTrue(last.energy_error_is_lower_bound)&&numeric(last.energy_error_percent)!==null?'≥ ':'')+fmt(last.energy_error_percent,1),'%')}${metric('Поза комфортом',fmt(last.comfort_violation_minutes,1),'хв')}${metric('Перегрів',fmt(last.overheat_minutes,1),'хв')}${metric('Покриття датчика',numeric(last.sensor_coverage)===null?'—':fmt(last.sensor_coverage*100,0),'%')}</div><p class="muted note">${h(last.attribution||'Причина відхилення не встановлена')}${isTrue(last.energy_complete)?'':' · енергія врахована частково'}. ${last.significant_replans===null||last.significant_replans===undefined?'Історію перепланувань цього циклу не збережено.':`Суттєвих змін плану: ${fmt(last.significant_replans,0)}.`}</p>`:'<p class="muted note">Щоденний підсумок з’явиться після завершення циклу збереження даних.</p>';
     return this.section('Точність і якість роботи',table+`<p class="muted note">Незалежні перевірки виданих прогнозів. «—» означає, що спостережень ще недостатньо. Підтвердження короткого горизонту не доводить точності на добу.</p>`+report+storage,'controller-quality');
@@ -530,7 +533,8 @@
       learning_submit_failed:'Не вдалося запустити аналіз',
       learning_job_timeout:'Перевищено час аналізу',
       model_commit_failed:'Не вдалося зберегти оновлення моделі',
-      rollback_baseline_unavailable:'Немає підтвердженої моделі для відкату'};
+      rollback_baseline_unavailable:'Немає підтвердженої моделі для відкату',
+      current_conditions_unqualified:'Поточні умови не дозволяють застосування. Архівні вимірювання все одно аналізуються.'};
     const reasonText=value=>String(value||'').split(',').map(item=>reasons[item.trim()]||item.trim()).filter(Boolean).join(' · ');
     const date=value=>typeof value==='string'&&Number.isFinite(Date.parse(value))?this.time(value,true):'—';
     const windows=numeric(a.independent_windows),minutes=numeric(a.qualified_minutes);
@@ -553,7 +557,43 @@
       <p class="muted note">Активна модель керує опаленням. Коефіцієнти змінюються автоматично лише після незалежних перевірок 1 і 3 годин.</p>`;
     const old=a.learning_attempt;
     const historic=old?`<details class="learning-legacy"><summary>Попередній алгоритм · історія спроб</summary><p class="muted note">${h(date(old.time))} · ${h(old.reason||old.status||'Немає пояснення')}</p></details>`:'';
-    return this.section('Самонавчання моделі',progress+historic,'learning-progress');
+    const gates={unknown_ventilation:'Невідомий стан вентиляції',circulation_or_unknown:'Циркуляція або невідомий стан',
+      unknown_or_unqualified_voltage:'Напруга не підтверджена',unqualified_outage:'Відключення електромережі',
+      unknown_grid:'Мережу не підтверджено',unqualified_kws:'Немає виміряної потужності KWS',
+      missing_kws:'Немає фактичної потужності',missing_measured_interval:'Недостатньо вимірювань між звітами',
+      unknown_execution:'Невизначений режим нагріву',room_conflict:'Неузгоджені температурні датчики',
+      room_report_missing:'Немає незалежного температурного звіту',unknown_fireplace:'Немає даних каміна',
+      fireplace:'Працював камін',missing_weather_issue:'Немає перевіреної погоди',
+      stale_weather:'Застарілий прогноз погоди',no_windows:'Немає придатних інтервалів',
+      independent_hours:'Замало годин',independent_days:'Замало незалежних днів',
+      heating_coverage:'Замало підтвердженого нагріву',idle_coverage:'Замало підтвердженого охолодження',
+      return_excitation:'Замало змін обратки',independent_holdout:'Замало незалежних перевірок',
+      unknown_ventilation_supply:'Не підтверджено живлення вентиляції'};
+    const reject=Object.entries(a.rejection_counts||{}).filter(([,count])=>numeric(count)!==null&&count>0).sort((x,y)=>y[1]-x[1]).slice(0,8);
+    const current=Array.isArray(a.current_reasons)?a.current_reasons:[];
+    const blockers=Array.isArray(a.analysis_blockers)?a.analysis_blockers:[];
+    const analysis={pending:'Ще не оцінено',insufficient_data:'Даних для покращення недостатньо',
+      holdout_passed:'Перевірка теплових коефіцієнтів пройдена',rejected:'Пропозицію не підтверджено',
+      accepted:'Підтверджена пропозиція',frozen:'Оцінювання призупинено'};
+    const acceptedChanges=Array.isArray(a.last_accepted_changes)?a.last_accepted_changes:[];
+    const changeNames={floor_air:'Передача тепла в кімнату',room_loss:'Тепловтрати'};
+    const archived=acceptedChanges.length?
+      `<p class="muted note">Останні застосовані коефіцієнти: ${acceptedChanges.map(x=>
+        `${h(changeNames[x.parameter]||x.parameter)} ${h(fmt(x.before,5))} → ${h(fmt(x.after,5))}`).join(' · ')}</p>`:'';
+    const historicMAE=(numeric(a.last_accepted_mae_1h)!==null||numeric(a.last_accepted_mae_3h)!==null)?
+      `<p class="muted note">Останнє прийняте оновлення · MAE 1/3 год:
+      ${h(fmt(a.last_accepted_mae_1h,3))} / ${h(fmt(a.last_accepted_mae_3h,3))} °C (не поточний кандидат).</p>`:'';
+    const diag=`<details class="learning-evidence" ${!windows||status==='frozen'?'open':''}>
+      <summary>Чому модель ще не оновлюється</summary>
+      <p class="muted note">Незалежних температурних звітів у свіжій історії: ${h(numeric(a.verified_reports)===null?'—':fmt(a.verified_reports,0))}.
+      Оцінка архіву: ${h(analysis[a.analysis_status]||'Немає результату')}.</p>
+      ${blockers.length?`<p class="muted note">Умови, яких бракує: ${h(blockers.map(x=>gates[x]||x).join(' · '))}</p>`:''}
+      ${current.length?`<p class="muted note">Зараз: ${h(current.slice(0,8).map(x=>gates[x]||x).join(' · '))}</p>`:''}
+      ${reject.length?`<p class="muted note">Відхилені вікна (причини можуть повторюватися): ${h(reject.map(([name,count])=>
+        (gates[name]||name)+' — '+fmt(count,0)).join(' · '))}</p>`:''}
+      ${!reject.length&&!current.length?'<p class="muted note">Потрібні нові незалежні вимірювання, щоб з’ясувати причину.</p>':''}
+    </details>`;
+    return this.section('Самонавчання моделі',progress+archived+historicMAE+diag+historic,'learning-progress');
   }
   model() {
     const a=this.attrs('model'),env=this.attrs('environment'),p=a.power_learning||{},s=this.attrs('summary').last_24h||{},f=this.attrs('forecast');
