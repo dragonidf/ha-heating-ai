@@ -1650,6 +1650,18 @@ class DecisionJournal:
                     self.snapshot_count+=1
                 elif path.name.endswith(('.jsonl','.jsonl.gz')):
                     self.daily_log_bytes+=info.st_size
+        # On a restart the archive may already exceed the 256 MiB initial
+        # budget. Restore a safe disk-backed headroom limit *before* treating
+        # that transient budget as critical; otherwise all closed days get
+        # recompressed in the first control tick and cause a CPU spike.
+        # If physical disk reserve is low, preserve the old emergency
+        # compaction path and keep the existing fail-closed disk check below.
+        if self.auto_capacity:
+            space=self.health()
+            free,total=space.get('free_bytes'),space.get('disk_total_bytes')
+            if free is not None and total is not None and free>max(
+                    self.MIN_FREE_BYTES,int(total*.1)):
+                self._capacity_headroom(stamp)
         # Compact at most one closed day per six hours before critical pressure.
         # At >=90% keep the original urgent full-compaction behavior and
         # 60-second retry. No extra thread, timer or HA state mutation.

@@ -70,6 +70,35 @@ class ArchiveCapacityTests(unittest.TestCase):
             journal._prepare(now+60)
             self.assertEqual(compressed.read_bytes(),before)
 
+    def test_restart_restores_disk_headroom_before_throttled_compaction(self):
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory() as directory,self.limits(),patch(
+                'heating_recovery.shutil.disk_usage',
+                return_value=SimpleNamespace(free=500000,total=1000000)):
+            folder=Path(directory)/'decision_history'
+            folder.mkdir()
+            now=time.time()
+            protected=folder/'longterm.json.gz'
+            snapshot=os.urandom(30000)
+            protected.write_bytes(snapshot)
+            os.utime(protected,(now-3*86400,now-3*86400))
+            paths=[]
+            for days in (2,1):
+                day=datetime.fromtimestamp(now-days*86400,timezone.utc).strftime('%Y-%m-%d')
+                path=folder/(day+'.jsonl')
+                path.write_bytes(b'{"event":"old_day"}\\n'*100)
+                os.utime(path,(now-days*86400,now-days*86400))
+                paths.append(path)
+            journal=DecisionJournal(directory)
+            journal._prepare(now)
+            self.assertGreater(journal.max_bytes,journal.DEFAULT_MAX_BYTES)
+            self.assertEqual(protected.read_bytes(),snapshot)
+            # The temporary 10 KiB initial budget must NOT force both
+            # historic days to compress synchronously on startup.
+            self.assertTrue(any(path.exists() for path in paths))
+            self.assertEqual(journal.snapshot_bytes,len(snapshot))
+            self.assertEqual(journal.snapshot_count,1)
+
     def test_default_grows_for_retention_and_preserves_all_original_bytes(self):
         with tempfile.TemporaryDirectory() as directory,self.limits(),patch('heating_recovery.shutil.disk_usage',return_value=SimpleNamespace(free=500000,total=1000000)):
             path,raw,stamp=self.seed(directory);journal=DecisionJournal(directory)
