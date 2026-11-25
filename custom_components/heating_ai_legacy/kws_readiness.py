@@ -98,6 +98,12 @@ class KWSReadiness:
                     continue_allowed=continue_allowed, last_qualified_link_at=self.last_qualified_link_at,
                     kws_relay_state=rows.get('relay', {}).get('value'),
                     kws_status=rows.get('status', {}).get('value'),
+                    grid_state=grid,
+                    kws_fault_state=rows.get('fault', {}).get('value'),
+                    kws_relay_at=rows.get('relay', {}).get('at'),
+                    kws_status_at=rows.get('status', {}).get('at'),
+                    kws_fault_at=rows.get('fault', {}).get('at'),
+                    kws_phases_v=[rows.get(p, {}).get('value') for p in 'abc'],
                     grid_confirmed=grid == 'on', voltage_qualified=voltage_ok,
                     kws_link_fresh=linked, kws_contactor_on=rows.get('relay', {}).get('value') == 'on',
                     kws_fault=rows.get('fault', {}).get('fault_code', rows.get('fault', {}).get('value')),
@@ -105,3 +111,101 @@ class KWSReadiness:
                     grid_since=self.grid_since, stable_since=self.stable_since,
                     diagnosis_overdue=self.grid_since is not None and
                     now-self.grid_since >= max(120, reset_delay)+300 and reason != 'ready')
+
+
+class KWSRestorePolicy:
+    """One-shot, volatile authorization to restore a previously energized relay.
+
+    Only a witnessed physical outage qualifies. No cached authorization is
+    recovered after a process restart. Never clears an active KWS fault.
+    All callers must still verify current grid, voltage and thermostat OFF.
+    """
+    def __init__(self):
+        self.previous_grid = None
+        self.previous_ready = False
+        self.outage_at = None
+        self.attempted = False
+        self.inflight = False
+        self.manual_hold = False
+        self.status = 'waiting_observation'
+
+    def cancel(self, reason):
+        self.outage_at = None
+        self.inflight = False
+        self.previous_ready = False
+        self.status = reason
+
+    def manual_intent(self, action):
+        if action in ('turn_off', 'toggle'):
+            self.manual_hold = True
+            self.cancel('manual_hold')
+        elif action == 'turn_on':
+            self.manual_hold = False
+            self.cancel('manual_on')
+
+    def observe(self, now, report, enabled):
+        grid = report.get('grid_state')
+        relay = report.get('kws_relay_state')
+        fault = report.get('kws_fault')
+        if not enabled:
+            self.cancel('disabled')
+        elif self.manual_hold:
+            self.cancel('manual_hold')
+        elif grid == 'unknown':
+            self.cancel('grid_unknown')
+        elif grid == 'off' and self.previous_grid != 'off':
+            self.outage_at = now if self.previous_grid == 'on' and self.previous_ready else None
+            self.attempted = self.inflight = False
+            self.status = 'waiting_grid' if self.outage_at is not None else 'no_previous_on_proof'
+        if self.outage_at is not None:
+            # The only tolerated historical trip is a witnessed undervoltage
+            # during the blackout. Any other trip cancels this epoch.
+            if report.get('kws_fault_state') == 'on' and fault not in (2, '2'):
+                self.cancel('other_protection')
+            elif grid == 'on' and relay == 'on' and report.get('kws_status') == 'on':
+                self.cancel('restored')
+            elif grid == 'on' and not self.attempted:
+                self.status = 'waiting_safe_recovery'
+        self.previous_grid = grid
+        self.previous_ready = bool(enabled and not self.manual_hold and grid == 'on' and report.get('ready'))
+
+    def eligible(self, now, report, voltage, delay, *, claimed=False):
+        if (self.manual_hold or self.outage_at is None or
+                (self.attempted and not (claimed and self.inflight)) or
+                report.get('grid_state') != 'on' or
+                not report.get('voltage_qualified') or not report.get('kws_link_fresh') or
+                report.get('kws_relay_state') != 'off' or report.get('kws_status') != 'off' or
+                report.get('kws_fault_state') != 'off' or report.get('kws_fault') not in (0, '0', 'off', 'none')):
+            return False
+        if not isinstance(delay, (int, float)) or not isfinite(delay) or not 0 <= delay <= 500:
+            return False
+        grid_at, stable_at = report.get('grid_since'), report.get('stable_since')
+        if (not isinstance(grid_at, (int, float)) or not isinstance(stable_at, (int, float)) or
+                grid_at <= self.outage_at or now-grid_at < max(120, delay) or now-stable_at < 30):
+            return False
+        # Fresh post-return OFF and cleared-fault reports are required, not
+        # stale values from before a power failure or before a trip.
+        for key in ('kws_relay_at', 'kws_status_at', 'kws_fault_at'):
+            at = report.get(key)
+            if not isinstance(at, (int, float)) or not grid_at <= at <= now+5:
+                return False
+        low, high = voltage.get('recovery_low_v'), voltage.get('recovery_high_v')
+        if not all(isinstance(v, (int, float)) and isfinite(v) for v in (low, high)) or low >= high:
+            return False
+        for phases in (voltage.get('phases_v'), report.get('kws_phases_v')):
+            if (not isinstance(phases, list) or len(phases) != 3 or
+                    not all(isinstance(v, (int, float)) and isfinite(v) and low <= v <= high for v in phases)):
+                return False
+        return True
+
+    def claim(self):
+        if self.outage_at is None or self.attempted or self.manual_hold:
+            return False
+        self.attempted = self.inflight = True
+        self.status = 'attempt_claimed'
+        return True
+
+    def finish(self, success):
+        self.inflight = False
+        if self.outage_at is not None:
+            self.status = 'command_sent_waiting_echo' if success else 'attempt_failed_no_retry'
