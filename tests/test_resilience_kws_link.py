@@ -8,6 +8,7 @@ _SPEC = importlib.util.spec_from_file_location("resilience_kws_readiness", _PATH
 _MOD = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MOD)
 KWSReadiness = _MOD.KWSReadiness
+KWSRestorePolicy = _MOD.KWSRestorePolicy
 
 
 def rows(at, *, relay="on", fault="off", code=0, status="on", voltages=(220., 230., 225.)):
@@ -83,6 +84,87 @@ class KWSLinkResilienceTests(unittest.TestCase):
         self.assertFalse(report["ready"])
         self.assertFalse(report["continue_allowed"])
         self.assertEqual(report["kws_relay_state"], "off")
+
+
+class KWSRestorePolicyTests(unittest.TestCase):
+    def outage(self):
+        policy = KWSRestorePolicy()
+        policy.observe(1000, {"grid_state": "on", "ready": True,
+                              "kws_relay_state": "on", "kws_status": "on"}, True)
+        policy.observe(1015, {"grid_state": "off", "ready": False,
+                              "kws_relay_state": "off", "kws_fault_state": "on",
+                              "kws_fault": 2}, True)
+        return policy
+
+    @staticmethod
+    def restored(**overrides):
+        return {
+            "grid_state": "on", "ready": False, "voltage_qualified": True,
+            "kws_link_fresh": True, "kws_relay_state": "off", "kws_status": "off",
+            "kws_fault_state": "off", "kws_fault": 0,
+            "grid_since": 1030, "stable_since": 1030,
+            "kws_relay_at": 1149, "kws_status_at": 1149, "kws_fault_at": 1149,
+            "kws_phases_v": [220., 230., 225.], **overrides
+        }
+
+    voltage = {"recovery_low_v": 201, "recovery_high_v": 250,
+               "phases_v": [220., 230., 225.]}
+
+    def test_waits_hardware_delay_and_clear_fault(self):
+        p = self.outage()
+        bad = self.restored(kws_fault_state="on", kws_fault=2, kws_status="standby")
+        p.observe(1123, bad, True)
+        self.assertFalse(p.eligible(1123, bad, self.voltage, 120))
+        self.assertFalse(p.eligible(1150, bad, self.voltage, 120))
+        healthy = self.restored(kws_relay_at=1122, kws_status_at=1122, kws_fault_at=1122)
+        self.assertFalse(p.eligible(1123, healthy, self.voltage, 120))  # yesterday: 93s
+        self.assertTrue(p.eligible(1150, healthy, self.voltage, 120))
+
+    def test_one_attempt_no_retry_and_dispatch_recheck(self):
+        p = self.outage()
+        r = self.restored()
+        p.observe(1150, r, True)
+        self.assertTrue(p.eligible(1150, r, self.voltage, 120))
+        self.assertTrue(p.claim())
+        self.assertFalse(p.eligible(1150, r, self.voltage, 120))
+        self.assertTrue(p.eligible(1150, r, self.voltage, 120, claimed=True))
+        self.assertFalse(p.eligible(1150, self.restored(kws_fault_state="on", kws_fault=2),
+                                    self.voltage, 120, claimed=True))
+        p.finish(False)
+        self.assertFalse(p.claim())
+        self.assertFalse(p.eligible(1160, r, self.voltage, 120, claimed=True))
+
+    def test_manual_off_and_other_fault_are_hard_vetoes(self):
+        p = self.outage()
+        p.manual_intent("turn_off")
+        self.assertFalse(p.eligible(1150, self.restored(), self.voltage, 120))
+        p = self.outage()
+        p.observe(1050, self.restored(kws_fault_state="on", kws_fault=3), True)
+        self.assertFalse(p.eligible(1150, self.restored(), self.voltage, 120))
+
+    def test_unknown_or_stale_is_not_permission(self):
+        for key, value in (("grid_state", "unknown"), ("kws_link_fresh", False),
+                           ("kws_fault", "unknown"), ("kws_fault_at", 1029),
+                           ("kws_relay_at", 1029), ("kws_status_at", 1029),
+                           ("kws_phases_v", [220., 255., 225.])):
+            with self.subTest(key=key):
+                p = self.outage()
+                self.assertFalse(p.eligible(1150, self.restored(**{key:value}), self.voltage, 120))
+        self.assertFalse(self.outage().eligible(1150, self.restored(), self.voltage, None))
+
+    def test_no_reclose_from_boot_or_without_observed_prior_on(self):
+        p = KWSRestorePolicy()
+        p.observe(1015, {"grid_state": "off", "ready": False}, True)
+        self.assertFalse(p.eligible(1150, self.restored(), self.voltage, 120))
+        p = self.outage()
+        p.observe(1031, {"grid_state": "unknown"}, True)
+        self.assertFalse(p.eligible(1150, self.restored(), self.voltage, 120))
+
+    def test_native_auto_restore_needs_no_command(self):
+        p = self.outage()
+        p.observe(1150, self.restored(kws_relay_state="on", kws_status="on", ready=True), True)
+        self.assertEqual(p.status, "restored")
+        self.assertFalse(p.claim())
 
 
 if __name__ == "__main__":
