@@ -1641,12 +1641,16 @@ class DecisionJournal:
             self.snapshot_count=sum(p.name.endswith('.json.gz') for p,_ in files)
             self.daily_log_bytes=sum(info.st_size for p,info in files if p.name.endswith(('.jsonl','.jsonl.gz')))
             self.oldest_at=min((info.st_mtime for _,info in files),default=stamp)
-        # Lossless closed-day compression before the critical 90% threshold.
-        # Only closed .jsonl days are processed; snapshot digests and records
-        # remain byte-identical. No extra threads, jobs or scheduled polls.
-        if self.used_bytes>=self.max_bytes*.6 and stamp-self.last_compaction>6*3600:
+        # Compact at most one closed day per six hours before critical pressure.
+        # At >=90% keep the original urgent full-compaction behavior and
+        # 60-second retry. No extra thread, timer or HA state mutation.
+        critical=self.used_bytes>=self.max_bytes*.9
+        early=self.used_bytes>=self.max_bytes*.6
+        if (critical and stamp-self.last_compaction>60 or
+                early and stamp-self.last_compaction>6*3600):
             self.last_compaction=stamp
             day=datetime.fromtimestamp(stamp,timezone.utc).strftime('%Y-%m-%d')
+            compacted=0
             for path in sorted(self.directory.glob('????-??-??.jsonl')):
                 if path.stem>=day:continue
                 info=path.stat();archive=path.with_suffix('.jsonl.gz');temporary=archive.with_suffix('.tmp');existing=archive.exists()
@@ -1669,6 +1673,8 @@ class DecisionJournal:
                         compressed_size=archive.stat().st_size
                         self.used_bytes+=compressed_size
                         if self.daily_log_bytes is not None:self.daily_log_bytes+=compressed_size
+                    compacted+=1
+                    if not critical and compacted>=1:break
                 finally:
                     temporary.unlink(missing_ok=True)
         self._capacity_headroom(stamp)
