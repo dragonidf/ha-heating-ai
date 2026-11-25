@@ -422,7 +422,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         for row in hass.rows.values():
             row.last_updated = row.last_reported = datetime.fromtimestamp(stamp, timezone.utc)
 
-    async def test_K05_T02_gateway_blocks_deye_disconnect_and_invalid_probe(self):
+    async def test_K05_T02_gateway_reserves_deye_transport_and_blocks_unsafe_inputs(self):
         with package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
             for stamp in range(1000, 1151, 15):
@@ -436,7 +436,10 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 app._dispatch_manual_epoch = app.memory['native_manual_epoch']
                 app._dispatch_action = 'heat'
                 self.assertTrue(app.async_command_allowed('climate', 'set_hvac_mode', {'hvac_mode':'heat'}))
-                for entity, value in [('binary_sensor.deye_link','off'), ('sensor.return','unavailable'), ('sensor.room','unknown')]:
+                hass.rows['binary_sensor.deye_link'].state = 'off'
+                self.assertTrue(app.async_command_allowed('climate','set_hvac_mode', {'hvac_mode':'heat'}))
+                hass.rows['binary_sensor.deye_link'].state = 'on'
+                for entity, value in [('sensor.return','unavailable'), ('sensor.room','unknown')]:
                     old = hass.rows[entity].state
                     hass.rows[entity].state = value
                     self.assertFalse(app.async_command_allowed('climate','set_hvac_mode', {'hvac_mode':'heat'}), entity)
@@ -667,7 +670,7 @@ class BreakerTests(unittest.TestCase):
                 self.assertEqual(rows['relay']['value'], 'on')
         self.assertGreater(ready_count, 0)
         self.assertLess(time.perf_counter()-started, 10)
-        self.assertEqual(set(vars(guard)), {'grid_since','stable_since','reset_since','observed_grid_loss'})
+        self.assertEqual(set(vars(guard)), {'grid_since','stable_since','reset_since','observed_grid_loss','last_qualified_link_at','link_grace_seconds'})
 
     def test_K03_unchanged_post_return_status_uses_live_device_reports(self):
         guard = kws.KWSReadiness()
