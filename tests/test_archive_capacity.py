@@ -27,9 +27,9 @@ class ArchiveCapacityTests(unittest.TestCase):
             now=time.time()
             journal=DecisionJournal(directory,max_bytes=10000)
             journal.directory.mkdir()
-            raw=(b'{"x":"stable"}\n'*290)
+            contents=[b'{"x":"stable"}\n'*130,b'{"x":"stable"}\n'*450]
             paths=[]
-            for days in (2,1):
+            for days,raw in zip((2,1),contents):
                 name=datetime.fromtimestamp(now-days*86400,timezone.utc).strftime('%Y-%m-%d')+'.jsonl'
                 path=journal.directory/name
                 path.write_bytes(raw)
@@ -40,7 +40,7 @@ class ArchiveCapacityTests(unittest.TestCase):
             self.assertEqual(sum(p.with_suffix('.jsonl.gz').exists() for p in paths),1)
             journal._prepare(now+6*3600+1)
             self.assertEqual(sum(p.exists() for p in paths),0)
-            for p in paths:
+            for p,raw in zip(paths,contents):
                 self.assertEqual(gzip.decompress(p.with_suffix('.jsonl.gz').read_bytes()),raw)
 
     def test_midrange_journal_compresses_closed_day_losslessly_without_new_polling(self):
