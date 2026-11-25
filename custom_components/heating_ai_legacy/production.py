@@ -33,7 +33,7 @@ from .native_voltage import VoltageGuard
 from .production_migration import load_installation
 from .const import DOMAIN, SOURCE_HINTS
 from .critical_ledger import CriticalLedger, LedgerConflict, FILENAME
-from .kws_readiness import KWSReadiness
+from .kws_readiness import KWSReadiness, KWSRestorePolicy
 from . import manual_energy
 from .native_controller.heating_outages import blocked
 
@@ -61,6 +61,7 @@ class NativeController(HeatingClimate):
         self.command_ledger = None
         self.command_ledger_status = None
         self.kws_readiness = KWSReadiness()
+        self.kws_restore = KWSRestorePolicy()
         self._command_sequence = 0
         self._pending_command_evidence = {}
         self._echo_lock = threading.Lock()
@@ -416,6 +417,8 @@ class NativeController(HeatingClimate):
                         after=signature, voltage=self.voltage_status, equipment=equipment), stamp=time.time())
                 self._equipment_signature = signature
             self._reconcile_writer_fence()
+            if self.cfg.get("kws_auto_restore") == "enabled" and self.kws_restore.outage_at is not None:
+                self._try_kws_restore()
         except Exception as exc:
             self.record_failure("ledger_recovery", exc)
         try:
@@ -660,6 +663,27 @@ class NativeController(HeatingClimate):
             self.listen_state(self.voltage_changed, entity, attribute="all")
         self.listen_state(self.voltage_changed, self.args["grid_presence_helper"])
         # Recovery is attempted from the existing periodic control tick only.
+        self._on_loop(self._async_listen_kws_manual_intent)
+
+    @callback
+    def _async_listen_kws_manual_intent(self):
+        @callback
+        def manual_intent(event):
+            if event.context.id == self._context.id:
+                return
+            data = event.data
+            if data.get("domain") not in ("switch", "homeassistant") or data.get("service") not in ("turn_on", "turn_off", "toggle"):
+                return
+            service_data = data.get("service_data") or {}
+            target = service_data.get("entity_id") or (data.get("target") or {}).get("entity_id")
+            relay = self.cfg.get("kws_relay", "switch.energy_meter_kotel")
+            entities = [target] if isinstance(target, str) else target if isinstance(target, (tuple, list)) else []
+            if relay in entities:
+                self.kws_restore.manual_intent(data["service"])
+            elif (not entities or "all" in entities) and self.kws_restore.outage_at is not None and data["service"] != "turn_on":
+                # Ambiguous group/area commands cannot authorize an automatic reclose.
+                self.kws_restore.cancel("ambiguous_manual_command")
+        self._handles[uuid4().hex] = self.hass.bus.async_listen("call_service", manual_intent)
 
     @callback
     def async_manual_snapshot(self):
@@ -1160,10 +1184,80 @@ class NativeController(HeatingClimate):
             voltage_report["voltage_qualified"], rows,
             reset_delay=self.cfg.get("kws_reset_delay", 120), grid_epoch=grid_epoch)
         self.equipment_status["kws_relay_entity"] = self.cfg.get("kws_relay", "switch.energy_meter_kotel")
+        restore = getattr(self, "kws_restore", None)
+        if restore is not None:
+            enabled = self.cfg.get("kws_auto_restore") == "enabled"
+            restore.observe(now, self.equipment_status, enabled)
+            self.equipment_status["kws_auto_restore"] = enabled
+            self.equipment_status["kws_restore_status"] = restore.status
+            self.equipment_status["kws_restore_manual_hold"] = restore.manual_hold
         return self.equipment_status
 
     @callback
+    def _async_kws_restore_gate(self, report, *, claimed=False):
+        """Re-read physical inputs immediately before any relay energization."""
+        if (not self._running or not self._writer or self._closing
+                or not self.cfg.get("allow_actuation")
+                or self.cfg.get("power_accounting_method") != "kws"
+                or self.cfg.get("kws_auto_restore") != "enabled"
+                or self.memory.get("state_load_error") or getattr(self, "settings_transaction", False)
+                or (self.command_ledger_status or {}).get("fenced", True)
+                or self._pending_command_evidence
+                or (self._equipment_service_task is not None and not self._equipment_service_task.done())
+                or self.raw("armed") != "on" or self.raw("mode") != "Автоматичне керування"
+                or (self.memory.get("manual_energy") or {}).get("status") == "active"):
+            return False
+        now = time.time()
+        thermostat = self.hass.states.get(self.args["thermostat"])
+        try:
+            # Closing a supply relay must never be an unobserved heat start.
+            if (thermostat is None or thermostat.state != "off"
+                    or not report.get("grid_since", now) <= thermostat.last_reported.timestamp() <= now+5
+                    or now-thermostat.last_reported.timestamp() > 180):
+                return False
+            delay = self.hass.states.get(self.cfg.get("kws_reset_delay_entity", "number.energy_meter_kotel_reset_delay"))
+            reset_delay = float(delay.state)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return self.kws_restore.eligible(now, report, self.voltage_status or {}, reset_delay, claimed=claimed)
+
+    @callback
+    def _async_claim_kws_restore(self):
+        report = self.async_kws_status()
+        return self._async_kws_restore_gate(report) and self.kws_restore.claim()
+
+    def _try_kws_restore(self):
+        # One attempt per observed outage; no retry after a trip, command error,
+        # HA restart or manual override. The normal plan still controls heat.
+        now = time.time()
+        outage = self.outage_execution_schedule(grid=self.grid_state(), stamp=now)
+        if outage.get("valid") and blocked(now, now+15, outage.get("outages", [])):
+            return
+        if not self._on_loop(self._async_claim_kws_restore):
+            return
+        success = False
+        try:
+            relay = self.cfg.get("kws_relay", "switch.energy_meter_kotel")
+            self.memory["kws_restore_attempt"] = dict(at=now, entity_id=relay, status="prepared")
+            self.save()
+            # NativeBridge checks the same live interlock twice around dispatch.
+            self.call_service("switch/turn_on", entity_id=relay)
+            self.memory["kws_restore_attempt"]["status"] = "service_returned"
+            success = True
+        except Exception as exc:
+            self.memory["kws_restore_attempt"]["status"] = "failed_no_retry"
+            self.record_failure("kws_restore", exc)
+        finally:
+            self._on_loop(self.kws_restore.finish, success)
+            self.save()
+
+    @callback
     def async_command_allowed(self, domain, service, data):
+        if domain == "switch":
+            return (service == "turn_on"
+                    and data.get("entity_id") == self.cfg.get("kws_relay", "switch.energy_meter_kotel")
+                    and self.kws_restore.inflight
+                    and self._async_kws_restore_gate(self.async_kws_status(), claimed=True))
         if domain == "fan":
             fan = self.async_fan_snapshot()
             if (getattr(self, "_fan_dispatch_signature", None) != fan["permissions"]
