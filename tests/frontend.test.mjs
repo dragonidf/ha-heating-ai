@@ -89,7 +89,7 @@ test('a wholly unmeasured cycle is not displayed as zero actual consumption',()=
   assert.match(p.energyComparison(),/0,00/);
 });
 test('inlet nominal accounting is labelled as calculated in the boiler and cycle cards',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.pending=new Set();p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
   const now=Date.now()/1000;
   const data={power_confirmed:{measurement_basis:'nominal_inlet_stage',timestamp:new Date().toISOString()},
     plan_history:{energy_cycles:[{start:now-3600,end:now+3600,observed_kwh:1,calculated_kwh:2,calculated_other_kwh:2,complete:false,initial_plan:{kwh:2}}]}};
@@ -130,7 +130,7 @@ test('plan/fact names KWS measurements and explicitly unclassified meter increme
 });
 
 test('partial-meter reserve is visible without calling assumed watts actual boiler heating',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.pending=new Set();p.config={};p.entity=()=>null;p.time=()=> '00:00';p.config={};
   const data={controller:{quality:true,control_power_basis:'partial_meter_reserve'},
     forecast:{created_at:new Date().toISOString(),weather_complete:true},grid_status:{raw:'on'},
     power_confirmed:{assumed_control_w:6000,control_reserve:{valid:true,upper_w:6200}}};
@@ -343,7 +343,7 @@ test('device bindings use existing HA relay choices with friendly names',()=>{
   assert.match(html,/Рекуператор вітальні/);assert.match(html,/Витяжка ванної/);assert.doesNotMatch(html,/sensor.unrelated/);
 });
 test('boiler advice remains visible when no mode can fully meet comfort',()=>{
-  const p=Object.create(HeatingAIPanel.prototype);p.config={};p.state=k=>({power_model:'auto',power_confirmed:'0',boiler_active:'off'})[k];
+  const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.pending=new Set();p.config={};p.state=k=>({power_model:'auto',power_confirmed:'0',boiler_active:'off'})[k];
   p.attrs=k=>k==='power_model'?{recommendation:{status:'model_bound_insufficient',alternatives:[
     {nominal_kw:3,mode:'fixed_3',found:true,deficit_degree_hours:4},
     {nominal_kw:6,mode:'fixed_6',found:true,deficit_degree_hours:3},
@@ -701,4 +701,46 @@ test('journal breakdown uses cached metrics and never equates archive budget wit
   assert.match(html,/Знімки: 600,0 МіБ/);
   assert.match(html,/журнали: 100,0 МіБ/);
   assert.match(html,/Ліміт архіву не є розміром диска/);
+});
+
+ test('source controls reuse guarded KWS and circulation settings rather than inventing a pump',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.pending=new Set();p.systemDraft={};
+  p.attrs=k=>k==='system_settings'?{values:{kws_auto_restore:'disabled',boiler_power_mode:'fixed_6'}}:k==='fireplace_status'?{temperature:21.1}:{};
+  p.state=k=>({fireplace_status:'Неактивний',fan:'off',fan_mode:'Авто',manual_energy:'idle',return:'22.8'})[k]||'off';
+  p.id=k=>({fan_mode:'input_select.heating_fan_mode',fan_control:'input_boolean.heating_fan_control'})[k]||'sensor.'+k;
+  p.entity=k=>k==='fan_mode'?{state:'Авто',attributes:{options:['Авто','Зупинити','Ручний запуск']}}:k==='fan_control'?{state:'on',attributes:{}}:undefined;
+  p.boilerActual=()=>({meta:{},stale:false,power:0,heating:false});p.controllerHealth=()=>({});
+  p.equipmentReadiness=()=>({configured:true,ready:true,relayState:'on',relayControl:true,relayId:'switch.energy_meter_kotel',label:'Готовий',restoreLabel:'Вимкнено'});
+  const boiler=p.boilerOverview(),fire=p.fireplaceOverview();
+  assert.match(boiler,/data-system-key="kws_auto_restore"/);assert.match(boiler,/data-open-manual/);assert.match(boiler,/data-info="switch.energy_meter_kotel"/);
+  assert.match(fire,/data-control="fan_mode"/);assert.match(fire,/Ручний запуск/);assert.match(fire,/data-control="fan_control"/);assert.doesNotMatch(fire,/Насос/);
+});
+
+test('frontend loader keeps HA registration stable while fetching a new local asset digest',async()=>{
+  const {mkdtemp,readFile,writeFile,rm}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os');const {join}=await import('node:path');const {pathToFileURL}=await import('node:url');
+  const dir=await mkdtemp(join(tmpdir(),'heating-loader-'));
+  const oldFetch=globalThis.fetch,oldRegistry=globalThis.customElements;
+  const registered='0123456789abcdef',next='fedcba9876543210',definitions=new Map(),requests=[];
+  try{
+    const loader=await readFile(new URL('../custom_components/heating_ai_legacy/assets/full-panel-loader.js',import.meta.url),'utf8');
+    await writeFile(join(dir,'loader.mjs'),loader);
+    await writeFile(join(dir,'package.json'),'{"type":"module"}');
+    const stub='export class HeatingAIPanel { static digest = new URL(import.meta.url).searchParams.get("v") || new URL(import.meta.url).pathname.match(/full-panel-([a-f0-9]{16})\\.js$/)?.[1] }';
+    await writeFile(join(dir,'full-panel.js'),stub);
+    await writeFile(join(dir,'full-panel-'+next+'.js'),stub);
+    globalThis.customElements={get:name=>definitions.get(name),define:(name,component)=>definitions.set(name,component)};
+    globalThis.fetch=async(url,options)=>{requests.push([url.pathname,options]);return {ok:true,json:async()=>({digest:next})}};
+    const url=pathToFileURL(join(dir,'loader.mjs'));url.searchParams.set('v',registered);
+    await import(url);
+    assert.equal(definitions.get('heating-ai-v1-'+registered).digest,next);
+    assert.equal(definitions.size,1);
+    assert.equal(requests.length,1);assert.ok(requests[0][0].endsWith('/full-panel-version.json'));assert.equal(requests[0][1].cache,'no-store');
+    globalThis.fetch=async()=>({ok:true,json:async()=>({digest:'../../untrusted.js'})});
+    url.searchParams.set('case','invalid');
+    await assert.rejects(import(url),/Invalid Heating AI asset manifest/);
+    globalThis.fetch=async()=>({ok:false,status:404});
+    definitions.clear();url.searchParams.set('case','legacy');
+    await import(url);assert.equal(definitions.get('heating-ai-v1-'+registered).digest,registered);
+  }finally{globalThis.fetch=oldFetch;globalThis.customElements=oldRegistry;await rm(dir,{recursive:true,force:true});}
 });

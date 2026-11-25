@@ -798,3 +798,18 @@ main .overview .hero button,main .overview .heat-sources button,main .overview .
 
 /* Make both learning disclosure summaries accessible for touch. */
 .learning-progress .learning-legacy summary,.learning-legacy-control summary{min-height:44px}
+
+/* Compact independent source cards; controls expand only on request. */
+.overview .heat-sources{align-items:start}
+.overview .heat-sources>.card{align-self:start;gap:0}
+.heat-sources .power-advice,.heat-sources .fire-details{margin-top:4px}
+.heat-sources .source-recovery{font-size:.6875rem;line-height:1.35;margin:2px 0 4px;overflow-wrap:anywhere}
+.heat-sources .source-action{width:100%;margin:4px 0 0;padding:4px 6px;border:1px solid var(--stroke);background:var(--raised);color:var(--green);font-size:.75rem;line-height:1.2;white-space:normal}
+.heat-sources .source-mode-status{display:flex;justify-content:space-between;align-items:center;gap:4px;min-height:28px;font-size:.6875rem;color:var(--muted)}
+.heat-sources .source-mode-status strong{color:var(--primary-text-color);font-weight:500;text-align:right;overflow-wrap:anywhere}
+.heat-sources .source-controls{display:grid;gap:6px;padding:4px 0 8px;min-width:0}
+.heat-sources .source-controls .field{min-width:0;margin:0;display:grid;gap:4px}
+.heat-sources .source-controls select,.heat-sources .source-controls .equipment-select{width:100%;min-width:0;max-width:100%;min-height:44px}
+.heat-sources .source-controls .system-actions{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
+.heat-sources .source-controls .equipment-status{flex-basis:100%;overflow-wrap:anywhere}
+.heat-sources details>summary{line-height:1.25;white-space:normal}

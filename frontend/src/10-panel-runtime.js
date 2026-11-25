@@ -305,7 +305,8 @@ export class HeatingAIPanel extends HTMLElement {
     } catch { this.helpersPromise=null;for(const slot of slots)if(slot.isConnected)slot.textContent='Не вдалося завантажити графік Home Assistant. Оновіть сторінку.'; }
   }
   async clicked(e) {
-    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo],[data-manual-energy]'); if(!el)return;
+    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo],[data-manual-energy],[data-open-manual]'); if(!el)return;
+    if(el.hasAttribute('data-open-manual')){const target=this.shadowRoot.querySelector('.next-action');if(target){target.open=true;target.querySelector('.manual-energy')?.scrollIntoView({block:'center',behavior:'auto'});}return;}
     if(el.hasAttribute('data-manual-energy')){await this.manualEnergyClick(el.dataset.manualEnergy);return;}
     if(el.hasAttribute('data-system-help')){this.systemHelp=el.dataset.systemHelp;this.render();return;}
     if(el.hasAttribute('data-system-close')){this.closeSystemHelp();return;}

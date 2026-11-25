@@ -22,7 +22,7 @@ class MarketplaceCarrierTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "heating_ai_v1_marketplace.zip"
             result = build(path)
-            self.assertEqual(result["files"], 52)
+            self.assertEqual(result["files"], 54)
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 wanted = {
@@ -34,13 +34,20 @@ class MarketplaceCarrierTests(unittest.TestCase):
                     "native_migration.py", "native_floor.py", "native_voltage.py",
                     "native_bridge.py", "calculation_worker.py", "production.py", "production_migration.py",
                     "native_controller/__init__.py", "native_controller/release.json",
-                    "assets/full-panel.js", "assets/full-panel-loader.js",
+                    "assets/full-panel.js", "assets/full-panel-loader.js", "assets/full-panel-version.json",
                     "critical_ledger.py", "kws_readiness.py", "manual_energy.py", "sensor.py",
                     "strings.json", "translations/uk.json", "assets/panel.js",
                     *(f"native_engine/{name}" for name in PURE_MODULES),
                     *(f"native_controller/{name}" for name in EXPECTED),
                 }
+                digest = hashlib.sha256(archive.read("assets/full-panel.js")).hexdigest()[:16]
+                immutable_asset = f"assets/full-panel-{digest}.js"
+                wanted.add(immutable_asset)
                 self.assertEqual(names, wanted)
+                self.assertEqual(archive.read(immutable_asset), archive.read("assets/full-panel.js"))
+                self.assertEqual(json.loads(archive.read("assets/full-panel-version.json")), {
+                    "digest": hashlib.sha256(archive.read("assets/full-panel.js")).hexdigest()[:16],
+                })
                 self.assertFalse(any(name.startswith("legacy_app/") for name in names))
                 source = ROOT / "apps" / "heating_ai"
                 recorded = json.loads((source / "release.json").read_bytes())
