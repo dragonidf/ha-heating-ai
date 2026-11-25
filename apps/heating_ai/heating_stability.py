@@ -263,16 +263,24 @@ def insure_day(now, room, floor, outside, fire, model, weather, settings, power_
             or (settings.get('actuator') or {}).get('safety_stop')):
         return baseline
     points=[p for row in baseline['_calculation_curve'] for p in row['_fine']]
-    breach=next((p['ts'] for p in points if p['ts']<start+86400 and
+    allowed_start=settings.get('day_insurance_start','10:00')
+    allowed_end=settings.get('day_insurance_end','20:00')
+    day=now.date()
+    if start>=local_boundary(day,allowed_end,now.tzinfo).timestamp():
+        day+=timedelta(days=1)
+    earliest=max(start,local_boundary(day,allowed_start,now.tzinfo).timestamp())
+    latest=local_boundary(day,allowed_end,now.tzinfo).timestamp()
+    breach=next((p['ts'] for p in points if earliest<=p['ts']<start+86400 and
+                 datetime.fromtimestamp(p['ts'],now.tzinfo).date()==day and
                  (limits:=comfort_at(datetime.fromtimestamp(p['ts'],now.tzinfo),settings))[3]=='День'
                  and p['temperature']<limits[1]-.01),None)
     if breach is None:
         return baseline
-    last=max(start,breach-3600)
+    last=max(earliest,min(latest-600,breach-3600))
     runs=heat_runs(s for row in baseline['_calculation_curve'] for s in row['heat_segments'])
     candidates=[]
     for offset in (0,1800,3600,5400,7200,9000,10800):
-        begin=max(start,last-offset)
+        begin=max(earliest,last-offset)
         for minutes in (10,15,20,25,30,40,60):
             end=begin+minutes*60
             window=begin,end

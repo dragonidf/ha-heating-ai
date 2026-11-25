@@ -28,6 +28,29 @@ class SufficiencySearchTests(unittest.TestCase):
         settings["day_insurance_used"]={now.date().isoformat():[begin,begin+1200]}
         self.assertFalse(day_insurance_window(now,settings,(begin+3600,begin+4800)))
 
+    def test_day_insurance_skips_expired_evening_breach(self):
+        from heating_stability import insure_day, day_insurance_window
+        now=self.now.replace(hour=22,minute=30,second=0)
+        later=now.replace(hour=14)+timedelta(days=1)
+        settings=dict(self.settings,day_insurance='enabled',
+                      modulation_profile={'physical_mode':'fixed_6'},
+                      outage_schedule={'mode':'normal','valid':True})
+        baseline=dict(weather_complete=True,split_comfort_applied=True,
+                      morning_reserve={'comfort_deficit':{'day_deficit_degree_hours':4}},
+                      _calculation_curve=[{'_fine':[
+                          {'ts':now.timestamp()+300,'temperature':settings['lower']-.2},
+                          {'ts':later.timestamp(),'temperature':settings['lower']-.2}],
+                          'heat_segments':[]}])
+        with patch('heating_stability.replay',return_value=None) as check:
+            result=insure_day(now,20.8,22.,1.,0.,self.x['model'],[],settings,6.,baseline,None)
+        self.assertIs(result,baseline)
+        self.assertGreater(check.call_count,0)
+        for call in check.call_args_list:
+            window=call.kwargs['day_window']
+            self.assertEqual(datetime.fromtimestamp(window[0],now.tzinfo).date(),later.date())
+            self.assertTrue(day_insurance_window(now,settings,window))
+            self.assertTrue(call.kwargs['strict_upper'])
+
     def test_day_insurance_executes_only_a_safe_capped_window(self):
         from heating_stability import stable_plan
         now=self.now.replace(hour=10,minute=0,second=0)
