@@ -86,7 +86,7 @@ class ArchiveCapacityTests(unittest.TestCase):
             for days in (2,1):
                 day=datetime.fromtimestamp(now-days*86400,timezone.utc).strftime('%Y-%m-%d')
                 path=folder/(day+'.jsonl')
-                path.write_bytes(b'{"event":"old_day"}\\n'*100)
+                path.write_bytes(b'{"event":"old_day"}\n'*100)
                 os.utime(path,(now-days*86400,now-days*86400))
                 paths.append(path)
             journal=DecisionJournal(directory)
