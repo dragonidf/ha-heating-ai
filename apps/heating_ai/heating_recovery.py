@@ -1635,12 +1635,21 @@ class DecisionJournal:
                 if p.is_file() and p.stat().st_mtime<stamp-self.retention:
                     p.unlink()
             self.last_rotation=stamp
-            files=[(p,p.stat()) for p in self.directory.iterdir() if p.is_file()]
-            self.used_bytes=sum(info.st_size for _,info in files)
-            self.snapshot_bytes=sum(info.st_size for p,info in files if p.name.endswith('.json.gz'))
-            self.snapshot_count=sum(p.name.endswith('.json.gz') for p,_ in files)
-            self.daily_log_bytes=sum(info.st_size for p,info in files if p.name.endswith(('.jsonl','.jsonl.gz')))
-            self.oldest_at=min((info.st_mtime for _,info in files),default=stamp)
+            # Single streaming scan: do not retain thousands of Path/stat pairs
+            # in RAM just to publish archive composition once per hour.
+            self.used_bytes=self.snapshot_bytes=self.daily_log_bytes=self.snapshot_count=0
+            self.oldest_at=stamp
+            for path in self.directory.iterdir():
+                if not path.is_file():
+                    continue
+                info=path.stat()
+                self.used_bytes+=info.st_size
+                self.oldest_at=min(self.oldest_at,info.st_mtime)
+                if path.name.endswith('.json.gz'):
+                    self.snapshot_bytes+=info.st_size
+                    self.snapshot_count+=1
+                elif path.name.endswith(('.jsonl','.jsonl.gz')):
+                    self.daily_log_bytes+=info.st_size
         # Compact at most one closed day per six hours before critical pressure.
         # At >=90% keep the original urgent full-compaction behavior and
         # 60-second retry. No extra thread, timer or HA state mutation.
