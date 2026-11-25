@@ -29,7 +29,7 @@ from .native_controller import heating_learning_windows as learning
 from .native_controller.heating_model import comfort_at, number
 from .native_controller.heating_ui import system_fields
 from .native_controller.heating_recovery import wire_values
-from .native_voltage import VoltageGuard
+from .native_voltage import VoltageGuard, select_phase_voltages
 from .production_migration import load_installation
 from .const import DOMAIN, SOURCE_HINTS
 from .critical_ledger import CriticalLedger, LedgerConflict, FILENAME
@@ -1098,26 +1098,35 @@ class NativeController(HeatingClimate):
             grid, volts = self.raw("grid"), self.val("grid_voltage")
             if grid == "off" or (volts is not None and volts < 150):
                 return legacy
-        for entity in phases:
+        def current(entity):
             value = number(self.get_state(entity))
-            if value is None or not 150 <= value <= 350 or not self.fresh(entity, 90):
-                return legacy
-        return "on"
+            return value if value is not None and self.fresh(entity, 90) else None
+        primary = [current(entity) for entity in phases]
+        backup = [current("sensor.energy_meter_kotel_napruga_"+p) for p in "abc"] if any(v is None for v in primary) else []
+        selected, _ = select_phase_voltages(primary, backup, self.args.get("min_voltage_v", 190),
+                                            self.args.get("max_voltage_v", 260))
+        return "on" if all(v is not None and 150 <= v <= 350 for v in selected) else legacy
 
     @callback
     def async_voltage_status(self):
         now = time.time()
         presence = self.hass.states.get(self.args["grid_presence_helper"])
         confirmed = presence is not None and presence.state in ("on", "Наявна мережа")
-        phases = []
-        for entity in self.args["voltage_entities"]:
+        def current(entity):
             state = self.hass.states.get(entity)
             try:
                 voltage = float(state.state)
                 age = now-state.last_reported.timestamp()
-                phases.append(voltage if -5 <= age <= 90 else None)
+                return voltage if isfinite(voltage) and 0 <= voltage <= 350 and -5 <= age <= 90 else None
             except (ValueError, TypeError, AttributeError):
-                phases.append(None)
+                return None
+        primary = [current(entity) for entity in self.args["voltage_entities"]]
+        backup = []
+        if (confirmed and self.cfg.get("power_accounting_method") == "kws"
+                and any(v is None for v in primary)):
+            backup = [current("sensor.energy_meter_kotel_napruga_"+p) for p in "abc"]
+        phases, voltage_source = select_phase_voltages(
+            primary, backup, self.args.get("min_voltage_v", 190), self.args.get("max_voltage_v", 260))
         self.voltage_status = self.voltage_guard.evaluate(
             now, confirmed, phases,
             minimum_v=self.args.get("min_voltage_v", 190),
@@ -1125,7 +1134,7 @@ class NativeController(HeatingClimate):
             recovery_seconds=self.args.get("voltage_recovery_seconds", 30),
         )
         self.voltage_status.update(physical_commands_enabled=self._writer,
-                                   physical_authority=self._writer)
+                                   physical_authority=self._writer, voltage_source=voltage_source)
         return self.voltage_status
 
     @callback
@@ -1218,6 +1227,9 @@ class NativeController(HeatingClimate):
             delay = self.hass.states.get(self.cfg.get("kws_reset_delay_entity", "number.energy_meter_kotel_reset_delay"))
             reset_delay = float(delay.state)
         except (AttributeError, TypeError, ValueError):
+            return False
+        # Relay reclosure needs both independent input and KWS voltage readings.
+        if (self.voltage_status or {}).get("voltage_source") != "input":
             return False
         return self.kws_restore.eligible(now, report, self.voltage_status or {}, reset_delay, claimed=claimed)
 
