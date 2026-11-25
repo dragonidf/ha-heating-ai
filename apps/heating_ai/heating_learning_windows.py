@@ -21,6 +21,7 @@ RETENTION = 60 * 86400
 MAX_WEATHER_AGE = 3 * 3600
 IDENTITY = ("epoch", "source", "thermal_model_version", "equipment_version", "boiler_power_mode")
 FIT_FIELDS = ("floor_air", "room_loss")
+DRIFT_LIMITS = ((7, .05), (30, .12))
 _JOB_LOCK = Lock()
 
 
@@ -70,7 +71,7 @@ def ventilation_interval_duty(evidence):
     return powered if powered in (0., 1.) else None
 
 
-def row_reasons(row, *, strict):
+def row_reasons(row, *, strict, physics=False):
     reasons = set(row.get("shadow_reasons") or ())
     power = number(row.get("power"))
     if power is None or not 0 <= power <= 10.5:
@@ -83,9 +84,14 @@ def row_reasons(row, *, strict):
         reasons.add("unknown_grid" if row.get("grid") != "off" else "unqualified_outage")
     if row.get("voltage_qualified") is not True:
         reasons.add("unknown_or_unqualified_voltage")
-    if row.get("manual_extra_active") or row.get("execution") == "manual_or_native":
+    manual = (physics and row.get("manual_extra_active") is True
+              and number(row.get("manual_measurement_id")) is not None
+              and number(row.get("interval_kw")) is not None)
+    if manual:
+        reasons.discard("manual_extra_request")
+    elif row.get("manual_extra_active") or row.get("execution") == "manual_or_native":
         reasons.add("manual_extra_request")
-    if strict and (row.get("manual_extra_active") is not False
+    if strict and not manual and (row.get("manual_extra_active") is not False
                    or row.get("execution") not in ("automatic", "idle")):
         reasons.add("unknown_execution")
     if strict and any(row.get(key) is None for key in IDENTITY):
@@ -194,7 +200,7 @@ def _spans(rows, times, start, end):
     return zip(rows[left:right], rows[left+1:right+1])
 
 
-def _continuous(rows, times, start, end, identity):
+def _continuous(rows, times, start, end, identity, *, physics=False):
     pairs = _spans(rows, times, start, end)
     if pairs is None:
         return [], {"missing_bracket"}
@@ -203,8 +209,10 @@ def _continuous(rows, times, start, end, identity):
         x, y = a["ts"], b["ts"]
         if not 0 < y-x <= 600:
             reasons.add("telemetry_gap")
-        reasons.update(row_reasons(a, strict=True))
-        reasons.update(row_reasons(b, strict=True))
+        reasons.update(row_reasons(a, strict=True, physics=physics))
+        reasons.update(row_reasons(b, strict=True, physics=physics))
+        if physics and a.get("manual_measurement_id") != b.get("manual_measurement_id"):
+            reasons.add("manual_session_boundary")
         if any(tuple(row.get(k) for k in IDENTITY) != identity for row in (a,b)):
             reasons.add("identity_changed")
         if a.get("shadow_ventilation") != b.get("shadow_ventilation"):
@@ -259,8 +267,8 @@ def build_observation_windows(samples, tz):
             counts["local_midnight"] += 1
             continue
         identity = tuple(first.get(k) for k in IDENTITY)
-        steps, reasons = _continuous(rows,times,start,end,identity)
-        reasons |= row_reasons(first,strict=True) | row_reasons(row,strict=True)
+        steps, reasons = _continuous(rows,times,start,end,identity,physics=True)
+        reasons |= row_reasons(first,strict=True,physics=True) | row_reasons(row,strict=True,physics=True)
         if abs(row["room"]-first["room"]) > .6:
             reasons.add("room_jump")
         if reasons:
@@ -271,6 +279,7 @@ def build_observation_windows(samples, tz):
         sun = sum(seconds*factor for seconds, _, _, factor, _ in steps)/(end-start)
         windows.append(dict(start=start,end=end,day=day,room_start=first["room"],room_end=row["room"],
                             floor=steps[0][4],steps=steps,heat=heating,idle=idle,sun=sun,
+                            manual=first.get("manual_measurement_id") is not None,
                             equipment=list(identity[2:]),vent=first["shadow_ventilation"]))
         anchor = None  # an independent physical report belongs to at most one window
     anchor_at = None
@@ -280,7 +289,15 @@ def build_observation_windows(samples, tz):
         if not issues and not row_reasons(row,strict=True):
             anchor_at = at
     observation = rows[-1] if rows else {}
+    eligibility_counts = dict(manual_physics_windows=sum(w["manual"] for w in windows),
+                              automatic_physics_windows=sum(not w["manual"] for w in windows),
+                              primary_reports=len(reports),
+                              electrical_intervals=sum(
+                                  r.get("power_source")=="kws_phases" and r.get("power_quality")=="measured"
+                                  and (kw:=number(r.get("interval_kw"))) is not None
+                                  and 0<=kw<=10.5 for r in rows))
     return dict(windows=windows,rejection_counts=dict(counts),unique_primary_reports=len(reports),
+                eligibility_counts=eligibility_counts,
                 last_verified_anchor=anchor_at,
                 current_observation_quality={
                     "primary_fresh": observation.get("primary_fresh",False),
@@ -737,6 +754,28 @@ def promotion_evidence(rows):
     return dict(status="accepted",metrics=metrics,strata=strata)
 
 
+def drift_totals(history, now, days):
+    """Total relative travel per coefficient, including rolls back."""
+    cutoff = now.timestamp() - days*86400
+    totals = dict.fromkeys(FIT_FIELDS, 0.)
+    for row in history:
+        if not cutoff <= row["at"] <= now.timestamp():
+            continue
+        for key, (before, after) in row.get("changes", {}).items():
+            if key in totals and number(before) and number(after) is not None:
+                totals[key] += abs(after-before)/abs(before)
+    return totals
+
+
+def model_drift_allowed(active, proposed, state, now):
+    for days, limit in DRIFT_LIMITS:
+        totals = drift_totals(state.get("changes_history", ()), now, days)
+        if any(totals[key]+abs(proposed[key]-active[key])/abs(active[key]) > limit+1e-12
+               for key in proposed if key in totals and proposed[key]!=active[key]):
+            return False
+    return True
+
+
 def promotion_allowed(active, fitted_base, proposed, evidence, state, now, *, legacy_day=None):
     date=now.date().isoformat()
     baseline=(legacy_day or {}).get("baseline",active) if (legacy_day or {}).get("date")==date else active
@@ -750,7 +789,8 @@ def promotion_allowed(active, fitted_base, proposed, evidence, state, now, *, le
                     and abs(proposed[k]-active[k])<=.01*abs(active[k])+1e-12
                     and abs(proposed[k]-baseline[k])<=.02*abs(baseline[k])+1e-12
                     and abs(proposed[k]-baseline[k])<=.05*abs(baseline[k])+1e-12
-                    for k in proposed))
+                    for k in proposed)
+            and model_drift_allowed(active,proposed,state,now))
 
 
 def rollback_reason(rows, strata):
@@ -826,11 +866,12 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                 independent_windows=len(windows),
                 qualified_minutes=round(coverage["seconds"]/60,1),
                 verified_reports=window_report["unique_primary_reports"],
+                eligibility_counts=window_report.get("eligibility_counts",{}),
                 rejection_counts=dict(sorted(window_report["rejection_counts"].items(),
                                              key=lambda item:(-item[1],item[0]))[:12]),
                 current_reasons=window_report["current_observation_quality"]["reasons"],
                 analysis_status="pending", analysis_blockers=[])
-    evidence_key = sha256(_encode([now.date().isoformat(),model,
+    evidence_key = sha256(_encode([now.date().isoformat(),model,eligible,cooldown,
                                   [(w['start'],w['end']) for w in windows],
                                   [(f['snapshot']['start'],f['checks']) for f in archive]])).hexdigest()
     previous_report = saved["report"]

@@ -11,6 +11,42 @@ from heating_stability import stable_plan,reference,replay,expected
 
 
 class SufficiencySearchTests(unittest.TestCase):
+    def test_day_insurance_requires_opt_in_and_confirmed_supply(self):
+        from heating_stability import day_insurance_window
+        now=self.now.replace(hour=12)
+        begin=now.timestamp()+1800
+        settings=dict(self.settings,day_insurance="enabled",
+                      modulation_profile={"physical_mode":"fixed_6"},
+                      outage_schedule={"mode":"normal","valid":True})
+        self.assertTrue(day_insurance_window(now,settings,(begin,begin+1200)))
+        self.assertFalse(day_insurance_window(now,{**settings,"day_insurance":"disabled"},
+                                             (begin,begin+1200)))
+        self.assertFalse(day_insurance_window(now,settings,(begin,begin+2400)))
+        self.assertFalse(day_insurance_window(now,{**settings,"outage_schedule":{"mode":"unknown"}},
+                                             (begin,begin+1200)))
+        # A day's allowance may only authorize its first reserved session.
+        settings["day_insurance_used"]={now.date().isoformat():[begin,begin+1200]}
+        self.assertFalse(day_insurance_window(now,settings,(begin+3600,begin+4800)))
+
+    def test_day_insurance_executes_only_a_safe_capped_window(self):
+        from heating_stability import stable_plan
+        now=self.now.replace(hour=10,minute=0,second=0)
+        stamp=now.timestamp()
+        weather=[dict(ts=stamp+3600*i,temperature=1.) for i in range(-1,29)]
+        settings=dict(self.settings,outage_schedule=dict(valid=True,mode='normal'),
+                      modulation_profile=dict(physical_mode='fixed_6'))
+        args=now,20.8,22.,1.,0.,self.x['model'],weather
+        baseline,_=stable_plan(*args,settings,6.)
+        plan,reference=stable_plan(*args,dict(settings,day_insurance='enabled'),6.)
+        self.assertIsNone(baseline.get('day_insurance_window'))
+        begin,end=plan['day_insurance_window']
+        self.assertEqual(reference['day_insurance_window'],[begin,end])
+        self.assertGreaterEqual(end-begin,600)
+        self.assertLessEqual(6*(end-begin)/3600,3.)
+        self.assertLess(plan['morning_reserve']['day_deficit_degree_hours'],
+                        baseline['morning_reserve']['day_deficit_degree_hours'])
+        self.assertTrue(any(s['start']==begin and not s['conditional'] for s in plan['heat_segments']))
+
     def setUp(self):
         self.x=json.loads(Path(__file__).with_name('insufficient_morning_case.json').read_text())
         self.now=datetime.fromisoformat(self.x['now']).astimezone(ZoneInfo('Europe/Kiev'))

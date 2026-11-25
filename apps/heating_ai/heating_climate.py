@@ -19,7 +19,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
-from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics
+from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
 from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at,
                                  solar_context,room_source_check,observe_residual,residual_at,ENVIRONMENT_POLICY_VERSION)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
@@ -779,7 +779,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
             return None
         fresh=replay(now,room,floor,outside,fire,self.model,weather,settings,reference['segments'],
-                     reference['split'],3.,reserve_checked=True,window_extensions=approved_extensions(settings,reference))
+                     reference['split'],3.,reserve_checked=True,window_extensions=approved_extensions(settings,reference),
+                     day_window=reference.get('day_insurance_window'))
         if fresh is None:
             self.calculation_rejection('plan','replay_rejected',job_id=job['id'])
             self.poll_calculation('plan',key,stable_plan,*args,power_kw=3.,previous=self.memory.get('plan_reference'))
@@ -813,6 +814,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             profile={k:v for k,v in profile.items() if k not in ('bands','stage_minutes')},
             bands=[{k:b.get(k) for k in ('return_min','return_max','power_kw','minutes')} for b in profile.get('bands',[])[:16]],
             measured_calibration=dict(intervals=observed.get('intervals'),minutes=observed.get('minutes'),
+                electrical_validated=observed.get('electrical_validated'),
+                holdout_mae_kw=observed.get('holdout_mae_kw'),baseline_mae_kw=observed.get('baseline_mae_kw'),
                 bands=[{k:b.get(k) for k in ('return_min','return_max','measured_kw','minutes')}
                        for b in observed.get('bands',[])[:16]])
                 if observed.get('power_source')=='kws_phases' else None,
@@ -1549,6 +1552,27 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory["learn_date"]=now.date().isoformat()
             self.run_diagnostic('learning',self.daily_learn)
 
+    def allow_insurance_now(self,now,settings,window):
+        if not window or not window[0]<=now.timestamp()<window[1]:
+            return True
+        if not day_insurance_window(now,settings,window):
+            return False
+        today=now.date().isoformat()
+        used=self.memory.get('day_insurance_used') or {}
+        if today in used:
+            return tuple(used[today])==tuple(window)
+        if today not in used:
+            self.memory['day_insurance_used']={today:list(window)}
+            if self.memory.get('state_load_error'):
+                self.memory['day_insurance_used']=used
+                return False
+            try:
+                self.save()
+            except (OSError,ValueError,TypeError):
+                self.memory['day_insurance_used']=used
+                return False
+        return True
+
     def tick_inner(self):
         now=self.now()
         self.ventilation_tick(now.timestamp())
@@ -1620,6 +1644,11 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.operational_outage_key=runtime_key
         settings["outage_schedule"] = operational
         settings["outage_advance_limit"] = self.cfg.get("outage_advance_limit",180)
+        for key in ('day_insurance','day_insurance_kwh','day_insurance_start','day_insurance_end','day_insurance_deficit'):
+            if key in self.cfg:
+                settings[key]=self.cfg[key]
+        if settings.get('day_insurance')=='enabled':
+            settings['day_insurance_used']=self.memory.get('day_insurance_used',{})
         settings.update({k:system_values(self.cfg)[k] for k in ('risk_cold_delta','risk_blackout_short_minutes','risk_blackout_long_minutes')})
         emergency = outage_data['emergency']
         published_outage_now=bool(outage_data.get("valid") and blocked(now.timestamp(),now.timestamp()+15,outage_data["outages"]))
@@ -1804,6 +1833,10 @@ class HeatingClimate(HeatingRecovery,Hass):
             safety_stop=grid!='on' or not permitted or self.raw('mode')!='Автоматичне керування' or
                         room is not None and room>=upper or coast_overheat and not once)
         committed_heat=self.minimum_heat_commit(now.timestamp(),grid,outage_now,room,coast_overheat and not once)
+        prior_insurance=self.memory.get('planned_day_insurance')
+        if (prior_insurance and 0<=now.timestamp()-prior_insurance[1]<600 and command_at
+                and prior_insurance[0]<=command_at<prior_insurance[1]):
+            committed_heat=False
         if manual_ending and not planned_now:committed_heat=False
         background=getattr(self,'runtime_ready',False) and callable(getattr(self,'submit_to_executor',None))
         ready=None
@@ -1822,6 +1855,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             segments=self.memory.get("planned_heat_segments",[])
             planned_now=any(s["start"] <= now.timestamp() < s["end"] for s in segments)
             demand=planned_now or manual_requested
+            if planned_now and not manual_requested and not self.allow_insurance_now(
+                    now,settings,self.memory.get('planned_day_insurance')):
+                planned_now=demand=committed_heat=False
             if manual_ending and not planned_now:committed_heat=False
             if once or committed_heat:
                 demand=True
@@ -1896,6 +1932,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          cycle_energy=forecast['cycle_energy'],
                          stress_scenarios=forecast['stress_scenarios'],
                          planned_kwh=forecast["energy"],horizon_hours=forecast["horizon_hours"],
+                         day_insurance_window=forecast.get('day_insurance_window'),
                          control_power_basis=settings['control_power_basis'] if reserve_active else getattr(self,'power_source','unknown'),
                          electrical_inputs_unavailable=measured_power is None,grid_state=grid,return_estimated=not probe_ok,
                          estimated_morning_request_minutes=settings.get('estimated_morning_request_minutes',0.),
@@ -1952,6 +1989,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.publish("sensor.heating_forecast","unavailable",friendly_name="Клімат — мінімум прогнозу",curve=[],
                          reason="Недостатньо актуальних даних або некоректні межі",planning_policy_version=4,created_at=now.isoformat())
         planned_heat=bool(forecast and forecast["heat"])
+        if planned_heat and not manual_requested and not self.allow_insurance_now(
+                now,settings,forecast.get('day_insurance_window')):
+            planned_heat=committed_heat=False
         demand=planned_heat or manual_requested
         # The optimiser already balances comfort, stored heat and tariff.
         # Reaching the soft air target must not cancel its scheduled session.
@@ -2021,6 +2061,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.run_diagnostic('plan_history_publish',self.publish_plan_history)
         self.run_diagnostic('ai_summary',self.publish_ai_summary,refresh=True)
         self.memory["planned_heat_segments"]=forecast["heat_segments"] if forecast else []
+        self.memory["planned_day_insurance"]=(forecast or {}).get('day_insurance_window')
         self.memory["demand"]=demand
         self.decision_context=dict(settings=settings,forecast=forecast,action=action,reason=reason,
             coast_overheat=coast_overheat and not once,

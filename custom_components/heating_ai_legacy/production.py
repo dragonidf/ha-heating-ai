@@ -233,6 +233,12 @@ class NativeController(HeatingClimate):
             "room_source_disagreement","room_sources_suspect","energy")
         compact = {key:row.get(key) for key in fields}
         stamp = row["ts"]
+        manual = self.memory.get("manual_energy") or {}
+        if (row.get("manual_extra_active") is True and manual.get("status")=="active"
+                and len(self.samples)>=2 and (started:=number(manual.get("started_at"))) is not None
+                and started<=self.samples[-2]["ts"] and interval_kw is not None
+                and "control_mode_changed" not in reasons and "unplanned_heat" not in reasons):
+            compact["manual_measurement_id"] = manual["started_at"]
         record = self.raw("room", attribute="all") or {}
         entity = self.cfg.get("room")
         try:
@@ -392,8 +398,15 @@ class NativeController(HeatingClimate):
             self.memory["adaptive_schedule"]=dict(schedule,completed_at=self.now().isoformat())
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
-                                        "verified_reports","rejection_counts","current_reasons",
+                                        "verified_reports","rejection_counts","current_reasons","eligibility_counts",
                                         "analysis_status","analysis_blockers")}
+        self._apply_learning_result(issued,result)
+        if self._learning_status.get("status") not in ("accepted","rolled_back"):
+            checkpoint=self.memory.setdefault("online_learning",{})
+            checkpoint["changes_history"]=self._learning_history(
+                checkpoint,self._learning_status["status"],self._learning_status.get("reason"))
+
+    def _apply_learning_result(self, issued, result):
         if not (result.get("proposed") or result.get("rollback")):
             return
         checkpoint=self.memory.get("online_learning") or {}
@@ -424,8 +437,24 @@ class NativeController(HeatingClimate):
         else:
             self._learning_status.update(status="rejected",reason="promotion_limits_or_prior_evidence")
 
+    def _learning_history(self, checkpoint, status, reason, model=None):
+        stamp=self.now().timestamp()
+        model=self.model if model is None else model
+        metrics=self._learning_status.get("metrics",{})
+        row=dict(at=stamp,status=status,reason=reason,version=model.get("version"),
+                 windows=self._learning_status.get("independent_windows"),
+                 minutes=self._learning_status.get("qualified_minutes"),
+                 changes={k:[self.model[k],model[k]] for k in learning.FIT_FIELDS
+                          if k in self.model and k in model and self.model[k]!=model[k]},
+                 mae={h:[metrics[h].get(side,{}).get("mae") for side in ("old","new")]
+                      for h in ("1","3") if h in metrics})
+        history=[event for event in checkpoint.get("changes_history",())
+                 if stamp-30*86400<=event["at"]<=stamp]
+        return (history+[row])[-96:]
+
     def _commit_learning_model(self, model, checkpoint, status, reason):
         """Commit the model and its rollback evidence at one filesystem boundary."""
+        checkpoint={**checkpoint,"changes_history":self._learning_history(checkpoint,status,reason,model)}
         values={**self.memory,"model":model,"weather":self.weather,"online_learning":checkpoint,
                 "previous_model":dict(self.model),"predictions":[],"hour_errors":[]}
         values.pop("pending_model",None)
@@ -1671,6 +1700,12 @@ class NativeController(HeatingClimate):
                 independent_windows=report.get("independent_windows",0),
                 qualified_minutes=report.get("qualified_minutes",0.),
                 verified_reports=report.get("verified_reports",0),
+                learning_eligibility=report.get("eligibility_counts",{}),
+                learning_history=[r for r in checkpoint.get("changes_history",())
+                                  if now.timestamp()-30*86400<=r["at"]<=now.timestamp()],
+                model_drift={str(days):learning.drift_totals(checkpoint.get("changes_history",()),
+                                                             now,days)
+                             for days,_ in learning.DRIFT_LIMITS},
                 rejection_counts=report.get("rejection_counts",{}),
                 current_reasons=report.get("current_reasons",[]),
                 analysis_status=report.get("analysis_status","pending"),

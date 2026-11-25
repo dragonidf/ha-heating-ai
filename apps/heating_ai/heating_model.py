@@ -1301,12 +1301,15 @@ def learn_power_modes(samples,model=None):
                 reference=step(*reference,a['outside'],baseline,a.get('fire',0.),evaluation_model,dt)
                 thermal.append(abs(simulated[0]-b['room']));base_thermal.append(abs(reference[0]-b['room']))
         days=len({datetime.fromtimestamp(r['ts']).date() for r in rows})
-        accepted=(days>=2 and len(errors)>=6 and candidate['minutes']>=60 and statistics.mean(errors)<statistics.mean(base)*.95 and
-                  source!='kws_phases' and bool(thermal) and statistics.mean(thermal)<=statistics.mean(base_thermal))
+        electrical_ok=(days>=2 and len(errors)>=6 and candidate['minutes']>=60
+                       and statistics.mean(errors)<statistics.mean(base)*.95)
+        thermal_ok=bool(thermal) and statistics.mean(thermal)<=statistics.mean(base_thermal)
+        accepted=electrical_ok and source!='kws_phases' and thermal_ok
         stage_seconds={k:sum((r.get('instantaneous_stage_seconds') or {}).get(k,0.) for r in train if r.get('heating_requested')) for k in ('off','3','6','9','unknown')}
         known=sum(stage_seconds[k] for k in ('off','3','6','9'))
         probabilities={k:stage_seconds[k]/known for k in ('off','3','6','9')} if known else None
         candidate.update(physical_mode=mode,validated=accepted,equipment_version=latest,sessions=len(sessions),days=days,
+            electrical_validated=electrical_ok,
             holdout_samples=len(errors),holdout_mae_kw=statistics.mean(errors) if errors else None,
             baseline_mae_kw=statistics.mean(base) if base else None,
             holdout_temperature_mae=statistics.mean(thermal) if thermal else None,

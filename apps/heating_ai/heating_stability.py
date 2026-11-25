@@ -20,7 +20,8 @@ from heating_environment import forecast_step,gain_at,safe_upper,has_upper_risk,
 def policy(settings):
     keys=('target','lower','upper','start','end','strategy','split_comfort',
           'morning_min_minutes','day_price','night_price','budget_multiplier',
-          'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin','equipment_version','ventilation_model','ventilation_expected')
+          'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin','equipment_version','ventilation_model','ventilation_expected',
+          'day_insurance','day_insurance_kwh','day_insurance_start','day_insurance_end','day_insurance_deficit')
     return {**{k:settings.get(k) for k in keys},'environment_policy_version':ENVIRONMENT_POLICY_VERSION,
             'energy_budget_policy_version':1,
             'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
@@ -37,6 +38,35 @@ def approved_extensions(settings, proposal):
     return proposal.get('approved_window_extensions') or []
 
 
+def day_insurance_window(now, settings, window):
+    if not window or settings.get('day_insurance')!='enabled':
+        return False
+    if settings.get('strategy')!='Тільки в дозволені години':
+        return False
+    start,end=window
+    left=datetime.fromtimestamp(start,now.tzinfo)
+    right=datetime.fromtimestamp(end-.001,now.tzinfo)
+    mode=(settings.get('modulation_profile') or {}).get('physical_mode')
+    # The installed boiler can draw its full stage rating; a learned duty
+    # estimate must never increase the duration of this capped reservation.
+    if mode not in ('fixed_3','fixed_6','fixed_9','auto') or end-start<600:
+        return False
+    rated=9 if mode=='auto' else int(mode[-1])
+    cap=number(settings.get('day_insurance_kwh',3.))
+    allowed=(settings.get('day_insurance_start','10:00'),settings.get('day_insurance_end','20:00'))
+    used=(settings.get('day_insurance_used') or {}).get(left.date().isoformat())
+    if (cap is None or rated*(end-start)/3600>cap+1e-9 or left.date()!=right.date()
+            or used is not None and tuple(used)!=tuple(window)
+            or not all(in_window(t,*allowed) and not in_window(t,settings['start'],settings['end'])
+                       and not in_window(t,'23:00','07:00') for t in (left,right))):
+        return False
+    boundaries=(settings['start'],*allowed,'23:00')
+    if any(start<local_boundary(left.date(),clock,now.tzinfo).timestamp()<end for clock in boundaries):
+        return False
+    data=availability(settings.get('outage_schedule') or {},start,end)
+    return schedule_covered(data,start,end) and not blocked(start,end,data.get('outages',[]))
+
+
 def reference(now, room, floor, outside, fire, model, weather, settings, result):
     return dict(at=now.timestamp(),room=room,floor=floor,outside=outside,fire=fire,
                 model=dict(model),policy=policy(settings),weather=list(weather),
@@ -50,6 +80,7 @@ def reference(now, room, floor, outside, fire, model, weather, settings, result)
                 profile=settings.get('modulation_profile'),curve=list(result.get('_calculation_curve',result['curve'])),
                 environment=settings.get('environment',{}),
                 approved_window_extensions=result.get('approved_window_extensions',[]),
+                day_insurance_window=result.get('day_insurance_window'),
                 extension_outages=result.get('extension_outages',[]),
                 outage_shifted=result.get('outage_shifted',False),outage_preheat=result.get('outage_preheat',False))
 
@@ -62,7 +93,7 @@ def expected(previous,stamp,key,initial):
     return points[-1][1]
 
 
-def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False,context_override=None,window_extensions=(), *, forecast_context=None, reserve_needed=None, strict_upper=False):
+def replay(now, room, floor, outside, fire, model, weather, settings, segments, split, power_kw=9., reserve_checked=False,context_override=None,window_extensions=(), *, forecast_context=None, reserve_needed=None, strict_upper=False, day_window=None):
     """Integrate at <=5 min, splitting at exact session and forecast boundaries."""
     start=now.timestamp(); public_finish=start+86400
     context=context_override or reserve_context(now,settings,model)
@@ -78,8 +109,11 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
         return None
     data=availability(settings.get('outage_schedule') or {},start,finish)
     outages=data.get('outages',[]) if data.get('valid') else []
+    if day_window and not day_insurance_window(now,settings,day_window):
+        day_window=None
     def extension(a,b):
-        return any(a>=lo and b<=hi for lo,hi in window_extensions)
+        return ((day_window and day_window[0]<=a and b<=day_window[1])
+                or any(a>=lo and b<=hi for lo,hi in window_extensions))
     segments=[dict(s,start=max(start,s['start']),end=min(finish,s['end']))
               for s in segments if s['end']>start and s['start']<finish]
     for s in segments:
@@ -199,6 +233,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 outage_mode=data.get('mode','scheduled' if data.get('valid') else 'unknown'),
                 outage_shifted=False,outage_preheat=False,outside_minutes=sum(r['outside_minutes'] for r in rows),
                 approved_window_extensions=[list(pair) for pair in window_extensions],
+                day_insurance_window=list(day_window) if day_window and day_window[1]>start else None,
                 extension_outages=[dict(start=o['start'],end=o['end']) for o in outages] if window_extensions else [],
                 outage_status=data.get('reason','Графік не підключений'),
                 comfort_shortfall=any(r['temperature']<r['lower'] for r in rows),heat_segments=all_segments,
@@ -216,6 +251,66 @@ def heat_runs(segments):
         else:
             runs.append((start, end))
     return tuple(runs)
+
+
+def insure_day(now, room, floor, outside, fire, model, weather, settings, power_kw, baseline,
+               forecast_context):
+    reserve=baseline.get('morning_reserve') or {}
+    deficit=(reserve.get('comfort_deficit') or {}).get('day_deficit_degree_hours',0.)
+    start=now.timestamp()
+    if (settings.get('day_insurance')!='enabled' or deficit<settings.get('day_insurance_deficit',.5)
+            or not baseline.get('weather_complete') or settings.get('cycle_energy_budget')
+            or (settings.get('actuator') or {}).get('safety_stop')):
+        return baseline
+    points=[p for row in baseline['_calculation_curve'] for p in row['_fine']]
+    breach=next((p['ts'] for p in points if p['ts']<start+86400 and
+                 (limits:=comfort_at(datetime.fromtimestamp(p['ts'],now.tzinfo),settings))[3]=='День'
+                 and p['temperature']<limits[1]-.01),None)
+    if breach is None:
+        return baseline
+    last=max(start,breach-3600)
+    runs=heat_runs(s for row in baseline['_calculation_curve'] for s in row['heat_segments'])
+    candidates=[]
+    for offset in (0,1800,3600,5400,7200,9000,10800):
+        begin=max(start,last-offset)
+        for minutes in (10,15,20,25,30,40,60):
+            end=begin+minutes*60
+            window=begin,end
+            if day_insurance_window(now,settings,window) and not any(
+                    begin<b+900 and a-900<end for a,b in runs):
+                candidates.append((minutes, -begin, window))
+    best=None
+    deadline=monotonic()+.20
+    for _,_,window in sorted(set(candidates))[:24]:
+        if monotonic()>=deadline:
+            return baseline
+        proposal=sorted((*runs,window))
+        result=replay(now,room,floor,outside,fire,model,weather,settings,
+                      [dict(start=a,end=b) for a,b in proposal],baseline['split_comfort_applied'],
+                      power_kw,reserve_checked=True,context_override=reserve,
+                      window_extensions=approved_extensions(settings,baseline),
+                      forecast_context=forecast_context,strict_upper=True,day_window=window)
+        if result is None or heat_runs(s for row in result['_calculation_curve']
+                                      for s in row['heat_segments'])!=tuple(proposal):
+            continue
+        actual=result['morning_reserve']['comfort_deficit']
+        original=reserve['comfort_deficit']
+        if (actual['day_deficit_degree_hours']>=deficit-.01
+                or actual['night_deficit_degree_hours']>original['night_deficit_degree_hours']+.001
+                or actual['comfort_minutes']<original['comfort_minutes']-.01
+                or actual['minimum_before_next_heat']<original['minimum_before_next_heat']-.001):
+            continue
+        if actual['day_deficit_degree_hours']<=.01:
+            best=result
+            break
+        if best is None or actual['day_deficit_degree_hours']<best['morning_reserve']['comfort_deficit']['day_deficit_degree_hours']:
+            best=result
+    if best is None:
+        return baseline
+    result=dict(baseline)
+    result.update(best,outage_shifted=baseline.get('outage_shifted',False),
+                  outage_preheat=baseline.get('outage_preheat',False),plan_stable=False)
+    return apply_search_diagnostics(now,settings,result)
 
 
 def night_variants(runs, left, right, step):
@@ -344,7 +439,8 @@ def stress_scenarios(now,room,floor,outside,fire,model,weather,settings,nominal,
     for name,scenario,requests,out,weather_rows in cases:
         result=replay(now,room,floor,out,fire,model,weather_rows,scenario,requests,
                       nominal.get('split_comfort_applied',False),power_kw,reserve_checked=True,context_override=context,
-                      window_extensions=approved_extensions(settings,nominal))
+                window_extensions=approved_extensions(settings,nominal),
+                day_window=nominal.get('day_insurance_window'))
         rows.append(dict(name=name,hypothetical=True,scope='frozen_plan_without_replanning',
             assessment_until=(context or {}).get('assessment_until',now.timestamp()+86400),
             available=result is not None,energy=result.get('energy') if result else None,
@@ -361,7 +457,8 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
         forecast_context = ForecastContext(now,weather,outside,model,settings)
         baseline = optimise(*args,forecast_context=forecast_context)
         try:
-            return refine_night_plan(*args,baseline,forecast_context=forecast_context)
+            refined=refine_night_plan(*args,baseline,forecast_context=forecast_context)
+            return insure_day(*args,refined,forecast_context)
         except Exception:
             fallback = dict(baseline,local_search_status='failed')
             if baseline.get('morning_reserve'):
@@ -394,7 +491,8 @@ def stable_plan(now, room, floor, outside, fire, model, weather, settings, power
             checked=previous.get('search_check_key')==key
             result=replay(now,room,floor,outside,fire,model,weather,settings,
                           previous['segments'],previous['split'],power_kw,reserve_checked=checked,
-                          window_extensions=approved_extensions(settings,previous))
+                          window_extensions=approved_extensions(settings,previous),
+                          day_window=previous.get('day_insurance_window'))
             budget=settings.get('cycle_energy_budget') or {}
             if result and budget:
                 remaining=sum(s.get('kwh',0.)*max(0.,min(s['end'],budget['end'])-max(s['start'],budget['start']))/

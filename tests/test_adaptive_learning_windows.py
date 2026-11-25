@@ -34,6 +34,36 @@ def samples(minutes=120, report_every=60, *, day=0, power=0.):
 
 
 class WindowsTest(unittest.TestCase):
+    def test_rolling_drift_blocks_small_changes_when_path_budget_is_used(self):
+        from heating_learning_windows import promotion_allowed
+        now = datetime.fromtimestamp(BASE + 8*86400, timezone.utc)
+        active = dict(DEFAULT_MODEL, validated=True)
+        value = active["room_loss"]
+        history = [{"at":now.timestamp()-day*86400,
+                    "changes":{"room_loss":[value/1.01,value]}} for day in range(1,6)]
+        proposed = {"room_loss":value*1.005}
+        self.assertFalse(promotion_allowed(active,active,proposed,{"status":"accepted"},
+                                           {"changes_history":history},now))
+        self.assertTrue(promotion_allowed(active,active,proposed,{"status":"accepted"},
+                                          {"changes_history":history[:3]},now))
+
+    def test_verified_manual_session_is_physics_only(self):
+        from heating_learning_windows import _continuous, IDENTITY
+        rows = samples(60, power=4.)
+        for row in rows:
+            row.update(manual_extra_active=True, execution="manual_or_native",
+                       manual_measurement_id=BASE-60, interval_kw=4.,
+                       shadow_reasons=("manual_extra_request",))
+        evidence = build_observation_windows(rows, timezone.utc)
+        self.assertEqual(evidence["windows"][0]["heat"], 3600)
+        self.assertEqual(evidence["eligibility_counts"]["manual_physics_windows"], 1)
+        timestamps = [r["ts"] for r in rows]
+        identity = tuple(rows[0].get(k) for k in IDENTITY)
+        _, reasons = _continuous(rows, timestamps, timestamps[0], timestamps[-1], identity)
+        self.assertIn("manual_extra_request", reasons)
+        rows[5]["manual_measurement_id"] = BASE+10
+        self.assertFalse(build_observation_windows(rows, timezone.utc)["windows"])
+
     def test_off_ventilation_without_supply_can_be_observed(self):
         from heating_learning_windows import ventilation_current_qualified, ventilation_interval_duty
         off={"recuperator":{"relay":"off","supply":"unknown"},
