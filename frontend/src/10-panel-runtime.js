@@ -262,6 +262,12 @@ export class HeatingAIPanel extends HTMLElement {
     }
     this.systemDraft={...this.systemUndo.values};this.systemMessage='Попередні значення відновлено у формі. Натисніть «Зберегти».';this.render();
   }
+  async changeKwsRestore(value) {
+    const current=this.attrs('system_settings').values?.kws_auto_restore;
+    if(this.systemPending||!['enabled','disabled'].includes(current)||!['enabled','disabled'].includes(value)||current===value||Object.keys(this.systemDraft||{}).some(k=>k!=='kws_auto_restore'))return;
+    this.systemDraft={kws_auto_restore:value};
+    await this.saveSystemSettings();
+  }
   async saveSystemSettings() {
     if(this.systemPending||!Object.keys(this.systemDraft).length)return;
     if([...this.shadowRoot.querySelectorAll('[data-system-key]')].some(el=>Object.hasOwn(this.systemDraft,el.dataset.systemKey)&&!el.reportValidity())) {
@@ -305,7 +311,9 @@ export class HeatingAIPanel extends HTMLElement {
     } catch { this.helpersPromise=null;for(const slot of slots)if(slot.isConnected)slot.textContent='Не вдалося завантажити графік Home Assistant. Оновіть сторінку.'; }
   }
   async clicked(e) {
-    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo],[data-manual-energy],[data-open-manual]'); if(!el)return;
+    const el=e.target.closest('[data-tab],[data-info],[data-press],[data-menu],[data-history-range],[data-history-series],[data-history-refresh],[data-forecast-horizon],[data-comparison-days],[data-comparison-zoom],[data-comparison-refresh],[data-comparison-apply],[data-system-help],[data-system-close],[data-system-save],[data-system-reset],[data-system-undo],[data-manual-energy],[data-open-manual],[data-kws-toggle],[data-fan-mode]'); if(!el)return;
+    if(el.hasAttribute('data-kws-toggle')){await this.changeKwsRestore(el.dataset.kwsToggle);return;}
+    if(el.hasAttribute('data-fan-mode')){const option=el.dataset.fanMode,entity=this.entity('fan_mode');if(entity?.attributes?.options?.includes(option)&&entity.state!==option)await this.call('fan_mode','select_option',{option});return;}
     if(el.hasAttribute('data-open-manual')){const target=this.shadowRoot.querySelector('.next-action');if(target){target.open=true;target.querySelector('.manual-energy')?.scrollIntoView({block:'center',behavior:'auto'});}return;}
     if(el.hasAttribute('data-manual-energy')){await this.manualEnergyClick(el.dataset.manualEnergy);return;}
     if(el.hasAttribute('data-system-help')){this.systemHelp=el.dataset.systemHelp;this.render();return;}
