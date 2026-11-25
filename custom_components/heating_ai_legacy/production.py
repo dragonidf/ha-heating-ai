@@ -1393,6 +1393,7 @@ class NativeController(HeatingClimate):
                 learning_status=report["status"],learning_gate=report["reason"],
                 last_successful_learning=(checkpoint.get("last_successful_learning") or
                                           (self.memory.get("learning_success") or {}).get("time")),
+                last_adaptive_promotion=checkpoint.get("last_successful_learning"),
                 independent_windows=report.get("independent_windows",0),
                 qualified_minutes=report.get("qualified_minutes",0.),
                 verified_reports=report.get("verified_reports",0),
