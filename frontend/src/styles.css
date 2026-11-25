@@ -813,3 +813,37 @@ main .overview .hero button,main .overview .heat-sources button,main .overview .
 .heat-sources .source-controls .system-actions{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
 .heat-sources .source-controls .equipment-status{flex-basis:100%;overflow-wrap:anywhere}
 .heat-sources details>summary{line-height:1.25;white-space:normal}
+
+/* Source cards: actual overview controls, not collapsed proxy links. */
+.overview .heat-sources>.card{padding:10px;gap:0;align-self:start;display:flex;flex-direction:column}
+.heat-sources .card-heading{min-height:26px;gap:4px}
+.heat-sources .card-heading h2{margin:0;font-size:.875rem}
+.heat-sources .card-heading .source-state,.heat-sources .fire-phase{min-height:0;max-width:65%;font-size:.6875rem;line-height:1.2}
+.heat-sources .source-reading,.heat-sources .fire-temperature{margin:0;padding:0;min-width:0;line-height:1.05;font-size:1.875rem}
+.heat-sources .source-passive{display:flex;justify-content:space-between;align-items:center;gap:4px;min-height:22px;margin:0;font-size:.6875rem;color:var(--muted)}
+.heat-sources .source-modes{margin:2px 0 0;padding:3px 0 0;gap:4px;min-height:32px}
+.heat-sources .source-modes>div{display:flex;flex-direction:column;justify-content:center;min-width:0;font-size:.6875rem;line-height:1.25;overflow-wrap:anywhere;color:var(--muted)}
+.heat-sources .equipment-readiness{padding:0;margin:0;border:0;min-width:0;gap:4px;border-radius:0;background:transparent!important;text-align:left}
+.heat-sources .equipment-readiness span{line-height:1.2}.heat-sources .equipment-readiness small{display:block;color:var(--muted);font-size:.625rem}
+.heat-sources .source-switch{width:100%;display:flex;align-items:center;justify-content:space-between;gap:3px;text-align:left;padding:0;border:0;border-radius:8px;font-size:.6875rem;line-height:1.2}
+.heat-sources .source-switch>span{min-width:0;overflow-wrap:anywhere}.heat-sources .source-switch small{display:block;color:var(--muted);font-size:.625rem}
+.source-switch-track{position:relative;width:34px;height:19px;flex:none;border-radius:20px;background:var(--control-stroke)}
+.source-switch-track::after{content:'';position:absolute;width:13px;height:13px;left:3px;top:3px;border-radius:50%;background:var(--primary-text-color)}
+.source-switch[aria-checked="true"] .source-switch-track{background:var(--green)}
+.source-switch[aria-checked="true"] .source-switch-track::after{left:18px;background:var(--surface)}
+.heat-sources .source-footer{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(44px,1fr);gap:4px;margin-top:2px;align-items:start}
+.heat-sources .source-action{margin:0;padding:2px 3px;font-size:.6875rem;line-height:1.2;border-radius:8px}
+.heat-sources .source-footer .power-advice{margin:0;padding:0;border:0;min-width:0}
+.heat-sources .source-footer summary{padding:0 2px;justify-content:center;white-space:normal;font-size:.6875rem;gap:2px}
+.heat-sources .source-footer:has(.power-advice[open]){grid-template-columns:minmax(0,1fr)}
+.heat-sources .source-expanded{min-width:0;padding-top:4px}
+.heat-sources .fireplace-card .source-support{margin:0}
+.heat-sources .fireplace-card .fan-actual{margin:0}
+.heat-sources .source-mode-status{min-height:22px;margin:0;color:var(--muted)}
+.source-fan-modes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0;border:1px solid var(--stroke);border-radius:9px;padding:0;min-width:0}
+.heat-sources .source-fan-modes button{border:0;border-radius:7px;padding:1px;font-size:.625rem;line-height:1.15;white-space:normal;overflow-wrap:anywhere;min-width:0}
+.source-fan-modes button[aria-pressed="true"]{background:var(--raised);color:var(--green);box-shadow:inset 0 0 0 1px var(--green);font-weight:600}
+.heat-sources .source-fan-auto .field{display:flex;flex-direction:row;align-items:center;justify-content:space-between;gap:4px;min-height:44px;margin:0;padding:0;font-size:.6875rem}
+.heat-sources .source-fan-auto .toggle{flex:none;min-width:44px}
+.heat-sources .fire-details{margin:2px 0 0;padding:0}
+.heat-sources .source-error{color:var(--source-yellow);font-size:.625rem;overflow-wrap:anywhere}

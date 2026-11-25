@@ -72,8 +72,53 @@ def main():
             assert page.evaluate('calls.length')==0, 'Opening manual heat must not issue a command'
             page.locator('.next-action>summary').click()
             page.locator('.fire-details>summary').click()
-            assert page.locator('.fire-details [data-control="fan_mode"]').is_visible()
+            assert page.locator('.fireplace-card [data-fan-mode="Ручний запуск"]').is_visible()
             page.locator('.fire-details>summary').click()
+            # Reproduce the actual reported production state, including KWS.
+            page.evaluate("""() => {
+              const values={kws_auto_restore:'disabled',power_accounting_method:'kws',boiler_power_mode:'fixed_6'};
+              mockHass.states={...mockHass.states,
+                'sensor.heating_system_settings':{state:'Налаштування',attributes:{revision:1,persisted_revision:1,values}},
+                'sensor.heating_diagnostics':{state:'OK',attributes:{reliability:{equipment:{ready:true,reason:'ready',kws_relay_entity:'switch.energy_meter_kotel',kws_relay_state:'on',kws_link_fresh:true,kws_fault:'off',voltage_qualified:true,kws_restore_status:'disabled'}}}},
+                'switch.energy_meter_kotel':{state:'on',attributes:{}},
+                'sensor.heating_power_confirmed':{state:'0',attributes:{timestamp:new Date().toISOString()}},
+                'sensor.probe':{state:'22.4',attributes:{}},
+                'sensor.heating_power_model':{state:'fixed_6',attributes:{recommendation:{mode:'fixed_9'}}},
+                'sensor.heating_fireplace':{state:'Неактивний',attributes:{temperature:20.9}},
+                'fan.circulation':{state:'off',attributes:{}},
+                'input_select.heating_fan_mode':{state:'Авто',attributes:{options:['Авто','Зупинити','Ручний запуск']}},
+                'input_boolean.heating_fan_control':{state:'on',attributes:{}}};
+              panel.hass={...mockHass};window.calls=[];window.systemRequests=[];
+            }""")
+            for width in (320,360,390,430):
+                page.set_viewport_size({'width':width,'height':844})
+                page.evaluate('()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))')
+                boiler=page.locator('.boiler-card');fire=page.locator('.fireplace-card')
+                assert boiler.locator('[data-kws-toggle]').is_visible()
+                assert fire.locator('[data-fan-mode]').count()==3
+                assert all(c.is_visible() for c in fire.locator('[data-fan-mode]').all())
+                assert boiler.bounding_box()['height']<=290,(width,boiler.bounding_box())
+                assert fire.bounding_box()['height']<=290,(width,fire.bounding_box())
+                assert abs(boiler.bounding_box()['height']-fire.bounding_box()['height'])<=44,(width,boiler.bounding_box(),fire.bounding_box())
+                assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                assert not boiler.locator('.power-advice').get_attribute('open')
+                assert not fire.locator('.fire-details').get_attribute('open')
+                page.locator('.heat-sources').screenshot(path=str(ARTIFACTS/f'heating-production-source-cards-{width}.png'))
+                measurements.append(dict(production_width=width,boiler=boiler.bounding_box()['height'],fireplace=fire.bounding_box()['height']))
+            page.set_viewport_size({'width':390,'height':844})
+            toggle=page.locator('[data-kws-toggle]')
+            assert toggle.get_attribute('aria-checked')=='false'
+            toggle.click()
+            assert toggle.get_attribute('aria-checked')=='true'
+            assert page.evaluate('systemRequests.at(-1).data.values')=={'kws_auto_restore':'enabled'}
+            toggle.click()
+            assert toggle.get_attribute('aria-checked')=='false'
+            assert page.evaluate('systemRequests.at(-1).data.values')=={'kws_auto_restore':'disabled'}
+            page.locator('[data-fan-mode="Ручний запуск"]').click()
+            assert page.evaluate('calls.at(-1)')=={'domain':'input_select','service':'select_option','data':{'entity_id':'input_select.heating_fan_mode','option':'Ручний запуск'}}
+            page.locator('[data-fan-mode="Зупинити"]').click()
+            assert page.evaluate('calls.at(-1).data.option')=='Зупинити'
+            page.evaluate('calls=[];systemRequests=[]')
             page.locator('nav [data-tab="model"]').click()
             page.wait_for_function('panel.comparisonPending===null')
             page.screenshot(path=str(ARTIFACTS/'heating-mobile-history-390.png'),full_page=True)

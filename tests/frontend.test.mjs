@@ -712,8 +712,8 @@ test('journal breakdown uses cached metrics and never equates archive budget wit
   p.boilerActual=()=>({meta:{},stale:false,power:0,heating:false});p.controllerHealth=()=>({});
   p.equipmentReadiness=()=>({configured:true,ready:true,relayState:'on',relayControl:true,relayId:'switch.energy_meter_kotel',label:'Готовий',restoreLabel:'Вимкнено'});
   const boiler=p.boilerOverview(),fire=p.fireplaceOverview();
-  assert.match(boiler,/data-system-key="kws_auto_restore"/);assert.match(boiler,/data-open-manual/);assert.match(boiler,/data-info="switch.energy_meter_kotel"/);
-  assert.match(fire,/data-control="fan_mode"/);assert.match(fire,/Ручний запуск/);assert.match(fire,/data-control="fan_control"/);assert.doesNotMatch(fire,/Насос/);
+  assert.match(boiler,/role="switch" aria-label="Автовідновлення KWS"/);assert.match(boiler,/data-kws-toggle="enabled"/);assert.match(boiler,/data-open-manual/);assert.match(boiler,/data-info="switch.energy_meter_kotel"/);
+  assert.match(fire,/data-fan-mode="Авто"/);assert.match(fire,/data-fan-mode="Зупинити"/);assert.match(fire,/Ручний запуск/);assert.match(fire,/data-control="fan_control"/);assert.doesNotMatch(fire,/Насос/);
 });
 
 test('frontend loader keeps HA registration stable while fetching a new local asset digest',async()=>{
@@ -744,3 +744,5 @@ test('frontend loader keeps HA registration stable while fetching a new local as
     await import(url);assert.equal(definitions.get('heating-ai-v1-'+registered).digest,registered);
   }finally{globalThis.fetch=oldFetch;globalThis.customElements=oldRegistry;await rm(dir,{recursive:true,force:true});}
 });
+
+test('inline KWS toggle cannot save another draft or bypass existing revision save',async()=>{const p=Object.create(HeatingAIPanel.prototype);p.attrs=()=>({values:{kws_auto_restore:'disabled'}});p.systemDraft={boiler_power_mode:'fixed_9'};let calls=0;p.saveSystemSettings=async()=>{calls++;assert.deepEqual(p.systemDraft,{kws_auto_restore:'enabled'});};await p.changeKwsRestore('enabled');assert.equal(calls,0);p.systemDraft={};await p.changeKwsRestore('bogus');assert.equal(calls,0);await p.changeKwsRestore('enabled');assert.equal(calls,1);});
