@@ -638,6 +638,7 @@ test('unified learning card displays current collection status rather than the o
   assert.match(text,/Кандидат · MAE 1 год: —/);assert.match(text,/Кандидат · MAE 3 год: —/);
   assert.match(text,/Наступний аналіз/);assert.match(text,/2026-11-24T10:00/);
   assert.match(text,/Останнє успішне застосування/);assert.match(text,/2026-10-24T06:54/);
+  assert.match(text,/жодних нових коефіцієнтів ще не застосовано/);
   assert.match(text,/Попередній алгоритм · історія спроб/);
   assert.match(text,/Old legacy gate/);
   assert.doesNotMatch(text,/Остання спроба навчання/);
