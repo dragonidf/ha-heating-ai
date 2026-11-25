@@ -354,8 +354,12 @@ class NativeController(HeatingClimate):
         previous=self.memory.get("adaptive_schedule") or {}
         if previous.get("day")!=today:
             slot="daily"
-        elif (now.hour,now.minute)>=(20,45) and previous.get("slot")=="daily" and (
-                self._learning_last_report>previous.get("room_report",0.)):
+        elif previous.get("slot")=="daily" and (
+                ((now.hour,now.minute)>=(20,45) and
+                 self._learning_last_report>previous.get("room_report",0.)) or
+                (previous.get("eligible_at_issue") is False and self._learning_eligible())):
+            # Historical analysis can run during an outage. Spend the one
+            # remaining daily attempt when qualification returns, not only at night.
             slot="retry"
         else:
             return
@@ -370,17 +374,18 @@ class NativeController(HeatingClimate):
             return
         now=self.now()
         self.memory["last_analysis"]=now.isoformat()
+        eligible=self._learning_eligible()
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
                     generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
                     schedule=dict(day=now.date().isoformat(),slot=slot,
-                                  room_report=self._learning_last_report))
+                                  room_report=self._learning_last_report,eligible_at_issue=eligible))
         self._learning_job=issued
         self._learning_status.update(status="evaluating",reason="scheduled_evaluation")
         try:
             self.submit_to_executor(learning.run_learning,self.directory/"online_learning_v1.json",
                 tuple(self._learning_rows),tuple(self._learning_forecasts),issued["model"],
                 deepcopy(self.memory.get("ventilation_model") or {}),
-                deepcopy(self.memory.get("online_learning") or {}),now,self._learning_eligible(),
+                deepcopy(self.memory.get("online_learning") or {}),now,eligible,
                 callback=self._learning_finished,job_id=issued["id"])
         except Exception as exc:
             self._learning_job=None
@@ -454,9 +459,25 @@ class NativeController(HeatingClimate):
 
     def _commit_learning_model(self, model, checkpoint, status, reason):
         """Commit the model and its rollback evidence at one filesystem boundary."""
+        ventilation=self.memory.get("ventilation_model")
+        active_vent=bool(ventilation and ventilation.get("validated")
+                         and ventilation.get("model_version")==self.model.get("version"))
+        if status=="accepted" and active_vent and model.get("room_loss")!=self.model.get("room_loss"):
+            self._learning_status.update(status="rejected",reason="room_loss_not_identifiable_with_ventilation")
+            return False
         checkpoint={**checkpoint,"changes_history":self._learning_history(checkpoint,status,reason,model)}
+        if status=="accepted":
+            checkpoint["prior_ventilation_model"]=deepcopy(ventilation)
         values={**self.memory,"model":model,"weather":self.weather,"online_learning":checkpoint,
                 "previous_model":dict(self.model),"predictions":[],"hour_errors":[]}
+        # Validation used the existing qualified ventilation coefficients. Keep
+        # that exact physical context across a version-only rebind, and restore
+        # its previous snapshot on rollback, at the same atomic write boundary.
+        if status=="accepted" and active_vent:
+            values["ventilation_model"]={**ventilation,"model_version":model["version"],
+                                        "carried_from_model_version":self.model["version"]}
+        elif status=="rolled_back" and "prior_ventilation_model" in checkpoint:
+            values["ventilation_model"]=deepcopy(checkpoint.pop("prior_ventilation_model")) or {}
         values.pop("pending_model",None)
         if status=="accepted":
             values["learning_success"]=dict(time=checkpoint["last_successful_learning"],

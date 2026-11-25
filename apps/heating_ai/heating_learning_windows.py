@@ -383,7 +383,9 @@ def evaluate_windows(windows, model, ventilation=None):
     if (not train or not holdout or not any(w["heat"] for w in train) or not any(w["idle"] for w in train)
             or not any(w["heat"] for w in holdout) or not any(w["idle"] for w in holdout)):
         blockers.append("independent_holdout")
-    fields = FIT_FIELDS
+    # A qualified ventilation fit replaces room_loss in _score; that parameter
+    # is not identifiable from these windows. Never select an arbitrary tied value.
+    fields = ("floor_air",) if qualified_vent else FIT_FIELDS
     if blockers:
         cooling = [w for w in thermal if w["idle"]>=w["end"]-w["start"]
                    and abs(w["floor"]-w["room_start"])<=1.5
@@ -400,7 +402,7 @@ def evaluate_windows(windows, model, ventilation=None):
     old = _score(train,model,ventilation=ventilation)
     best, objective = model, old["mae"]
     for a in (-.01,0.,.01) if "floor_air" in fields else (0.,):
-        for b in (-.01,0.,.01):
+        for b in (-.01,0.,.01) if "room_loss" in fields else (0.,):
             candidate = {**model,"floor_air":model["floor_air"]*(1+a),"room_loss":model["room_loss"]*(1+b)}
             if not all(BOUNDS[k][0]<=candidate[k]<=BOUNDS[k][1] for k in FIT_FIELDS):
                 continue

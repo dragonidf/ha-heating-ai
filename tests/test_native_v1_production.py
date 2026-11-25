@@ -230,6 +230,25 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 learn.assert_called_once()
             self.assertEqual(app.command_ledger.calls,[])
 
+    async def test_daily_retry_waits_for_recovered_qualification(self):
+        with package(self.root / "package") as (component, _):
+            _, app=self.controller(component)
+            date=datetime(2026,11,1,14,tzinfo=timezone.utc)
+            app.memory["adaptive_schedule"]={"day":date.date().isoformat(),"slot":"daily",
+                                             "room_report":1000.,"eligible_at_issue":False}
+            app._learning_last_report=1000.
+            with patch.object(app,"daily_learn") as learn, patch.object(app,"_learning_eligible") as ready:
+                ready.return_value=False
+                app.schedule_learning(date)
+                learn.assert_not_called()
+                ready.return_value=True
+                app.schedule_learning(date)
+                learn.assert_called_once_with(slot="retry")
+                learn.reset_mock()
+                app.memory["adaptive_schedule"]["slot"]="retry"
+                app.schedule_learning(date)
+                learn.assert_not_called()
+
     async def test_learning_commit_and_rollback_are_atomic_and_leave_control_ledgers(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)
@@ -237,7 +256,10 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             app.now = lambda: datetime(2026,11,1,tzinfo=timezone.utc)
             app.model = {"version":6,"validated":True,"floor_air":.035}
             source=dict(app.model)
-            app.memory.update(model=source,manual_energy={"status":"completed"},energy_cursor=3.)
+            ventilation=dict(validated=True,model_version=6,base_room_loss=.015,
+                             recuperator=.002,bath=.001)
+            app.memory.update(model=source,manual_energy={"status":"completed"},energy_cursor=3.,
+                              ventilation_model=dict(ventilation))
             app._learning_rows.append({"ts":1.})
             app.submit_to_executor=Mock()
             app._learning_eligible=Mock(return_value=True)
@@ -250,11 +272,16 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(component.os,"replace",side_effect=OSError("disk")):
                 app._learning_finished({"job_id":job,"result":outcome})
             self.assertEqual(app.model,source)
+            self.assertEqual(app.memory["ventilation_model"],ventilation)
             self.assertEqual(app.statefile.read_bytes() if app.statefile.exists() else None,original)
             app.daily_learn()
             self.assertIsNotNone(app._learning_job)
             app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
             self.assertEqual(app.model["version"],7)
+            self.assertEqual(app.memory["ventilation_model"],{**ventilation,"model_version":7,
+                             "carried_from_model_version":6})
+            self.assertEqual(json.loads(app.statefile.read_text())["ventilation_model"],
+                             app.memory["ventilation_model"])
             self.assertEqual(json.loads(app.statefile.read_text())["model"],app.model)
             self.assertEqual(app.memory["energy_cursor"],3.)
             from test_unified_learning import pairs
@@ -266,6 +293,8 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 app._monitor_learning(issued+3600)
             self.assertEqual(app.model,source)
             self.assertEqual(json.loads(app.statefile.read_text())["model"],source)
+            self.assertEqual(app.memory["ventilation_model"],ventilation)
+            self.assertEqual(json.loads(app.statefile.read_text())["ventilation_model"],ventilation)
             self.assertGreater(app.memory["online_learning"]["frozen_until"],app.now().timestamp())
             self.assertEqual(app.memory["manual_energy"],{"status":"completed"})
             self.assertEqual(app.command_ledger.calls,[])

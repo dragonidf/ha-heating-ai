@@ -47,6 +47,29 @@ class WindowsTest(unittest.TestCase):
         self.assertTrue(promotion_allowed(active,active,proposed,{"status":"accepted"},
                                           {"changes_history":history[:3]},now))
 
+    def test_qualified_ventilation_does_not_change_unidentifiable_room_loss(self):
+        from heating_model import step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        ventilation=dict(validated=True,model_version=6,base_room_loss=.015,
+                         recuperator=.002,bath=.001)
+        truth=dict(model,floor_air=model["floor_air"]*1.01,room_loss=.017)
+        windows=[]
+        for day in range(6):
+            for j,kw in enumerate((0.,4.)):
+                room,floor=21.,22.+4*j
+                start=BASE+day*86400+j*7200
+                steps=[]
+                for i in range(12):
+                    steps.append([300,3.+day,kw,0.,floor])
+                    room,floor=step(room,floor,3.+day,kw,0.,truth,1/12)
+                windows.append(dict(start=start,end=start+3600,day=f"2026-11-{day+1:02}",
+                    room_start=21.,room_end=room,floor=steps[0][4],steps=steps,
+                    heat=3600 if kw else 0,idle=0 if kw else 3600,sun=0.,
+                    equipment=[6,1,"fixed_6"],vent=[1.,0.]))
+        report=evaluate_windows(windows,model,ventilation)
+        self.assertEqual(report["status"],"holdout_passed")
+        self.assertEqual(report["coefficients"],{"floor_air":truth["floor_air"]})
+
     def test_verified_manual_session_is_physics_only(self):
         from heating_learning_windows import _continuous, IDENTITY
         rows = samples(60, power=4.)
