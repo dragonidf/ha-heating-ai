@@ -89,6 +89,7 @@ class FakeHA:
     def __init__(self):
         self.loop = asyncio.get_running_loop()
         self.rows, self.listeners = {}, []
+        self.bus = SimpleNamespace(async_listen=self.listen)
         self.states = SimpleNamespace(get=self.rows.get, async_all=lambda: list(self.rows.values()),
                                       async_set=self.set_state)
         self.services = SimpleNamespace(async_call=AsyncMock(side_effect=self.service))
