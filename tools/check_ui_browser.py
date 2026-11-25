@@ -385,9 +385,10 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==38, fields.count()
+    assert fields.count()==39, fields.count()
+    assert page.locator('[data-system-key="kws_auto_restore"]').count()==1
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==67
+    assert panel.locator('.system-help').count()==68
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()

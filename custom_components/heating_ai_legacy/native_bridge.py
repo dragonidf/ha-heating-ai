@@ -226,6 +226,7 @@ class Hass:
         allowed = {
             "climate": ("set_temperature", "set_hvac_mode"),
             "fan": ("turn_on", "turn_off"),
+            "switch": ("turn_on",),
             "input_boolean": ("turn_off",),
             "input_select": ("select_option",),
             "persistent_notification": ("create", "dismiss"),
@@ -233,7 +234,14 @@ class Hass:
         if action not in allowed.get(domain, ()):
             raise PermissionError("Service outside controller scope")
         targets = {value for value in self.args.values() if isinstance(value, str)}
-        if domain != "persistent_notification" and data.get("entity_id") not in targets:
+        if domain == "switch":
+            config = getattr(self, "cfg", self.args)
+            if (config.get("power_accounting_method") != "kws"
+                    or data.get("entity_id") != config.get("kws_relay", "switch.energy_meter_kotel")
+                    or set(data) != {"entity_id"}
+                    or not callable(getattr(self, "async_command_allowed", None))):
+                raise PermissionError("Switch outside the guarded KWS restoration scope")
+        elif domain != "persistent_notification" and data.get("entity_id") not in targets:
             raise PermissionError("Entity outside configured controller scope")
 
         async def permitted():

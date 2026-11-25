@@ -422,7 +422,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         for row in hass.rows.values():
             row.last_updated = row.last_reported = datetime.fromtimestamp(stamp, timezone.utc)
 
-    async def test_K05_T02_gateway_blocks_deye_disconnect_and_invalid_probe(self):
+    async def test_K05_T02_gateway_reserves_deye_transport_and_blocks_unsafe_inputs(self):
         with package(self.root/'package') as (component, _):
             hass, app = self.controller(component)
             for stamp in range(1000, 1151, 15):
@@ -436,7 +436,10 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 app._dispatch_manual_epoch = app.memory['native_manual_epoch']
                 app._dispatch_action = 'heat'
                 self.assertTrue(app.async_command_allowed('climate', 'set_hvac_mode', {'hvac_mode':'heat'}))
-                for entity, value in [('binary_sensor.deye_link','off'), ('sensor.return','unavailable'), ('sensor.room','unknown')]:
+                hass.rows['binary_sensor.deye_link'].state = 'off'
+                self.assertTrue(app.async_command_allowed('climate','set_hvac_mode', {'hvac_mode':'heat'}))
+                hass.rows['binary_sensor.deye_link'].state = 'on'
+                for entity, value in [('sensor.return','unavailable'), ('sensor.room','unknown')]:
                     old = hass.rows[entity].state
                     hass.rows[entity].state = value
                     self.assertFalse(app.async_command_allowed('climate','set_hvac_mode', {'hvac_mode':'heat'}), entity)
@@ -445,6 +448,34 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 hass.rows['climate.boiler'].attributes['temperature'] = 10
                 hass.rows['switch.energy_meter_kotel'].state = 'off'
                 self.assertFalse(app.async_command_allowed('climate','set_hvac_mode', {'hvac_mode':'auto'}))
+            hass.services.async_call.assert_not_called()
+
+    async def test_voltage_backup_requires_complete_fresh_kws_and_never_masks_bad_input(self):
+        with package(self.root/'package') as (component, _):
+            hass, app = self.controller(component)
+            for stamp in range(1000, 1151, 15):
+                self.configure_kws(hass, app, stamp)
+                with patch.object(component.time, 'time', return_value=stamp):
+                    app.async_kws_status()
+            with patch.object(component.time, 'time', return_value=1150):
+                self.assertTrue(app.async_voltage_status()['voltage_qualified'])
+                self.assertEqual(app.async_voltage_status()['voltage_source'], 'input')
+                hass.rows['sensor.l1'].state = 'unavailable'
+                backup = app.async_voltage_status()
+                self.assertTrue(backup['voltage_qualified'], backup)
+                self.assertEqual(backup['voltage_source'], 'kws')
+                hass.rows['binary_sensor.deye_link'].state = 'off'
+                self.assertTrue(app.async_kws_status()['ready'])
+                hass.rows['sensor.l2'].state = '195'
+                report = app.async_voltage_status()
+                self.assertFalse(report['voltage_qualified'])
+                self.assertEqual(report['voltage_source'], 'input_unsafe_or_incomplete')
+                hass.rows['sensor.l2'].state = '230'
+                hass.rows['sensor.energy_meter_kotel_napruga_c'].last_reported = datetime.fromtimestamp(900, timezone.utc)
+                self.assertFalse(app.async_voltage_status()['voltage_qualified'])
+                hass.rows['sensor.energy_meter_kotel_napruga_c'].last_reported = datetime.fromtimestamp(1150, timezone.utc)
+                hass.rows['sensor.grid'].state = 'Відсутня мережа'
+                self.assertFalse(app.async_voltage_status()['voltage_qualified'])
             hass.services.async_call.assert_not_called()
 
     async def test_restored_kws_setting_and_existing_post_return_relay_survive_reload(self):
@@ -667,7 +698,7 @@ class BreakerTests(unittest.TestCase):
                 self.assertEqual(rows['relay']['value'], 'on')
         self.assertGreater(ready_count, 0)
         self.assertLess(time.perf_counter()-started, 10)
-        self.assertEqual(set(vars(guard)), {'grid_since','stable_since','reset_since','observed_grid_loss'})
+        self.assertEqual(set(vars(guard)), {'grid_since','stable_since','reset_since','observed_grid_loss','last_qualified_link_at','link_grace_seconds'})
 
     def test_K03_unchanged_post_return_status_uses_live_device_reports(self):
         guard = kws.KWSReadiness()

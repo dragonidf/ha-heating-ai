@@ -30,6 +30,33 @@ def valid_policy(minimum_v: Any, maximum_v: Any,
     )
 
 
+def select_phase_voltages(primary, backup, minimum_v=190., maximum_v=260.):
+    """Select a complete fresh three-phase source, never mask a known bad phase.
+
+    The caller supplies only current readings and independently confirms that
+    both meters observe the direct mains. Do not synthesize a mixed vector.
+    """
+    def plausible(value):
+        return type(value) in (int, float) and isfinite(value) and 0 <= value <= 350
+
+    def complete(values):
+        return isinstance(values, list) and len(values) == 3 and all(plausible(v) for v in values)
+
+    if complete(primary):
+        return primary, "input"
+    if (not valid_policy(minimum_v, maximum_v)
+            or not isinstance(primary, list) or len(primary) != 3):
+        return primary, "unavailable"
+    # A valid, explicitly unsafe primary reading cannot be replaced by another
+    # source, even if that source reports three perfectly normal voltages.
+    if any(plausible(v) and (v <= minimum_v+LOW_MARGIN_V or v >= maximum_v-HIGH_MARGIN_V)
+           for v in primary):
+        return primary, "input_unsafe_or_incomplete"
+    if complete(backup):
+        return backup, "kws"
+    return primary, "unavailable"
+
+
 class VoltageGuard:
     def __init__(self):
         self.stable_since: float | None = None
