@@ -235,8 +235,9 @@ class Hass:
             raise PermissionError("Service outside controller scope")
         targets = {value for value in self.args.values() if isinstance(value, str)}
         if domain == "switch":
-            if (self.args.get("power_accounting_method") != "kws"
-                    or data.get("entity_id") != self.args.get("kws_relay", "switch.energy_meter_kotel")
+            config = getattr(self, "cfg", self.args)
+            if (config.get("power_accounting_method") != "kws"
+                    or data.get("entity_id") != config.get("kws_relay", "switch.energy_meter_kotel")
                     or set(data) != {"entity_id"}
                     or not callable(getattr(self, "async_command_allowed", None))):
                 raise PermissionError("Switch outside the guarded KWS restoration scope")
