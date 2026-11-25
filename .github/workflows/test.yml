@@ -40,11 +40,11 @@ jobs:
       - name: Bounded controller and journal measurements
         if: matrix.python == '3.12'
         run: python tools/check_validation.py --output "$RUNNER_TEMP/heating-validation.json"
-      - name: Paired A/A and A/B CPU and RSS against released 0.5.19
+      - name: Paired A/A and A/B CPU and RSS against released 0.5.20
         if: matrix.python == '3.12'
         run: |
-          git fetch --force origin refs/tags/v0.5.19:refs/tags/v0.5.19
-          git worktree add --detach "$RUNNER_TEMP/heating-baseline" v0.5.19
+          git fetch --force origin refs/tags/v0.5.20:refs/tags/v0.5.20
+          git worktree add --detach "$RUNNER_TEMP/heating-baseline" v0.5.20
           python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --both-online | tee "$RUNNER_TEMP/heating-runtime-overhead.json"
       - uses: actions/upload-artifact@v4
         if: matrix.python == '3.12'
