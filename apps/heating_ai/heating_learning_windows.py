@@ -849,8 +849,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                     for r in score_frozen(dict(item["snapshot"],candidate={"coefficients":thermal["coefficients"]}),
                                           [r for r in item["checks"] if r[0] in (1,3)],now.tzinfo)]
             gate=promotion_evidence(scored)
-            result.update(status=gate["status"],reason=gate.get("reason","independent_holdout_passed"),
-                          metrics=gate.get("metrics",{}))
+            result["metrics"]=gate.get("metrics",{})
             result["analysis_status"]=gate["status"]
             result["analysis_blockers"]=[] if gate["status"]=="accepted" else [gate.get("reason","holdout_forecasts_required")]
             if eligible:
