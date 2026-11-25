@@ -847,3 +847,6 @@ main .overview .hero button,main .overview .heat-sources button,main .overview .
 .heat-sources .source-fan-auto .toggle{flex:none;min-width:44px}
 .heat-sources .fire-details{margin:2px 0 0;padding:0}
 .heat-sources .source-error{color:var(--source-yellow);font-size:.625rem;overflow-wrap:anywhere}
+
+/* Circulation is already labelled immediately above the mode chips. */
+.heat-sources .source-fan-modes{margin-top:3px}

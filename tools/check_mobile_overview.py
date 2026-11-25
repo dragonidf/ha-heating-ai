@@ -97,6 +97,8 @@ def main():
                 assert boiler.locator('[data-kws-toggle]').is_visible()
                 assert fire.locator('[data-fan-mode]').count()==3
                 assert all(c.is_visible() for c in fire.locator('[data-fan-mode]').all())
+                print('Production source cards:',width,boiler.bounding_box()['height'],fire.bounding_box()['height'],flush=True)
+                page.locator('.heat-sources').screenshot(path=str(ARTIFACTS/f'heating-production-source-cards-{width}.png'))
                 assert boiler.bounding_box()['height']<=290,(width,boiler.bounding_box())
                 assert fire.bounding_box()['height']<=290,(width,fire.bounding_box())
                 assert abs(boiler.bounding_box()['height']-fire.bounding_box()['height'])<=44,(width,boiler.bounding_box(),fire.bounding_box())
@@ -118,6 +120,10 @@ def main():
             assert page.evaluate('calls.at(-1)')=={'domain':'input_select','service':'select_option','data':{'entity_id':'input_select.heating_fan_mode','option':'Ручний запуск'}}
             page.locator('[data-fan-mode="Зупинити"]').click()
             assert page.evaluate('calls.at(-1).data.option')=='Зупинити'
+            page.evaluate("setHeatingScenario({'input_select.heating_fan_mode':{state:'Зупинити'}})")
+            assert page.locator('[data-fan-mode="Зупинити"]').get_attribute('aria-pressed')=='true'
+            page.locator('[data-fan-mode="Авто"]').click()
+            assert page.evaluate('calls.at(-1).data.option')=='Авто'
             page.evaluate('calls=[];systemRequests=[]')
             page.locator('nav [data-tab="model"]').click()
             page.wait_for_function('panel.comparisonPending===null')
