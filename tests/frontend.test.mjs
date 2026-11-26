@@ -762,3 +762,35 @@ test('frontend loader keeps HA registration stable while fetching a new local as
 });
 
 test('inline KWS toggle cannot save another draft or bypass existing revision save',async()=>{const p=Object.create(HeatingAIPanel.prototype);p.attrs=()=>({values:{kws_auto_restore:'disabled'}});p.systemDraft={boiler_power_mode:'fixed_9'};let calls=0;p.saveSystemSettings=async()=>{calls++;assert.deepEqual(p.systemDraft,{kws_auto_restore:'enabled'});};await p.changeKwsRestore('enabled');assert.equal(calls,0);p.systemDraft={};await p.changeKwsRestore('bogus');assert.equal(calls,0);await p.changeKwsRestore('enabled');assert.equal(calls,1);});
+
+test('learning reports real support for all four thermal coefficients without claiming promotion',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.attrs=()=>({learning_status:'collecting',parameters:{floor_air:.044,room_loss:.0128,floor_decay:.12,heat_gain:.5},
+    parameter_support:{floor_air:{available:{windows:12,minutes:180,days:3},training:{windows:8,minutes:120,days:2},holdout:{windows:4,minutes:60,days:1},selected_for_candidate:true,status:'candidate_evaluated',basis:'thermal_windows'},
+      room_loss:{available:{windows:12,minutes:180,days:3},status:'not_identifiable_with_ventilation',basis:'thermal_windows'},
+      floor_decay:{available:{windows:0,minutes:0,days:0},status:'insufficient_support',basis:'warm_idle'},
+      heat_gain:{available:{windows:2,minutes:60,days:1},status:'not_selected',basis:'measured_heat'}}});
+  p.section=(title,body)=>body;p.compactMetric=()=>'';p.time=()=> '12:00';
+  const markup=p.learningProgress();
+  assert.match(markup,/Докази за коефіцієнтами/);
+  for(const label of ['Передача тепла в кімнату','Тепловтрати','Охолодження підлоги','Потужність нагріву підлоги'])assert.ok(markup.includes(label));
+  assert.match(markup,/12 \/ 180 \/ 3/);
+  assert.match(markup,/8 \/ 120 \/ 2/);
+  assert.match(markup,/4 \/ 60 \/ 1/);
+  assert.match(markup,/Не відокремлено від вентиляції/);
+  assert.match(markup,/0 \/ 0 \/ 0/);
+  assert.doesNotMatch(markup,/NaN|undefined|Коефіцієнти оновлено/);
+});
+test('quality distinguishes advisory 48h conditional cohorts and independent counts',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.section=(title,body)=>body;
+  p.attrs=()=>({advisory_validation:{groups:[
+    {horizon:48,basis:'conditional',weather_known:false,schedule_known:false,days:3,independent:{n:2,mae:.65,bias:-.25},all_reports:{n:16,mae:.35},minimum_lead_hours:47.5,maximum_lead_hours:48.3},
+    {horizon:24,basis:'known',weather_known:true,schedule_known:true,days:1,independent:{n:1,mae:.4,bias:.4},all_reports:{n:4}}],pending:{24:0,36:2,48:3},used_for_control:false}});
+  const markup=p.controllerQuality();
+  assert.match(markup,/Дорадчий прогноз · 24–48 год/);
+  assert.match(markup,/0,650/);assert.match(markup,/-0,250/);
+  assert.match(markup,/2 \/ 16 \/ 3/);
+  assert.match(markup,/36 год: 2/);assert.match(markup,/48 год: 3/);
+  assert.match(markup,/не керує котлом/);
+  assert.doesNotMatch(markup,/NaN|undefined/);
+});
