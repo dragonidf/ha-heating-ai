@@ -88,6 +88,43 @@ class DecisionHistoryTests(unittest.TestCase):
             self.assertTrue(failed['storage_degraded'])
             self.assertTrue(protected.exists())
 
+    def test_staged_pack_is_additive_and_reader_accepts_exact_packed_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            values=[dict(i=i,data=list(range(2000))) for i in range(8)]
+            stamp=time.time()
+            ids=[journal.snapshot(v,stamp) for v in values]
+            before={p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')}
+            result=journal.stage_snapshot_pack(ids)
+            self.assertEqual(result['snapshots'],8)
+            self.assertEqual(before,{p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')})
+            restored=DecisionJournal(directory)
+            for key,value in zip(ids,values):
+                self.assertEqual(restored.read_snapshot(key),value)
+                self.assertEqual(restored._packed_snapshot(key),gzip.decompress(before[key+'.json.gz']))
+            # Simulate a future authorized promotion, not done by staging.
+            (journal.directory/(ids[0]+'.json.gz')).unlink()
+            self.assertEqual(restored.read_snapshot(ids[0]),values[0])
+            blob=journal.directory/'packed_v1'/(result['pack']+'.xz')
+            blob.write_bytes(blob.read_bytes()[:-4])
+            with self.assertRaises(ValueError):restored.read_snapshot(ids[0])
+            # A damaged staged copy never makes existing originals unreadable.
+            self.assertEqual(restored.read_snapshot(ids[1]),values[1])
+
+    def test_staging_failure_keeps_all_legacy_snapshots(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            ids=[journal.snapshot(dict(i=i),time.time()) for i in range(2)]
+            before={p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')}
+            original=journal._atomic_pack_file
+            def interrupted(path,raw,mtime=None):
+                if path.name.endswith('.snapshot-ref'):raise OSError('interrupted')
+                return original(path,raw,mtime)
+            with patch.object(journal,'_atomic_pack_file',side_effect=interrupted):
+                with self.assertRaises(OSError):journal.stage_snapshot_pack(ids)
+            self.assertEqual(before,{p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')})
+
     def test_snapshot_corruption_and_bad_identifiers_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)

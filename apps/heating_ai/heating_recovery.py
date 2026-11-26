@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 import gzip
+import lzma
 import hashlib
 import json
 import os
@@ -1724,13 +1725,122 @@ class DecisionJournal:
         os.utime(path,(stamp,stamp))
         return digest
 
+    PACK_RAW_LIMIT=8*1024*1024
+    PACK_SIZE_LIMIT=9*1024*1024
+    PACK_MEMORY_LIMIT=16*1024*1024
+    PACK_ROWS=8
+
+    @staticmethod
+    def _valid_digest(value):
+        return isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
+
+    @staticmethod
+    def _sync_directory(path):
+        fd=os.open(path,os.O_RDONLY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
+
+    @classmethod
+    def _atomic_pack_file(cls,path,raw,mtime=None):
+        # Immutable content addresses: never overwrite conflicting bytes.
+        if path.exists():
+            if path.read_bytes()!=raw:raise ValueError('Conflicting packed evidence')
+            return
+        temporary=path.with_name(path.name+'.'+uuid4().hex+'.tmp')
+        try:
+            with temporary.open('xb') as stream:
+                stream.write(raw);stream.flush();os.fsync(stream.fileno())
+            if mtime is not None:os.utime(temporary,(mtime,mtime))
+            temporary.replace(path);cls._sync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _decode_snapshot_pack(cls,blob,ids):
+        if (not 1<=len(ids)<=cls.PACK_ROWS or len(set(ids))!=len(ids)
+                or not all(cls._valid_digest(v) for v in ids) or len(blob)>cls.PACK_SIZE_LIMIT):
+            raise ValueError('Invalid snapshot pack bounds')
+        try:
+            decoder=lzma.LZMADecompressor(format=lzma.FORMAT_XZ,memlimit=cls.PACK_MEMORY_LIMIT)
+            raw=decoder.decompress(blob,max_length=cls.PACK_RAW_LIMIT+1)
+        except lzma.LZMAError as exc:raise ValueError('Invalid compressed snapshot pack') from exc
+        if len(raw)>cls.PACK_RAW_LIMIT or not decoder.eof or decoder.unused_data or not raw.endswith(b'\n'):
+            raise ValueError('Incomplete or oversized snapshot pack')
+        rows=raw[:-1].split(b'\n')
+        if len(rows)!=len(ids) or any(hashlib.sha256(row).hexdigest()!=key for row,key in zip(rows,ids)):
+            raise ValueError('Snapshot pack checksum mismatch')
+        return rows
+
+    def _packed_snapshot(self,digest):
+        pointer=self.directory/(digest+'.snapshot-ref')
+        if pointer.stat().st_size>2048:raise ValueError('Oversized snapshot pointer')
+        ref=json.loads(pointer.read_bytes())
+        key=ref.get('pack')
+        if ref.get('schema')!=1 or not self._valid_digest(key):
+            raise ValueError('Invalid snapshot pointer')
+        folder=self.directory/'packed_v1'
+        manifest=folder/(key+'.pack.json')
+        blob_path=folder/(key+'.xz')
+        if manifest.stat().st_size>16384 or blob_path.stat().st_size>self.PACK_SIZE_LIMIT:
+            raise ValueError('Oversized snapshot pack')
+        header=json.loads(manifest.read_bytes())
+        ids=header.get('snapshots')
+        if (header.get('schema')!=1 or header.get('sha256')!=key or not isinstance(ids,list)
+                or digest not in ids):raise ValueError('Invalid snapshot pack manifest')
+        blob=blob_path.read_bytes()
+        if hashlib.sha256(blob).hexdigest()!=key:raise ValueError('Snapshot block checksum mismatch')
+        rows=self._decode_snapshot_pack(blob,ids)
+        return rows[ids.index(digest)]
+
+    def stage_snapshot_pack(self,digests):
+        """Durable additive staging only; no source removal or automatic migration.
+
+        This preparatory API deliberately keeps all legacy gzip files, so a
+        failed or interrupted stage cannot change the existing reader or rollback.
+        """
+        with self.lock:
+            ids=list(digests)
+            if not 2<=len(ids)<=self.PACK_ROWS or len(set(ids))!=len(ids) or not all(self._valid_digest(v) for v in ids):
+                raise ValueError('Invalid snapshot pack selection')
+            rows=[];mtimes=[];size=0
+            for digest in ids:
+                path=self.directory/(digest+'.json.gz')
+                with gzip.open(path,'rb') as stream:raw=stream.read(self.PACK_RAW_LIMIT+1)
+                size+=len(raw)+1
+                if size>self.PACK_RAW_LIMIT or b'\n' in raw or hashlib.sha256(raw).hexdigest()!=digest:
+                    raise ValueError('Invalid or oversized source snapshot')
+                json.loads(raw);rows.append(raw);mtimes.append(path.stat().st_mtime)
+            blob=lzma.compress(b'\n'.join(rows)+b'\n',format=lzma.FORMAT_XZ,preset=1)
+            if self._decode_snapshot_pack(blob,ids)!=rows:raise ValueError('Snapshot pack roundtrip mismatch')
+            key=hashlib.sha256(blob).hexdigest()
+            folder=self.directory/'packed_v1';folder.mkdir(exist_ok=True)
+            self._sync_directory(self.directory)
+            encode=lambda v:json.dumps(v,sort_keys=True,separators=(',',':')).encode()
+            manifest=encode(dict(schema=1,sha256=key,snapshots=ids))
+            self._atomic_pack_file(folder/(key+'.xz'),blob)
+            self._atomic_pack_file(folder/(key+'.pack.json'),manifest)
+            for digest,mtime in zip(ids,mtimes):
+                self._atomic_pack_file(self.directory/(digest+'.snapshot-ref'),
+                    encode(dict(schema=1,pack=key)),mtime)
+                if self._packed_snapshot(digest)!=rows[ids.index(digest)]:
+                    raise ValueError('Packed snapshot verification failed')
+            # Recount on the next normal rotation; staged bytes are not a
+            # space-saving claim until promotion/retention is implemented.
+            self.used_bytes=None
+            return dict(pack=key,snapshots=len(ids),packed_bytes=len(blob)+len(manifest))
+
     def read_snapshot(self,digest):
-        if len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):
+        if not self._valid_digest(digest):
             raise ValueError('Invalid snapshot identifier')
-        raw=gzip.decompress((self.directory/(digest+'.json.gz')).read_bytes())
-        if hashlib.sha256(raw).hexdigest()!=digest:
-            raise ValueError('Snapshot checksum mismatch')
-        return json.loads(raw)
+        with self.lock:
+            path=self.directory/(digest+'.json.gz')
+            if path.exists():
+                raw=gzip.decompress(path.read_bytes())
+            else:
+                raw=self._packed_snapshot(digest)
+            if hashlib.sha256(raw).hexdigest()!=digest:
+                raise ValueError('Snapshot checksum mismatch')
+            return json.loads(raw)
 
     def _recent_telemetry_lines(self,path,minimum_ts):
         """Stream the bounded tail from one descriptor, even during a rotation."""
