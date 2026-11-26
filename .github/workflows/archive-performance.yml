@@ -1,0 +1,29 @@
+name: Online archive maintenance performance
+on:
+  pull_request:
+    paths:
+      - 'tools/benchmark_online_archive.py'
+      - 'apps/heating_ai/heating_recovery.py'
+      - 'custom_components/heating_ai_legacy/production.py'
+      - '.github/workflows/archive-performance.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  large-archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/benchmark_online_archive.py --entries 100000 --output "$RUNNER_TEMP/heating-online-archive.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: online-archive-raw
+          path: ${{ runner.temp }}/heating-online-archive.json
+          retention-days: 14
