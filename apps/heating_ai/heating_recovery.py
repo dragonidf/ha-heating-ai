@@ -1715,11 +1715,12 @@ class DecisionJournal:
             # Reconcile references before legacy rotation so a newer gzip mtime
             # can protect an older staged pointer.
             self._rotate_packed(stamp)
-            for p in self.directory.iterdir():
-                if (p.is_file() and not p.name.endswith('.snapshot-ref')
-                        and not (self.packed_gc_error and p.name.endswith('.json.gz'))
-                        and p.stat().st_mtime<stamp-self.retention):
-                    p.unlink()
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    if (entry.is_file() and not entry.name.endswith('.snapshot-ref')
+                            and not (self.packed_gc_error and entry.name.endswith('.json.gz'))
+                            and entry.stat().st_mtime<stamp-self.retention):
+                        Path(entry.path).unlink()
             self.last_rotation=stamp
             # Single streaming scan: do not retain thousands of Path/stat pairs
             # in RAM just to publish archive composition once per hour.
@@ -1728,32 +1729,33 @@ class DecisionJournal:
             cold=[]
             rejected=set(getattr(self,'_cold_pack_skipped',()))
             self._cold_queue=()
-            for path in self.directory.iterdir():
-                if not path.is_file():
-                    continue
-                info=path.stat()
-                self.used_bytes+=info.st_size
-                self.oldest_at=min(self.oldest_at,info.st_mtime)
-                if path.name.endswith('.json.gz'):
-                    self.snapshot_bytes+=info.st_size
-                    self.snapshot_count+=1
-                    # Reuse the existing stat; the shortlist stays bounded.
-                    # Only potential oldest entries need a pointer lookup.
-                    if (self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES
-                            and stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE):
-                        digest=path.name[:-8]
-                        item=(info.st_mtime,digest)
-                        if (digest not in rejected and (len(cold)<self.COLD_QUEUE_LIMIT or item<cold[-1])
-                                and self._valid_digest(digest) and not path.is_symlink()
-                                and not (self.directory/(digest+'.snapshot-ref')).exists()):
-                            insort(cold,item)
-                            if len(cold)>self.COLD_QUEUE_LIMIT:cold.pop()
-                elif path.name.endswith(('.jsonl','.jsonl.gz')):
-                    self.daily_log_bytes+=info.st_size
-                elif path.name.endswith('.snapshot-ref'):
-                    self.snapshot_bytes+=info.st_size
-                    if not (self.directory/(path.name[:-13]+'.json.gz')).exists():
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    info=entry.stat()
+                    self.used_bytes+=info.st_size
+                    self.oldest_at=min(self.oldest_at,info.st_mtime)
+                    if entry.name.endswith('.json.gz'):
+                        self.snapshot_bytes+=info.st_size
                         self.snapshot_count+=1
+                        # Reuse the existing stat; the shortlist stays bounded.
+                        # Only potential oldest entries need a pointer lookup.
+                        if (self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES
+                                and stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE):
+                            digest=entry.name[:-8]
+                            item=(info.st_mtime,digest)
+                            if (digest not in rejected and (len(cold)<self.COLD_QUEUE_LIMIT or item<cold[-1])
+                                    and self._valid_digest(digest) and not entry.is_symlink()
+                                    and not (self.directory/(digest+'.snapshot-ref')).exists()):
+                                insort(cold,item)
+                                if len(cold)>self.COLD_QUEUE_LIMIT:cold.pop()
+                    elif entry.name.endswith(('.jsonl','.jsonl.gz')):
+                        self.daily_log_bytes+=info.st_size
+                    elif entry.name.endswith('.snapshot-ref'):
+                        self.snapshot_bytes+=info.st_size
+                        if not (self.directory/(entry.name[:-13]+'.json.gz')).exists():
+                            self.snapshot_count+=1
             folder=self.directory/'packed_v1'
             self.packed_bytes=self.packed_snapshot_count=self.packed_blocks=0
             if folder.is_dir():
