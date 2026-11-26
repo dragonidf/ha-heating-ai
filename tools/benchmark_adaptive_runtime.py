@@ -218,11 +218,26 @@ def main():
     parser.add_argument("--controlled",type=Path,help="write randomized paired 30+ triplets, including raw measurements")
     parser.add_argument("--repeat",type=int,default=30)
     parser.add_argument("--full-ring",action="store_true",help="keep the full 4032-row historical sample buffer")
+    parser.add_argument("--profile",action="store_true",help="separate CPU hotspot diagnostic; not valid for timed acceptance")
     opts=parser.parse_args()
-    if opts.controlled:opts.both_online=True
+    if opts.profile and opts.controlled:
+        parser.error("profiling must not contaminate controlled timings")
+    if opts.profile or opts.controlled:opts.both_online=True
     if opts.child:
         path,mode=opts.child
-        print(json.dumps(asyncio.run(child(Path(path),mode,Path(path).parent,full_ring=opts.full_ring))))
+        task=child(Path(path),mode,Path(path).parent,full_ring=opts.full_ring)
+        if opts.profile:
+            import cProfile
+            import pstats
+            profiler=cProfile.Profile(timer=process_time)
+            result=profiler.runcall(asyncio.run,task)
+            print(f"CPU profile: {Path(path).name}, full_ring={opts.full_ring}",file=sys.stderr)
+            stats=pstats.Stats(profiler,stream=sys.stderr).strip_dirs()
+            stats.sort_stats("cumulative").print_stats(45)
+            stats.sort_stats("tottime").print_stats(45)
+        else:
+            result=asyncio.run(task)
+        print(json.dumps(result))
         return
     with TemporaryDirectory() as folder:
         root=Path(folder)
@@ -245,7 +260,8 @@ def main():
         for name,mode in variants:
             result=json.loads(subprocess.check_output(
                 [sys.executable,__file__,str(baseline),"--child",str(root/name),mode]+
-                (["--full-ring"] if opts.full_ring else []),text=True))
+                (["--full-ring"] if opts.full_ring else [])+
+                (["--profile"] if opts.profile else []),text=True))
             if mode=="online":
                 (root/"online_learning_v1.json").unlink()
             actions=result.pop("command_golden")
@@ -254,7 +270,10 @@ def main():
             elif actions!=golden:
                 raise AssertionError("Production command sequence changed")
             results[name+":"+mode]=result
-        if opts.both_online:
+        if opts.profile:
+            print(json.dumps(dict(scope="instrumented CPU profile, not acceptance timing",
+                                  exact_command_match=True,full_ring=opts.full_ring)))
+        elif opts.both_online:
             baseline=results["baseline:online"];control=results["control:online"];candidate=results["candidate:online"]
             comparison={}
             for operation in ("tick","aggregation","training"):
