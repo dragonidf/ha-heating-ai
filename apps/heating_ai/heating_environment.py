@@ -305,7 +305,9 @@ def prepare_ventilation(base_loss,settings):
 def has_upper_risk(settings):
     environment=settings.get('environment') or {}
     solar=environment.get('solar') or {}
-    return bool(solar.get('observed_gain') or solar.get('validated') and solar.get('coefficient') or
+    profile=settings.get('modulation_profile') or {}
+    return bool(profile.get('power_source')=='kws_phases' and profile.get('validated') is True and
+                profile.get('conservative_upper_kw') or solar.get('observed_gain') or solar.get('validated') and solar.get('coefficient') or
                 (environment.get('residual') or {}).get('rate',0)>0 or (settings.get('ventilation_model') or {}).get('validated'))
 
 

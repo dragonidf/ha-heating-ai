@@ -17,7 +17,7 @@ from heating_fallback import (fallback_power,repair_samples,estimated_power,alig
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
                            nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
-                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,outdoor_at,SEARCH_FIELDS)
+                           learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,retain_kws_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
 from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at,
@@ -620,7 +620,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.equipment_listeners=tracked
 
     def refresh_equipment_models(self):
-        self.memory['power_calibrations']=learn_power_modes(self.samples,self.model)
+        self.memory['power_calibrations']=retain_kws_profile(learn_power_modes(self.samples,self.model),
+            self.memory.get('kws_forecast_profile'),self.model,self.memory.get('equipment_version',0))
         fit=fit_ventilation(self.samples,self.model,self.climate_tz)
         previous=self.memory.get('ventilation_model') or {}
         today=self.now().date().isoformat()
@@ -821,6 +822,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             bands=[{k:b.get(k) for k in ('return_min','return_max','power_kw','minutes')} for b in profile.get('bands',[])[:16]],
             measured_calibration=dict(intervals=observed.get('intervals'),minutes=observed.get('minutes'),
                 electrical_validated=observed.get('electrical_validated'),
+                thermal_validation_status=('passed' if profile.get('power_source')=='kws_phases' and profile.get('validated')
+                    else observed.get('thermal_validation_status')),
+                forecast_calibration=(self.memory.get('online_learning') or {}).get('power_learning'),
                 holdout_mae_kw=observed.get('holdout_mae_kw'),baseline_mae_kw=observed.get('baseline_mae_kw'),
                 bands=[{k:b.get(k) for k in ('return_min','return_max','measured_kw','minutes')}
                        for b in observed.get('bands',[])[:16]])

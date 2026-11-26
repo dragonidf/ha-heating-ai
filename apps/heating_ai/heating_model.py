@@ -563,6 +563,8 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
         environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain','observed_at')},
         astronomy=(settings.get('environment') or {}).get('astronomy'),
         residual=(settings.get('environment') or {}).get('residual'))
+    upper=certified_upper_power(settings.get('modulation_profile'))
+    if upper is not None:data['profile_upper_kw']=upper
     return hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
@@ -618,6 +620,7 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
     start_stamp=now.timestamp()
     actuator=settings.get('actuator') or {};actuator_enabled=bool(actuator)
     risk_enabled=has_upper_risk(settings)
+    upper_power=certified_upper_power(settings.get('modulation_profile'))
     beams = [(0., room, floor, [], [], 0., room, room, 0.,actuator.get('action'),actuator.get('changed_at',0.),0.,room,floor,0.,0.)]
     budget=settings.get('cycle_energy_budget') or {}
     def rank(value):
@@ -789,12 +792,14 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                                       modulation_power(nf,profile,3.,anchor,elapsed_minutes)) if active else 0.
                         delivered_kw=effective_kw
                         nr,nf=integrate(nr,nf,out,delivered_kw,fire_gain,dt,gains[0])
-                        ur,uf=(integrate(ur,uf,out,delivered_kw,fire_gain,dt,gains[1],upper=True)
+                        risk_kw=max(delivered_kw,upper_power) if active and upper_power is not None else delivered_kw
+                        ur,uf=(integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True)
                                if risk_enabled else (nr,nf))
                         # A session remains unsafe if its stored heat overshoots
                         # later, after the boiler has stopped (including daytime).
                         upper_risk=max(nr,ur)
-                        if upper_risk>max(room,limit_high)+.01 and (active or had_heat or heat_segments):
+                        if ((upper_risk>max(room,limit_high)+.01 and (active or had_heat or heat_segments))
+                                or active and upper_power is not None and uf>50):
                             unsafe=True
                             break
                         shortage+=max(0.,limit_low-nr)*dt
@@ -1325,11 +1330,16 @@ def learn_power_modes(samples,model=None):
                             (interval:=modulation_interval(a,b,source)) is not None]
             sessions=sorted({a['heat_command_at'] for a,b,interval in physical_pairs})
         if len(sessions)<3:continue
-        split=sessions[-1];train=[r for r in rows if r.get('heat_command_at')!=split];test=[r for r in rows if r.get('heat_command_at')==split]
+        split=sessions[-max(1,len(sessions)//4)] if source=='kws_phases' else sessions[-1]
+        if source=='kws_phases':
+            train=[r for r in rows if number(r.get('heat_command_at')) is not None and r['heat_command_at']<split]
+            test=[r for r in rows if number(r.get('heat_command_at')) is not None and r['heat_command_at']>=split]
+        else:
+            train=[r for r in rows if r.get('heat_command_at')!=split];test=[r for r in rows if r.get('heat_command_at')==split]
         evaluation_model=(test[0].get('thermal_model') or model) if test else model
         baseline=3. if mode=='auto' else float(mode[-1])
-        training_observations=None if physical_pairs is None else (interval for a,b,interval in physical_pairs if a['heat_command_at']!=split)
-        testing_pairs=zip(test,test[1:]) if physical_pairs is None else ((a,b) for a,b,interval in physical_pairs if a['heat_command_at']==split)
+        training_observations=None if physical_pairs is None else (interval for a,b,interval in physical_pairs if a['heat_command_at']<split)
+        testing_pairs=zip(test,test[1:]) if physical_pairs is None else ((a,b) for a,b,interval in physical_pairs if a['heat_command_at']>=split)
         candidate=learn_modulation(train,power_source=source,prior_kw=baseline if source=='kws_phases' else 3.,observations=training_observations)
         errors=[];base=[];thermal=[];base_thermal=[];holdout_minutes=0.
         simulated=None;reference=None
@@ -1367,9 +1377,40 @@ def learn_power_modes(samples,model=None):
             baseline_temperature_mae=statistics.mean(base_thermal) if base_thermal else None,
             stage_probabilities=probabilities,stage_seconds=stage_seconds,stage_note='Probabilities from time-aligned instantaneous power bands only; not proof of physical TEN contacts',
             last_sample_at=rows[-1]['ts'] if rows else None)
+        if physical_pairs is not None:
+            candidate.update(training_until=max((b['ts'] for a,b,_ in physical_pairs if a['heat_command_at']<split),default=0.),
+                electrical_holdout_days=len({datetime.fromtimestamp(a['ts']).date() for a,b,_ in physical_pairs if a['heat_command_at']>=split}),
+                observed_upper_kw=max((interval[4] for a,b,interval in physical_pairs),default=baseline))
         candidates[mode]=candidate
         if accepted:profiles[mode]=candidate
     return dict(version=2,profiles=profiles,candidates=candidates,status='validated' if profiles else 'insufficient_independent_sessions')
+
+
+def certified_upper_power(profile):
+    if not profile or profile.get('power_source')!='kws_phases' or profile.get('validated') is not True:
+        return None
+    value=number(profile.get('conservative_upper_kw'))
+    mode=profile.get('physical_mode')
+    rated=9. if mode=='auto' else float(mode[-1]) if mode in ('fixed_3','fixed_6','fixed_9') else None
+    observed=number(profile.get('observed_upper_kw'))
+    return value if (rated is not None and observed is not None and value is not None
+                     and max(rated,observed)<=value<=10.5
+                     and profile.get('thermal_validation_status')=='passed') else None
+
+
+def retain_kws_profile(calibrations, profile, model, equipment_version):
+    result=dict(calibrations or {})
+    result['profiles']={mode:p for mode,p in (result.get('profiles') or {}).items()
+                        if p.get('power_source')!='kws_phases'}
+    if (certified_upper_power(profile) is not None and profile.get('thermal_model_version')==model.get('version')
+            and profile.get('equipment_version')==equipment_version
+            and profile.get('physical_mode') in ('fixed_3','fixed_6','fixed_9','auto')):
+        result['profiles'][profile['physical_mode']]=profile
+    if result['profiles']:
+        result['status']='validated'
+    elif result.get('status')=='validated':
+        result['status']='insufficient_independent_sessions'
+    return result
 
 
 def power_profile(mode,calibrations,legacy,equipment_version=None):

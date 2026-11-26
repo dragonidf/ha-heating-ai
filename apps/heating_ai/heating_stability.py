@@ -9,7 +9,7 @@ import math
 from time import monotonic
 from uuid import uuid4
 from heating_model import (held_action,number,plan as optimise, step, outdoor_at, in_window,
-                           modulation_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
+                           modulation_power, certified_upper_power, morning_runs, morning_runs_valid,comfort_at,weather_coverage,
                            reserve_context,attach_reserve,coast_reserve_needed,local_boundary,
                            SEARCH_POLICY_VERSION,SEARCH_FIELDS,search_input_key,apply_search_diagnostics,power_profile,
                            ForecastContext)
@@ -145,6 +145,7 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
     anchor=settings.get('modulation_anchor')
     rows=[]; r,f=room,floor; ur,uf=room,floor;low=high=room; energy=0.; all_segments=[]
     risk_enabled=has_upper_risk(settings)
+    upper_power=certified_upper_power(profile)
     actuator=settings.get('actuator') or {};command=actuator.get('action');command_at=actuator.get('changed_at',0.)
     for block in range(count):
         a=start+1800*block; b=a+1800
@@ -176,14 +177,15 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 fire_gain=model['fire_gain']*max(0.,fire*math.exp(-(t-start)/7200))
                 delivered_kw=kw if active else 0.
                 r,f=forecast.integrate(r,f,out,delivered_kw,fire_gain,dt,gains[0])
-                ur,uf=(forecast.integrate(ur,uf,out,delivered_kw,fire_gain,dt,gains[1],upper=True)
+                risk_kw=max(delivered_kw,upper_power) if active and upper_power is not None else delivered_kw
+                ur,uf=(forecast.integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True)
                        if risk_enabled else (r,f))
                 low=min(low,r); high=max(high,r)
                 fine.append(dict(ts=u,temperature=r,upper_temperature=max(r,ur),**{'return':f}))
                 if max(r,ur)>(hi if strict_upper else max(room,hi)+.01) and (active or all_segments or heats):
                     return None
                 if active:
-                    if r>hi or f>50:
+                    if r>hi or f>50 or upper_power is not None and uf>50:
                         return None
                     s=dict(start=t,end=u,power_kw=round(kw,3),kwh=kw*dt)
                     s['conditional']=not schedule_covered(data,t,u)

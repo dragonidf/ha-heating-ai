@@ -28,7 +28,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .native_controller.heating_climate import HeatingClimate
 from .native_controller import heating_learning_windows as learning
-from .native_controller.heating_model import comfort_at, number
+from .native_controller.heating_model import comfort_at, number, retain_kws_profile
 from .native_controller.heating_ui import system_fields
 from .native_controller.heating_recovery import wire_values
 from .native_voltage import VoltageGuard, select_phase_voltages
@@ -232,6 +232,7 @@ class NativeController(HeatingClimate):
             "boiler_power_mode","fire_valid","fire_active","external_gain","residual_gain",
             "room_source_disagreement","room_sources_suspect","energy")
         compact = {key:row.get(key) for key in fields}
+        compact.update(heating_requested=row.get("heating_requested"),command_at=number(self.memory.get("command_at")))
         stamp = row["ts"]
         manual = self.memory.get("manual_energy") or {}
         if (row.get("manual_extra_active") is True and manual.get("status")=="active"
@@ -387,6 +388,9 @@ class NativeController(HeatingClimate):
                 tuple(self._learning_rows),tuple(self._learning_forecasts),issued["model"],
                 deepcopy(self.memory.get("ventilation_model") or {}),
                 deepcopy(self.memory.get("online_learning") or {}),now,eligible,
+                dict(mode=self.cfg.get("boiler_power_mode","unconfirmed"),equipment=issued["equipment"],
+                     calibrations=deepcopy(self.memory.get("power_calibrations") or {}),
+                     active=deepcopy(self.memory.get("kws_forecast_profile"))),
                 callback=self._learning_finished,job_id=issued["id"])
         except Exception as exc:
             self._learning_job=None
@@ -406,6 +410,8 @@ class NativeController(HeatingClimate):
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
                                         "verified_reports","rejection_counts","current_reasons","eligibility_counts",
                                         "analysis_status","analysis_blockers")}
+        if result.get("power_learning") is not None:
+            self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
         self._apply_learning_result(issued,result)
         if self._learning_status.get("status") not in ("accepted","rolled_back"):
             checkpoint=self.memory.setdefault("online_learning",{})
@@ -413,7 +419,7 @@ class NativeController(HeatingClimate):
                 checkpoint,self._learning_status["status"],self._learning_status.get("reason"))
 
     def _apply_learning_result(self, issued, result):
-        if not (result.get("proposed") or result.get("rollback")):
+        if not (result.get("proposed") or result.get("proposed_power") or result.get("rollback")):
             return
         checkpoint=self.memory.get("online_learning") or {}
         now=self.now()
@@ -426,12 +432,14 @@ class NativeController(HeatingClimate):
         if result.get("rollback"):
             self._rollback_learning(result["reason"])
         elif (result.get("evidence_fingerprint")!=checkpoint.get("last_rejected_evidence")
-              and learning.promotion_allowed(self.model,issued["model"],result["proposed"],
-                                             result["evidence"],checkpoint,now,
-                                             legacy_day=self.memory.get("learning_day"))):
+              and (learning.power_promotion_allowed(self.model,result["proposed_power"],result["evidence"],
+                        checkpoint,now,self.cfg.get("boiler_power_mode","unconfirmed"),issued["equipment"])
+                   if result.get("proposed_power") else
+                   learning.promotion_allowed(self.model,issued["model"],result["proposed"],
+                        result["evidence"],checkpoint,now,legacy_day=self.memory.get("learning_day")))):
             old=dict(self.model)
             version=max(old["version"],checkpoint.get("generation",0))+1
-            new={**old,**result["proposed"],"version":version}
+            new={**old,**(result.get("proposed") or {}),"version":version}
             next_checkpoint={**checkpoint,"generation":version,"promotion_day":now.date().isoformat(),
                 "daily_baseline":old,"prior_model":old,"fingerprint":result["evidence_fingerprint"],
                 "restored_learning_success":deepcopy(self.memory.get("learning_success")),
@@ -439,7 +447,10 @@ class NativeController(HeatingClimate):
                 "metrics":result["metrics"],"last_successful_learning":now.isoformat(),
                 "previous_plan_id":(self.memory.get("plan_reference") or {}).get("plan_id"),
                 "rollback_reason":None}
-            self._commit_learning_model(new,next_checkpoint,"accepted","independent_holdout_passed")
+            if result.get("proposed_power"):
+                next_checkpoint["pending_kws_profile"]=result["proposed_power"]
+            self._commit_learning_model(new,next_checkpoint,"accepted",
+                "kws_independent_thermal_holdout" if result.get("proposed_power") else "independent_holdout_passed")
         else:
             self._learning_status.update(status="rejected",reason="promotion_limits_or_prior_evidence")
 
@@ -469,6 +480,7 @@ class NativeController(HeatingClimate):
         checkpoint={**checkpoint,"changes_history":self._learning_history(checkpoint,status,reason,model)}
         if status=="accepted":
             checkpoint["prior_ventilation_model"]=deepcopy(ventilation)
+            checkpoint["prior_kws_profile"]=deepcopy(self.memory.get("kws_forecast_profile"))
         values={**self.memory,"model":model,"weather":self.weather,"online_learning":checkpoint,
                 "previous_model":dict(self.model),"predictions":[],"hour_errors":[]}
         # Validation used the existing qualified ventilation coefficients. Keep
@@ -479,6 +491,19 @@ class NativeController(HeatingClimate):
                                         "carried_from_model_version":self.model["version"]}
         elif status=="rolled_back" and "prior_ventilation_model" in checkpoint:
             values["ventilation_model"]=deepcopy(checkpoint.pop("prior_ventilation_model")) or {}
+        profile=self.memory.get("kws_forecast_profile")
+        if status=="accepted":
+            profile=checkpoint.pop("pending_kws_profile",profile)
+            if profile and profile.get("thermal_model_version")==self.model.get("version"):
+                profile={**profile,"thermal_model_version":model["version"]}
+        elif status=="rolled_back":
+            profile=checkpoint.pop("prior_kws_profile",None)
+        if profile and profile.get("equipment_version")!=self.memory.get("equipment_version",0):
+            profile=None
+        if profile or "kws_forecast_profile" in self.memory:
+            values["kws_forecast_profile"]=profile
+            values["power_calibrations"]=retain_kws_profile(values.get("power_calibrations"),profile,model,
+                                                           self.memory.get("equipment_version",0))
         values.pop("pending_model",None)
         if status=="accepted":
             values["learning_success"]=dict(time=checkpoint["last_successful_learning"],
