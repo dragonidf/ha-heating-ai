@@ -412,6 +412,38 @@ class WindowsTest(unittest.TestCase):
         self.assertIsNone(solar_weather_evidence(stamp,timezone.utc,weather,stamp+1,geometry,current)["forecast_factor"])
         self.assertIsNone(solar_context_at(stamp,timezone.utc,weather,stamp,{"days":geometry["days"]}))
 
+    def test_advisory_validation_uses_real_reports_and_separate_horizon_cohorts(self):
+        from heating_learning_windows import advisory_validation_update,advisory_validation_summary
+        start=BASE;identity=[6,1,"fixed_6"]
+        curve=[dict(ts=start+i*3600,temperature=20.+i*.01,
+            basis="calculated_plan" if i<=24 else "conditional_repeat",
+            weather_known=i<=36,schedule_known=i<=24) for i in range(1,49)]
+        outlook=dict(status="conditional",curve=curve)
+        state=advisory_validation_update({},start,identity,outlook=outlook)
+        self.assertEqual(len(state["pending"]),3)
+        self.assertEqual(advisory_validation_update(state,start+300,identity,outlook=outlook),state)
+        for h in (24,36,48):
+            at=start+h*3600-900
+            report=dict(ts=at,room=20.,room_reported_at=at,room_valid=True,
+                        source="Вітальня",report_verified=True)
+            rejected=advisory_validation_update(state,at,identity,report={**report,"report_verified":False})
+            self.assertEqual(rejected["completed"],state["completed"])
+            state=advisory_validation_update(state,at,identity,report=report)
+        self.assertEqual(len(state["pending"]),0)
+        self.assertEqual(len(state["completed"]),3)
+        summary=advisory_validation_summary(state,identity,timezone.utc,start+172800)
+        self.assertEqual(len(summary["groups"]),3)
+        self.assertEqual(summary["groups"][-1]["horizon"],48)
+        self.assertEqual(summary["groups"][-1]["basis"],"conditional_repeat")
+        self.assertFalse(summary["groups"][-1]["weather_known"])
+        self.assertEqual(summary["groups"][-1]["independent"]["n"],1)
+        self.assertAlmostEqual(summary["groups"][-1]["all_reports"]["mae"],.4775)
+        self.assertFalse(advisory_validation_summary(state,[7,1,"fixed_6"],timezone.utc,start+172800)["groups"])
+        pending=advisory_validation_update({},start,identity,outlook=outlook)
+        expired=advisory_validation_update(pending,start+172800+301,identity)
+        self.assertEqual(expired["expired"],{"24":1,"36":1,"48":1})
+        self.assertEqual(expired["completed"],[])
+
     def test_solar_missing_condition_future_issue_and_missing_geometry(self):
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Kyiv")

@@ -343,7 +343,17 @@ class NativeController(HeatingClimate):
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
         self._learning_rows.append(compact)
         if verified:
+            self.memory["advisory_validation"]=learning.advisory_validation_update(
+                self.memory.get("advisory_validation"),stamp,self._advisory_identity(),report=compact)
             self._monitor_learning(observed)
+
+    def _advisory_identity(self):
+        return [self.model.get("version"),self.memory.get("equipment_version",0),
+                self.cfg.get("boiler_power_mode","unconfirmed")]
+
+    def remember_advisory_outlook(self, now, outlook):
+        self.memory["advisory_validation"]=learning.advisory_validation_update(
+            self.memory.get("advisory_validation"),now.timestamp(),self._advisory_identity(),outlook=outlook)
 
     def _monitor_learning(self, reported):
         checkpoint=self.memory.get("online_learning") or {}
@@ -1934,6 +1944,9 @@ class NativeController(HeatingClimate):
                 candidate_holdout_mae_3h=metrics.get("3",{}).get("new",{}).get("mae"),
                 active_version=self.model.get("version"),rollback_reason=checkpoint.get("rollback_reason"),
                 next_learning=upcoming.isoformat())
+        if entity == "sensor.heating_controller_quality":
+            attributes["advisory_validation"]=learning.advisory_validation_summary(
+                self.memory.get("advisory_validation"),self._advisory_identity(),self.now().tzinfo,self.now().timestamp())
         if entity == "sensor.heating_diagnostics":
             now = time.time()
             observation = getattr(self, "power_observation", {})

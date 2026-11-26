@@ -363,6 +363,90 @@ def build_observation_windows(samples, tz):
                 idle_minutes=sum(w["idle"] for w in windows)/60)
 
 
+def advisory_validation_update(previous, stamp, identity, *, outlook=None, report=None):
+    """Small separate prospective ledger, no archive snapshots or fit input.
+
+    Issue at most every six hours. Compare a real independent room report
+    within the final 30 minutes before each horizon, interpolating ONLY the
+    previously issued temperature curve. Never extrapolate 48h past its end.
+    """
+    state=dict(previous) if isinstance(previous,dict) else {}
+    pending=[p for p in state.get("pending",[]) if isinstance(p,dict)
+             and number(p.get("due")) is not None and number(p.get("issued")) is not None][-36:]
+    completed=[p for p in state.get("completed",[]) if isinstance(p,dict)
+               and number(p.get("reported")) is not None and p["reported"]>=stamp-30*86400
+               and number(p.get("error")) is not None][-384:]
+    expired=dict(state.get("expired") or {})
+    observed=report_time(report) if isinstance(report,dict) else None
+    actual=number(report.get("room")) if observed is not None else None
+    if report and (report.get("room_source_disagreement") or report.get("room_sources_suspect")
+                   or report.get("room_source_status") in ("pending","room_source_disagreement")):
+        observed=None
+    kept=[]
+    for p in pending:
+        due=p["due"];h=str(p["horizon"])
+        # A qualified report may arrive at the next existing sample tick.
+        if (observed is not None and actual is not None and due-1800<=observed<=due
+                and observed>p["issued"] and observed<=stamp):
+            left,right=p["bracket"]
+            if left[0]<=observed<=right[0] and right[0]>left[0]:
+                expected=left[1]+(right[1]-left[1])*(observed-left[0])/(right[0]-left[0])
+                completed.append({k:p[k] for k in ("issued","horizon","identity","basis","weather_known","schedule_known")}
+                    |dict(reported=observed,error=expected-actual,lead_hours=(observed-p["issued"])/3600))
+                continue
+        if stamp>due+REPORT_ALIGNMENT_SECONDS:
+            expired[h]=expired.get(h,0)+1
+        else:
+            kept.append(p)
+    last=number(state.get("last_issued")) or 0.
+    if isinstance(outlook,dict) and outlook.get("status")=="conditional" and stamp-last>=21600:
+        curve=outlook.get("curve") or []
+        added=[]
+        for h in (24,36,48):
+            due=stamp+h*3600
+            right=next((p for p in curve if abs(p["ts"]-due)<.001),None)
+            left=next((p for p in reversed(curve) if p["ts"]<due-1799),None)
+            if not left or not right or not 0<right["ts"]-left["ts"]<=3600.001:
+                continue
+            if any(number(p.get("temperature")) is None for p in (left,right)):
+                continue
+            covered=[p for p in curve if p["ts"]<=due]
+            added.append(dict(issued=stamp,due=due,horizon=h,identity=list(identity),
+                basis=right["basis"],weather_known=all(p.get("weather_known") is True for p in covered),
+                schedule_known=all(p.get("schedule_known") is True for p in covered),
+                bracket=[[p["ts"],p["temperature"]] for p in (left,right)]))
+        if added:
+            kept.extend(added);last=stamp
+    return dict(pending=kept[-36:],completed=completed[-384:],expired=expired,last_issued=last)
+
+
+def advisory_validation_summary(state, identity, tz, stamp):
+    """Current identity only; keep conditional cohorts distinct."""
+    state=state or {};groups={}
+    for p in state.get("completed",[]):
+        if p.get("identity")!=list(identity) or p["reported"]<stamp-30*86400:
+            continue
+        key=(p["horizon"],p["basis"],p["weather_known"],p["schedule_known"])
+        groups.setdefault(key,[]).append(p)
+    metrics=[]
+    for (h,basis,weather,schedule),rows in sorted(groups.items()):
+        ordered=sorted(rows,key=lambda p:p["reported"])
+        independent=[];end=-math.inf
+        for p in ordered:
+            if p["issued"]>=end:
+                independent.append(p);end=p["reported"]
+        metrics.append(dict(horizon=h,basis=basis,weather_known=weather,schedule_known=schedule,
+            days=len({_local_day(p["reported"],tz) for p in ordered}),
+            all_reports=_metrics([p["error"] for p in ordered]),
+            independent=_metrics([p["error"] for p in independent]),
+            minimum_lead_hours=min(p["lead_hours"] for p in ordered),
+            maximum_lead_hours=max(p["lead_hours"] for p in ordered)))
+    return dict(groups=metrics,pending={str(h):sum(p.get("horizon")==h and p.get("identity")==list(identity)
+                       for p in state.get("pending",[])) for h in (24,36,48)},
+                expired=state.get("expired",{}),validation_basis="real_report_frozen_advisory",
+                target_tolerance_minutes=30,used_for_control=False)
+
+
 def _metrics(errors):
     if not errors:
         return dict(n=0,mae=None,bias=None,median=None,p95=None)

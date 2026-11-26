@@ -1984,6 +1984,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             long_outlook=self.run_diagnostic('advisory_48h',advisory_outlook_48,
                 now,room,floor,outside,fire,self.model,usable_weather,advisory_settings,forecast,
                 default=dict(status='unavailable',reason='projection_failed',curve=[]))
+            if source=='Вітальня' and room_check['status'] not in ('pending','room_source_disagreement') and hasattr(self,'remember_advisory_outlook'):
+                self.run_diagnostic('advisory_validation_issue',self.remember_advisory_outlook,now,long_outlook)
             self.publish('sensor.heating_forecast_outlook','Прогноз температури',
                 advisory_48h=long_outlook,**forecast_outlook_for_panel(forecast,now,settings))
             self.publish("sensor.heating_forecast",forecast["minimum"],friendly_name="Клімат — мінімум прогнозу",
