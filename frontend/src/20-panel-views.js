@@ -278,16 +278,28 @@
     const morning=Array.isArray(f.morning_runs_minutes)?f.morning_runs_minutes.reduce((sum,v)=>sum+(numeric(v)??0),0):null;
     const stale=this.equipmentPlanPending()||!Number.isFinite(Date.parse(f.created_at))||Date.now()-Date.parse(f.created_at)>420000;
     const reserve=f.morning_reserve&&typeof f.morning_reserve==='object'?f.morning_reserve:null;
+    const visible=reserve?.comfort_24h;
+    const comfortMetrics=visible?'<div class="plan-breakdown" data-plan-comfort>'+
+      metric('Пік за 24 год',fmt(visible.predicted_maximum,2),'°C')+
+      metric('Час піку',this.time(visible.predicted_maximum_at,true))+
+      metric('Мінімум за 24 год',fmt(visible.minimum_before_next_heat,2),'°C')+
+      metric('У межах комфорту',numeric(visible.comfort_minutes)===null?'—':fmt(visible.comfort_minutes/60,1),'год')+
+      metric('Вихід за нижню межу',visible.first_comfort_violation_at?this.time(visible.first_comfort_violation_at,true):'—')+
+      '</div>':'';
+    const improvement=numeric(reserve?.local_deficit_reduction_degree_hours)>0?
+      '<p class="muted note">Прогнозований дефіцит до наступного нагріву скорочено на '+
+      fmt(reserve.local_deficit_reduction_degree_hours,2)+' °C·год.</p>':'';
     const budget=f.cycle_energy&&typeof f.cycle_energy==='object'?f.cycle_energy:{};
     const budgetRow=numeric(budget.remaining_kwh)!==null?`<div class="plan-morning" data-cycle-budget><strong>Цикл${isTrue(budget.observation_complete)?'':' · часткові дані'}</strong><span>${fmt(budget.observed_kwh,2)} + ${fmt(budget.remaining_kwh,2)} = ${fmt(budget.projected_total_kwh,2)} кВт·год</span></div>`:'';
     const sourceNames={weather:'погода',grid:'мережа',thermal_state:'тепловий стан',power:'потужність',manual:'режим і дозволи',fallback:'штатне керування',model:'модель',execution:'виконання',initial_projection:'перший прогноз'};
     const budgetDetails=numeric(budget.remaining_kwh)!==null?`<div class="plan-breakdown">${metric('Фактична перерва живлення',fmt(budget.deviation?.outage_minutes,1),'хв')}${metric('Середня потужність за запитом',fmt(budget.deviation?.request_average_kw,2),'кВт')}${metric('Поточний мінімум',fmt(budget.deviation?.minimum_temperature,2),'°C')}</div>${budget.deviation?.violation_at?this.row('Ризик нижче мінімуму',this.time(Number(budget.deviation.violation_at),true)+' · '+fmt(budget.deviation.violation_temperature,3)+' °C < '+fmt(budget.deviation.lower,3)+' °C'):''}<div class="plan-breakdown">${metric('Передцикловий план',fmt(budget.baseline?.kwh,2),'кВт·год')}${metric('Зміна оцінки циклу',fmt(budget.delta_from_baseline_kwh,2),'кВт·год')}</div><p class="muted note">Виміряно + залишок = оцінка всього циклу. База ${h(this.time(budget.baseline?.at,true))}. Зміни: ${h((Array.isArray(budget.change_sources)?budget.change_sources:[]).map(k=>sourceNames[k]||k).join(', '))}.${isTrue(budget.baseline_consumed)?' Початковий бюджет витрачено; залишкова потреба перевіряється, це не жорсткий stop.':''}</p>`:'';
     const stresses=Array.isArray(f.stress_scenarios)?f.stress_scenarios:[];
-    const sessionDetails=s=>`${fmt((s.end-s.start)/60,0)} хв${numeric(s.power_kw)!==null?' · ≈'+fmt(s.power_kw,1)+' кВт':''}${numeric(s.kwh)!==null?' · '+fmt(s.kwh,2)+' кВт·год':''}${isTrue(s.conditional)?' · умовно':''}`;
+    const dayWindow=Array.isArray(f.day_insurance_window)?f.day_insurance_window:null;
+    const sessionDetails=s=>`${fmt((s.end-s.start)/60,0)} хв${numeric(s.power_kw)!==null?' · ≈'+fmt(s.power_kw,1)+' кВт':''}${numeric(s.kwh)!==null?' · '+fmt(s.kwh,2)+' кВт·год':''}${isTrue(s.conditional)?' · умовно':''}${dayWindow&&s.start<dayWindow[1]&&s.end>dayWindow[0]?' · страховий догрів':''}`;
     const stressDetails=stresses.length?`<div class="plan-breakdown">${stresses.map(r=>metric(r.name==='cold_low_solar'?'Холодно / мало сонця':`Без мережі ${String(r.name).replace('blackout_','')} хв`,fmt(r.deficit_degree_hours,2),'°C·год дефіциту')).join('')}</div><p class="muted note">Гіпотетичні сценарії замороженого плану без перепланування. Це не прогноз аварії та не додатковий запит нагріву.</p>`:'';
     const execution=reserve?`<div class="plan-breakdown" data-reserve-execution>${metric('Заплановано вранці',fmt(reserve.planned_minutes,1),'хв')}${metric('Автоматично виконано',fmt(reserve.confirmed_completed_minutes,1),'хв')}${metric('Фактична енергія ранку',fmt(reserve.confirmed_kwh,2),'кВт·год')}${metric('Ручний нагрів вранці',fmt(reserve.manual_completed_minutes,1),'хв')}</div><p class="note ${isTrue(reserve.predicted_sufficient)?'muted':'warn'}">${h(reserve.impossibility_reason|| (reserve.reserve_sufficient===null?'Запас до наступного вікна умовний: бракує перевірки потрібного горизонту.':'Достатній за поточним сценарієм.'))}${numeric(reserve.day_deficit_minutes)>0?` Денна нижня межа: ${fmt(reserve.day_deficit_minutes,0)} хв, найбільше відхилення ${fmt(reserve.day_max_shortfall,2)} °C.`:''}</p>`:'';
     if(!diagnostics)return this.section('План нагріву',`<div class="sessions-grid">${segments.map(s=>`<div class="session"><div><strong>${h(this.time(s.start,true))} → ${h(this.time(s.end))}</strong><span class="muted">${h(sessionDetails(s))}</span></div><span class="heat-dot"></span></div>`).join('')||'<p class="empty">Нагрів не запланований.</p>'}</div><button class="text-button" data-tab="model">План і виконання докладніше ↗</button>`,'plan-card');
-    return this.section('План нагріву',`<p class="plan-reason muted">${h(f.split_reason||'Контролер розраховує оптимальні інтервали.')}</p><div class="sessions-grid">${segments.map(s=>`<div class="session"><div><strong>${h(this.time(s.start,true))} → ${h(this.time(s.end))}</strong><span class="muted">${h(sessionDetails(s))}</span></div><span class="heat-dot"></span></div>`).join('')||'<p class="empty">Нагрів не запланований.</p>'}</div><div class="plan-morning"><strong>Ранковий прогрів</strong><span>${fmt(morning,0)} хв <small class="muted">· мін. ${fmt(f.morning_min_minutes,0)} хв</small></span></div>${execution}${budgetRow}${stale?'<p class="forecast-warning warn note">План застарів: потрібен новий розрахунок.</p>':''}<details class="plan-details"><summary>Подробиці плану</summary>${budgetDetails}${stressDetails}<div class="plan-breakdown">${metric('Вечір',fmt(f.session_kwh?.evening,2),'кВт·год')}${metric('Ранок',fmt(f.session_kwh?.morning,2),'кВт·год')}${metric('Інші інтервали',fmt(f.session_kwh?.other,2),'кВт·год')}${metric('Умовний нагрів',fmt(f.conditional_heat_minutes,0),'хв')}${metric('Поза дозволеними годинами',fmt(f.outside_minutes,0),'хв')}${metric('Перенесено через відключення',isTrue(f.outage_shifted)?'Так':'Ні')}</div><p class="muted note">${h(morning?'Ранковий прогрів зарезервовано.':f.split_reason||'Ранкового нагріву немає.')}</p></details>`, 'plan-card');
+    return this.section('План нагріву',`<p class="plan-reason muted">${h(f.split_reason||'Контролер розраховує оптимальні інтервали.')}</p><div class="sessions-grid">${segments.map(s=>`<div class="session"><div><strong>${h(this.time(s.start,true))} → ${h(this.time(s.end))}</strong><span class="muted">${h(sessionDetails(s))}</span></div><span class="heat-dot"></span></div>`).join('')||'<p class="empty">Нагрів не запланований.</p>'}</div><div class="plan-morning"><strong>Ранковий прогрів</strong><span>${fmt(morning,0)} хв <small class="muted">· мін. ${fmt(f.morning_min_minutes,0)} хв</small></span></div>${execution}${improvement}${comfortMetrics}${budgetRow}${stale?'<p class="forecast-warning warn note">План застарів: потрібен новий розрахунок.</p>':''}<details class="plan-details"><summary>Подробиці плану</summary>${budgetDetails}${stressDetails}<div class="plan-breakdown">${metric('Вечір',fmt(f.session_kwh?.evening,2),'кВт·год')}${metric('Ранок',fmt(f.session_kwh?.morning,2),'кВт·год')}${metric('Інші інтервали',fmt(f.session_kwh?.other,2),'кВт·год')}${metric('Умовний нагрів',fmt(f.conditional_heat_minutes,0),'хв')}${metric('Поза дозволеними годинами',fmt(f.outside_minutes,0),'хв')}${metric('Перенесено через відключення',isTrue(f.outage_shifted)?'Так':'Ні')}</div><p class="muted note">${h(morning?'Ранковий прогрів зарезервовано.':f.split_reason||'Ранкового нагріву немає.')}</p></details>`, 'plan-card');
   }
   nextHeatText() {
     if((this.state('mode')||this.attrs('controller').mode)==='Спостереження')return 'призупинене';
@@ -560,6 +572,7 @@
     const date=value=>typeof value==='string'&&Number.isFinite(Date.parse(value))?this.time(value,true):'—';
     const windows=numeric(a.independent_windows),minutes=numeric(a.qualified_minutes);
     const next=date(a.next_learning);
+    const completed=date(a.last_completed_analysis);
     const last=date(a.last_successful_learning||a.learning_success?.time);
     const adaptiveLast=date(a.last_adaptive_promotion);
     const active=a.active_version??a.parameters?.version??'—';
@@ -573,7 +586,7 @@
         ${metric('Кандидат · MAE 1 год',numeric(a.candidate_holdout_mae_1h)===null?'—':fmt(a.candidate_holdout_mae_1h,3),'°C')}
         ${metric('Кандидат · MAE 3 год',numeric(a.candidate_holdout_mae_3h)===null?'—':fmt(a.candidate_holdout_mae_3h,3),'°C')}
       </div>
-      <div class="learning-progress-dates"><span>Наступний аналіз <strong>${h(next)}</strong></span><span>Останнє успішне застосування <strong>${h(last)}</strong></span></div>
+      <div class="learning-progress-dates"><span>Наступний аналіз <strong>${h(next)}</strong></span><span>Останній завершений аналіз <strong>${h(completed)}</strong></span><span>Останнє успішне застосування <strong>${h(last)}</strong></span></div>
       <p class="muted note">Нова модель · останнє застосування: <strong>${h(adaptiveLast)}</strong>${adaptiveLast==='—'?' · жодних нових коефіцієнтів ще не застосовано':''}.</p>
       ${a.rollback_reason?`<p class="warn note">Відкат моделі: ${h(reasonText(a.rollback_reason))}</p>`:''}
       ${a.learning_storage_error?`<p class="warn note">Помилка збереження: ${h(a.learning_storage_error)}</p>`:''}
@@ -616,7 +629,33 @@
         (gates[name]||name)+' — '+fmt(count,0)).join(' · '))}</p>`:''}
       ${!reject.length&&!current.length?'<p class="muted note">Потрібні нові незалежні вимірювання, щоб з’ясувати причину.</p>':''}
     </details>`;
-    return this.section('Самонавчання моделі',progress+archived+historicMAE+diag+historic,'learning-progress');
+    const events=Array.isArray(a.learning_history)?a.learning_history:[];
+    const recent=Date.now()/1000-7*86400;
+    const eventList=rows=>rows.slice().reverse().map(e=>{
+      const errors=Object.entries(e.mae||{}).filter(([,value])=>Array.isArray(value)&&value.some(v=>numeric(v)!==null))
+        .map(([hours,value])=>h(hours)+' год '+fmt(value[0],3)+' → '+fmt(value[1],3)+' °C');
+      const delta=Object.entries(e.changes||{}).map(([key,values])=>
+        h(key)+' '+fmt(values[0],6)+' → '+fmt(values[1],6));
+      return '<li><strong>'+h(this.time(e.at,true))+' · '+h(labels[e.status]||'Аналіз')+
+        (e.version!=null?' · v'+h(e.version):'')+'</strong>'+
+        '<div class="muted">'+h(reasonText(e.reason))+'</div>'+
+        (errors.length?'<div>MAE · '+errors.join(' · ')+'</div>':'')+
+        (delta.length?'<div>'+delta.join(' · ')+'</div>':'')+'</li>';
+    }).join('');
+    const eligibility=a.learning_eligibility||{};
+    const drift=Object.entries(a.model_drift||{}).map(([days,values])=>h(days)+' діб · '+
+      Object.entries(values).map(([key,value])=>h(key)+' '+fmt(value*100,1)+'%').join(' · ')).join('<br>');
+    const coverage=Object.keys(eligibility).length?
+      '<p class="muted note">Ручні теплові вікна '+fmt(eligibility.manual_physics_windows,0)+
+      ' · автоматичні '+fmt(eligibility.automatic_physics_windows,0)+
+      ' · інтервали KWS '+fmt(eligibility.electrical_intervals,0)+'</p>':'';
+    const learningHistory=events.length?
+      '<details class="learning-evidence"><summary>Історія навчання · 7 діб</summary><ul>'+
+      (eventList(events.filter(e=>e.at>=recent))||'<li>Записів за останні 7 діб немає.</li>')+'</ul>'+
+      (drift?'<p class="muted note">Накопичені зміни коефіцієнтів<br>'+drift+'</p>':'')+
+      '<details><summary>Раніші записи · до 30 діб</summary><ul>'+
+      (eventList(events.filter(e=>e.at<recent))||'<li>Раніших записів немає.</li>')+'</ul></details></details>':'';
+    return this.section('Самонавчання моделі',progress+coverage+archived+historicMAE+diag+learningHistory+historic,'learning-progress');
   }
   model() {
     const a=this.attrs('model'),env=this.attrs('environment'),p=a.power_learning||{},s=this.attrs('summary').last_24h||{},f=this.attrs('forecast');

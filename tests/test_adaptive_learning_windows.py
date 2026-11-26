@@ -33,7 +33,109 @@ def samples(minutes=120, report_every=60, *, day=0, power=0.):
     return rows
 
 
+class StorageLearningTest(unittest.TestCase):
+    model=dict(__import__('heating_model').DEFAULT_MODEL,version=6,validated=True,
+               floor_air=.055,room_loss=.022,floor_decay=.38,heat_gain=1.0368)
+
+    def windows(self,field,days=10,shift=.01):
+        from heating_model import step
+        truth={**self.model,field:self.model[field]*(1+shift)}
+        output=[]
+        for day in range(days):
+            for j,(floor,kw,seconds) in enumerate(((33.+day%8,0.,7200),
+                    (22.+day%3,7.+day%3,7200),(40.+day%4,0.,1800),(21.+day%3,5.,3600))):
+                start=BASE+day*86400+j*10800
+                room,f=21.,floor
+                steps=[]
+                for i in range(seconds//300):
+                    outside=-6+2*day%17
+                    steps.append([300,outside,kw,0.,f])
+                    room,f=step(room,f,outside,kw,0.,truth,1/12)
+                output.append(dict(start=start,end=start+seconds,day=f'2026-11-{day+1:02}',
+                    room_start=21.,room_end=room,floor=floor,steps=steps,
+                    heat=seconds if kw else 0,idle=0 if kw else seconds,sun=0.,
+                    equipment=[6,1,'fixed_6'],vent=[0.,0.]))
+        return output
+
+    def test_storage_coefficients_need_excitation_and_later_independent_holdout(self):
+        from heating_learning_windows import evaluate_windows,promotion_allowed
+        now=datetime(2026,11,11,tzinfo=timezone.utc)
+        for field in ('floor_decay','heat_gain'):
+            with self.subTest(field=field):
+                result=evaluate_windows(self.windows(field),self.model)
+                self.assertEqual(result['status'],'holdout_passed')
+                self.assertEqual(result['coefficients'],{field:self.model[field]*1.01})
+                self.assertTrue(promotion_allowed(self.model,self.model,result['coefficients'],
+                    {'status':'accepted'},{},now))
+                self.assertFalse(promotion_allowed(self.model,self.model,result['coefficients'],
+                    {'status':'rejected'},{},now))
+
+    def test_storage_fit_rejects_weak_support_and_conflicting_later_days(self):
+        from heating_learning_windows import _storage_candidate,evaluate_windows
+        self.assertIsNone(_storage_candidate(self.windows('heat_gain',days=2),self.model,self.model,None))
+        self.assertIsNone(_storage_candidate([w for w in self.windows('heat_gain') if w['heat']],
+                                             self.model,self.model,None))
+        rows=self.windows('heat_gain')
+        rows[-8:]=self.windows('heat_gain',shift=-.01)[-8:]
+        result=evaluate_windows(rows,self.model)
+        self.assertEqual(result['status'],'holdout_rejected')
+        self.assertIsNone(result['coefficients'])
+
+
 class WindowsTest(unittest.TestCase):
+    def test_rolling_drift_blocks_small_changes_when_path_budget_is_used(self):
+        from heating_learning_windows import promotion_allowed
+        now = datetime.fromtimestamp(BASE + 8*86400, timezone.utc)
+        active = dict(DEFAULT_MODEL, validated=True)
+        value = active["room_loss"]
+        history = [{"at":now.timestamp()-day*86400,
+                    "changes":{"room_loss":[value/1.01,value]}} for day in range(1,6)]
+        proposed = {"room_loss":value*1.005}
+        self.assertFalse(promotion_allowed(active,active,proposed,{"status":"accepted"},
+                                           {"changes_history":history},now))
+        self.assertTrue(promotion_allowed(active,active,proposed,{"status":"accepted"},
+                                          {"changes_history":history[:3]},now))
+
+    def test_qualified_ventilation_does_not_change_unidentifiable_room_loss(self):
+        from heating_model import step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        ventilation=dict(validated=True,model_version=6,base_room_loss=.015,
+                         recuperator=.002,bath=.001)
+        truth=dict(model,floor_air=model["floor_air"]*1.01,room_loss=.017)
+        windows=[]
+        for day in range(6):
+            for j,kw in enumerate((0.,4.)):
+                room,floor=21.,22.+4*j
+                start=BASE+day*86400+j*7200
+                steps=[]
+                for i in range(12):
+                    steps.append([300,3.+day,kw,0.,floor])
+                    room,floor=step(room,floor,3.+day,kw,0.,truth,1/12)
+                windows.append(dict(start=start,end=start+3600,day=f"2026-11-{day+1:02}",
+                    room_start=21.,room_end=room,floor=steps[0][4],steps=steps,
+                    heat=3600 if kw else 0,idle=0 if kw else 3600,sun=0.,
+                    equipment=[6,1,"fixed_6"],vent=[1.,0.]))
+        report=evaluate_windows(windows,model,ventilation)
+        self.assertEqual(report["status"],"holdout_passed")
+        self.assertEqual(report["coefficients"],{"floor_air":truth["floor_air"]})
+
+    def test_verified_manual_session_is_physics_only(self):
+        from heating_learning_windows import _continuous, IDENTITY
+        rows = samples(60, power=4.)
+        for row in rows:
+            row.update(manual_extra_active=True, execution="manual_or_native",
+                       manual_measurement_id=BASE-60, interval_kw=4.,
+                       shadow_reasons=("manual_extra_request",))
+        evidence = build_observation_windows(rows, timezone.utc)
+        self.assertEqual(evidence["windows"][0]["heat"], 3600)
+        self.assertEqual(evidence["eligibility_counts"]["manual_physics_windows"], 1)
+        timestamps = [r["ts"] for r in rows]
+        identity = tuple(rows[0].get(k) for k in IDENTITY)
+        _, reasons = _continuous(rows, timestamps, timestamps[0], timestamps[-1], identity)
+        self.assertIn("manual_extra_request", reasons)
+        rows[5]["manual_measurement_id"] = BASE+10
+        self.assertFalse(build_observation_windows(rows, timezone.utc)["windows"])
+
     def test_off_ventilation_without_supply_can_be_observed(self):
         from heating_learning_windows import ventilation_current_qualified, ventilation_interval_duty
         off={"recuperator":{"relay":"off","supply":"unknown"},
@@ -70,8 +172,8 @@ class WindowsTest(unittest.TestCase):
             self.assertIn("analysis_status",result)
             self.assertGreater(len(load_evidence(path)["windows"]),0)
 
-    def test_60_and_120_minute_reports_survive_cached_temperature_ticks(self):
-        for cadence in (60, 120):
+    def test_real_reports_survive_cached_temperature_ticks(self):
+        for cadence in (5, 10, 15, 30, 60, 120):
             with self.subTest(cadence=cadence):
                 rows = samples(cadence, cadence)
                 result = build_observation_windows(rows, timezone.utc)
@@ -79,7 +181,8 @@ class WindowsTest(unittest.TestCase):
                 self.assertEqual(result["eligible_minutes"], cadence)
                 self.assertEqual(result["unique_primary_reports"], 2)
                 self.assertEqual(result["windows"][0]["room_end"], rows[-1]["room"])
-                self.assertFalse(transitions(rows))
+                if cadence > 5:
+                    self.assertFalse(transitions(rows))
 
     def test_republish_or_bad_intermediate_evidence_breaks_window(self):
         invalid = [
@@ -112,6 +215,25 @@ class WindowsTest(unittest.TestCase):
         evidence = build_observation_windows(samples(120, 120), timezone.utc)["windows"]
         report = evaluate_windows(evidence, dict(DEFAULT_MODEL, version=6))
         self.assertEqual(report["status"], "insufficient_data")
+
+    def test_independent_cooling_days_can_identify_only_room_heat_loss(self):
+        from heating_model import step
+        from tools.replay_adaptive_learning import MODEL
+
+        actual=dict(MODEL,room_loss=MODEL["room_loss"]*1.01)
+        windows=[]
+        for day in range(8):
+            rows=samples(120,120,day=day)
+            room,floor=21.,21.
+            outside=2.+day%4
+            for row in rows:
+                row.update(outside=outside,room=room if row["report_verified"] else 21.)
+                row["return"]=floor
+                room,floor=step(room,floor,outside,0.,0.,actual,1/12)
+            windows.extend(build_observation_windows(rows,timezone.utc)["windows"])
+        result=evaluate_windows(windows,MODEL)
+        self.assertEqual(result["status"],"holdout_passed")
+        self.assertEqual(result["coefficients"],{"room_loss":actual["room_loss"]})
 
     def test_prospective_gate_requires_both_horizons_and_coverage(self):
         issue = BASE
@@ -213,6 +335,70 @@ class WindowsTest(unittest.TestCase):
         self.assertFalse(review_limits(model,{"floor_air":model["floor_air"]*1.02},model,
                      manual_approval=True,evidence=True,degraded=False)["review_eligible"])
 
+
+    def asynchronous_report_fixture(self, offset):
+        from heating_learning_windows import freeze_forecast
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        now=datetime.fromtimestamp(BASE,timezone.utc)
+        settings=dict(target=22.,lower=19.,upper=24.,equipment_version=1,
+                      modulation_profile={'physical_mode':'fixed_6'})
+        weather=[dict(ts=BASE+i*3600,temperature=5.,condition='cloudy') for i in range(7)]
+        fine=[dict(ts=BASE+i*300,temperature=21-i*.01,upper_temperature=21.1-i*.01)
+              for i in range(1,73)]
+        snapshot=freeze_forecast(now,21.,23.,5.,0.,weather,BASE-60,settings,
+            dict(curve=fine,heat_segments=[]),model,
+            {'coefficients':{'floor_air':model['floor_air']*1.001}},'boot')
+        rows=[]
+        for i in range(75):
+            stamp=BASE+i*300
+            report=next((BASE+3600*h+offset for h in (1,3)
+                         if 0<=stamp-(BASE+3600*h+offset)<300),None)
+            rows.append(dict(ts=stamp,room=20.8,room_valid=True,source='Вітальня',
+                room_reported_at=report,report_verified=report is not None,grid='on',
+                voltage_qualified=True,power_source='kws_phases',power_quality='measured',
+                power=0.,interval_kw=0.,execution='idle',manual_extra_active=False,
+                outside=5.,fire=0.,fire_valid=True,fire_active=False,shadow_ventilation=[0.,0.],
+                epoch='boot',thermal_model_version=6,equipment_version=1,boiler_power_mode='fixed_6',
+                weather_issue_at=stamp-60,solar_factor=0.,**{'return':23.}))
+        return snapshot,rows
+
+    def test_asynchronous_reports_use_actual_time_and_keep_guards(self):
+        from heating_learning_windows import qualify_frozen,score_frozen
+        for offset in (-240,-61,61,240,300):
+            with self.subTest(offset=offset):
+                snapshot,rows=self.asynchronous_report_fixture(offset)
+                checks=qualify_frozen(snapshot,rows,timezone.utc)
+                self.assertEqual(len(checks),2)
+                for h,due,old,upper,lo,hi,zone,actual,reasons,*rest in checks:
+                    self.assertEqual(due,BASE+3600*h+offset)
+                    self.assertAlmostEqual(old,21-(due-BASE)/300*.01)
+                    self.assertEqual(actual,20.8)
+                    self.assertFalse(reasons)
+                self.assertTrue(all(x['trajectory_guard_ok'] for x in
+                                    score_frozen(snapshot,checks,timezone.utc)))
+
+    def test_asynchronous_reports_do_not_extrapolate_or_change_legacy_archive(self):
+        from heating_learning_windows import qualify_frozen
+        snapshot,rows=self.asynchronous_report_fixture(301)
+        self.assertEqual(qualify_frozen(snapshot,rows,timezone.utc),[])
+        snapshot,rows=self.asynchronous_report_fixture(240)
+        snapshot.pop('report_alignment_seconds')
+        self.assertEqual(qualify_frozen(snapshot,rows,timezone.utc),[])
+        snapshot,rows=self.asynchronous_report_fixture(240)
+        snapshot['guards']=[g for g in snapshot['guards'] if not BASE+3600<=g[0]<=BASE+3900]
+        self.assertFalse(any(x[0]==1 for x in qualify_frozen(snapshot,rows,timezone.utc)))
+
+    def test_asynchronous_exact_and_early_report(self):
+        from heating_learning_windows import qualify_frozen,score_frozen
+        snapshot,rows=self.asynchronous_report_fixture(0)
+        checks=qualify_frozen(snapshot,rows,timezone.utc)
+        self.assertEqual(checks[0][1],BASE+3600)
+        self.assertEqual(checks[0][2],snapshot['points']['1'][1])
+        self.assertTrue(all(x['trajectory_guard_ok'] for x in
+                            score_frozen(snapshot,checks,timezone.utc)))
+        snapshot,rows=self.asynchronous_report_fixture(-300)
+        checks=qualify_frozen(snapshot,rows[:12],timezone.utc)
+        self.assertEqual(checks[0][1],BASE+3300)
 
     def test_frozen_weather_snapshot_rejects_lookahead_and_internal_gaps(self):
         from heating_learning_windows import freeze_forecast

@@ -23,10 +23,12 @@ from homeassistant.components.weather.const import DATA_COMPONENT as WEATHER_ENT
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .native_controller.heating_climate import HeatingClimate
 from .native_controller import heating_learning_windows as learning
-from .native_controller.heating_model import comfort_at, number
+from .native_controller.heating_model import comfort_at, number, retain_kws_profile
 from .native_controller.heating_ui import system_fields
 from .native_controller.heating_recovery import wire_values
 from .native_voltage import VoltageGuard, select_phase_voltages
@@ -84,6 +86,8 @@ class NativeController(HeatingClimate):
         self._learning_control_mode = None
         self._learning_last_report = 0.
         self._learning_last_value = None
+        self._learning_room_entity = None
+        self._learning_room_report = None
         self._learning_last_issue = 0.
         self._learning_generation = 0
         self._learning_current_ok = False
@@ -92,9 +96,10 @@ class NativeController(HeatingClimate):
 
     def sample(self, room, probe, outside, power, fire, source, primary, thermostat, quality, settings=None):
         before = self.last_sample
+        gap = self._capture_sample_power(power)
         result = super().sample(room, probe, outside, power, fire, source, primary, thermostat, quality, settings)
         try:
-            self._learning_tick(power, fire, source, quality, before)
+            self._learning_tick(power, fire, source, quality, before, gap)
         except Exception as exc:
             self._learning_breaks.add("capture_error")
             self._learning_current_ok = False
@@ -102,20 +107,30 @@ class NativeController(HeatingClimate):
             self.log("Adaptive sample skipped: %s", type(exc).__name__, level="WARNING")
         return result
 
-    def _learning_tick(self, power, fire, source, quality, before):
+    def _capture_sample_power(self,power):
         stamp = time.time()
         previous = self._learning_last_tick
         self._learning_last_tick = stamp
-        reasons = set()
-        kw = number(power)
+        measured = (getattr(self,"power_source",None),getattr(self,"power_quality",None)) == ("kws_phases","measured")
+        kw = number(power) if measured else None
+        if kw is not None and not 0<=kw<=10.5:
+            kw = None
         previous_kw = self._learning_previous_kw
         self._learning_previous_kw = kw
-        if previous is None or not 0 < stamp-previous<=45:
-            reasons.add("tick_gap_or_restart")
-        elif kw is not None and previous_kw is not None:
+        gap = previous is None or not 0 < stamp-previous<=45
+        if not gap and kw is not None and previous_kw is not None:
             duration = stamp-previous
             self._learning_kw_seconds += duration
             self._learning_kw_integral += (kw+previous_kw)*duration/2
+        return gap
+
+    def measured_sample_power(self,start,end):
+        if self._learning_kw_seconds>0 and self._learning_kw_seconds>=.95*(end-start):
+            return self._learning_kw_integral/self._learning_kw_seconds
+        return None
+
+    def _learning_tick(self, power, fire, source, quality, before, gap):
+        reasons = {"tick_gap_or_restart"} if gap else set()
         if getattr(self, "planning_grid_state", None) != "on":
             reasons.add("unqualified_outage")
         voltage = (self.voltage_status or {}).get("voltage_qualified") is True
@@ -161,13 +176,54 @@ class NativeController(HeatingClimate):
         if before == self.last_sample:
             return
         try:
-            interval_kw = (self._learning_kw_integral/self._learning_kw_seconds
-                           if self._learning_kw_seconds>0
-                           and self._learning_kw_seconds>=.95*(self.last_sample-before) else None)
+            interval_kw = self.measured_sample_power(before,self.last_sample)
             self._learning_append(self.samples[-1], voltage, self._learning_breaks, interval_kw)
         finally:
             self._learning_kw_integral = self._learning_kw_seconds = 0.
             self._learning_breaks.clear()
+
+    @callback
+    def _async_listen_room_reports(self):
+        entity = self.cfg.get("room")
+        if not entity:
+            return
+        try:
+            entry = entity_registry.async_get(self.hass).async_get(entity)
+        except AttributeError:
+            # The optional report source must not prevent the writer from
+            # starting before the entity registry has finished loading.
+            return
+        if not entry or entry.platform != "tuya" or entry.original_device_class != "temperature":
+            return
+        prefix = "tuya."
+        if not entry.unique_id.startswith(prefix):
+            return
+        # Home Assistant Tuya uses tuya.<device id><description key>.
+        # Only a temperature datapoint with its own timestamp is accepted.
+        datapoint = next((key for key in ("va_temperature","temp_current")
+                          if entry.unique_id.endswith(key)),None)
+        if not datapoint:
+            return
+        device = entry.unique_id[len(prefix):-len(datapoint)]
+        if not device:
+            return
+
+        @callback
+        def room_report(properties=None, timestamps=None):
+            if entity != self.cfg.get("room") or datapoint not in (properties or ()):
+                return
+            observed = number((timestamps or {}).get(datapoint))
+            if observed is None:
+                return
+            if observed > 100_000_000_000:
+                observed /= 1000
+            received = time.time()
+            previous = self._learning_room_report
+            if 0<=received-observed<=300 and (previous is None or observed>previous[1]):
+                self._learning_room_report = entity,observed,received
+
+        self._handles[uuid4().hex] = async_dispatcher_connect(
+            self.hass,f"tuya_entry_update_{device}",room_report)
 
     def _learning_append(self, row, voltage, reasons, interval_kw):
         fields = ("ts","room","return","outside","power","fire","source","room_valid",
@@ -176,24 +232,54 @@ class NativeController(HeatingClimate):
             "boiler_power_mode","fire_valid","fire_active","external_gain","residual_gain",
             "room_source_disagreement","room_sources_suspect","energy")
         compact = {key:row.get(key) for key in fields}
+        requested=row.get("heating_requested")
+        command_at=number(self.memory.get("command_at"))
+        command=self.memory.get("command_diagnostic") or {}
+        confirmed_at=number(command.get("confirmed_at"))
+        mode="heat" if requested is True else "off"
+        compact.update(heating_requested=requested,command_at=command_at,
+            command_confirmed=bool(isinstance(requested,bool) and self.memory.get("owned")
+                and self.memory.get("last_command")==mode and self.memory.get("expected_mode")==mode
+                and command.get("status")=="confirmed" and command.get("accepted_mode")==mode
+                and command_at is not None and confirmed_at is not None and command_at<=confirmed_at<=row["ts"]
+                and not self._pending_command_evidence
+                and not (self.command_ledger_status or {}).get("fenced",True)
+                and self.raw("thermostat")==mode))
         stamp = row["ts"]
+        manual = self.memory.get("manual_energy") or {}
+        if (row.get("manual_extra_active") is True and manual.get("status")=="active"
+                and len(self.samples)>=2 and (started:=number(manual.get("started_at"))) is not None
+                and started<=self.samples[-2]["ts"] and interval_kw is not None
+                and "control_mode_changed" not in reasons and "unplanned_heat" not in reasons):
+            compact["manual_measurement_id"] = manual["started_at"]
         record = self.raw("room", attribute="all") or {}
-        # HA last_reported also advances for duplicate publications. Require a
-        # numeric state transition from the known primary, not just a timestamp.
+        entity = self.cfg.get("room")
         try:
-            changed = datetime.fromisoformat(record["last_changed"]).timestamp()
+            observed = datetime.fromisoformat(record["last_changed"]).timestamp()
         except (KeyError,ValueError,TypeError):
-            changed = None
+            observed = None
         reported = number(row.get("room_reported_at"))
+        source_report = self._learning_room_report
+        direct = bool(source_report and source_report[0]==entity and reported is not None
+                      and abs(reported-source_report[2])<=5 and 0<=stamp-source_report[1]<=300)
+        if direct:
+            observed = source_report[1]
         temperature = number(record.get("state"))
-        verified = (temperature is not None and temperature!=self._learning_last_value and changed is not None and reported is not None and changed<=reported<=stamp
-                    and changed>self._learning_last_report and 0<=stamp-changed<=300
+        source_changed = entity != self._learning_room_entity
+        if source_changed:
+            self._learning_room_entity = entity
+            self._learning_epoch = uuid4().hex
+            self._learning_last_report = observed or 0.
+            self._learning_last_value = temperature
+        verified = (temperature is not None and (direct or temperature!=self._learning_last_value)
+                    and observed is not None and reported is not None and observed<=reported<=stamp
+                    and observed>self._learning_last_report and 0<=stamp-observed<=300
                     and temperature==number(row.get("room"))
                     and row.get("room_valid") is True)
         if verified:
-            self._learning_last_report = changed
+            self._learning_last_report = observed
             self._learning_last_value = temperature
-            compact["room_reported_at"] = changed
+            compact["room_reported_at"] = observed
         ventilation = []
         for key in ("recuperator","bath"):
             evidence = (row.get("ventilation") or {}).get(key,{})
@@ -212,7 +298,7 @@ class NativeController(HeatingClimate):
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
         self._learning_rows.append(compact)
         if verified:
-            self._monitor_learning(changed)
+            self._monitor_learning(observed)
 
     def _monitor_learning(self, reported):
         checkpoint=self.memory.get("online_learning") or {}
@@ -222,7 +308,8 @@ class NativeController(HeatingClimate):
             return
         candidates=[record for record in self._learning_forecasts
                     if record["model"]==self.model and record["start"]>=monitoring["at"]
-                    and any(abs(reported-point[0])<=60 for key,point in record["points"].items()
+                    and any(abs(reported-point[0])<=min(learning.REPORT_ALIGNMENT_SECONDS,
+                            record.get("report_alignment_seconds",60)) for key,point in record["points"].items()
                             if key in ("1","3"))]
         if not candidates:
             return
@@ -274,7 +361,25 @@ class NativeController(HeatingClimate):
                     and self._learning_current_ok and self._learning_last_tick is not None
                     and 0<=stamp-self._learning_last_tick<=45)
 
-    def daily_learn(self, kwargs=None, **extra):
+    def schedule_learning(self,now):
+        if now.hour<10:
+            return
+        today=now.date().isoformat()
+        previous=self.memory.get("adaptive_schedule") or {}
+        if previous.get("day")!=today:
+            slot="daily"
+        elif previous.get("slot")=="daily" and (
+                ((now.hour,now.minute)>=(20,45) and
+                 self._learning_last_report>previous.get("room_report",0.)) or
+                (previous.get("eligible_at_issue") is False and self._learning_eligible())):
+            # Historical analysis can run during an outage. Spend the one
+            # remaining daily attempt when qualification returns, not only at night.
+            slot="retry"
+        else:
+            return
+        self.run_diagnostic("learning",self.daily_learn,slot=slot)
+
+    def daily_learn(self, kwargs=None, *, slot=None, **extra):
         if self._learning_job is not None:
             if time.monotonic()-self._learning_job["started"]>120:
                 self._learning_status.update(status="frozen",reason="learning_job_timeout")
@@ -283,15 +388,21 @@ class NativeController(HeatingClimate):
             return
         now=self.now()
         self.memory["last_analysis"]=now.isoformat()
+        eligible=self._learning_eligible()
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
-                    generation=self._learning_generation,equipment=self.memory.get("equipment_version",0))
+                    generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
+                    schedule=dict(day=now.date().isoformat(),slot=slot,
+                                  room_report=self._learning_last_report,eligible_at_issue=eligible))
         self._learning_job=issued
         self._learning_status.update(status="evaluating",reason="scheduled_evaluation")
         try:
             self.submit_to_executor(learning.run_learning,self.directory/"online_learning_v1.json",
                 tuple(self._learning_rows),tuple(self._learning_forecasts),issued["model"],
                 deepcopy(self.memory.get("ventilation_model") or {}),
-                deepcopy(self.memory.get("online_learning") or {}),now,self._learning_eligible(),
+                deepcopy(self.memory.get("online_learning") or {}),now,eligible,
+                dict(mode=self.cfg.get("boiler_power_mode","unconfirmed"),equipment=issued["equipment"],
+                     calibrations=deepcopy(self.memory.get("power_calibrations") or {}),
+                     active=deepcopy(self.memory.get("kws_forecast_profile"))),
                 callback=self._learning_finished,job_id=issued["id"])
         except Exception as exc:
             self._learning_job=None
@@ -304,11 +415,23 @@ class NativeController(HeatingClimate):
             return
         self._learning_job=None
         result=data["result"]
+        schedule=issued.get("schedule") or {}
+        if schedule.get("slot"):
+            self.memory["adaptive_schedule"]=dict(schedule,completed_at=self.now().isoformat())
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
-                                        "verified_reports","rejection_counts","current_reasons",
+                                        "verified_reports","rejection_counts","current_reasons","eligibility_counts",
                                         "analysis_status","analysis_blockers")}
-        if not (result.get("proposed") or result.get("rollback")):
+        if result.get("power_learning") is not None:
+            self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
+        self._apply_learning_result(issued,result)
+        if self._learning_status.get("status") not in ("accepted","rolled_back"):
+            checkpoint=self.memory.setdefault("online_learning",{})
+            checkpoint["changes_history"]=self._learning_history(
+                checkpoint,self._learning_status["status"],self._learning_status.get("reason"))
+
+    def _apply_learning_result(self, issued, result):
+        if not (result.get("proposed") or result.get("proposed_power") or result.get("rollback")):
             return
         checkpoint=self.memory.get("online_learning") or {}
         now=self.now()
@@ -321,12 +444,14 @@ class NativeController(HeatingClimate):
         if result.get("rollback"):
             self._rollback_learning(result["reason"])
         elif (result.get("evidence_fingerprint")!=checkpoint.get("last_rejected_evidence")
-              and learning.promotion_allowed(self.model,issued["model"],result["proposed"],
-                                             result["evidence"],checkpoint,now,
-                                             legacy_day=self.memory.get("learning_day"))):
+              and (learning.power_promotion_allowed(self.model,result["proposed_power"],result["evidence"],
+                        checkpoint,now,self.cfg.get("boiler_power_mode","unconfirmed"),issued["equipment"])
+                   if result.get("proposed_power") else
+                   learning.promotion_allowed(self.model,issued["model"],result["proposed"],
+                        result["evidence"],checkpoint,now,legacy_day=self.memory.get("learning_day")))):
             old=dict(self.model)
             version=max(old["version"],checkpoint.get("generation",0))+1
-            new={**old,**result["proposed"],"version":version}
+            new={**old,**(result.get("proposed") or {}),"version":version}
             next_checkpoint={**checkpoint,"generation":version,"promotion_day":now.date().isoformat(),
                 "daily_baseline":old,"prior_model":old,"fingerprint":result["evidence_fingerprint"],
                 "restored_learning_success":deepcopy(self.memory.get("learning_success")),
@@ -334,14 +459,63 @@ class NativeController(HeatingClimate):
                 "metrics":result["metrics"],"last_successful_learning":now.isoformat(),
                 "previous_plan_id":(self.memory.get("plan_reference") or {}).get("plan_id"),
                 "rollback_reason":None}
-            self._commit_learning_model(new,next_checkpoint,"accepted","independent_holdout_passed")
+            if result.get("proposed_power"):
+                next_checkpoint["pending_kws_profile"]=result["proposed_power"]
+            self._commit_learning_model(new,next_checkpoint,"accepted",
+                "kws_independent_thermal_holdout" if result.get("proposed_power") else "independent_holdout_passed")
         else:
             self._learning_status.update(status="rejected",reason="promotion_limits_or_prior_evidence")
 
+    def _learning_history(self, checkpoint, status, reason, model=None):
+        stamp=self.now().timestamp()
+        model=self.model if model is None else model
+        metrics=self._learning_status.get("metrics",{})
+        row=dict(at=stamp,status=status,reason=reason,version=model.get("version"),
+                 windows=self._learning_status.get("independent_windows"),
+                 minutes=self._learning_status.get("qualified_minutes"),
+                 changes={k:[self.model[k],model[k]] for k in learning.FIT_FIELDS
+                          if k in self.model and k in model and self.model[k]!=model[k]},
+                 mae={h:[metrics[h].get(side,{}).get("mae") for side in ("old","new")]
+                      for h in ("1","3") if h in metrics})
+        history=[event for event in checkpoint.get("changes_history",())
+                 if stamp-30*86400<=event["at"]<=stamp]
+        return (history+[row])[-96:]
+
     def _commit_learning_model(self, model, checkpoint, status, reason):
         """Commit the model and its rollback evidence at one filesystem boundary."""
+        ventilation=self.memory.get("ventilation_model")
+        active_vent=bool(ventilation and ventilation.get("validated")
+                         and ventilation.get("model_version")==self.model.get("version"))
+        if status=="accepted" and active_vent and model.get("room_loss")!=self.model.get("room_loss"):
+            self._learning_status.update(status="rejected",reason="room_loss_not_identifiable_with_ventilation")
+            return False
+        checkpoint={**checkpoint,"changes_history":self._learning_history(checkpoint,status,reason,model)}
+        if status=="accepted":
+            checkpoint["prior_ventilation_model"]=deepcopy(ventilation)
+            checkpoint["prior_kws_profile"]=deepcopy(self.memory.get("kws_forecast_profile"))
         values={**self.memory,"model":model,"weather":self.weather,"online_learning":checkpoint,
                 "previous_model":dict(self.model),"predictions":[],"hour_errors":[]}
+        # Validation used the existing qualified ventilation coefficients. Keep
+        # that exact physical context across a version-only rebind, and restore
+        # its previous snapshot on rollback, at the same atomic write boundary.
+        if status=="accepted" and active_vent:
+            values["ventilation_model"]={**ventilation,"model_version":model["version"],
+                                        "carried_from_model_version":self.model["version"]}
+        elif status=="rolled_back" and "prior_ventilation_model" in checkpoint:
+            values["ventilation_model"]=deepcopy(checkpoint.pop("prior_ventilation_model")) or {}
+        profile=self.memory.get("kws_forecast_profile")
+        if status=="accepted":
+            profile=checkpoint.pop("pending_kws_profile",profile)
+            if profile and profile.get("thermal_model_version")==self.model.get("version"):
+                profile={**profile,"thermal_model_version":model["version"]}
+        elif status=="rolled_back":
+            profile=checkpoint.pop("prior_kws_profile",None)
+        if profile and profile.get("equipment_version")!=self.memory.get("equipment_version",0):
+            profile=None
+        if profile or "kws_forecast_profile" in self.memory:
+            values["kws_forecast_profile"]=profile
+            values["power_calibrations"]=retain_kws_profile(values.get("power_calibrations"),profile,model,
+                                                           self.memory.get("equipment_version",0))
         values.pop("pending_model",None)
         if status=="accepted":
             values["learning_success"]=dict(time=checkpoint["last_successful_learning"],
@@ -664,6 +838,7 @@ class NativeController(HeatingClimate):
         self.listen_state(self.voltage_changed, self.args["grid_presence_helper"])
         # Recovery is attempted from the existing periodic control tick only.
         self._on_loop(self._async_listen_kws_manual_intent)
+        self._on_loop(self._async_listen_room_reports)
 
     @callback
     def _async_listen_kws_manual_intent(self):
@@ -1574,6 +1749,7 @@ class NativeController(HeatingClimate):
                      for key in ("floor_air","room_loss")
                      if key in previous and key in self.model and previous[key]!=self.model[key]]
             attributes.update(last_accepted_changes=changes,
+                last_completed_analysis=(self.memory.get("adaptive_schedule") or {}).get("completed_at"),
                 last_accepted_mae_1h=accepted_metrics.get("1",{}).get("new",{}).get("mae"),
                 last_accepted_mae_3h=accepted_metrics.get("3",{}).get("new",{}).get("mae"),
                 learning_status=report["status"],learning_gate=report["reason"],
@@ -1583,6 +1759,12 @@ class NativeController(HeatingClimate):
                 independent_windows=report.get("independent_windows",0),
                 qualified_minutes=report.get("qualified_minutes",0.),
                 verified_reports=report.get("verified_reports",0),
+                learning_eligibility=report.get("eligibility_counts",{}),
+                learning_history=[r for r in checkpoint.get("changes_history",())
+                                  if now.timestamp()-30*86400<=r["at"]<=now.timestamp()],
+                model_drift={str(days):learning.drift_totals(checkpoint.get("changes_history",()),
+                                                             now,days)
+                             for days,_ in learning.DRIFT_LIMITS},
                 rejection_counts=report.get("rejection_counts",{}),
                 current_reasons=report.get("current_reasons",[]),
                 analysis_status=report.get("analysis_status","pending"),

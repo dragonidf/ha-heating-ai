@@ -54,6 +54,10 @@ def package(directory):
         "homeassistant.components.http.server": module("homeassistant.components.http.server", StaticPathConfig=Mock()),
         "homeassistant.components.weather.const": module("homeassistant.components.weather.const", DATA_COMPONENT="weather"),
         "homeassistant.exceptions": module("homeassistant.exceptions", ConfigEntryNotReady=RuntimeError),
+        "homeassistant.helpers": module("homeassistant.helpers", entity_registry=SimpleNamespace(
+            async_get=lambda hass: SimpleNamespace(async_get=lambda entity: None))),
+        "homeassistant.helpers.dispatcher": module("homeassistant.helpers.dispatcher",
+            async_dispatcher_connect=Mock()),
         "homeassistant.helpers.event": module("homeassistant.helpers.event",
             async_track_state_change_event=lambda hass, ids, cb: hass.listen(ids, cb)),
         "homeassistant.helpers.template": module("homeassistant.helpers.template", Template=Mock()),
@@ -208,6 +212,43 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.model,{"version":6})
             self.assertEqual(app.command_ledger.calls,[])
 
+    async def test_native_schedule_catches_up_and_retries_only_after_new_reports(self):
+        with package(self.root / "package") as (component, _):
+            _, app=self.controller(component)
+            date=datetime(2026,11,1,14,tzinfo=timezone.utc)
+            with patch.object(app,"daily_learn") as learn:
+                app.schedule_learning(date)
+                learn.assert_called_once()
+                app.memory["adaptive_schedule"]={"day":date.date().isoformat(),"slot":"daily",
+                                                 "room_report":1000.}
+                learn.reset_mock()
+                app._learning_last_report=1000.
+                app.schedule_learning(date.replace(hour=21))
+                learn.assert_not_called()
+                app._learning_last_report=2000.
+                app.schedule_learning(date.replace(hour=21))
+                learn.assert_called_once()
+            self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_daily_retry_waits_for_recovered_qualification(self):
+        with package(self.root / "package") as (component, _):
+            _, app=self.controller(component)
+            date=datetime(2026,11,1,14,tzinfo=timezone.utc)
+            app.memory["adaptive_schedule"]={"day":date.date().isoformat(),"slot":"daily",
+                                             "room_report":1000.,"eligible_at_issue":False}
+            app._learning_last_report=1000.
+            with patch.object(app,"daily_learn") as learn, patch.object(app,"_learning_eligible") as ready:
+                ready.return_value=False
+                app.schedule_learning(date)
+                learn.assert_not_called()
+                ready.return_value=True
+                app.schedule_learning(date)
+                learn.assert_called_once_with(slot="retry")
+                learn.reset_mock()
+                app.memory["adaptive_schedule"]["slot"]="retry"
+                app.schedule_learning(date)
+                learn.assert_not_called()
+
     async def test_learning_commit_and_rollback_are_atomic_and_leave_control_ledgers(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)
@@ -215,7 +256,10 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             app.now = lambda: datetime(2026,11,1,tzinfo=timezone.utc)
             app.model = {"version":6,"validated":True,"floor_air":.035}
             source=dict(app.model)
-            app.memory.update(model=source,manual_energy={"status":"completed"},energy_cursor=3.)
+            ventilation=dict(validated=True,model_version=6,base_room_loss=.015,
+                             recuperator=.002,bath=.001)
+            app.memory.update(model=source,manual_energy={"status":"completed"},energy_cursor=3.,
+                              ventilation_model=dict(ventilation))
             app._learning_rows.append({"ts":1.})
             app.submit_to_executor=Mock()
             app._learning_eligible=Mock(return_value=True)
@@ -228,11 +272,16 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(component.os,"replace",side_effect=OSError("disk")):
                 app._learning_finished({"job_id":job,"result":outcome})
             self.assertEqual(app.model,source)
+            self.assertEqual(app.memory["ventilation_model"],ventilation)
             self.assertEqual(app.statefile.read_bytes() if app.statefile.exists() else None,original)
             app.daily_learn()
             self.assertIsNotNone(app._learning_job)
             app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
             self.assertEqual(app.model["version"],7)
+            self.assertEqual(app.memory["ventilation_model"],{**ventilation,"model_version":7,
+                             "carried_from_model_version":6})
+            self.assertEqual(json.loads(app.statefile.read_text())["ventilation_model"],
+                             app.memory["ventilation_model"])
             self.assertEqual(json.loads(app.statefile.read_text())["model"],app.model)
             self.assertEqual(app.memory["energy_cursor"],3.)
             from test_unified_learning import pairs
@@ -244,7 +293,50 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 app._monitor_learning(issued+3600)
             self.assertEqual(app.model,source)
             self.assertEqual(json.loads(app.statefile.read_text())["model"],source)
+            self.assertEqual(app.memory["ventilation_model"],ventilation)
+            self.assertEqual(json.loads(app.statefile.read_text())["ventilation_model"],ventilation)
             self.assertGreater(app.memory["online_learning"]["frozen_until"],app.now().timestamp())
+            self.assertEqual(app.memory["manual_energy"],{"status":"completed"})
+            self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_kws_profile_promotion_and_rollback_are_atomic(self):
+        from test_kws_forecast_learning import PROFILE
+        with package(self.root / "package") as (component, _):
+            _, app = self.controller(component)
+            app.directory = self.root
+            app.now = lambda: datetime(2026,11,1,tzinfo=timezone.utc)
+            app.model = {"version":6,"validated":True,"floor_air":.035}
+            source=dict(app.model)
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.memory.update(model=source,equipment_version=1,
+                manual_energy={"status":"completed"},energy_cursor=3.)
+            app._learning_rows.append({"ts":1.})
+            app.submit_to_executor=Mock()
+            app._learning_eligible=Mock(return_value=True)
+            outcome={"status":"accepted","proposed_power":dict(PROFILE),
+                "evidence":{"status":"accepted","strata":{"1:night_idle":{"mae":.3,"violation":False}}},
+                "metrics":{},"evidence_fingerprint":"fixture-power"}
+            app.daily_learn()
+            original=app.statefile.read_bytes() if app.statefile.exists() else None
+            with patch.object(component.os,"replace",side_effect=OSError("disk")):
+                app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
+            self.assertEqual(app.model,source)
+            self.assertIsNone(app.memory.get("kws_forecast_profile"))
+            self.assertEqual(app.statefile.read_bytes() if app.statefile.exists() else None,original)
+            app.daily_learn()
+            app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
+            self.assertEqual(app.model,{**source,"version":7})
+            applied={**PROFILE,"thermal_model_version":7}
+            self.assertEqual(app.memory["kws_forecast_profile"],applied)
+            self.assertEqual(app.memory["power_calibrations"]["profiles"]["fixed_6"],applied)
+            self.assertEqual(json.loads(app.statefile.read_text())["kws_forecast_profile"],applied)
+            app._rollback_learning("fixture")
+            self.assertEqual(app.model,source)
+            self.assertIsNone(app.memory.get("kws_forecast_profile"))
+            self.assertFalse(app.memory["power_calibrations"]["profiles"])
+            self.assertIsNone(json.loads(app.statefile.read_text())["kws_forecast_profile"])
+            self.assertGreater(app.memory["online_learning"]["frozen_until"],app.now().timestamp())
+            self.assertEqual(app.memory["energy_cursor"],3.)
             self.assertEqual(app.memory["manual_energy"],{"status":"completed"})
             self.assertEqual(app.command_ledger.calls,[])
 
@@ -263,6 +355,48 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 app._learning_append(dict(ts=stamp,room=float(value),room_valid=True,room_reported_at=stamp),True,(),0.)
                 self.assertIs(app._learning_rows[-1]["report_verified"],expected)
             self.assertEqual(app.memory,{})
+            self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_direct_primary_reports_with_unchanged_temperature_are_independent(self):
+        with package(self.root / "package") as (component, _):
+            hass, app = self.controller(component)
+            app.climate_tz = timezone.utc
+            app.cfg["room"] = "sensor.primary"
+            hass.rows["sensor.primary"] = State("sensor.primary", 21., at=3000.)
+            primary = hass.rows["sensor.primary"]
+            entry=SimpleNamespace(platform="tuya",original_device_class="temperature",
+                                  unique_id="tuya.test123va_temperature")
+            with patch.object(component.entity_registry,"async_get",
+                              return_value=SimpleNamespace(async_get=lambda key: entry)):
+                app._async_listen_room_reports()
+            _, signal, dispatch = component.async_dispatcher_connect.call_args.args
+            self.assertEqual(signal,"tuya_entry_update_test123")
+            for stamp, report, datapoint, observed, expected in (
+                (3000., 3000., None, None, False),  # cached at startup
+                (3300., 3000., None, None, False),  # same cached report
+                (6600., 6599., "va_temperature", 6598., True),
+                (6790., 6789., "va_temperature", 6598., False),  # same hardware packet
+                (6900., 6899., None, None, False),  # availability republish
+                (7200., 7199., "va_humidity", 7198., False),
+            ):
+                primary.last_reported = datetime.fromtimestamp(report, timezone.utc)
+                with patch.object(component.time,"time",return_value=report):
+                    dispatch([datapoint] if datapoint else None,
+                             {datapoint:observed} if datapoint else None)
+                app._learning_append(dict(ts=stamp,room=21.,room_valid=True,
+                    room_reported_at=report),True,(),0.)
+                self.assertIs(app._learning_rows[-1]["report_verified"],expected)
+            self.assertEqual(app.command_ledger.calls,[])
+
+    async def test_room_report_subscription_is_optional_until_registry_loads(self):
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            app.cfg["room"]="sensor.primary"
+            registry=Mock()
+            registry.async_get.side_effect=AttributeError("Entity registry is not loaded")
+            with patch.object(component.entity_registry,"async_get",return_value=registry):
+                app._async_listen_room_reports()
+            component.async_dispatcher_connect.assert_not_called()
             self.assertEqual(app.command_ledger.calls,[])
 
     async def test_manual_request_uses_native_serialized_control_only(self):

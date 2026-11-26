@@ -12,15 +12,18 @@ from tempfile import NamedTemporaryFile
 from threading import Lock
 
 from heating_environment import daylight, forecast_step, weather_factor
-from heating_model import BOUNDS, comfort_at, number, outdoor_at, transitions
+from heating_model import BOUNDS, comfort_at, number, outdoor_at, transitions, modulation_power, certified_upper_power
 
 SCHEMA = 1
 # The byte limit is deliberately below the storage ceiling to bound decoding RSS.
 MAX_BYTES = 512 * 1024
 RETENTION = 60 * 86400
 MAX_WEATHER_AGE = 3 * 3600
+REPORT_ALIGNMENT_SECONDS = 300
 IDENTITY = ("epoch", "source", "thermal_model_version", "equipment_version", "boiler_power_mode")
-FIT_FIELDS = ("floor_air", "room_loss")
+BASE_FIT_FIELDS = ("floor_air", "room_loss")
+FIT_FIELDS = BASE_FIT_FIELDS + ("floor_decay", "heat_gain")
+DRIFT_LIMITS = ((7, .05), (30, .12))
 _JOB_LOCK = Lock()
 
 
@@ -70,7 +73,7 @@ def ventilation_interval_duty(evidence):
     return powered if powered in (0., 1.) else None
 
 
-def row_reasons(row, *, strict):
+def row_reasons(row, *, strict, physics=False):
     reasons = set(row.get("shadow_reasons") or ())
     power = number(row.get("power"))
     if power is None or not 0 <= power <= 10.5:
@@ -83,9 +86,14 @@ def row_reasons(row, *, strict):
         reasons.add("unknown_grid" if row.get("grid") != "off" else "unqualified_outage")
     if row.get("voltage_qualified") is not True:
         reasons.add("unknown_or_unqualified_voltage")
-    if row.get("manual_extra_active") or row.get("execution") == "manual_or_native":
+    manual = (physics and row.get("manual_extra_active") is True
+              and number(row.get("manual_measurement_id")) is not None
+              and number(row.get("interval_kw")) is not None)
+    if manual:
+        reasons.discard("manual_extra_request")
+    elif row.get("manual_extra_active") or row.get("execution") == "manual_or_native":
         reasons.add("manual_extra_request")
-    if strict and (row.get("manual_extra_active") is not False
+    if strict and not manual and (row.get("manual_extra_active") is not False
                    or row.get("execution") not in ("automatic", "idle")):
         reasons.add("unknown_execution")
     if strict and any(row.get(key) is None for key in IDENTITY):
@@ -194,7 +202,7 @@ def _spans(rows, times, start, end):
     return zip(rows[left:right], rows[left+1:right+1])
 
 
-def _continuous(rows, times, start, end, identity):
+def _continuous(rows, times, start, end, identity, *, physics=False):
     pairs = _spans(rows, times, start, end)
     if pairs is None:
         return [], {"missing_bracket"}
@@ -203,8 +211,10 @@ def _continuous(rows, times, start, end, identity):
         x, y = a["ts"], b["ts"]
         if not 0 < y-x <= 600:
             reasons.add("telemetry_gap")
-        reasons.update(row_reasons(a, strict=True))
-        reasons.update(row_reasons(b, strict=True))
+        reasons.update(row_reasons(a, strict=True, physics=physics))
+        reasons.update(row_reasons(b, strict=True, physics=physics))
+        if physics and a.get("manual_measurement_id") != b.get("manual_measurement_id"):
+            reasons.add("manual_session_boundary")
         if any(tuple(row.get(k) for k in IDENTITY) != identity for row in (a,b)):
             reasons.add("identity_changed")
         if a.get("shadow_ventilation") != b.get("shadow_ventilation"):
@@ -248,10 +258,10 @@ def build_observation_windows(samples, tz):
             anchor = end, row
             continue
         start, first = anchor
-        if end-start < 900:
+        if end-start < 300:
             continue
         anchor = end, row
-        if end-start > 9000:
+        if end-start > 7200:
             counts["anchor_expired"] += 1
             continue
         day = _local_day(start, tz)
@@ -259,8 +269,8 @@ def build_observation_windows(samples, tz):
             counts["local_midnight"] += 1
             continue
         identity = tuple(first.get(k) for k in IDENTITY)
-        steps, reasons = _continuous(rows,times,start,end,identity)
-        reasons |= row_reasons(first,strict=True) | row_reasons(row,strict=True)
+        steps, reasons = _continuous(rows,times,start,end,identity,physics=True)
+        reasons |= row_reasons(first,strict=True,physics=True) | row_reasons(row,strict=True,physics=True)
         if abs(row["room"]-first["room"]) > .6:
             reasons.add("room_jump")
         if reasons:
@@ -271,16 +281,25 @@ def build_observation_windows(samples, tz):
         sun = sum(seconds*factor for seconds, _, _, factor, _ in steps)/(end-start)
         windows.append(dict(start=start,end=end,day=day,room_start=first["room"],room_end=row["room"],
                             floor=steps[0][4],steps=steps,heat=heating,idle=idle,sun=sun,
+                            manual=first.get("manual_measurement_id") is not None,
                             equipment=list(identity[2:]),vent=first["shadow_ventilation"]))
         anchor = None  # an independent physical report belongs to at most one window
     anchor_at = None
-    if anchor and rows and rows[-1]["ts"]-anchor[0]<=9000:
+    if anchor and rows and rows[-1]["ts"]-anchor[0]<=7200:
         at, row = anchor
         _, issues = _continuous(rows,times,at,rows[-1]["ts"],tuple(row.get(k) for k in IDENTITY))
         if not issues and not row_reasons(row,strict=True):
             anchor_at = at
     observation = rows[-1] if rows else {}
+    eligibility_counts = dict(manual_physics_windows=sum(w["manual"] for w in windows),
+                              automatic_physics_windows=sum(not w["manual"] for w in windows),
+                              primary_reports=len(reports),
+                              electrical_intervals=sum(
+                                  r.get("power_source")=="kws_phases" and r.get("power_quality")=="measured"
+                                  and (kw:=number(r.get("interval_kw"))) is not None
+                                  and 0<=kw<=10.5 for r in rows))
     return dict(windows=windows,rejection_counts=dict(counts),unique_primary_reports=len(reports),
+                eligibility_counts=eligibility_counts,
                 last_verified_anchor=anchor_at,
                 current_observation_quality={
                     "primary_fresh": observation.get("primary_fresh",False),
@@ -301,7 +320,7 @@ def _metrics(errors):
                 median=median(absolute),p95=absolute[math.ceil(.95*len(errors))-1])
 
 
-def _score(windows, coefficients, solar=0., ventilation=None):
+def _errors(windows, coefficients, solar=0., ventilation=None):
     errors = []
     floor_air, loss = coefficients["floor_air"], coefficients["room_loss"]
     heat_gain, decay = coefficients["heat_gain"], coefficients["floor_decay"]
@@ -317,7 +336,11 @@ def _score(windows, coefficients, solar=0., ventilation=None):
             room += (floor_air*difference-ventilation_loss*(room-outside)+solar*sun)*hours
             floor += (heat_gain*kw-decay*difference)*hours
         errors.append(room-window["room_end"])
-    return _metrics(errors)
+    return errors
+
+
+def _score(windows, coefficients, solar=0., ventilation=None):
+    return _metrics(_errors(windows,coefficients,solar,ventilation))
 
 
 def _split(windows):
@@ -337,6 +360,59 @@ def _coverage(windows):
                 idle_days=len({w["day"] for w in windows if w["idle"]}))
 
 
+def _storage_candidate(train, model, base_best, ventilation):
+    """One-coordinate update only with independent excitation and sensitivity.
+
+    Return is a proxy, not a direct floor measurement. Fit on actual room
+    endpoints, never the simulated floor or cached temperature as a target.
+    A weak or collinear parameter must remain unchanged.
+    """
+    coverage=_coverage(train)
+    if coverage["days"]<4 or coverage["seconds"]<12*3600:
+        return None
+    warm=[w for w in train if w["end"]-w["start"]>=1800 and
+          w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.]
+    heat=[w for w in train if w["end"]-w["start"]>=1800 and
+          w["heat"]>=.75*(w["end"]-w["start"])]
+    if any(_coverage(rows)["days"]<3 or _coverage(rows)["seconds"]<3*3600 for rows in (warm,heat)):
+        return None
+    base=_errors(train,model,ventilation=ventilation)
+    best_error=_score(train,base_best,ventilation=ventilation)["mae"]
+    sensitivity={}
+    options=[]
+    for field in FIT_FIELDS:
+        trial={**model,field:model[field]*1.01}
+        if not BOUNDS[field][0]<=trial[field]<=BOUNDS[field][1]:
+            continue
+        vector=[b-a for a,b in zip(base,_errors(train,trial,ventilation=ventilation))]
+        magnitude=math.sqrt(sum(v*v for v in vector))
+        if magnitude>1e-9:
+            sensitivity[field]=(vector,magnitude)
+    for field,cohort in (("floor_decay",warm),("heat_gain",heat)):
+        if field not in sensitivity:
+            continue
+        vector,norm=sensitivity[field]
+        if norm/math.sqrt(len(vector))<.001:
+            continue
+        if any(abs(sum(a*b for a,b in zip(vector,other)))/(norm*size)>=.985
+               for key,(other,size) in sensitivity.items() if key!=field):
+            continue
+        cohort_old=_score(cohort,model,ventilation=ventilation)["mae"]
+        for scale in (.99,1.01):
+            candidate={**model,field:model[field]*scale}
+            if not BOUNDS[field][0]<=candidate[field]<=BOUNDS[field][1]:
+                continue
+            objective=_score(train,candidate,ventilation=ventilation)["mae"]
+            cohort_error=_score(cohort,candidate,ventilation=ventilation)["mae"]
+            if (best_error-objective>=max(.001,.02*best_error) and
+                    cohort_old-cohort_error>=max(.001,.02*cohort_old)):
+                options.append((objective,field,candidate))
+    if not options:
+        return None
+    _,field,candidate=min(options,key=lambda x:(x[0],x[1]))
+    return field,candidate
+
+
 def evaluate_windows(windows, model, ventilation=None):
     """Bounded offline fit. Holdout is selected by whole, later local days."""
     # Fit v6 only with one current equipment and mode identity.
@@ -347,6 +423,14 @@ def evaluate_windows(windows, model, ventilation=None):
     qualified_vent = ventilation and ventilation.get("validated") and ventilation.get("model_version")==model.get("version")
     thermal = [w for w in windows if w["sun"]<=.02 and
                (qualified_vent or max(w["vent"])==0.)]
+    # Over short intervals sensor rounding can dominate the thermal response.
+    # Prefer longer observations when they already cover both regimes and days.
+    longer = [w for w in thermal if w["end"]-w["start"] >= 900]
+    support = _coverage(longer)
+    if (support["seconds"] >= 8*3600 and support["days"] >= 5
+            and support["heat"] >= 2*3600 and support["heat_days"] >= 2
+            and support["idle"] >= 3*3600 and support["idle_days"] >= 2):
+        thermal = longer
     coverage = _coverage(thermal)
     returns = [step[4] for w in thermal for step in w["steps"]]
     blockers = [key for key, ok in (
@@ -358,28 +442,59 @@ def evaluate_windows(windows, model, ventilation=None):
     if (not train or not holdout or not any(w["heat"] for w in train) or not any(w["idle"] for w in train)
             or not any(w["heat"] for w in holdout) or not any(w["idle"] for w in holdout)):
         blockers.append("independent_holdout")
+    # A qualified ventilation fit replaces room_loss in _score; that parameter
+    # is not identifiable from these windows. Never select an arbitrary tied value.
+    fields = ("floor_air",) if qualified_vent else BASE_FIT_FIELDS
     if blockers:
-        return dict(status="insufficient_data", blockers=blockers, coverage=coverage)
+        cooling = [w for w in thermal if w["idle"]>=w["end"]-w["start"]
+                   and abs(w["floor"]-w["room_start"])<=1.5
+                   and all(w["room_start"]-step[1]>=5. for step in w["steps"])]
+        train,holdout = _split(cooling)
+        outside = [w["steps"][0][1] for w in cooling]
+        support = _coverage(train)
+        if (qualified_vent or not holdout or support["seconds"]<8*3600 or support["days"]<2
+                or not outside or max(outside)-min(outside)<2.):
+            return dict(status="insufficient_data", blockers=blockers, coverage=coverage)
+        fields = ("room_loss",)
     # Bound both the grid and per-candidate displacement; widening belongs to a
     # separate qualification for equipment gain and decay.
     old = _score(train,model,ventilation=ventilation)
     best, objective = model, old["mae"]
-    for a in (-.01,0.,.01):
-        for b in (-.01,0.,.01):
+    for a in (-.01,0.,.01) if "floor_air" in fields else (0.,):
+        for b in (-.01,0.,.01) if "room_loss" in fields else (0.,):
             candidate = {**model,"floor_air":model["floor_air"]*(1+a),"room_loss":model["room_loss"]*(1+b)}
             if not all(BOUNDS[k][0]<=candidate[k]<=BOUNDS[k][1] for k in FIT_FIELDS):
                 continue
             score = _score(train,candidate,ventilation=ventilation)["mae"]
             if score<objective:
                 best,objective=candidate,score
+    # Select using training only; never fall back to a different candidate
+    # after looking at the later holdout.
+    storage = _storage_candidate(train,model,best,ventilation) if not blockers else None
+    if storage:
+        field,best=storage
+        fields=(field,)
     baseline = _score(holdout,model,ventilation=ventilation)
     shadow = _score(holdout,best,ventilation=ventilation)
     qualified = best!=model and shadow["mae"]<baseline["mae"] and shadow["p95"]<=baseline["p95"]
+    if storage:
+        cohort=[w for w in holdout if w["end"]-w["start"]>=1800 and (
+            w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.
+            if field=="floor_decay" else w["heat"]>=.75*(w["end"]-w["start"]))]
+        support=_coverage(cohort)
+        prior=_score(cohort,model,ventilation=ventilation)
+        changed=_score(cohort,best,ventilation=ventilation)
+        qualified=bool(qualified and support["days"]>=2 and support["seconds"]>=2*3600
+            and baseline["mae"]-shadow["mae"]>=max(.001,.02*baseline["mae"])
+            and abs(shadow["bias"])<=abs(baseline["bias"])
+            and prior["mae"]-changed["mae"]>=max(.001,.02*prior["mae"])
+            and changed["p95"]<=prior["p95"])
+
     return dict(status="holdout_passed" if qualified else "holdout_rejected",
                 blockers=[] if qualified else ["held_out_no_improvement"],
                 coverage=coverage, train_windows=len(train), holdout_days=len({w["day"] for w in holdout}),
                 holdout_start=min(w["day"] for w in holdout),
-                old=baseline,shadow=shadow, coefficients={k:best[k] for k in FIT_FIELDS} if qualified else None,
+                old=baseline,shadow=shadow, coefficients={k:best[k] for k in fields} if qualified else None,
                 equipment=latest)
 
 
@@ -552,7 +667,7 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
                 point.get("upper_temperature",point["temperature"]),low,high,zone]
     if not points:
         return None
-    last = max(p[0] for p in points.values())
+    last = min(max(p[0] for p in points.values())+REPORT_ALIGNMENT_SECONDS,known,fine[-1]["ts"])
     segments = [[max(start,s["start"]),min(last,s["end"]),s["power_kw"]]
                 for s in forecast.get("heat_segments",[]) if s["end"]>start and s["start"]<last]
     climate = {k:settings[k] for k in ("environment","thermal_model_version","ventilation_model",
@@ -562,22 +677,27 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
     climate = json.loads(_encode(climate))
     guards = []
     for point in fine:
-        if start<point["ts"]<=min(last,start+10860):
+        if start<point["ts"]<=min(last,start+10860+REPORT_ALIGNMENT_SECONDS):
             at=datetime.fromtimestamp(point["ts"]-.001,now.tzinfo)
             _,low,high,_=comfort_at(at,settings)
             guards.append([point["ts"],point["temperature"],point.get("upper_temperature"),low,high])
     return dict(start=start, issue_at=issue, provider="heating_weather_forecast",
+                report_alignment_seconds=REPORT_ALIGNMENT_SECONDS,
+                comfort_profile={k:settings[k] for k in ("target","lower","upper","night_target",
+                    "night_lower","night_upper","sleep_start","sleep_end") if k in settings},
                 weather=relevant, weather_known_until=known,
                 room=room,floor=floor,outside=outside,fire=fire, settings=climate,
                 model=dict(model),candidate=candidate,epoch=epoch,points=points,
+                power_upper_kw=certified_upper_power(settings.get("modulation_profile")),
                 segments=segments,guards=guards,identity=[epoch,"Вітальня",model.get("version"),
                     settings.get("equipment_version"),(settings.get("modulation_profile") or {}).get("physical_mode")])
 
 
-def _frozen_predictions(snapshot, tz, finish):
+def _frozen_predictions(snapshot, tz, finish, *, evaluated_targets=()):
     start, segments = snapshot["start"], snapshot["segments"]
     weather, settings = snapshot["weather"], snapshot["settings"]
     horizon_targets = {v[0] for v in snapshot["points"].values() if v[0]<=finish}
+    horizon_targets.update(t for t in evaluated_targets if start<t<=finish)
     guard_targets = {v[0] for v in snapshot.get("guards",()) if v[0]<=finish}
     boundaries = sorted({start,finish,*horizon_targets,*guard_targets,
                          *(start+i*300 for i in range(1,math.ceil((finish-start)/300))),
@@ -586,17 +706,98 @@ def _frozen_predictions(snapshot, tz, finish):
     states = [(room,floor),(room,floor)]
     models = (snapshot["model"],{**snapshot["model"],**(snapshot["candidate"] or {}).get("coefficients",{})})
     predictions, peaks = {}, [room,room]
+    profile=(snapshot["candidate"] or {}).get("power_profile")
+    prior_upper=number(snapshot.get("power_upper_kw"))
+    next_upper=certified_upper_power(profile) if profile else prior_upper
+    risk=prior_upper is not None or next_upper is not None
+    upper_states=[(room,floor),(room,floor)]
+    upper_peaks=[room,room]
+    storage_ok=True
     for a,b in zip(boundaries,boundaries[1:]):
         when = datetime.fromtimestamp(a,tz)
-        kw = next((kw for lo,hi,kw in segments if lo<=a and b<=hi),0.)
+        segment=next((kw for lo,hi,kw in segments if lo<=a and b<=hi),None)
+        kw=segment if segment is not None else 0.
         fire = snapshot["fire"]*math.exp(-(a-start)/7200)
         outside = outdoor_at(weather,when,snapshot["outside"])
         for i,(model, (r,f)) in enumerate(zip(models,states)):
-            states[i] = forecast_step(r,f,outside,kw,fire,model,(b-a)/3600,when,weather,settings)
+            power=(modulation_power(f,profile) if i==1 and profile and segment is not None else kw)
+            states[i] = forecast_step(r,f,outside,power,fire,model,(b-a)/3600,when,weather,settings)
             peaks[i] = max(peaks[i],states[i][0])
+            if risk:
+                bound=(prior_upper,next_upper)[i]
+                upper_kw=max(power,bound) if segment is not None and bound is not None else power
+                ur,uf=upper_states[i]
+                upper_states[i]=forecast_step(ur,uf,outside,upper_kw,fire,model,(b-a)/3600,
+                                              when,weather,settings,upper=True)
+                upper_peaks[i]=max(upper_peaks[i],upper_states[i][0])
+                if i==1 and segment is not None and upper_states[i][1]>50:
+                    storage_ok=False
         if b in horizon_targets or b in guard_targets:
-            predictions[b] = states[1][0]-states[0][0], peaks[1]-peaks[0]
+            nominal=(states[1][0]-states[0][0],peaks[1]-peaks[0])
+            predictions[b]=(nominal+(max(0.,upper_states[1][0]-upper_states[0][0],
+                                      upper_peaks[1]-upper_peaks[0]),storage_ok) if risk else nominal)
     return predictions
+
+
+def _aligned_forecast_point(snapshot, horizon, at, tz):
+    """Evaluate the issue-time trajectory at a real report, never interpolate the measurement."""
+    due,old,upper,low,high,zone = snapshot["points"][horizon]
+    if at==due:
+        return due,old,upper,low,high,zone
+    if not snapshot.get("report_alignment_seconds") or horizon not in ("1","3"):
+        return None
+    guards=snapshot.get("guards",())
+    if not guards or not snapshot["start"]<at<=snapshot["weather_known_until"]:
+        return None
+    times=[g[0] for g in guards]
+    index=bisect_left(times,at)
+    if index>=len(guards) or index==0:
+        return None
+    a,b=guards[index-1],guards[index]
+    if not 0<b[0]-a[0]<=301 or a[2] is None or b[2] is None:
+        return None
+    fraction=(at-a[0])/(b[0]-a[0])
+    # Only the already issued model curve is interpolated; the physical report
+    # remains untouched. Retain a conservative upper envelope of the bracket.
+    nominal=a[1]+fraction*(b[1]-a[1])
+    upper=max(a[2],b[2])
+    _,low,high,zone=comfort_at(datetime.fromtimestamp(at-.001,tz),snapshot["comfort_profile"])
+    return at,nominal,upper,low,high,zone
+
+
+def _command_follows_plan(rows,times,start,end,segments):
+    """Independent command chronology, not measured watts, proves execution.
+
+    Zero duty during an established request is a real KWS observation. A
+    missing command timestamp or unobserved generation cannot establish it.
+    """
+    spans=_spans(rows,times,start,end)
+    if spans is None:
+        return False
+    mismatch=covered=0.
+    for a,b in spans:
+        x,y=a["ts"],b["ts"]
+        first,last=a.get("heating_requested"),b.get("heating_requested")
+        before,after=number(a.get("command_at")),number(b.get("command_at"))
+        if (a.get("command_confirmed") is not True or b.get("command_confirmed") is not True
+                or not isinstance(first,bool) or not isinstance(last,bool) or before is None or after is None
+                or before>x or after>y or not 0<y-x<=600):
+            return False
+        if first==last:
+            if before!=after:return False
+            pieces=((x,y,first),)
+        elif x<after<=y and before<after:
+            pieces=((x,after,first),(after,y,last))
+        else:
+            return False
+        for lo,hi,active in pieces:
+            lo,hi=max(start,lo),min(end,hi)
+            if hi<=lo:continue
+            duration=hi-lo
+            planned=sum(max(0.,min(hi,b)-max(lo,a)) for a,b,_ in segments)
+            mismatch+=abs(duration-planned) if active else planned
+            covered+=duration
+    return abs(covered-(end-start))<.01 and mismatch<=120.
 
 
 def qualify_frozen(snapshot, rows, tz):
@@ -608,16 +809,27 @@ def qualify_frozen(snapshot, rows, tz):
         return []
     checks = []
     for horizon,(due,old,upper,low,high,zone) in snapshot["points"].items():
-        if due>snapshot["weather_known_until"] or due>times[-1]:
+        alignment=(min(REPORT_ALIGNMENT_SECONDS,snapshot.get("report_alignment_seconds",0))
+                   if horizon in ("1","3") else 0)
+        tolerance=alignment or 60
+        if due>snapshot["weather_known_until"] or (not alignment and due>times[-1]):
             continue
-        candidates = ((at,r) for r in rows[bisect_left(times,due-300):bisect_right(times,due+600)]
-                      if (at:=report_time(r)) is not None and abs(at-due)<=60)
-        chosen = min(candidates,key=lambda pair:abs(pair[0]-due),default=None)
+        candidates = ((at,r) for r in rows[bisect_left(times,due-max(300,tolerance)):
+                                           bisect_right(times,due+tolerance+300)]
+                      if (at:=report_time(r)) is not None and abs(at-due)<=tolerance)
+        aligned=[]
+        for at,row in candidates:
+            point=_aligned_forecast_point(snapshot,horizon,at,tz) if alignment else (due,old,upper,low,high,zone)
+            if point is not None and point[0]<=times[-1]:
+                aligned.append((abs(at-due),at,row,point))
+        chosen=min(aligned,key=lambda item:(item[0],item[1]),default=None)
         if chosen is None:
             continue
-        at,row = chosen
+        _,at,row,point=chosen
+        due,old,upper,low,high,zone=point
         steps,reasons = _continuous(rows,times,start,due,tuple(snapshot["identity"]))
         reasons |= row_reasons(row, strict=True)
+        command_verified=(not reasons and _command_follows_plan(rows,times,start,due,snapshot["segments"]))
         actual_kwh = sum(seconds*kw/3600 for seconds,_,kw,_,_ in steps if kw is not None)
         planned_kwh = sum(max(0.,min(due,b)-a)*kw/3600 for a,b,kw in snapshot["segments"])
         planned_minutes = sum(max(0.,min(due,b)-a)/60 for a,b,_ in snapshot["segments"])
@@ -633,9 +845,12 @@ def qualify_frozen(snapshot, rows, tz):
                 reasons.add("execution_timing_mismatch")
                 break
             cursor=right
-        checks.append((int(horizon), due, old, upper, low, high, zone, row["room"], reasons,
-                       planned_kwh,actual_kwh,planned_minutes,actual_minutes))
-    return [row[:-5]+(sorted(row[-5]),)+row[-4:] for row in checks]
+        check=(int(horizon), due, old, upper, low, high, zone, row["room"], sorted(reasons),
+               planned_kwh,actual_kwh,planned_minutes,actual_minutes)
+        if command_verified:
+            check+=({"command_verified":True},)
+        checks.append(check)
+    return checks
 
 
 def compare_frozen(snapshot, rows, tz):
@@ -646,17 +861,31 @@ def score_frozen(snapshot, checks, tz):
     if not checks:
         return []
     start = snapshot["start"]
-    predictions = (_frozen_predictions(snapshot,tz,max(check[1] for check in checks))
+    predictions = (_frozen_predictions(snapshot,tz,max(check[1] for check in checks),
+                                      evaluated_targets=[check[1] for check in checks])
                    if snapshot["candidate"] else {})
     results=[]
-    for h,due,old,upper,low,high,zone,actual,reasons,plan_kwh,actual_kwh,plan_min,actual_min in checks:
-        delta,peak_delta = predictions.get(due,(0.,0.))
+    power_candidate=(snapshot.get("candidate") or {}).get("power_profile")
+    for h,due,old,upper,low,high,zone,actual,reasons,plan_kwh,actual_kwh,plan_min,actual_min,*extra in checks:
+        reasons=set(reasons)
+        if power_candidate or (snapshot.get("power_upper_kw") is not None and not snapshot.get("candidate")):
+            if extra and extra[0].get("command_verified") is True:
+                reasons.difference_update(("plan_execution_mismatch","execution_timing_mismatch"))
+            else:
+                reasons.add("independent_command_evidence_required")
+        change=predictions.get(due,(0.,0.))
+        delta,peak_delta=change[:2]
+        upper_change=max(change[:3])
+        storage_ok=len(change)<4 or change[3]
         guards = [g for g in snapshot.get("guards",()) if g[0]<=due]
+        if (guards and guards[-1][0]<due and snapshot.get("report_alignment_seconds")
+                and h in (1,3) and _aligned_forecast_point(snapshot,str(h),due,tz) is not None):
+            guards.append([due,old,upper,low,high])
         trajectory_ok = bool(guards and guards[-1][0]==due
             and all(0<b-a<=301 for a,b in zip([start]+[g[0] for g in guards], [g[0] for g in guards])))
         if trajectory_ok and predictions:
-            trajectory_ok=all(high_risk is not None
-                and max(0.,high_risk+max(predictions[t])-hi)<=max(0.,high_risk-hi)
+            trajectory_ok=all(high_risk is not None and (len(predictions[t])<4 or predictions[t][3])
+                and max(0.,high_risk+max(predictions[t][:3])-hi)<=max(0.,high_risk-hi)
                 and max(0.,lo-(nom+predictions[t][0]))<=max(0.,lo-nom)
                 for t,nom,high_risk,lo,hi in guards)
         shadow = old+delta
@@ -679,11 +908,11 @@ def score_frozen(snapshot, checks, tz):
         results.append(dict(start=start,end=due,day=_local_day(start,tz),horizon=h,
             old_error=old-actual,shadow_error=shadow-actual,valid=not reasons,reasons=sorted(reasons),
             trajectory_guard_ok=trajectory_ok,stratum=stratum,violation=violation,
-            guard_ok=(max(0.,upper+max(delta,peak_delta)-high)<=max(0.,upper-high) and
+            guard_ok=(storage_ok and max(0.,upper+upper_change-high)<=max(0.,upper-high) and
                       max(0.,low-shadow)<=max(0.,low-old)),
             categories=categories,planned_kwh=plan_kwh,actual_kwh=actual_kwh,
             energy_error=actual_kwh-plan_kwh,planned_minutes=plan_min,actual_minutes=actual_min,
-            upper_risk=max(0.,upper+max(delta,peak_delta)-high),comfort_deficit=max(0.,low-shadow),
+            upper_risk=max(0.,upper+upper_change-high),comfort_deficit=max(0.,low-shadow),
             peak_delta=peak_delta))
     return results
 
@@ -708,7 +937,7 @@ def promotion_evidence(rows):
             return dict(status="insufficient_data",reason=f"holdout_{horizon}h",metrics=metrics)
         old,new=(_metrics([r[key] for r in qualified]) for key in ("old_error","shadow_error"))
         metrics[str(horizon)]={"old":old,"new":new}
-        if (not old["mae"] or new["mae"]>.98*old["mae"] or abs(new["bias"])>abs(old["bias"])
+        if (not old["mae"] or new["mae"]>.98*old["mae"] or new["p95"]>old["p95"] or abs(new["bias"])>abs(old["bias"])
                 or any(r.get("guard_ok") is not True or r.get("trajectory_guard_ok",True) is not True
                        for r in qualified)):
             return dict(status="rejected",reason=f"quality_{horizon}h",metrics=metrics)
@@ -717,6 +946,100 @@ def promotion_evidence(rows):
             strata[f"{horizon}:{group}"]=dict(mae=_metrics([r["old_error"] for r in members])["mae"],
                                              violation=any(r["violation"] for r in members))
     return dict(status="accepted",metrics=metrics,strata=strata)
+
+
+def qualify_power_candidate(context, archive, model, tz, evidence_after=0.):
+    mode=context.get("mode")
+    equipment=context.get("equipment")
+    candidate=((context.get("calibrations") or {}).get("candidates") or {}).get(mode) or {}
+    if (mode not in ("fixed_3","fixed_6","fixed_9","auto") or
+            candidate.get("physical_mode")!=mode or candidate.get("equipment_version")!=equipment or
+            candidate.get("power_source")!="kws_phases" or candidate.get("electrical_validated") is not True or
+            candidate.get("electrical_holdout_days",0)<2 or candidate.get("holdout_minutes",0)<60):
+        return dict(status="insufficient_data",reason="independent_kws_electrical_holdout")
+    rated=9. if mode=="auto" else float(mode[-1])
+    observed=number(candidate.get("observed_upper_kw"))
+    trained=number(candidate.get("training_until"))
+    if observed is None or not 0<=observed<=10.5 or trained is None or trained<=0:
+        return dict(status="rejected",reason="invalid_kws_calibration")
+    profile=dict(candidate,validated=True,thermal_model_version=model.get("version"),
+                 thermal_validation_status="passed",conservative_upper_kw=max(rated,observed))
+    if not power_profile_valid(profile):
+        return dict(status="rejected",reason="invalid_kws_forecast_profile")
+    current=context.get("active") or {}
+    if (current.get("physical_mode")==mode and current.get("equipment_version")==equipment and
+            current.get("thermal_model_version")==model.get("version") and
+            certified_upper_power(current)==profile["conservative_upper_kw"] and
+            [(b.get("return_c"),b.get("power_kw")) for b in current.get("bands",())]==
+            [(b.get("return_c"),b.get("power_kw")) for b in profile.get("bands",())]):
+        return dict(status="collecting",reason="kws_profile_unchanged")
+    scored=[r for item in archive if item["snapshot"]["model"]==model
+            and item["snapshot"]["start"]>=max(trained,evidence_after)
+            and item["snapshot"]["identity"][2:]==[model.get("version"),equipment,mode]
+            for r in score_frozen(dict(item["snapshot"],candidate={"power_profile":profile}),
+                                  [r for r in item["checks"] if r[0] in (1,3)],tz)]
+    # An idle-only cohort cannot validate a power model. Each horizon needs
+    # heating evidence on at least two independent days, including after-stop.
+    for h in (1,3):
+        heat=[r for r in independent_checks(scored,h) if r["planned_minutes"]>=10]
+        if len({r["day"] for r in heat})<2 or not any("after_stop" in r["categories"] for r in heat):
+            return dict(status="insufficient_data",reason=f"kws_heated_holdout_{h}h")
+    gate=promotion_evidence(scored)
+    if gate["status"]!="accepted":
+        return dict(status=gate["status"],reason=gate.get("reason"),metrics=gate.get("metrics",{}))
+    return dict(status="accepted",reason="kws_independent_thermal_holdout",profile=profile,
+                gate=gate,fingerprint=sha256(_encode([profile,scored])).hexdigest())
+
+
+def power_profile_valid(profile):
+    if (not isinstance(profile,dict) or profile.get("electrical_validated") is not True or
+            (number(profile.get("electrical_holdout_days")) or 0)<2 or
+            (number(profile.get("holdout_minutes")) or 0)<60 or
+            (number(profile.get("training_until")) or 0)<=0 or certified_upper_power(profile) is None):
+        return False
+    bands=profile.get("bands")
+    if not isinstance(bands,list) or not 0<len(bands)<=33:
+        return False
+    previous=-math.inf
+    for band in bands:
+        if not isinstance(band,dict):return False
+        at,kw=number(band.get("return_c")),number(band.get("power_kw"))
+        if at is None or kw is None or not previous<at<=65 or not 0<=kw<=min(9.,profile["conservative_upper_kw"]):
+            return False
+        previous=at
+    return True
+
+
+def power_promotion_allowed(model, proposed, evidence, checkpoint, now, mode, equipment):
+    return (model.get("validated") is True and power_profile_valid(proposed)
+            and proposed.get("physical_mode")==mode and proposed.get("equipment_version")==equipment
+            and proposed.get("thermal_model_version")==model.get("version")
+            and proposed.get("electrical_validated") is True and proposed.get("thermal_validation_status")=="passed"
+            and certified_upper_power(proposed) is not None and evidence.get("status")=="accepted"
+            and checkpoint.get("promotion_day")!=now.date().isoformat()
+            and now.timestamp()>=checkpoint.get("frozen_until",0))
+
+
+def drift_totals(history, now, days):
+    """Total relative travel per coefficient, including rolls back."""
+    cutoff = now.timestamp() - days*86400
+    totals = dict.fromkeys(FIT_FIELDS, 0.)
+    for row in history:
+        if not cutoff <= row["at"] <= now.timestamp():
+            continue
+        for key, (before, after) in row.get("changes", {}).items():
+            if key in totals and number(before) and number(after) is not None:
+                totals[key] += abs(after-before)/abs(before)
+    return totals
+
+
+def model_drift_allowed(active, proposed, state, now):
+    for days, limit in DRIFT_LIMITS:
+        totals = drift_totals(state.get("changes_history", ()), now, days)
+        if any(totals[key]+abs(proposed[key]-active[key])/abs(active[key]) > limit+1e-12
+               for key in proposed if key in totals and proposed[key]!=active[key]):
+            return False
+    return True
 
 
 def promotion_allowed(active, fitted_base, proposed, evidence, state, now, *, legacy_day=None):
@@ -732,7 +1055,8 @@ def promotion_allowed(active, fitted_base, proposed, evidence, state, now, *, le
                     and abs(proposed[k]-active[k])<=.01*abs(active[k])+1e-12
                     and abs(proposed[k]-baseline[k])<=.02*abs(baseline[k])+1e-12
                     and abs(proposed[k]-baseline[k])<=.05*abs(baseline[k])+1e-12
-                    for k in proposed))
+                    for k in proposed)
+            and model_drift_allowed(active,proposed,state,now))
 
 
 def rollback_reason(rows, strata):
@@ -757,16 +1081,16 @@ def rollback_reason(rows, strata):
     return None
 
 
-def run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible):
+def run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible, power_context=None):
     """One bounded executor task; return a proposal and never touch HA state."""
     with _JOB_LOCK:
         try:
-            return _run_learning(path,rows,forecasts,model,ventilation,checkpoint,now,eligible)
+            return _run_learning(path,rows,forecasts,model,ventilation,checkpoint,now,eligible,power_context)
         except Exception as exc:
             return dict(status="frozen",reason="learning_storage_or_data_error",fault=type(exc).__name__)
 
 
-def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible):
+def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible, power_context=None):
     try:
         saved=load_evidence(path)
     except FileNotFoundError:
@@ -808,10 +1132,20 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                 independent_windows=len(windows),
                 qualified_minutes=round(coverage["seconds"]/60,1),
                 verified_reports=window_report["unique_primary_reports"],
+                eligibility_counts=window_report.get("eligibility_counts",{}),
                 rejection_counts=dict(sorted(window_report["rejection_counts"].items(),
                                              key=lambda item:(-item[1],item[0]))[:12]),
                 current_reasons=window_report["current_observation_quality"]["reasons"],
                 analysis_status="pending", analysis_blockers=[])
+    evidence_key = sha256(_encode([now.date().isoformat(),model,eligible,cooldown,power_context,
+                                  [(w['start'],w['end']) for w in windows],
+                                  [(f['snapshot']['start'],f['checks']) for f in archive]])).hexdigest()
+    previous_report = saved["report"]
+    if previous_report.get("evidence_key")==evidence_key:
+        return dict(result,status=previous_report["status"],reason=previous_report["reason"],
+                    analysis_status=previous_report.get("analysis_status","pending"),
+                    analysis_blockers=previous_report.get("analysis_blockers",[]),
+                    power_learning=previous_report.get("power_learning"))
     monitoring=checkpoint.get("monitoring")
     if monitoring and monitoring["version"]==model.get("version"):
         assessments={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
@@ -859,8 +1193,17 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                               evidence_fingerprint=sha256(_encode(scored)).hexdigest())
         result["solar"]=evaluate_solar([w for w in windows if w["equipment"][0]==model.get("version")],
                                       model,ventilation=ventilation)
+        if power_context and not result.get("proposed"):
+            power=qualify_power_candidate(power_context,archive,model,now.tzinfo,checkpoint.get("evidence_after",0.))
+            result["power_learning"]={k:v for k,v in power.items() if k in ("status","reason","metrics")}
+            if eligible and power.get("profile"):
+                result.update(status="accepted",reason=power["reason"],proposed_power=power["profile"],
+                              evidence=power["gate"],metrics=power["gate"]["metrics"],evidence_fingerprint=power["fingerprint"])
     payload=dict(windows=windows,forecasts=archive,comparisons=[],report={
         "status":result["status"], "reason":result["reason"], "updated_at":stamp,
+        "evidence_key":None if result.get("proposed") or result.get("proposed_power") or result.get("rollback") else evidence_key,
+        "power_learning":result.get("power_learning"),
+        "analysis_status":result["analysis_status"],"analysis_blockers":result["analysis_blockers"],
         "independent_windows":len(windows), "qualified_minutes":result["qualified_minutes"]})
     # Keep more than a week of compact issue snapshots where the byte cap permits.
     while len(_encode(payload))>MAX_BYTES-256:

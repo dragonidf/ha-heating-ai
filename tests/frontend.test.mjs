@@ -240,7 +240,9 @@ test('expert settings search filters locally without dropping schema fields',()=
   assert.match(filtered,/data-settings-search/);assert.match(filtered,/data-system-key="fire_start_delta"/);
   assert.doesNotMatch(filtered,/data-system-key="room_loss"/);
   p.settingsQuery='';const all=p.systemSettings();
-  assert.equal(p.systemFields().length,47);assert.match(all,/data-system-key="kws_auto_restore"/);assert.ok((all.match(/data-system-key=/g)||[]).length>=35);
+  assert.equal(p.systemFields().length,52);assert.match(all,/data-system-key="kws_auto_restore"/);assert.ok((all.match(/data-system-key=/g)||[]).length>=35);
+  assert.equal(p.systemFields().find(field=>field.key==='day_insurance').value,'disabled');
+  assert.match(all,/data-system-key="day_insurance_kwh"/);
 });
 test('paged history ignores duplicate and foreign pages and completes only after every point',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.comparisonStart=100;p.comparisonEnd=1000;p.comparisonPending='mine';
@@ -419,6 +421,20 @@ test('merged heat sessions preserve their total energy and show absolute dates',
   const merged=mergeSegments(rows);assert.equal(merged[0].kwh,.75);assert.equal(merged[0].power_kw,4.5);
   const p=Object.create(HeatingAIPanel.prototype);p.config={};p.attrs=()=>({created_at:new Date().toISOString(),heat_segments:rows});
   const markup=p.heatingPlan();assert.match(markup,/0,75 кВт·год/);assert.match(markup,/4,5 кВт/);
+});
+test('plan details distinguish 24-hour comfort from the extended reserve improvement',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.config={};
+  p.attrs=()=>({created_at:new Date().toISOString(),heat_segments:[],morning_reserve:{
+    local_deficit_reduction_degree_hours:1.25,
+    comfort_24h:{predicted_maximum:21.65,minimum_before_next_heat:19.85,
+      predicted_maximum_at:1795644000,comfort_minutes:600,first_comfort_violation_at:null},
+  }});
+  const markup=p.heatingPlan(true);
+  assert.match(markup,/Пік за 24 год/);
+  assert.match(markup,/21,65/);
+  assert.match(markup,/Мінімум за 24 год/);
+  assert.match(markup,/скорочено на 1,25 °C·год/);
 });
 test('controller health prioritizes fallback error over generic measurement warning',()=>{
   const panel=Object.create(HeatingAIPanel.prototype);

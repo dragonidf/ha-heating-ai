@@ -385,10 +385,15 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==39, fields.count()
-    assert page.locator('[data-system-key="kws_auto_restore"]').count()==1
+    assert fields.count()==44, fields.count()
+    for key in ('kws_auto_restore','day_insurance','day_insurance_start','day_insurance_end',
+                'day_insurance_kwh','day_insurance_deficit'):
+        assert page.locator(f'[data-system-key="{key}"]').count()==1, key
     for summary in panel.locator('.system-group>summary').all():summary.click()
-    assert panel.locator('.system-help').count()==68
+    assert panel.locator('.system-help').count()==73
+    for key in ('day_insurance','day_insurance_start','day_insurance_end','day_insurance_kwh','day_insurance_deficit'):
+        assert panel.locator(f'[data-system-help="{key}"]').count()==1, key
+    assert page.locator('[data-system-key="day_insurance"]').input_value()=='disabled'
     page.locator('[data-system-help="fire_start_delta"]').click()
     assert page.locator('.system-dialog').is_visible()
     assert '5' in page.locator('.system-dialog').inner_text()

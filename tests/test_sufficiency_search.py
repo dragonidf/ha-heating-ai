@@ -11,6 +11,91 @@ from heating_stability import stable_plan,reference,replay,expected
 
 
 class SufficiencySearchTests(unittest.TestCase):
+    def test_day_insurance_requires_opt_in_and_confirmed_supply(self):
+        from heating_stability import day_insurance_window
+        now=self.now.replace(hour=12)
+        begin=now.timestamp()+1800
+        settings=dict(self.settings,day_insurance="enabled",
+                      modulation_profile={"physical_mode":"fixed_6"},
+                      outage_schedule={"mode":"normal","valid":True})
+        self.assertTrue(day_insurance_window(now,settings,(begin,begin+1200)))
+        self.assertFalse(day_insurance_window(now,{**settings,"day_insurance":"disabled"},
+                                             (begin,begin+1200)))
+        self.assertFalse(day_insurance_window(now,settings,(begin,begin+2400)))
+        self.assertFalse(day_insurance_window(now,{**settings,"outage_schedule":{"mode":"unknown"}},
+                                             (begin,begin+1200)))
+        # A day's allowance may only authorize its first reserved session.
+        settings["day_insurance_used"]={now.date().isoformat():[begin,begin+1200]}
+        self.assertFalse(day_insurance_window(now,settings,(begin+3600,begin+4800)))
+
+    def test_day_insurance_skips_expired_evening_breach(self):
+        from heating_stability import insure_day, day_insurance_window
+        now=self.now.replace(hour=22,minute=30,second=0)
+        later=now.replace(hour=14)+timedelta(days=1)
+        settings=dict(self.settings,day_insurance='enabled',
+                      modulation_profile={'physical_mode':'fixed_6'},
+                      outage_schedule={'mode':'normal','valid':True})
+        baseline=dict(weather_complete=True,split_comfort_applied=True,
+                      morning_reserve={'comfort_deficit':{'day_deficit_degree_hours':4}},
+                      _calculation_curve=[{'_fine':[
+                          {'ts':now.timestamp()+300,'temperature':settings['lower']-.2},
+                          {'ts':later.timestamp(),'temperature':settings['lower']-.2}],
+                          'heat_segments':[]}])
+        with patch('heating_stability.replay',return_value=None) as check:
+            result=insure_day(now,20.8,22.,1.,0.,self.x['model'],[],settings,6.,baseline,None)
+        self.assertIs(result,baseline)
+        self.assertGreater(check.call_count,0)
+        for call in check.call_args_list:
+            window=call.kwargs['day_window']
+            self.assertEqual(datetime.fromtimestamp(window[0],now.tzinfo).date(),later.date())
+            self.assertTrue(day_insurance_window(now,settings,window))
+            self.assertTrue(call.kwargs['strict_upper'])
+
+    def test_day_insurance_executes_only_a_safe_capped_window(self):
+        from heating_stability import stable_plan
+        now=self.now.replace(hour=10,minute=0,second=0)
+        stamp=now.timestamp()
+        weather=[dict(ts=stamp+3600*i,temperature=1.) for i in range(-1,29)]
+        settings=dict(self.settings,outage_schedule=dict(valid=True,mode='normal'),
+                      modulation_profile=dict(physical_mode='fixed_6'))
+        args=now,20.8,22.,1.,0.,self.x['model'],weather
+        baseline,_=stable_plan(*args,settings,6.)
+        plan,reference=stable_plan(*args,dict(settings,day_insurance='enabled'),6.)
+        self.assertIsNone(baseline.get('day_insurance_window'))
+        begin,end=plan['day_insurance_window']
+        self.assertEqual(reference['day_insurance_window'],[begin,end])
+        self.assertGreaterEqual(end-begin,600)
+        self.assertLessEqual(6*(end-begin)/3600,3.)
+        self.assertLess(plan['morning_reserve']['day_deficit_degree_hours'],
+                        baseline['morning_reserve']['day_deficit_degree_hours'])
+        self.assertTrue(any(s['start']==begin and not s['conditional'] for s in plan['heat_segments']))
+
+    def test_fixed_unvalidated_power_fast_path_keeps_full_safety_forecast(self):
+        from heating_model import _plan
+        x=self.x
+        settings=dict(self.settings,modulation_profile=None,actuator={
+            "action":"off","changed_at":self.now.timestamp()-1800,"safety_stop":False})
+        args=(self.now,x["room"],x["floor"],x["outside"],x["fire"],x["model"],[])
+        expected=_plan(*args,settings,6.,hours_override=24.,split=True)
+        self.assertIsNotNone(expected)
+        fixed=dict(settings,modulation_profile={"physical_mode":"fixed_6","validated":False})
+        with patch("heating_model.modulation_power",side_effect=AssertionError("fixed rating is constant")):
+            actual=_plan(*args,fixed,6.,hours_override=24.,split=True)
+        self.assertEqual(actual,expected)
+
+    def test_off_intervals_do_not_evaluate_modulation(self):
+        from heating_model import _plan
+        now=self.now.replace(hour=12,minute=0,second=0)
+        x=self.x
+        settings=dict(self.settings,modulation_profile={"physical_mode":"auto","bands":[]},
+                      split_comfort=False,morning_min_minutes=0)
+        with patch("heating_model.modulation_power",side_effect=AssertionError("boiler is off")):
+            result=_plan(now,x["room"],x["floor"],x["outside"],x["fire"],x["model"],
+                         [],settings,3.,hours_override=3.)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["energy"],0.)
+        self.assertTrue(all(not r["heat_segments"] for r in result["curve"]))
+
     def setUp(self):
         self.x=json.loads(Path(__file__).with_name('insufficient_morning_case.json').read_text())
         self.now=datetime.fromisoformat(self.x['now']).astimezone(ZoneInfo('Europe/Kiev'))
@@ -39,6 +124,30 @@ class SufficiencySearchTests(unittest.TestCase):
                 _,lo,hi,_=comfort_at(datetime.fromtimestamp(point['ts']-.001,self.now.tzinfo),self.settings)
                 self.assertGreaterEqual(point['temperature'],lo-.001)
                 self.assertLessEqual(point['temperature'],hi+.001)
+
+    def test_local_search_checks_safe_heat_inside_free_night_window(self):
+        from heating_stability import refine_night_plan
+
+        now=self.now.replace(day=21,hour=23,minute=0,second=0)
+        start=now.timestamp()
+        settings=dict(self.settings,outage_schedule=dict(valid=True,mode='normal',outages=[]))
+        model=self.x['model']
+        baseline=replay(now,21.,22.,10.,0.,model,[],settings,
+                        [dict(start=start+5*3600,end=start+6*3600)],
+                        True,3.,reserve_checked=True)
+        improved=refine_night_plan(now,21.,22.,10.,0.,model,[],settings,3.,baseline)
+        before=baseline['morning_reserve']['comfort_deficit']
+        after=improved['morning_reserve']['comfort_deficit']
+        self.assertLess(after['deficit_degree_hours'],before['deficit_degree_hours'])
+        self.assertLessEqual(after['day_max_shortfall'],before['day_max_shortfall'])
+        self.assertGreater(improved['energy'],baseline['energy'])
+        self.assertTrue(all(23<=datetime.fromtimestamp(s['start'],now.tzinfo).hour or
+                            datetime.fromtimestamp(s['start'],now.tzinfo).hour<7
+                            for s in improved['heat_segments']))
+        with patch('heating_stability.monotonic',side_effect=(100.,101.)):
+            fallback=refine_night_plan(now,21.,22.,10.,0.,model,[],settings,3.,baseline)
+        self.assertEqual(fallback['heat_segments'],baseline['heat_segments'])
+        self.assertEqual(fallback['morning_reserve']['local_search_status'],'timeout')
 
     def stable(self,previous=None,settings=None):
         x=self.x

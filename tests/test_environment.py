@@ -233,6 +233,20 @@ class EnvironmentTests(unittest.TestCase):
         seg=[dict(start=at.timestamp(),end=at.timestamp()+1800)]
         result=replay(at,21.9,30,12,0,self.model,[],dict(self.settings,upper_margin=.3),seg,True,9)
         self.assertIsNone(result)
+
+    def test_conservative_peak_more_than_three_hours_after_heat_is_checked(self):
+        at = self.at.replace(hour=0,minute=0)
+        segment = dict(start=at.timestamp(),end=at.timestamp()+7200)
+        settings = dict(self.settings,upper=21.8,night_upper=21.8,
+                        thermal_model_version=1,
+                        ventilation_model=dict(validated=True,model_version=1,
+                                               base_room_loss=.005,recuperator=.02,bath=.005),
+                        ventilation_expected=dict(recuperator=1.,bath=0.))
+        nominal = replay(at,21,21,10,0,self.model,[],dict(settings,upper=26,night_upper=26),
+                         [segment],True,6,reserve_checked=True)
+        self.assertLessEqual(nominal['maximum'],21.8)
+        self.assertIsNone(replay(at,21,21,10,0,self.model,[],settings,[segment],True,6,
+                                 reserve_checked=True))
     def test_daytime_and_outage_not_used_to_fit_floor_coefficients(self):
         a=dict(ts=100,room=22,return_=24,outside=12,power=0,quality=True,grid='off',
                environment_version=1,daylight_weight=1,**{'return':24})
