@@ -521,6 +521,32 @@ class WindowsTest(unittest.TestCase):
                 weather_issue_at=stamp-60,solar_factor=0.,**{'return':23.}))
         return snapshot,rows
 
+    def test_frozen_forecast_keeps_issued_ventilation_topology_and_relevant_slots(self):
+        from copy import deepcopy
+        from heating_learning_windows import freeze_forecast
+        snapshot,rows=self.asynchronous_report_fixture(0)
+        start=snapshot["start"]
+        now=datetime.fromtimestamp(start,timezone.utc)
+        settings=dict(target=22.,lower=19.,upper=25.,equipment_version=1,
+            modulation_profile={"physical_mode":"fixed_6"},
+            ventilation_grid_only={"recuperator":{"entity":"switch.recup","when_powered":.8}},
+            ventilation_expected={"recuperator":.4,"bath":.1},
+            outage_schedule=dict(valid=True,mode="scheduled",slots=[
+                dict(start=start-3600,end=start+1800,off=False),
+                dict(start=start+1800,end=start+3600,off=True),
+                dict(start=start+86400,end=start+90000,off=True)]))
+        weather=[dict(ts=start+i*3600,temperature=5.,condition="cloudy") for i in range(8)]
+        fine=[dict(ts=start+i*300,temperature=21.,upper_temperature=22.) for i in range(1,73)]
+        forecast=dict(curve=[dict(ts=fine[-1]["ts"],_fine=fine)],heat_segments=[])
+        frozen=freeze_forecast(now,21.,23.,5.,0.,weather,start-60,settings,forecast,
+                               snapshot["model"],None,"boot")
+        self.assertIsNotNone(frozen)
+        self.assertEqual(len(frozen["settings"]["outage_schedule"]["slots"]),2)
+        original=deepcopy(frozen)
+        settings["ventilation_grid_only"]["recuperator"]["when_powered"]=0.
+        settings["outage_schedule"]["slots"][1]["off"]=False
+        self.assertEqual(frozen,original)
+
     def test_conditional_solar_projection_keeps_control_plan_and_freezes_actual_issue(self):
         from copy import deepcopy
         from heating_learning_windows import project_solar_nominal,freeze_forecast

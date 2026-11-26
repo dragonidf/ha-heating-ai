@@ -1772,6 +1772,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['thermal_model_version']=self.model.get('version')
         settings['ventilation_model']=self.memory.get('ventilation_model') or {}
         settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
+        settings['ventilation_grid_only']=ventilation_powered_expectation(self.samples,getattr(self,'ventilation_states',{}))
         floor=forecast_probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
         ventilation=getattr(self,'ventilation_states',{})
@@ -1979,8 +1980,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['plan_reference']=reference
             self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status=plan_execution_state)
             panel_forecast=forecast_for_panel(forecast)
-            advisory_settings=dict(settings,ventilation_grid_only=ventilation_powered_expectation(
-                self.samples,getattr(self,'ventilation_states',{})))
+            advisory_settings=settings
             long_outlook=self.run_diagnostic('advisory_48h',advisory_outlook_48,
                 now,room,floor,outside,fire,self.model,usable_weather,advisory_settings,forecast,
                 default=dict(status='unavailable',reason='projection_failed',curve=[]))

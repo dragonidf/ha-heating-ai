@@ -906,7 +906,11 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
     segments = [[max(start,s["start"]),min(last,s["end"]),s["power_kw"]]
                 for s in forecast.get("heat_segments",[]) if s["end"]>start and s["start"]<last]
     climate = {k:settings[k] for k in ("environment","thermal_model_version","ventilation_model",
-                                      "ventilation_expected") if k in settings}
+                                      "ventilation_expected","ventilation_grid_only") if k in settings}
+    if climate.get("ventilation_grid_only"):
+        schedule=settings.get("outage_schedule") or {}
+        climate["outage_schedule"]={k:schedule[k] for k in ("valid","mode","known_until","runtime_supply_override") if k in schedule}
+        climate["outage_schedule"]["slots"]=[s for s in schedule.get("slots",[]) if s["end"]>start and s["start"]<last]
     # Forecast/reference settings are immutable to the controller after issue.
     # Round-trip the small selected fields to keep the sidecar independent.
     climate = json.loads(_encode(climate))
