@@ -482,6 +482,31 @@ class WindowsTest(unittest.TestCase):
         empty=advisory_validation_summary(dict(completed=[row(20,.5)]),identity,timezone.utc,stamp)
         self.assertIsNone(empty["groups"][0]["periods"]["7"]["mae"])
 
+    def test_unavailable_solar_geometry_skips_time_conversion_without_losing_provenance(self):
+        from heating_learning_windows import solar_weather_evidence
+        from unittest.mock import patch
+        expected=dict(forecast_factor=None,forecast_basis="unknown",current_factor=None,
+                      current_basis="unknown",current_cloud=None,forecast_cloud=None)
+        with patch("heating_learning_windows.datetime") as clock:
+            result=solar_weather_evidence(BASE,timezone.utc,[],BASE-300,{},None)
+        self.assertEqual(result,expected)
+        clock.fromtimestamp.assert_not_called()
+
+    def test_verified_off_legacy_relay_does_not_read_irrelevant_supply_values(self):
+        from heating_environment import effective_ventilation_duty
+        class Evidence(dict):
+            def get(self,key,default=None):
+                if key in ("supply_unknown_fraction","powered_relay_on_fraction","supply_on_fraction"):
+                    raise AssertionError("Supply is irrelevant to a confirmed OFF relay")
+                return super().get(key,default)
+        self.assertEqual(effective_ventilation_duty(Evidence(seconds=300,on_fraction=0.,
+                         unknown_fraction=0.)),0.)
+        self.assertIsNone(effective_ventilation_duty(dict(seconds=300,on_fraction=0.,
+                         unknown_fraction=1.)))
+        self.assertEqual(effective_ventilation_duty(dict(seconds=300,on_fraction=None,
+                         unknown_fraction=1.,supply_unknown_fraction=0.,
+                         supply_on_fraction=0.,powered_relay_on_fraction=0.)),0.)
+
     def test_solar_missing_condition_future_issue_and_missing_geometry(self):
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Kyiv")
