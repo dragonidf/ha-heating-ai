@@ -111,6 +111,41 @@ class DecisionHistoryTests(unittest.TestCase):
             # A damaged staged copy never makes existing originals unreadable.
             self.assertEqual(restored.read_snapshot(ids[1]),values[1])
 
+    def test_pack_promotion_requires_savings_and_survives_partial_removal(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            values=[dict(i=i,data=list(range(10000))) for i in range(8)]
+            ids=[journal.snapshot(v,stamp) for v in values]
+            staged=journal.stage_snapshot_pack(ids,require_savings=True)
+            self.assertEqual(staged['status'],'staged')
+            self.assertLessEqual(staged['packed_bytes']*2,staged['legacy_bytes'])
+            key=staged['pack']
+            with self.assertRaises(PermissionError):journal.promote_snapshot_pack(key)
+            original_unlink=Path.unlink
+            def interrupt(path,*args,**kwargs):
+                if path.name==ids[1]+'.json.gz':raise OSError('interrupted promotion')
+                return original_unlink(path,*args,**kwargs)
+            with patch.object(Path,'unlink',interrupt):
+                with self.assertRaises(OSError):journal.promote_snapshot_pack(key,allow_remove=True)
+            restored=DecisionJournal(directory)
+            for digest,value in zip(ids,values):self.assertEqual(restored.read_snapshot(digest),value)
+            result=restored.promote_snapshot_pack(key,allow_remove=True)
+            self.assertEqual(result['removed'],7)
+            self.assertEqual(restored.promote_snapshot_pack(key,allow_remove=True)['removed'],0)
+            self.assertFalse(list(restored.directory.glob('*.json.gz')))
+            for digest,value in zip(ids,values):self.assertEqual(restored.read_snapshot(digest),value)
+
+    def test_pack_savings_gate_keeps_tiny_originals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            ids=[journal.snapshot(dict(i=i),time.time()) for i in range(2)]
+            result=journal.stage_snapshot_pack(ids,require_savings=True)
+            self.assertEqual(result['status'],'insufficient_savings')
+            self.assertFalse((journal.directory/'packed_v1').exists())
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),2)
+
     def test_packed_retention_accounts_for_shared_block_and_reuse(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory,retention_days=7,max_bytes=8*1024*1024)

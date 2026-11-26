@@ -1850,24 +1850,30 @@ class DecisionJournal:
         except (OSError,ValueError,TypeError) as exc:
             self.packed_gc_error=str(exc)
 
-    def _packed_snapshot(self,digest):
-        pointer=self.directory/(digest+'.snapshot-ref')
-        key=self._pack_pointer(pointer)
+    def _load_snapshot_pack(self,key):
+        if not self._valid_digest(key):raise ValueError('Invalid pack identifier')
         folder=self.directory/'packed_v1'
         manifest=folder/(key+'.pack.json')
         blob_path=folder/(key+'.xz')
         if manifest.stat().st_size>16384 or blob_path.stat().st_size>self.PACK_SIZE_LIMIT:
             raise ValueError('Oversized snapshot pack')
         header=json.loads(manifest.read_bytes())
-        ids=header.get('snapshots')
-        if (header.get('schema')!=1 or header.get('sha256')!=key or not isinstance(ids,list)
-                or digest not in ids):raise ValueError('Invalid snapshot pack manifest')
+        ids=header.get('snapshots') if isinstance(header,dict) else None
+        if (not isinstance(header,dict) or header.get('schema')!=1
+                or header.get('sha256')!=key or not isinstance(ids,list)):
+            raise ValueError('Invalid snapshot pack manifest')
         blob=blob_path.read_bytes()
         if hashlib.sha256(blob).hexdigest()!=key:raise ValueError('Snapshot block checksum mismatch')
         rows=self._decode_snapshot_pack(blob,ids)
+        return ids,rows,manifest.stat().st_size+len(blob)
+
+    def _packed_snapshot(self,digest):
+        key=self._pack_pointer(self.directory/(digest+'.snapshot-ref'))
+        ids,rows,_=self._load_snapshot_pack(key)
+        if digest not in ids:raise ValueError('Snapshot missing from pack')
         return rows[ids.index(digest)]
 
-    def stage_snapshot_pack(self,digests):
+    def stage_snapshot_pack(self,digests,*,require_savings=False):
         """Durable additive staging only; no source removal or automatic migration.
 
         This preparatory API deliberately keeps all legacy gzip files, so a
@@ -1877,7 +1883,7 @@ class DecisionJournal:
             ids=list(digests)
             if not 2<=len(ids)<=self.PACK_ROWS or len(set(ids))!=len(ids) or not all(self._valid_digest(v) for v in ids):
                 raise ValueError('Invalid snapshot pack selection')
-            rows=[];mtimes=[];size=0
+            rows=[];mtimes=[];size=0;legacy_bytes=0
             for digest in ids:
                 path=self.directory/(digest+'.json.gz')
                 with gzip.open(path,'rb') as stream:raw=stream.read(self.PACK_RAW_LIMIT+1)
@@ -1885,9 +1891,17 @@ class DecisionJournal:
                 if size>self.PACK_RAW_LIMIT or b'\n' in raw or hashlib.sha256(raw).hexdigest()!=digest:
                     raise ValueError('Invalid or oversized source snapshot')
                 json.loads(raw);rows.append(raw);mtimes.append(path.stat().st_mtime)
+                legacy_bytes+=path.stat().st_size
             blob=lzma.compress(b'\n'.join(rows)+b'\n',format=lzma.FORMAT_XZ,preset=1)
             if self._decode_snapshot_pack(blob,ids)!=rows:raise ValueError('Snapshot pack roundtrip mismatch')
             key=hashlib.sha256(blob).hexdigest()
+            encode=lambda v:json.dumps(v,sort_keys=True,separators=(',',':')).encode()
+            manifest=encode(dict(schema=1,sha256=key,snapshots=ids,legacy_bytes=legacy_bytes))
+            pointer_raw=encode(dict(schema=1,pack=key))
+            total_bytes=len(blob)+len(manifest)+len(pointer_raw)*len(ids)
+            if require_savings and total_bytes*2>legacy_bytes:
+                return dict(status='insufficient_savings',snapshots=len(ids),
+                            legacy_bytes=legacy_bytes,packed_bytes=total_bytes)
             # Staging is opt-in; include temporary duplicate bytes in the
             # existing archive/disk budget without rotating source evidence.
             folder=self.directory/'packed_v1'
@@ -1902,19 +1916,61 @@ class DecisionJournal:
             self.used_bytes=None
             folder.mkdir(exist_ok=True)
             self._sync_directory(self.directory)
-            encode=lambda v:json.dumps(v,sort_keys=True,separators=(',',':')).encode()
-            manifest=encode(dict(schema=1,sha256=key,snapshots=ids))
             self._atomic_pack_file(folder/(key+'.xz'),blob)
             self._atomic_pack_file(folder/(key+'.pack.json'),manifest)
             for digest,mtime in zip(ids,mtimes):
                 self._atomic_pack_file(self.directory/(digest+'.snapshot-ref'),
-                    encode(dict(schema=1,pack=key)),mtime)
-                if self._packed_snapshot(digest)!=rows[ids.index(digest)]:
-                    raise ValueError('Packed snapshot verification failed')
+                    pointer_raw,mtime)
+            stored_ids,stored_rows,_=self._load_snapshot_pack(key)
+            if stored_ids!=ids or stored_rows!=rows or any(
+                    self._pack_pointer(self.directory/(digest+'.snapshot-ref'))!=key for digest in ids):
+                raise ValueError('Packed snapshot verification failed')
             # Recount on the next normal rotation; staged bytes are not a
             # space-saving claim until promotion/retention is implemented.
             self.used_bytes=None
-            return dict(pack=key,snapshots=len(ids),packed_bytes=len(blob)+len(manifest))
+            return dict(status='staged',pack=key,snapshots=len(ids),packed_bytes=total_bytes,
+                        legacy_bytes=legacy_bytes)
+
+    def promote_snapshot_pack(self,key,*,allow_remove=False):
+        """Explicit offline promotion; verify all references before any removal.
+
+        Once the verified pack and all references are durable, interruption
+        between unlinks leaves a readable mixed archive. Repeating promotion
+        verifies the remaining originals and removes only exact duplicates.
+        Never called by the control loop.
+        """
+        if allow_remove is not True:
+            raise PermissionError('Packed archive promotion requires explicit opt-in')
+        with self.lock:
+            ids,rows,packed_bytes=self._load_snapshot_pack(key)
+            folder=self.directory/'packed_v1'
+            header=json.loads((folder/(key+'.pack.json')).read_bytes())
+            legacy_bytes=header.get('legacy_bytes')
+            if type(legacy_bytes) is not int or legacy_bytes<=0:
+                raise ValueError('Missing original archive byte count')
+            originals=[];remaining_bytes=0
+            for digest,raw in zip(ids,rows):
+                pointer=self.directory/(digest+'.snapshot-ref')
+                if self._pack_pointer(pointer)!=key:raise ValueError('Snapshot pointer differs')
+                packed_bytes+=pointer.stat().st_size
+                path=self.directory/(digest+'.json.gz')
+                if path.exists():
+                    with gzip.open(path,'rb') as stream:source=stream.read(self.PACK_RAW_LIMIT+1)
+                    if source!=raw:raise ValueError('Original snapshot differs')
+                    latest=max(path.stat().st_mtime,pointer.stat().st_mtime)
+                    os.utime(pointer,(latest,latest))
+                    with pointer.open('rb') as stream:os.fsync(stream.fileno())
+                    originals.append(path);remaining_bytes+=path.stat().st_size
+            if packed_bytes*2>legacy_bytes or remaining_bytes>legacy_bytes:
+                raise ValueError('Packed snapshot savings below required 50%')
+            # All pointers, block and manifest were checked and made durable
+            # before removal. No pointer or block is deleted in this operation.
+            self._sync_directory(folder);self._sync_directory(self.directory)
+            self.used_bytes=None
+            for path in originals:path.unlink()
+            self._sync_directory(self.directory)
+            return dict(status='promoted',pack=key,snapshots=len(ids),removed=len(originals),
+                        removed_bytes=remaining_bytes,packed_bytes=packed_bytes,legacy_bytes=legacy_bytes)
 
     def read_snapshot(self,digest):
         if not self._valid_digest(digest):
