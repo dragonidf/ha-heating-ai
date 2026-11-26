@@ -619,6 +619,26 @@ class HeatingClimate(HeatingRecovery,Hass):
                 if entity not in tracked:tracked[entity]=self.listen_state(self.ventilation_changed,entity)
             self.equipment_listeners=tracked
 
+    def ventilation_forecast_inputs(self):
+        """Memoize immutable sample-ring summaries, not live actuator evidence.
+
+        Sampling/recovery replaces the ring; live relay, entity and supply
+        changes are independent cache invalidators. No elapsed-time throttle.
+        """
+        samples=self.samples
+        states=getattr(self,'ventilation_states',{})
+        last=samples[-1] if samples else None
+        key=tuple((k,tuple((states.get(k) or {}).get(f) for f in
+                  ('entity','relay','effective_duty','supply_provenance'))) for k in ('recuperator','bath'))
+        cached=getattr(self,'_ventilation_forecast_cache',None)
+        if cached is not None and cached[0] is samples and cached[1]==len(samples) and cached[2] is last and cached[3]==key:
+            return cached[4]
+        expected,support=ventilation_expectation(samples,states)
+        powered=ventilation_powered_expectation(samples,states)
+        result=(expected,support,powered)
+        self._ventilation_forecast_cache=(samples,len(samples),last,key,result)
+        return result
+
     def active_ventilation_model(self):
         return compatible_ventilation_fit(self.memory.get('ventilation_model') or {},
                                          ventilation_binding_identity(self.cfg))
@@ -1006,9 +1026,10 @@ class HeatingClimate(HeatingRecovery,Hass):
     def ventilation_sample(self,stamp):
         self.ventilation_tick(stamp)
         result={}
+        bindings=ventilation_binding_identity(self.cfg)
         for name,row in self.ventilation_totals.items():
             seconds=row['seconds']
-            identity=ventilation_binding_identity(self.cfg).get(name) or {}
+            identity=bindings.get(name) or {}
             result[name]=dict(**identity,duty_policy=VENTILATION_DUTY_POLICY,seconds=round(seconds,1),
                 on_fraction=round(row['on']/seconds,4) if seconds else None,
                 unknown_fraction=round(row['unknown']/seconds,4) if seconds else None,
@@ -1791,8 +1812,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['equipment_version']=self.memory.get('equipment_version',0)
         settings['thermal_model_version']=self.model.get('version')
         settings['ventilation_model']=self.active_ventilation_model()
-        settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
-        settings['ventilation_grid_only']=ventilation_powered_expectation(self.samples,getattr(self,'ventilation_states',{}))
+        settings['ventilation_expected'],ventilation_support,settings['ventilation_grid_only']=self.ventilation_forecast_inputs()
         floor=forecast_probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
         ventilation=getattr(self,'ventilation_states',{})

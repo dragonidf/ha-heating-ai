@@ -352,6 +352,22 @@ class NativeController(HeatingClimate):
         return [self.model.get("version"),self.memory.get("equipment_version",0),
                 self.cfg.get("boiler_power_mode","unconfirmed")]
 
+    def advisory_validation_view(self):
+        # The ledger is replaced, never mutated, by advisory_validation_update.
+        # Recompute on identity change or exact 30-day expiry, not on every tick.
+        state=self.memory.get("advisory_validation")
+        identity=self._advisory_identity()
+        now=self.now();stamp=now.timestamp()
+        cached=getattr(self,"_advisory_view_cache",None)
+        if (cached is not None and cached[0] is state and cached[1]==identity
+                and cached[2]==now.tzinfo and cached[3]<=stamp<=cached[4]):
+            return cached[5]
+        result=learning.advisory_validation_summary(state,identity,now.tzinfo,stamp)
+        next_expiry=min((p["reported"]+30*86400 for p in (state or {}).get("completed",[])
+                         if p.get("identity")==identity and p["reported"]+30*86400>=stamp),default=float("inf"))
+        self._advisory_view_cache=(state,identity,now.tzinfo,stamp,next_expiry,result)
+        return result
+
     def remember_advisory_outlook(self, now, outlook):
         self.memory["advisory_validation"]=learning.advisory_validation_update(
             self.memory.get("advisory_validation"),now.timestamp(),self._advisory_identity(),outlook=outlook)
@@ -1947,8 +1963,7 @@ class NativeController(HeatingClimate):
                 active_version=self.model.get("version"),rollback_reason=checkpoint.get("rollback_reason"),
                 next_learning=upcoming.isoformat())
         if entity == "sensor.heating_controller_quality":
-            attributes["advisory_validation"]=learning.advisory_validation_summary(
-                self.memory.get("advisory_validation"),self._advisory_identity(),self.now().tzinfo,self.now().timestamp())
+            attributes["advisory_validation"]=self.advisory_validation_view()
         if entity == "sensor.heating_diagnostics":
             now = time.time()
             observation = getattr(self, "power_observation", {})

@@ -125,6 +125,30 @@ class SystemSettingsTests(unittest.TestCase):
         app.system_settings_changed('heating_system_settings',dict(request_id='request-1',revision=revision,values=values))
         return app.published['sensor.heating_system_settings']
 
+    def test_ventilation_summary_cache_invalidates_on_ring_and_live_identity(self):
+        from unittest.mock import patch
+        app=self.app()
+        app.samples=[]
+        app.ventilation_states={"recuperator":{"entity":"switch.recup","relay":"off",
+            "supply_provenance":"verified_grid_topology","effective_duty":0.}}
+        with patch("heating_climate.ventilation_expectation",return_value=({"recuperator":.2},{})) as mean, \
+             patch("heating_climate.ventilation_powered_expectation",return_value={}) as powered:
+            first=app.ventilation_forecast_inputs()
+            self.assertIs(first,app.ventilation_forecast_inputs())
+            self.assertEqual(mean.call_count,1)
+            app.ventilation_states["recuperator"]["relay"]="on"
+            app.ventilation_states["recuperator"]["effective_duty"]=1.
+            app.ventilation_forecast_inputs()
+            self.assertEqual(mean.call_count,2)
+            app.samples.append({"ts":1})
+            app.ventilation_forecast_inputs()
+            self.assertEqual(mean.call_count,3)
+            app.samples=list(app.samples)
+            app.ventilation_forecast_inputs()
+            self.assertEqual(mean.call_count,4)
+            self.assertEqual(powered.call_count,4)
+            self.assertEqual(app.next_compute,123456)
+
     def test_snapshot_does_not_modify_config_model_or_memory_or_export_secrets(self):
         app=self.app();app.cfg.update(token='PRIVATE',data_dir='/private/data',outage_max_age=7200)
         before=deepcopy((app.cfg,app.model,app.memory))
