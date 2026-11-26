@@ -1101,7 +1101,7 @@ export class HeatingAIPanel extends HTMLElement {
   advisoryAccuracy(q) {
     const v=q.advisory_validation||{},rows=Array.isArray(v.groups)?v.groups:[];
     const yesNo=value=>value===true||value==='true'?'підтв.':value===false||value==='false'?'невідомо':'—';
-    const basis={calculated_plan:'Розрахований план',conditional:'Умовний сценарій',known:'Відомі умови',conditional_heat_pattern:'Умовний повтор нагріву',conditional_coast:'Умовне охолодження'};
+    const basis={calculated_plan:'Розрахований план',conditional:'Умовний сценарій',known:'Відомі умови',conditional_repeat:'Умовний повтор нагріву',conditional_coast:'Умовне охолодження'};
     const table=rows.map(r=>`<tr><td>${fmt(r.horizon,0)} год<div class="muted">${h(basis[r.basis]||r.basis||'—')}</div></td><td>${yesNo(r.weather_known)} / ${yesNo(r.schedule_known)}</td><td>${fmt(r.independent?.mae,3)}</td><td>${fmt(r.independent?.bias,3)}</td><td>${fmt(r.independent?.n,0)} / ${fmt(r.all_reports?.n,0)} / ${fmt(r.days,0)}</td><td>${fmt(r.minimum_lead_hours,1)}–${fmt(r.maximum_lead_hours,1)}</td></tr>`).join('');
     const pending=[24,36,48].map(hours=>`${hours} год: ${fmt(v.pending?.[hours],0)}`).join(' · ');
     const expired=[24,36,48].map(hours=>`${hours} год: ${fmt(v.expired?.[hours],0)}`).join(' · ');

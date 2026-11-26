@@ -784,10 +784,11 @@ test('learning reports real support for all four thermal coefficients without cl
 test('quality distinguishes advisory 48h conditional cohorts and independent counts',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.section=(title,body)=>body;
   p.attrs=()=>({advisory_validation:{groups:[
-    {horizon:48,basis:'conditional',weather_known:false,schedule_known:false,days:3,independent:{n:2,mae:.65,bias:-.25},all_reports:{n:16,mae:.35},minimum_lead_hours:47.5,maximum_lead_hours:48.3},
-    {horizon:24,basis:'known',weather_known:true,schedule_known:true,days:1,independent:{n:1,mae:.4,bias:.4},all_reports:{n:4}}],pending:{24:0,36:2,48:3},used_for_control:false}});
+    {horizon:48,basis:'conditional_repeat',weather_known:false,schedule_known:false,days:3,independent:{n:2,mae:.65,bias:-.25},all_reports:{n:16,mae:.35},minimum_lead_hours:47.5,maximum_lead_hours:48.3},
+    {horizon:24,basis:'calculated_plan',weather_known:true,schedule_known:true,days:1,independent:{n:1,mae:.4,bias:.4},all_reports:{n:4}}],pending:{24:0,36:2,48:3},used_for_control:false}});
   const markup=p.controllerQuality();
   assert.match(markup,/Дорадчий прогноз · 24–48 год/);
+  assert.match(markup,/Умовний повтор нагріву/);assert.match(markup,/Розрахований план/);
   assert.match(markup,/0,650/);assert.match(markup,/-0,250/);
   assert.match(markup,/2 \/ 16 \/ 3/);
   assert.match(markup,/36 год: 2/);assert.match(markup,/48 год: 3/);
