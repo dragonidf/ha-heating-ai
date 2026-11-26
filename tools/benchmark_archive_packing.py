@@ -143,6 +143,106 @@ def synthetic_snapshots(count):
         now+=timedelta(minutes=5)
 
 
+def journal_lifecycle(rows):
+    """Measure actual native journal operations, including fsync and rollback.
+
+    Disposable filesystem, no HA or archive mutation. The pilot is deliberately
+    not a production daily CPU/RSS or worst-case disk latency certificate.
+    """
+    from heating_recovery import DecisionJournal
+    from pack_decision_archive import restore_mixed_archive
+    from tempfile import TemporaryDirectory
+    from threading import RLock
+    from time import time
+    import math
+
+    class TimedLock:
+        def __init__(self):
+            self.lock=RLock();self.durations=[]
+        def __enter__(self):
+            self.lock.acquire();self.started=perf_counter()
+            return self
+        def __exit__(self,*args):
+            self.durations.append(perf_counter()-self.started)
+            self.lock.release()
+
+    def measure(fn):
+        cpu=process_time();wall=perf_counter()
+        result=fn()
+        return result,dict(cpu_s=process_time()-cpu,wall_s=perf_counter()-wall)
+
+    def sizes(folder):
+        stats=[p.stat() for p in folder.rglob("*") if p.is_file()]
+        return dict(files=len(stats),bytes=sum(s.st_size for s in stats),
+                    allocated_bytes=sum(s.st_blocks*512 for s in stats))
+
+    def timing_summary(values):
+        ordered=sorted(values)
+        return dict(count=len(ordered),p95_ms=1000*ordered[math.ceil(.95*len(ordered))-1],
+                    max_ms=1000*ordered[-1]) if ordered else dict(count=0)
+
+    rows=list(dict.fromkeys(rows))
+    stamp=time()-3600
+    ids=[digest(row) for row in rows]
+    with TemporaryDirectory() as folder:
+        root=Path(folder)
+        journal=DecisionJournal(root,max_bytes=128*1024*1024)
+        lock=TimedLock();journal.lock=lock
+        def write():
+            for i,row in enumerate(rows):
+                if journal.snapshot(json.loads(row),stamp+i*300)!=ids[i]:
+                    raise AssertionError("journal content address differs")
+        _,write_cost=measure(write)
+        initial=sizes(journal.directory)
+        write_cost["lock"]=timing_summary(lock.durations);lock.durations.clear()
+        def read():
+            for key,row in zip(ids,rows):
+                if canonical(journal.read_snapshot(key))!=row:
+                    raise AssertionError("journal read differs")
+        _,gzip_read=measure(read)
+        gzip_read["lock"]=timing_summary(lock.durations);lock.durations.clear()
+        groups=[];batch=[];size=0
+        for key,row in zip(ids,rows):
+            if batch and (len(batch)>=MAX_ROWS or size+len(row)+1>MAX_RAW):
+                groups.append(batch);batch=[];size=0
+            batch.append(key);size+=len(row)+1
+        if batch:groups.append(batch)
+        stages=[];promotions=[];skipped=0
+        for batch in groups:
+            if len(batch)<2:
+                skipped+=len(batch);continue
+            stage,metric=measure(lambda:journal.stage_snapshot_pack(batch,require_savings=True))
+            metric["lock"]=timing_summary(lock.durations);lock.durations.clear()
+            metric["status"]=stage["status"];stages.append(metric)
+            if stage["status"]!="staged":
+                skipped+=len(batch);continue
+            promotion,metric=measure(lambda:journal.promote_snapshot_pack(stage["pack"],allow_remove=True))
+            metric["lock"]=timing_summary(lock.durations);lock.durations.clear()
+            metric["removed"]=promotion["removed"];promotions.append(metric)
+        packed=sizes(journal.directory)
+        _,packed_read=measure(read)
+        packed_read["lock"]=timing_summary(lock.durations);lock.durations.clear()
+        # Cold process-state simulation: the reader cannot rely on cached maps.
+        restarted=DecisionJournal(root,max_bytes=128*1024*1024)
+        for key,row in zip(ids,rows):
+            if canonical(restarted.read_snapshot(key))!=row:
+                raise AssertionError("restart read differs")
+        _,accounting=measure(lambda:journal._prepare(time()))
+        if journal.used_bytes!=packed["bytes"]:
+            raise AssertionError("archive accounting differs from file sizes")
+        restored=root/"legacy"
+        rollback,rollback_cost=measure(lambda:restore_mixed_archive(journal.directory,restored))
+        for key,row in zip(ids,rows):
+            if gzip.decompress((restored/(key+".json.gz")).read_bytes())!=row:
+                raise AssertionError("rollback bytes differ")
+        return dict(snapshot_count=len(ids),skipped=skipped,initial=initial,packed=packed,
+            ratio=packed["bytes"]/initial["bytes"],allocated_ratio=packed["allocated_bytes"]/initial["allocated_bytes"],
+            gzip_write=write_cost,gzip_read=gzip_read,staging=stages,promotion=promotions,
+            packed_read=packed_read,accounting=accounting,rollback=rollback,rollback_cost=rollback_cost,
+            exact_read_restart_rollback=True,peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            scope="actual native filesystem journal on synthetic planner snapshots; initial gzip writes plus conversion cost")
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--count",type=int,default=12)
@@ -150,8 +250,10 @@ def main():
     args=parser.parse_args()
     if not 2<=args.count<=24:
         parser.error("count must be 2..24")
-    result=compare(list(synthetic_snapshots(args.count)))
-    result["scope"]="synthetic sequential full-recompute snapshots; offline format pilot only"
+    rows=list(synthetic_snapshots(args.count))
+    result=compare(rows)
+    result["journal_lifecycle"]=journal_lifecycle(rows)
+    result["scope"]="synthetic sequential full-recompute snapshots; offline codec and journal lifecycle pilot"
     report=json.dumps(result,indent=2)
     print(report)
     if args.output:
