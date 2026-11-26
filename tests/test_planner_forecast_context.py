@@ -59,6 +59,35 @@ class ForecastContextTest(unittest.TestCase):
                                                1/12, 0., upper=upper)
                     self.assertEqual(actual, expected)
 
+    def test_published_ventilation_slots_match_prepared_and_scalar_forecast(self):
+        now=datetime(2026,11,23,12,tzinfo=ZoneInfo("Europe/Kyiv"))
+        start=now.timestamp()
+        model=DEFAULT_MODEL
+        settings=dict(thermal_model_version=model["version"],
+            ventilation_expected=dict(recuperator=.4,bath=.2),
+            ventilation_grid_only=dict(recuperator=dict(entity="switch.recup",when_powered=1.)),
+            ventilation_model=dict(validated=True,model_version=model["version"],
+                base_room_loss=.015,recuperator=.006,bath=.004),
+            outage_schedule=dict(valid=True,mode="scheduled",
+                slots=[dict(start=start,end=start+600,off=False),
+                       dict(start=start+600,end=start+1200,off=True)],
+                outages=[dict(start=start,end=start+1200)]))
+        context=ForecastContext(now,[],5.,model,settings)
+        results=[]
+        for offset in (0,600,1200):
+            when=datetime.fromtimestamp(start+offset,now.tzinfo)
+            for room,outside in ((22.,5.),(20.,25.)):
+                for upper in (False,True):
+                    actual=context.integrate(room,23.,outside,0.,0.,1/12,0.,upper=upper,
+                        interval=(start+offset,start+offset+300))
+                    scalar=forecast_step(room,23.,outside,0.,0.,model,1/12,when,[],settings,upper=upper)
+                    self.assertEqual(actual,scalar)
+            results.append(context.integrate(22.,23.,5.,0.,0.,1/12,0.,
+                interval=(start+offset,start+offset+300))[0])
+        self.assertLess(results[0],results[2])
+        self.assertLess(results[2],results[1])
+        self.assertEqual(len(context.ventilation_by_interval),3)
+
     def test_replay_keeps_all_boundaries_of_overlapping_session_requests(self):
         now = datetime(2026, 11, 23, 12, tzinfo=ZoneInfo("Europe/Kyiv"))
         stamp = now.timestamp()

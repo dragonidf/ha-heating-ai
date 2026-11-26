@@ -5,7 +5,7 @@ import math
 import hashlib
 import json
 from heating_environment import (forecast_step,safe_upper,has_upper_risk,ENVIRONMENT_POLICY_VERSION,
-                                 _weather_gains,_integrate_forecast,prepare_ventilation)
+                                 _weather_gains,_integrate_forecast,prepare_ventilation,ventilation_for_interval)
 import statistics
 from heating_outages import blocked, covered, availability, schedule_covered
 
@@ -64,6 +64,8 @@ class ForecastContext:
         self.ordered_weather = all(a<=b for a,b in zip(self.weather_times,self.weather_times[1:]))
         self.known_until = max(self.weather_times)+3600 if self.weather_times else None
         self.ventilation = prepare_ventilation(model.get('room_loss'),settings)
+        self.ventilation_settings = settings if settings.get('ventilation_grid_only') and self.ventilation[1] is not None else None
+        self.ventilation_by_interval = {}
         self.by_time = {}
 
     def at(self, when):
@@ -85,8 +87,14 @@ class ForecastContext:
             self.by_time[key] = stamp,elapsed,outside,gains
         return self.by_time[key]
 
-    def integrate(self, room, floor, outside, power, fire_gain, hours, gain, upper=False):
-        normal,cold,warm = self.ventilation
+    def integrate(self, room, floor, outside, power, fire_gain, hours, gain, upper=False, interval=None):
+        coefficients=self.ventilation
+        if self.ventilation_settings is not None and interval is not None:
+            coefficients=self.ventilation_by_interval.get(interval)
+            if coefficients is None:
+                coefficients=prepare_ventilation(self.model.get('room_loss'),self.ventilation_settings,interval)
+                self.ventilation_by_interval[interval]=coefficients
+        normal,cold,warm = coefficients
         coefficient = (cold if room>=outside else warm) if upper else normal
         loss = 0. if coefficient is None else coefficient*(room-outside)
         return _integrate_forecast(room,floor,outside,power,self.model,hours,fire_gain,gain,loss)
@@ -558,7 +566,7 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
         settings={k:settings.get(k) for k in keys},outage={k:outage.get(k) for k in ('mode','valid','outages','slots','known_until')},
         physical_mode=(settings.get('modulation_profile') or {}).get('physical_mode'),
         equipment_version=settings.get('equipment_version'),ventilation_model=settings.get('ventilation_model'),
-        ventilation_expected=settings.get('ventilation_expected'),profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
+        ventilation_expected=settings.get('ventilation_expected'),ventilation_grid_only=settings.get('ventilation_grid_only'),profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
         actuator=settings.get('actuator'),
         environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain','observed_at','risk_coefficient','control_no_sun')},
         astronomy=(settings.get('environment') or {}).get('astronomy'),
@@ -791,9 +799,9 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                         effective_kw=(fixed_kw if fixed_kw is not None else
                                       modulation_power(nf,profile,3.,anchor,elapsed_minutes)) if active else 0.
                         delivered_kw=effective_kw
-                        nr,nf=integrate(nr,nf,out,delivered_kw,fire_gain,dt,gains[0])
+                        nr,nf=integrate(nr,nf,out,delivered_kw,fire_gain,dt,gains[0],interval=(stamp,stop_stamp))
                         risk_kw=max(delivered_kw,upper_power) if active and upper_power is not None else delivered_kw
-                        ur,uf=(integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True)
+                        ur,uf=(integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True,interval=(stamp,stop_stamp))
                                if risk_enabled else (nr,nf))
                         # A session remains unsafe if its stored heat overshoots
                         # later, after the boiler has stopped (including daytime).
@@ -1098,25 +1106,7 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
 
 
 def advisory_ventilation(settings, data, start, end):
-    """Use the published physical slots, never boiler pre-stop padding."""
-    duty=dict(settings.get('ventilation_expected') or {})
-    topology=settings.get('ventilation_grid_only') or {}
-    if not topology or not data.get('valid') or data.get('mode')!='scheduled':
-        return duty,'empirical'
-    if not schedule_covered(data,start,end):
-        return duty,'unknown_supply_empirical'
-    slots=data.get('slots') or []
-    off=covered(start,end,[s for s in slots if s.get('off') is True])
-    on=covered(start,end,[s for s in slots if s.get('off') is False])
-    if not (off or on):
-        return duty,'mixed_supply_empirical'
-    for key in ('recuperator','bath'):
-        if key in topology:
-            # No supplied power means no forced airflow. When supplied, use
-            # independently estimated powered duty, never double-discount.
-            duty[key]=0. if off else topology[key].get('when_powered')
-    return duty,'published_off' if off else 'published_on'
-
+    return ventilation_for_interval(settings,data,start,end)
 
 def advisory_outlook_48(now, room, floor, outside, fire, model, weather, settings, forecast, *, step_seconds=900):
     """48 elapsed hours, read-only scenario on the existing model/plan.

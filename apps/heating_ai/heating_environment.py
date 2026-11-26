@@ -8,6 +8,7 @@ import math
 import statistics
 from datetime import datetime,timedelta
 from zoneinfo import ZoneInfo
+from heating_outages import schedule_covered, covered
 
 ENVIRONMENT_POLICY_VERSION=6
 
@@ -294,7 +295,8 @@ def observe_residual(previous,stamp,room,floor,outside,model,reported_at,quality
 
 def forecast_step(room,floor,outside,power,fire,model,hours,when,weather,settings,upper=False):
     gain=gain_at(when,weather,settings,upper=upper)
-    loss=ventilation_loss(room,outside,model['room_loss'],settings,upper=upper)
+    loss=ventilation_loss(room,outside,model['room_loss'],settings,upper=upper,
+                          interval=(when.timestamp(),when.timestamp()+hours*3600))
     return _integrate_forecast(room,floor,outside,power,model,hours,
                                model['fire_gain']*max(0.,fire),gain,loss)
 
@@ -305,15 +307,40 @@ def _integrate_forecast(room,floor,outside,power,model,hours,fire_gain,gain,loss
     return room+dr*hours,floor+df*hours
 
 
-def prepare_ventilation(base_loss,settings):
+def ventilation_for_interval(settings,data,start,end):
+    """Conditional airflow based on published physical slots, not boiler mask."""
+    duty=dict(settings.get('ventilation_expected') or {})
+    topology=settings.get('ventilation_grid_only') or {}
+    if not topology or not data.get('valid') or data.get('mode')!='scheduled':
+        return duty,'empirical'
+    if end<=start or not schedule_covered(data,start,end):
+        return duty,'unknown_supply_empirical'
+    slots=data.get('slots') or []
+    off=covered(start,end,[s for s in slots if s.get('off') is True])
+    on=covered(start,end,[s for s in slots if s.get('off') is False])
+    if not (off or on):
+        return duty,'mixed_supply_empirical'
+    for key in ('recuperator','bath'):
+        if key in topology:
+            duty[key]=0. if off else topology[key].get('when_powered')
+    return duty,'published_off' if off else 'published_on'
+
+
+def prepare_ventilation(base_loss,settings,interval=None):
     fit=settings.get('ventilation_model') or {}
     if not fit.get('validated') or fit.get('model_version')!=settings.get('thermal_model_version'):
         return None,None,None
     expected=settings.get('ventilation_expected') or {}
+    warm=dict(recuperator=1.,bath=1.)
+    if interval is not None and settings.get('ventilation_grid_only'):
+        expected,basis=ventilation_for_interval(settings,settings.get('outage_schedule') or {},*interval)
+        if basis=='published_off':
+            for key in warm:
+                if key in settings['ventilation_grid_only']:warm[key]=0.
     nominal=(_ventilation_adjustment(fit,base_loss,expected)
              if all(finite(expected.get(k)) is not None for k in ('recuperator','bath')) else None)
     return (nominal,_ventilation_adjustment(fit,base_loss,dict(recuperator=0.,bath=0.)),
-            _ventilation_adjustment(fit,base_loss,dict(recuperator=1.,bath=1.)))
+            _ventilation_adjustment(fit,base_loss,warm))
 
 
 def has_upper_risk(settings):
@@ -357,15 +384,11 @@ def anchor_weather(weather, stamp, outside):
 
 
 
-def ventilation_loss(room,outside,base_loss,settings,upper=False):
+def ventilation_loss(room,outside,base_loss,settings,upper=False,interval=None):
     """Replace the previously averaged loss, rather than adding it twice."""
-    fit=settings.get('ventilation_model') or {}
-    if not fit.get('validated') or fit.get('model_version')!=settings.get('thermal_model_version'):return 0.
-    expected=settings.get('ventilation_expected') or {}
-    if upper:
-        expected={k:0. if room>=outside else 1. for k in ('recuperator','bath')}
-    elif any(finite(expected.get(k)) is None for k in ('recuperator','bath')):return 0.
-    return _ventilation_adjustment(fit,base_loss,expected)*(room-outside)
+    normal,cold,warm=prepare_ventilation(base_loss,settings,interval)
+    coefficient=(cold if room>=outside else warm) if upper else normal
+    return 0. if coefficient is None else coefficient*(room-outside)
 
 
 def _ventilation_adjustment(fit,base_loss,expected):
