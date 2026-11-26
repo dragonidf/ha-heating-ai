@@ -70,6 +70,17 @@ class StorageLearningTest(unittest.TestCase):
                 self.assertFalse(promotion_allowed(self.model,self.model,result['coefficients'],
                     {'status':'rejected'},{},now))
 
+    def test_parameter_support_reflects_actual_selected_storage_cohort(self):
+        result=evaluate_windows(self.windows("floor_decay"),self.model)
+        support=result["parameter_support"]
+        self.assertEqual(set(support),{"floor_air","room_loss","floor_decay","heat_gain"})
+        self.assertTrue(support["floor_decay"]["selected_for_candidate"])
+        self.assertEqual(support["floor_decay"]["basis"],"warm_idle")
+        self.assertGreater(support["floor_decay"]["holdout"]["minutes"],0)
+        self.assertFalse(support["heat_gain"]["selected_for_candidate"])
+        self.assertIsNone(support["heat_gain"]["holdout"])
+        self.assertEqual(evaluate_windows([],self.model)["parameter_support"]["floor_air"]["available"]["windows"],0)
+
     def test_storage_fit_rejects_weak_support_and_conflicting_later_days(self):
         from heating_learning_windows import _storage_candidate,evaluate_windows
         self.assertIsNone(_storage_candidate(self.windows('heat_gain',days=2),self.model,self.model,None))

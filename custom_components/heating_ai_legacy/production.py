@@ -508,7 +508,7 @@ class NativeController(HeatingClimate):
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
                                         "verified_reports","rejection_counts","current_reasons","eligibility_counts",
-                                        "analysis_status","analysis_blockers","solar","solar_prospective","solar_weather")}
+                                        "analysis_status","analysis_blockers","parameter_support","solar","solar_prospective","solar_weather")}
         if result.get("power_learning") is not None:
             self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
         self._apply_learning_result(issued,result)
@@ -1929,7 +1929,7 @@ class NativeController(HeatingClimate):
             accepted_metrics=checkpoint.get("metrics",{})
             previous=checkpoint.get("prior_model") or {}
             changes=[dict(parameter=key,before=previous[key],after=self.model[key])
-                     for key in ("floor_air","room_loss")
+                     for key in learning.FIT_FIELDS
                      if key in previous and key in self.model and previous[key]!=self.model[key]]
             attributes.update(last_accepted_changes=changes,
                 last_completed_analysis=(self.memory.get("adaptive_schedule") or {}).get("completed_at"),
@@ -1952,6 +1952,7 @@ class NativeController(HeatingClimate):
                 current_reasons=report.get("current_reasons",[]),
                 analysis_status=report.get("analysis_status","pending"),
                 analysis_blockers=report.get("analysis_blockers",[]),
+                parameter_support=report.get("parameter_support",{}),
                 solar_learning=report.get("solar") or {},
                 solar_prospective=report.get("solar_prospective") or {},
                 solar_weather=report.get("solar_weather") or {},

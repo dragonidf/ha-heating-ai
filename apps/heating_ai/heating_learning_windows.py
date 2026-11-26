@@ -548,11 +548,38 @@ def _storage_candidate(train, model, base_best, ventilation):
     return field,candidate
 
 
+def thermal_parameter_support(thermal, qualified_vent, train=(), holdout=(), selected=(), blockers=()):
+    """Report the actual candidate cohorts, not sample counts as proof of fit."""
+    def describe(rows):
+        coverage=_coverage(rows)
+        return dict(windows=len(rows),minutes=round(coverage["seconds"]/60,1),
+                    days=coverage["days"])
+    def warm(rows):
+        return [w for w in rows if w["end"]-w["start"]>=1800
+                and w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.]
+    def heat(rows):
+        return [w for w in rows if w["end"]-w["start"]>=1800 and w["heat"]>=.75*(w["end"]-w["start"])]
+    result={}
+    for field in FIT_FIELDS:
+        cohort=warm if field=="floor_decay" else heat if field=="heat_gain" else lambda rows: rows
+        identified=not (field=="room_loss" and qualified_vent)
+        active=field in selected
+        result[field]=dict(available=describe(cohort(thermal)),
+            training=describe(cohort(train)) if active else None,
+            holdout=describe(cohort(holdout)) if active else None,
+            selected_for_candidate=active,
+            status=("not_identifiable_with_ventilation" if not identified else
+                    "candidate_evaluated" if active else "not_selected" if not blockers else "insufficient_support"),
+            basis=("warm_idle" if field=="floor_decay" else "measured_heat" if field=="heat_gain" else "thermal_windows"))
+    return result
+
+
 def evaluate_windows(windows, model, ventilation=None):
     """Bounded offline fit. Holdout is selected by whole, later local days."""
     # Fit v6 only with one current equipment and mode identity.
     if not windows or any(number(model.get(k)) is None for k in BOUNDS):
-        return dict(status="insufficient_data", blockers=["no_windows"])
+        return dict(status="insufficient_data", blockers=["no_windows"],
+                    parameter_support=thermal_parameter_support([],False,blockers=["no_windows"]))
     latest = windows[-1]["equipment"]
     windows = [w for w in windows if w["equipment"] == latest and latest[0] == model.get("version")]
     qualified_vent = ventilation and ventilation.get("validated") and ventilation.get("model_version")==model.get("version")
@@ -589,7 +616,8 @@ def evaluate_windows(windows, model, ventilation=None):
         support = _coverage(train)
         if (qualified_vent or not holdout or support["seconds"]<8*3600 or support["days"]<2
                 or not outside or max(outside)-min(outside)<2.):
-            return dict(status="insufficient_data", blockers=blockers, coverage=coverage)
+            return dict(status="insufficient_data", blockers=blockers, coverage=coverage,
+                        parameter_support=thermal_parameter_support(thermal,qualified_vent,blockers=blockers))
         fields = ("room_loss",)
     # Bound both the grid and per-candidate displacement; widening belongs to a
     # separate qualification for equipment gain and decay.
@@ -630,7 +658,8 @@ def evaluate_windows(windows, model, ventilation=None):
                 coverage=coverage, train_windows=len(train), holdout_days=len({w["day"] for w in holdout}),
                 holdout_start=min(w["day"] for w in holdout),
                 old=baseline,shadow=shadow, coefficients={k:best[k] for k in fields} if qualified else None,
-                equipment=latest)
+                equipment=latest,
+                parameter_support=thermal_parameter_support(thermal,qualified_vent,train,holdout,fields,blockers))
 
 
 def evaluate_solar(windows, model, commissioning=.283, ventilation=None):
@@ -1485,7 +1514,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                 current_reasons=window_report["current_observation_quality"]["reasons"],
                 solar_weather=window_report.get("solar_weather",{}),
                 analysis_status="pending", analysis_blockers=[])
-    evidence_key = sha256(_encode([now.date().isoformat(),model,eligible,cooldown,power_context,
+    evidence_key = sha256(_encode(["parameter_support_v1",now.date().isoformat(),model,eligible,cooldown,power_context,ventilation,
                                   [(w['start'],w['end']) for w in windows],
                                   [(f['snapshot']['start'],f['checks']) for f in archive]])).hexdigest()
     previous_report = saved["report"]
@@ -1493,6 +1522,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         return dict(result,status=previous_report["status"],reason=previous_report["reason"],
                     analysis_status=previous_report.get("analysis_status","pending"),
                     analysis_blockers=previous_report.get("analysis_blockers",[]),
+                    parameter_support=previous_report.get("parameter_support",{}),
                     power_learning=previous_report.get("power_learning"),
                     solar=previous_report.get("solar"),
                     solar_prospective=previous_report.get("solar_prospective"))
@@ -1521,7 +1551,8 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         # Promotion still needs the unchanged real-time eligibility gate.
         thermal=evaluate_windows(windows,model,ventilation)
         blockers=thermal.get("blockers",[])
-        result.update(analysis_status=thermal["status"],analysis_blockers=blockers)
+        result.update(analysis_status=thermal["status"],analysis_blockers=blockers,
+                      parameter_support=thermal.get("parameter_support",{}))
         if eligible:
             result.update(status=thermal["status"] if thermal["status"]=="insufficient_data" else "rejected",
                           reason=",".join(blockers) or "holdout_forecasts_required")
@@ -1566,6 +1597,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         "power_learning":result.get("power_learning"),"solar":result.get("solar"),
         "solar_prospective":result.get("solar_prospective"),
         "analysis_status":result["analysis_status"],"analysis_blockers":result["analysis_blockers"],
+        "parameter_support":result.get("parameter_support",{}),
         "independent_windows":len(windows), "qualified_minutes":result["qualified_minutes"]})
     # Keep more than a week of compact issue snapshots where the byte cap permits.
     while len(_encode(payload))>MAX_BYTES-256:
