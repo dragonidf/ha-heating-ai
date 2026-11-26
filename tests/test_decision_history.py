@@ -204,6 +204,44 @@ class DecisionHistoryTests(unittest.TestCase):
             self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),8)
             for key,value in zip(ids,values):self.assertEqual(journal.read_snapshot(key),value)
 
+    def test_cold_batch_compaction_preserves_hot_tiny_and_expired_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,retention_days=14)
+            stamp=time.time()
+            # Generate large deterministic overlapping data and distinct hashes.
+            from random import Random
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            cold=[dict(i=i,values=shared) for i in range(9)]
+            hot=dict(i=100,values=shared)
+            tiny=dict(i=101)
+            old=dict(i=102,values=shared)
+            cold_ids=[journal.snapshot(v,stamp-4*86400+i) for i,v in enumerate(cold)]
+            hot_id=journal.snapshot(hot,stamp-3600)
+            tiny_id=journal.snapshot(tiny,stamp-5*86400)
+            old_id=journal.snapshot(old,stamp-15*86400)
+            # No rotation is performed by selection or compaction.
+            self.assertEqual(journal.cold_pack_candidates(stamp),cold_ids[:8])
+            with self.assertRaises(PermissionError):journal.compact_cold_snapshot_batch(stamp)
+            result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True)
+            self.assertEqual(result['status'],'promoted',result)
+            self.assertEqual(result['removed'],8)
+            for key,value in zip(cold_ids,cold):self.assertEqual(journal.read_snapshot(key),value)
+            for key in (cold_ids[-1],hot_id,tiny_id,old_id):
+                self.assertTrue((journal.directory/(key+'.json.gz')).exists())
+            self.assertEqual(journal.compact_cold_snapshot_batch(stamp,allow_remove=True)['status'],'no_eligible_batch')
+
+    def test_cold_publication_rejects_recently_reused_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            ids=[journal.snapshot(dict(i=i,data=list(range(10000))),stamp-4*86400) for i in range(2)]
+            journal.snapshot(dict(i=0,data=list(range(10000))),stamp)
+            with self.assertRaises(ValueError):
+                journal.stage_snapshot_pack(ids,cold_at=stamp)
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),2)
+            self.assertFalse((journal.directory/'packed_v1').exists())
+
     def test_pack_savings_gate_keeps_tiny_originals(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)

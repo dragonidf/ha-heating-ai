@@ -1904,7 +1904,7 @@ class DecisionJournal:
         return dict(ids=ids,stats=stats,blob=blob,manifest=manifest,pointer_raw=pointer_raw,
                     key=key,legacy_bytes=legacy_bytes,total_bytes=total_bytes)
 
-    def stage_snapshot_pack(self,digests,*,require_savings=False):
+    def stage_snapshot_pack(self,digests,*,require_savings=False,cold_at=None):
         """Additive staging; expensive encoding is outside the journal lock.
 
         The locked publication still performs disk I/O and fsync. It is not
@@ -1923,6 +1923,9 @@ class DecisionJournal:
             for digest,expected in zip(ids,pack['stats']):
                 if self._snapshot_stat(self.directory/(digest+'.json.gz'))!=expected:
                     raise ValueError('Snapshot changed before pack publication')
+                if cold_at is not None and (not cold_at-self.retention<=expected[3]/1e9<=cold_at-self.COLD_PACK_MIN_AGE
+                        or (self.directory/(digest+'.snapshot-ref')).exists()):
+                    raise ValueError('Cold snapshot no longer eligible')
             folder=self.directory/'packed_v1'
             existing_bytes=sum(p.stat().st_size for p in self.directory.iterdir() if p.is_file())
             if folder.is_dir():existing_bytes+=sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
@@ -2007,6 +2010,63 @@ class DecisionJournal:
             return dict(status='promoted',pack=key,snapshots=len(prepared['ids']),removed=len(originals),
                         removed_bytes=prepared['remaining_bytes'],packed_bytes=prepared['packed_bytes'],
                         legacy_bytes=prepared['legacy_bytes'])
+
+    COLD_PACK_MIN_AGE=72*3600
+    COLD_PACK_MIN_BYTES=16*1024
+    COLD_PACK_MAX_BYTES=256*1024
+    COLD_PACK_RECENT_FAILURES=64
+
+    def cold_pack_candidates(self,stamp,*,skip=()):
+        """Bounded selection from cold, large, unreferenced legacy snapshots.
+
+        Scan without the shared lock; keep only the eight oldest candidates.
+        Live input references are protected by their last-use mtime. Staging
+        rechecks identity and age before publication. Never choose hot/tiny
+        input references or snapshots already represented by a packed pointer.
+        """
+        from heapq import nsmallest
+        rejected=set(skip)
+        def candidates():
+            for path in self.directory.glob('*.json.gz'):
+                digest=path.name[:-8]
+                if not self._valid_digest(digest) or digest in rejected:
+                    continue
+                try:
+                    info=path.stat()
+                    if not (stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE
+                            and self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES):
+                        continue
+                    if (self.directory/(digest+'.snapshot-ref')).exists():continue
+                    yield (info.st_mtime,digest)
+                except FileNotFoundError:
+                    continue
+        return [digest for _,digest in nsmallest(self.PACK_ROWS,candidates())]
+
+    def compact_cold_snapshot_batch(self,stamp,*,allow_remove=False):
+        """One bounded maintenance attempt on a stopped controller or backup.
+
+        Explicitly opt in to replacement. No call from the safety tick or
+        automatic production schedule. A rejected group is not retried in a
+        tight loop; the in-process skip list is bounded.
+        """
+        if allow_remove is not True:
+            raise PermissionError('Cold archive compaction requires explicit opt-in')
+        skipped=list(getattr(self,'_cold_pack_skipped',()))
+        ids=self.cold_pack_candidates(stamp,skip=skipped)
+        if len(ids)<2:return dict(status='no_eligible_batch',snapshots=0)
+        try:
+            # The source-age fence is also checked inside staging publication.
+            staged=self.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp)
+            if staged['status']!='staged':
+                self._cold_pack_skipped=(skipped+ids)[-self.COLD_PACK_RECENT_FAILURES:]
+                return staged
+            result=self.promote_snapshot_pack(staged['pack'],allow_remove=True)
+            return result
+        except (OSError,ValueError,TypeError) as exc:
+            # A partially published pack remains additive and can be checked
+            # by the explicit promotion/rollback tools. No blind cleanup.
+            self._cold_pack_skipped=(skipped+ids)[-self.COLD_PACK_RECENT_FAILURES:]
+            return dict(status='deferred',snapshots=len(ids),reason=str(exc))
 
     def read_snapshot(self,digest):
         if not self._valid_digest(digest):
