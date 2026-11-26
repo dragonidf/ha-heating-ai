@@ -159,13 +159,76 @@ def restore_archive(source,destination):
     return build_copy(source,destination,writer)
 
 
+def restore_mixed_archive(source,destination):
+    """Materialize legacy gzip from a consistent backup of native mixed storage.
+
+    Only live per-digest pointers own packed evidence. Old members of a shared
+    block may already have expired. Never resurrect them or alter the source.
+    """
+    from heating_recovery import DecisionJournal
+
+    def writer(source,staged):
+        journal=DecisionJournal(source.parent)
+        journal.directory=source
+        refs=[];copied=0;restored=0;verified=0
+        folder=source/"packed_v1"
+        if folder.is_symlink():
+            raise ValueError("symlinked pack folder")
+        for path in sorted(source.iterdir()):
+            if path.is_symlink():
+                raise ValueError("symlinked archive entry")
+            if path==folder and path.is_dir():
+                for item in path.iterdir():
+                    if item.is_symlink() or not item.is_file():
+                        raise ValueError("unsupported pack entry")
+                continue
+            if not path.is_file():
+                raise ValueError("unsupported archive entry")
+            if path.name.endswith(".snapshot-ref"):
+                key=path.name[:-13]
+                if not identifier(key):
+                    raise ValueError("invalid snapshot reference")
+                refs.append((key,path))
+                continue
+            key=path.name[:-8] if path.name.endswith(".json.gz") else ""
+            if identifier(key):
+                # Verify original evidence before copying, without requiring a
+                # staged duplicate to be usable in order to recover legacy.
+                with gzip.open(path,"rb") as stream:
+                    raw=stream.read()
+                if digest(raw)!=key:
+                    raise ValueError("legacy snapshot checksum mismatch")
+                json.loads(raw);verified+=1
+            shutil.copy2(path,staged/path.name)
+            with (staged/path.name).open("rb") as stream:os.fsync(stream.fileno())
+            copied+=1
+        for key,pointer in refs:
+            target=staged/(key+".json.gz")
+            if target.exists():
+                latest=max(target.stat().st_mtime,pointer.stat().st_mtime)
+                os.utime(target,(latest,latest))
+                continue
+            raw=journal._packed_snapshot(key)
+            if digest(raw)!=key:
+                raise ValueError("packed snapshot checksum mismatch")
+            json.loads(raw)
+            write_file(target,gzip.compress(raw,mtime=0),pointer.stat().st_mtime)
+            if read_gzip(target,key)!=raw:
+                raise ValueError("legacy materialization mismatch")
+            restored+=1
+        return dict(copied_files=copied,verified_legacy_snapshots=verified,
+                    restored_packed_snapshots=restored,live_references=len(refs))
+    return build_copy(source,destination,writer)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation",choices=("export","restore"))
+    parser.add_argument("operation",choices=("export","restore","restore-mixed"))
     parser.add_argument("source",type=Path)
     parser.add_argument("destination",type=Path)
     args=parser.parse_args()
-    result=(export_archive if args.operation=="export" else restore_archive)(args.source,args.destination)
+    operation={"export":export_archive,"restore":restore_archive,"restore-mixed":restore_mixed_archive}[args.operation]
+    result=operation(args.source,args.destination)
     print(json.dumps(result,indent=2))
 
 
