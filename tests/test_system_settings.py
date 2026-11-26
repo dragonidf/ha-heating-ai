@@ -63,6 +63,22 @@ class SystemSettingsTests(unittest.TestCase):
         app.configure_ventilation()
         self.assertNotIn('supply_kind',app.cfg['ventilation']['recuperator'])
 
+    def test_persisted_grid_only_selection_is_exact_and_never_transferred(self):
+        app=self.app()
+        app.cfg.update(recuperator_entity='switch.recuperator',bath_entity='switch.bath',
+                       grid_only_ventilation_entities=['switch.recuperator'])
+        app.configure_ventilation()
+        app.get_state=lambda entity:'unavailable'
+        app.grid_state=lambda:'off'
+        app.ventilation_tick(0.)
+        self.assertEqual(app.ventilation_states['recuperator']['effective_duty'],0.)
+        self.assertIsNone(app.ventilation_states['bath']['effective_duty'])
+        app.cfg['recuperator_entity']='switch.replacement'
+        app.configure_ventilation()
+        app.ventilation_tick(15.)
+        self.assertEqual(app.ventilation_states['recuperator']['supply_provenance'],'unknown')
+        self.assertIsNone(app.ventilation_states['recuperator']['effective_duty'])
+
     def test_grid_binding_never_overrides_explicit_supply_sensor(self):
         app=self.app()
         app.cfg['ventilation']={'recuperator':{'entity':'switch.recuperator','supply_kind':'grid_only',

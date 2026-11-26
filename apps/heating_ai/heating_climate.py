@@ -951,7 +951,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                 power_entity=binding.get('power_entity')
                 if isinstance(power_entity,str):
                     supply=self.get_state(power_entity);provenance='supply_sensor'
-                elif binding.get('supply_kind')=='grid_only':
+                elif (binding.get('supply_kind')=='grid_only' or
+                      isinstance(self.cfg.get('grid_only_ventilation_entities'),(list,tuple)) and
+                      binding['entity'] in self.cfg['grid_only_ventilation_entities']):
                     supply=grid;provenance='verified_grid_topology'
                 else:
                     supply='unknown';provenance='unknown'

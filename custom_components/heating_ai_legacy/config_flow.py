@@ -167,7 +167,7 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
-    """Configure only the read-only voltage qualification band."""
+    """Configure voltage qualification and confirmed ventilation supply topology."""
 
     def __init__(self, config_entry):
         self._entry = config_entry
@@ -183,7 +183,15 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
                     data_schema=self._schema(user_input),
                     errors={"base": "invalid_voltage_band"},
                 )
+            grid_only = user_input.get("grid_only_ventilation_entities",
+                                       self._entry.options.get("grid_only_ventilation_entities", []))
+            if (not isinstance(grid_only, list) or len(grid_only)>2 or
+                    any(not isinstance(entity, str) or not entity.startswith(("switch.", "fan."))
+                        for entity in grid_only) or len(set(grid_only))!=len(grid_only)):
+                return self.async_show_form(step_id="init", data_schema=self._schema(user_input),
+                                            errors={"base": "invalid_ventilation_topology"})
             return self.async_create_entry(title="", data={
+                "grid_only_ventilation_entities": grid_only,
                 "min_voltage_v": minimum,
                 "max_voltage_v": maximum,
                 "voltage_recovery_seconds": recovery,
@@ -196,6 +204,10 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
     @staticmethod
     def _schema(current):
         return vol.Schema({
+            vol.Optional("grid_only_ventilation_entities",
+                         default=current.get("grid_only_ventilation_entities", [])):
+                selector.EntitySelector(selector.EntitySelectorConfig(
+                    domain=["switch", "fan"], multiple=True)),
             vol.Required("min_voltage_v", default=current.get("min_voltage_v", 190)):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=140, max=235, step=1,

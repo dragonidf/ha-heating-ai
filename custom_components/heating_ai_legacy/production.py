@@ -1851,6 +1851,9 @@ async def async_setup_production(hass, entry):
                voltage_entities=entry.data.get("voltage_entities", [SOURCE_HINTS[f"voltage_l{i}"] for i in (1,2,3)]))
     cfg.update({key: entry.options.get(key, default) for key, default in (
         ("min_voltage_v", 190), ("max_voltage_v", 260), ("voltage_recovery_seconds", 30))})
+    # Keep the confirmation bound to the exact entity selected in native
+    # options. Empty or legacy options do not infer any supply topology.
+    cfg["grid_only_ventilation_entities"] = entry.options.get("grid_only_ventilation_entities", [])
     missing = [cfg[key] for key in ("thermostat", "room", "return", "mode", "armed")
                if hass.states.get(cfg[key]) is None]
     if missing:
