@@ -346,8 +346,8 @@ class DecisionHistoryTests(unittest.TestCase):
                             SimpleNamespace(st_mtime=stamp-4*86400,st_size=32768))
             with patch('heating_recovery.os.scandir',return_value=Entries()), \
                  patch.object(journal,'stage_snapshot_pack') as stage:
-                result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=stop)
-            self.assertEqual(result['status'],'stopped')
+                selected=journal.cold_pack_candidates(stamp,stop=stop)
+            self.assertEqual(selected,[])
             self.assertEqual(len(visited),4)
             stage.assert_not_called()
             self.assertEqual(journal.cold_pack_candidates(stamp,stop=stop),[])

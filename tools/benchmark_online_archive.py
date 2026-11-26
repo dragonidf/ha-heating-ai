@@ -42,7 +42,9 @@ def run(entries):
             digest=hashlib.sha256(str(i).encode()).hexdigest()
             (journal.directory/(digest+".json.gz")).touch()
         journal.used_bytes=None
+        scan_cpu=thread_time();scan_wall=perf_counter()
         journal._prepare(stamp)
+        hourly_reconciliation=dict(cpu_s=thread_time()-scan_cpu,wall_s=perf_counter()-scan_wall)
         before=journal.used_bytes
         rss_before=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         baseline=[]
@@ -84,13 +86,14 @@ def run(entries):
         for key,value in zip(ids,cold):
             assert restarted.read_snapshot(key)==value
         rss_after=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # Second pass measures no-candidate scan at the same scale.
+        # Second pass measures exhausted shortlist, no directory scan.
         cpu=thread_time(); wall=perf_counter()
         empty=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=Event())
         empty.update(cpu_s=thread_time()-cpu,wall_s=perf_counter()-wall)
         assert empty["status"]=="no_eligible_batch"
         return dict(entries=entries+9,baseline_read=summary(baseline),
             concurrent_read=summary(concurrent),maintenance=result,empty_scan=empty,
+            hourly_reconciliation_including_existing_work=hourly_reconciliation,
             daily_cpu_upper_estimate_s=96*max(result["cpu_s"],empty["cpu_s"]),
             rss_before_kib=rss_before,rss_after_kib=rss_after,
             exact_restart_reads=True,scope="synthetic archive + concurrent journal read; excludes HA tick and real disk")

@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from threading import RLock
+from bisect import insort
 from uuid import uuid4
 import gzip
 import lzma
@@ -1664,6 +1665,7 @@ class DecisionJournal:
         self.snapshot_bytes=None
         self.daily_log_bytes=None
         self.snapshot_count=None
+        self._cold_queue=()
         self.lock=RLock()
 
     def health(self):
@@ -1723,6 +1725,9 @@ class DecisionJournal:
             # in RAM just to publish archive composition once per hour.
             self.used_bytes=self.snapshot_bytes=self.daily_log_bytes=self.snapshot_count=0
             self.oldest_at=stamp
+            cold=[]
+            rejected=set(getattr(self,'_cold_pack_skipped',()))
+            self._cold_queue=()
             for path in self.directory.iterdir():
                 if not path.is_file():
                     continue
@@ -1732,6 +1737,17 @@ class DecisionJournal:
                 if path.name.endswith('.json.gz'):
                     self.snapshot_bytes+=info.st_size
                     self.snapshot_count+=1
+                    # Reuse the existing stat; the shortlist stays bounded.
+                    # Only potential oldest entries need a pointer lookup.
+                    if (self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES
+                            and stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE):
+                        digest=path.name[:-8]
+                        item=(info.st_mtime,digest)
+                        if (digest not in rejected and (len(cold)<self.COLD_QUEUE_LIMIT or item<cold[-1])
+                                and self._valid_digest(digest) and not path.is_symlink()
+                                and not (self.directory/(digest+'.snapshot-ref')).exists()):
+                            insort(cold,item)
+                            if len(cold)>self.COLD_QUEUE_LIMIT:cold.pop()
                 elif path.name.endswith(('.jsonl','.jsonl.gz')):
                     self.daily_log_bytes+=info.st_size
                 elif path.name.endswith('.snapshot-ref'):
@@ -1751,6 +1767,7 @@ class DecisionJournal:
                 # Pointers already counted in the top-level scan.
                 block_bytes=sum(path.stat().st_size for path in folder.iterdir() if path.is_file())
                 self.used_bytes+=block_bytes;self.snapshot_bytes+=block_bytes
+            self._cold_queue=tuple(digest for _,digest in cold)
         # On a restart the archive may already exceed the 256 MiB initial
         # budget. Restore a safe disk-backed headroom limit *before* treating
         # that transient budget as critical; otherwise all closed days get
@@ -2116,6 +2133,7 @@ class DecisionJournal:
     COLD_PACK_MIN_BYTES=16*1024
     COLD_PACK_MAX_BYTES=256*1024
     COLD_PACK_RECENT_FAILURES=64
+    COLD_QUEUE_LIMIT=64
 
     def cold_pack_candidates(self,stamp,*,skip=(),stop=None):
         """Bounded selection from cold, large, unreferenced legacy snapshots.
@@ -2171,7 +2189,17 @@ class DecisionJournal:
             raise PermissionError('Cold archive compaction requires explicit opt-in')
         if stop is not None and stop.is_set():return dict(status='stopped',snapshots=0)
         skipped=list(getattr(self,'_cold_pack_skipped',()))
-        ids=self.cold_pack_candidates(stamp,skip=skipped,stop=stop)
+        if stop is None:
+            ids=self.cold_pack_candidates(stamp,skip=skipped)
+        else:
+            # Online maintenance must not repeat the hourly full-directory
+            # scan. A stale shortlist is harmless: staging verifies each
+            # original fingerprint, current age, and pointer absence.
+            with self.lock:
+                if stop.is_set():return dict(status='stopped',snapshots=0)
+                if self.used_bytes is None:return dict(status='deferred',snapshots=0,reason='Archive accounting not ready')
+                ids=list(self._cold_queue[:self.PACK_ROWS])
+                self._cold_queue=self._cold_queue[self.PACK_ROWS:]
         if stop is not None and stop.is_set():return dict(status='stopped',snapshots=0)
         if len(ids)<2:return dict(status='no_eligible_batch',snapshots=0)
         try:
