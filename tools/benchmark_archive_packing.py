@@ -64,7 +64,7 @@ def compare(rows):
     baseline=sum(len(gzip.compress(row,mtime=0)) for row in rows)
     gzip_cpu=process_time()-start;gzip_wall=perf_counter()-wall
     reports={}
-    for limit in (2,4,8):
+    for limit in (1,2,4,8):
         groups=[];batch=[];size=0
         for row in rows:
             if len(row)+1>MAX_RAW:
@@ -80,7 +80,12 @@ def compare(rows):
             ids=[digest(r) for r in group]
             packed.append((blob,ids))
             # Account for a standalone index of content addresses + pack ID.
-            index_bytes+=len(canonical(dict(pack=digest(blob),snapshots=ids)))
+            block_id=digest(blob)
+            index_bytes+=len(canonical(dict(pack=block_id,snapshots=ids)))
+            # Include per-digest lookup pointers and retention metadata.
+            # No whole-directory scan is acceptable in a live reader.
+            index_bytes+=sum(len(canonical(dict(pack=block_id,sha256=key,mtime=1795700000.0)))
+                             for key in ids)
         encode_cpu=process_time()-start;encode_wall=perf_counter()-wall
         start=process_time()
         restored=[]
@@ -98,8 +103,18 @@ def compare(rows):
             ratio=total/baseline if baseline else None,encode_cpu_s=encode_cpu,
             encode_wall_s=encode_wall,decode_cpu_s=decode_cpu,
             exact_sha_roundtrip=True,legacy_gzip_roundtrip=True)
+    gzip_levels={}
+    for level in (1,3,6):
+        start=process_time()
+        blobs=[gzip.compress(row,compresslevel=level,mtime=0) for row in rows]
+        cpu=process_time()-start
+        if any(gzip.decompress(blob)!=row for blob,row in zip(blobs,rows)):
+            raise AssertionError("gzip level roundtrip failed")
+        size=sum(map(len,blobs))
+        gzip_levels[str(level)]=dict(bytes=size,ratio=size/baseline,encode_cpu_s=cpu)
     return dict(unique_snapshots=len(rows),raw_bytes=sum(map(len,rows)),
         baseline_gzip_bytes=baseline,baseline_cpu_s=gzip_cpu,baseline_wall_s=gzip_wall,
+        gzip_levels=gzip_levels,
         variants=reports,process_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
