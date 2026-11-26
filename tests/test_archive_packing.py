@@ -38,3 +38,33 @@ class ArchivePackingTests(unittest.TestCase):
         huge=lzma.compress(b"x"*(MAX_RAW+1),preset=1)
         with self.assertRaises(ValueError):
             unpack(huge,["0"*64])
+
+
+    def test_offline_archive_export_restore_preserves_source_and_hashes(self):
+        import gzip
+        import tempfile
+        from pack_decision_archive import export_archive,restore_archive
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);source=root/"source";source.mkdir()
+            raws=[canonical(dict(i=i,data=list(range(1000)))) for i in range(10)]
+            for row in raws:
+                (source/(digest(row)+".json.gz")).write_bytes(gzip.compress(row,mtime=0))
+            (source/"2026-11-26.jsonl").write_bytes(b'{"event":"full_recompute"}\n')
+            before={p.name:p.read_bytes() for p in source.iterdir()}
+            packed=root/"packed";restored=root/"restored"
+            self.assertEqual(export_archive(source,packed)["snapshots"],10)
+            self.assertEqual(restore_archive(packed,restored)["snapshots"],10)
+            self.assertEqual(before,{p.name:p.read_bytes() for p in source.iterdir()})
+            for row in raws:
+                self.assertEqual(gzip.decompress((restored/(digest(row)+".json.gz")).read_bytes()),row)
+            self.assertEqual((restored/"2026-11-26.jsonl").read_bytes(),before["2026-11-26.jsonl"])
+            with self.assertRaises(ValueError):
+                export_archive(source,source/"nested")
+            with self.assertRaises(ValueError):
+                restore_archive(packed,restored)
+            block=next(packed.glob("*.xz"))
+            block.write_bytes(block.read_bytes()[:-4])
+            broken=root/"broken"
+            with self.assertRaises(ValueError):
+                restore_archive(packed,broken)
+            self.assertFalse(broken.exists())
