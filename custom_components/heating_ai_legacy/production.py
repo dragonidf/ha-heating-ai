@@ -343,8 +343,9 @@ class NativeController(HeatingClimate):
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
         self._learning_rows.append(compact)
         if verified:
-            self.memory["advisory_validation"]=learning.advisory_validation_update(
-                self.memory.get("advisory_validation"),stamp,self._advisory_identity(),report=compact)
+            if "advisory_validation" in self.memory:
+                self.memory["advisory_validation"]=learning.advisory_validation_update(
+                    self.memory.get("advisory_validation"),stamp,self._advisory_identity(),report=compact)
             self._monitor_learning(observed)
 
     def _advisory_identity(self):
