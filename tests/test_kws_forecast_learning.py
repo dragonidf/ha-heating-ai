@@ -34,7 +34,7 @@ def fixture(start,high=27.,extra=True):
             manual_extra_active=False,outside=5.,fire=0.,fire_valid=True,fire_active=False,
             shadow_ventilation=[0.,0.],epoch='test',thermal_model_version=6,equipment_version=1,
             boiler_power_mode='fixed_6',weather_issue_at=at-60,solar_factor=0.,**{'return':actual_floor}))
-        if extra:rows[-1].update(heating_requested=active,command_at=start if active else start+1800)
+        if extra:rows[-1].update(heating_requested=active,command_at=start if active else start+1800,command_confirmed=True)
         if i:curve.append(dict(ts=at,temperature=room,upper_temperature=room))
         room,floor=step(room,floor,5.,6. if active else 0.,0.,MODEL,1/12)
         actual,actual_floor=step(actual,actual_floor,5.,kw,0.,MODEL,1/12)
@@ -51,6 +51,9 @@ class PowerForecastTest(unittest.TestCase):
         self.assertTrue(all(c[-1]=={'command_verified':True} for c in item['checks']))
         self.assertIn('plan_execution_mismatch',item['checks'][0][8])
         self.assertFalse(score_frozen(item['snapshot'],item['checks'],timezone.utc)[0]['valid'])
+        rows[3]['command_confirmed']=False
+        self.assertFalse(_command_follows_plan(rows,times,BASE,BASE+10800,item['snapshot']['segments']))
+        rows[3]['command_confirmed']=True
         rows[3]['command_at']+=1
         self.assertFalse(_command_follows_plan(rows,times,BASE,BASE+10800,item['snapshot']['segments']))
 

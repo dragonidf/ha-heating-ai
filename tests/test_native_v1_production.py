@@ -299,6 +299,47 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.memory["manual_energy"],{"status":"completed"})
             self.assertEqual(app.command_ledger.calls,[])
 
+    async def test_kws_profile_promotion_and_rollback_are_atomic(self):
+        from test_kws_forecast_learning import PROFILE
+        with package(self.root / "package") as (component, _):
+            _, app = self.controller(component)
+            app.directory = self.root
+            app.now = lambda: datetime(2026,11,1,tzinfo=timezone.utc)
+            app.model = {"version":6,"validated":True,"floor_air":.035}
+            source=dict(app.model)
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.memory.update(model=source,equipment_version=1,
+                manual_energy={"status":"completed"},energy_cursor=3.)
+            app._learning_rows.append({"ts":1.})
+            app.submit_to_executor=Mock()
+            app._learning_eligible=Mock(return_value=True)
+            outcome={"status":"accepted","proposed_power":dict(PROFILE),
+                "evidence":{"status":"accepted","strata":{"1:night_idle":{"mae":.3,"violation":False}}},
+                "metrics":{},"evidence_fingerprint":"fixture-power"}
+            app.daily_learn()
+            original=app.statefile.read_bytes() if app.statefile.exists() else None
+            with patch.object(component.os,"replace",side_effect=OSError("disk")):
+                app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
+            self.assertEqual(app.model,source)
+            self.assertIsNone(app.memory.get("kws_forecast_profile"))
+            self.assertEqual(app.statefile.read_bytes() if app.statefile.exists() else None,original)
+            app.daily_learn()
+            app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
+            self.assertEqual(app.model,{**source,"version":7})
+            applied={**PROFILE,"thermal_model_version":7}
+            self.assertEqual(app.memory["kws_forecast_profile"],applied)
+            self.assertEqual(app.memory["power_calibrations"]["profiles"]["fixed_6"],applied)
+            self.assertEqual(json.loads(app.statefile.read_text())["kws_forecast_profile"],applied)
+            app._rollback_learning("fixture")
+            self.assertEqual(app.model,source)
+            self.assertIsNone(app.memory.get("kws_forecast_profile"))
+            self.assertFalse(app.memory["power_calibrations"]["profiles"])
+            self.assertIsNone(json.loads(app.statefile.read_text())["kws_forecast_profile"])
+            self.assertGreater(app.memory["online_learning"]["frozen_until"],app.now().timestamp())
+            self.assertEqual(app.memory["energy_cursor"],3.)
+            self.assertEqual(app.memory["manual_energy"],{"status":"completed"})
+            self.assertEqual(app.command_ledger.calls,[])
+
     async def test_adaptive_capture_requires_numeric_change_at_primary(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)

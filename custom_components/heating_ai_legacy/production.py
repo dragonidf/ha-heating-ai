@@ -232,7 +232,19 @@ class NativeController(HeatingClimate):
             "boiler_power_mode","fire_valid","fire_active","external_gain","residual_gain",
             "room_source_disagreement","room_sources_suspect","energy")
         compact = {key:row.get(key) for key in fields}
-        compact.update(heating_requested=row.get("heating_requested"),command_at=number(self.memory.get("command_at")))
+        requested=row.get("heating_requested")
+        command_at=number(self.memory.get("command_at"))
+        command=self.memory.get("command_diagnostic") or {}
+        confirmed_at=number(command.get("confirmed_at"))
+        mode="heat" if requested is True else "off"
+        compact.update(heating_requested=requested,command_at=command_at,
+            command_confirmed=bool(isinstance(requested,bool) and self.memory.get("owned")
+                and self.memory.get("last_command")==mode and self.memory.get("expected_mode")==mode
+                and command.get("status")=="confirmed" and command.get("accepted_mode")==mode
+                and command_at is not None and confirmed_at is not None and command_at<=confirmed_at<=row["ts"]
+                and not self._pending_command_evidence
+                and not (self.command_ledger_status or {}).get("fenced",True)
+                and self.raw("thermostat")==mode))
         stamp = row["ts"]
         manual = self.memory.get("manual_energy") or {}
         if (row.get("manual_extra_active") is True and manual.get("status")=="active"

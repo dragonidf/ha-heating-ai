@@ -779,7 +779,8 @@ def _command_follows_plan(rows,times,start,end,segments):
         x,y=a["ts"],b["ts"]
         first,last=a.get("heating_requested"),b.get("heating_requested")
         before,after=number(a.get("command_at")),number(b.get("command_at"))
-        if (not isinstance(first,bool) or not isinstance(last,bool) or before is None or after is None
+        if (a.get("command_confirmed") is not True or b.get("command_confirmed") is not True
+                or not isinstance(first,bool) or not isinstance(last,bool) or before is None or after is None
                 or before>x or after>y or not 0<y-x<=600):
             return False
         if first==last:
