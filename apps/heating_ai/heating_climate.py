@@ -1815,6 +1815,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             forecast_solar=dict(solar)
             if certificate:
                 forecast_solar['risk_coefficient']=certificate['coefficient']
+                if certificate.get('comfort_credit') is True:
+                    forecast_solar.update(validated=True,coefficient=certificate['coefficient'])
             settings['environment']={'solar':forecast_solar,'astronomy':astronomy,'timezone':str(self.climate_tz),
                                      'last_heated_at':thermal.get('last_heated_at')}
             # Quantise the safety reserve so tiny MAE changes do not replan.
@@ -1823,13 +1825,14 @@ class HeatingClimate(HeatingRecovery,Hass):
                 friendly_name='Клімат — оцінка запасу тепла підлоги',unit_of_measurement='°C',
                 estimated=True,raw_return=probe if probe_ok else None,return_estimated=not probe_ok,floor_source=thermal['source'],
                 external_gain_c_per_hour=round(solar.get('observed_gain',0.),3),
-                solar_learning_days=solar['days'],solar_validated=solar['validated'],
-                solar_coefficient=round(solar['coefficient'],3),weather_condition=condition,
+                solar_learning_days=certificate.get('days',solar['days']),solar_validated=forecast_solar['validated'],
+                solar_coefficient=round(forecast_solar['coefficient'],3),weather_condition=condition,
                 solar_observation_quality=solar.get('observation_quality'),
                 solar_risk_coefficient=forecast_solar.get('risk_coefficient'),
                 solar_risk_holdout_days=certificate.get('holdout_days',0),
                 solar_risk_holdout_windows=certificate.get('holdout_windows',0),
-                solar_risk_only=bool(certificate),
+                solar_risk_only=bool(certificate and not certificate.get('comfort_credit')),
+                solar_nominal_validated=bool(certificate.get('comfort_credit')),
                 astronomy_available=bool(astronomy),room_source_check=room_check['status'],
                 recent_mae=environment_quality['recent_mae'],upper_margin=settings['upper_margin'],
                 note='Еквівалент запасу тепла, не температура поверхні; зовнішній прогрів не доводить сонце')

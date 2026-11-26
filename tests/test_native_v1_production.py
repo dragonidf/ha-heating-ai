@@ -263,6 +263,47 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.command_ledger.calls,[])
             hass.services.async_call.assert_not_called()
 
+    async def test_solar_credit_is_promoted_once_and_rolled_back_atomically(self):
+        import time
+        from copy import deepcopy
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            app.climate_tz=timezone.utc
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.memory["equipment_version"]=1
+            app._learning_eligible=Mock(return_value=True)
+            risk=dict(identity=[6,1,"fixed_6"],status="holdout_passed",coefficient=.5,
+                      comfort_credit=False,stored_at=1000.,holdout_end=900.,ventilation_model={})
+            app.memory["online_learning"]={"solar_risk_candidate":deepcopy(risk)}
+            issued=dict(model=dict(app.model),equipment=1,generation=app._learning_generation,
+                        solar_ventilation={},solar_risk=deepcopy(risk),started=time.monotonic())
+            report=dict(status="passed",identity=risk["identity"],coefficient=.5,issued_after=1000.)
+            app._update_solar_credit(issued,{"solar_prospective":{**report,"issued_after":999.}})
+            self.assertFalse(app.active_solar_risk_certificate()["comfort_credit"])
+            with patch.object(app,"save",side_effect=OSError):
+                app._update_solar_credit(issued,{"solar_prospective":report})
+            self.assertFalse(app.active_solar_risk_certificate()["comfort_credit"])
+            app._update_solar_credit(issued,{"solar_prospective":report})
+            active=app.active_solar_risk_certificate()
+            self.assertTrue(active["comfort_credit"])
+            self.assertEqual(active,json.loads(app.statefile.read_text())["online_learning"]["solar_risk_candidate"])
+            issued["solar_risk"]=deepcopy(active)
+            rollback=dict(status="rollback_required",identity=risk["identity"],coefficient=.5,
+                          issued_after=active["nominal_at"],rollback_reason="forecast_quality_regression")
+            app._learning_eligible=Mock(return_value=False)
+            app._update_solar_credit(issued,{"solar_prospective":rollback})
+            revoked=app.active_solar_risk_certificate()
+            self.assertFalse(revoked["comfort_credit"])
+            self.assertGreater(revoked["nominal_frozen_until"],revoked["nominal_revoked_at"])
+            issued["solar_risk"]=deepcopy(revoked)
+            app._learning_eligible=Mock(return_value=True)
+            app._update_solar_credit(issued,{"solar_prospective":report})
+            self.assertFalse(app.active_solar_risk_certificate()["comfort_credit"])
+            app.memory["online_learning"]["evidence_after"]=1001.
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            self.assertEqual(app.command_ledger.calls,[])
+            hass.services.async_call.assert_not_called()
+
     async def test_single_scheduled_learning_job_keeps_v6_without_evidence(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)

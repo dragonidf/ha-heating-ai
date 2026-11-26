@@ -435,6 +435,7 @@ class NativeController(HeatingClimate):
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
                     generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
                     solar_ventilation=deepcopy(self.memory.get("ventilation_model") or {}),
+                    solar_risk=deepcopy(self.active_solar_risk_certificate()),
                     schedule=dict(day=now.date().isoformat(),slot=slot,
                                   room_report=self._learning_last_report,eligible_at_issue=eligible))
         self._learning_job=issued
@@ -447,7 +448,7 @@ class NativeController(HeatingClimate):
                 dict(mode=self.cfg.get("boiler_power_mode","unconfirmed"),equipment=issued["equipment"],
                      calibrations=deepcopy(self.memory.get("power_calibrations") or {}),
                      active=deepcopy(self.memory.get("kws_forecast_profile")),
-                     solar_risk=deepcopy(self.active_solar_risk_certificate())),
+                     solar_risk=issued["solar_risk"]),
                 callback=self._learning_finished,job_id=issued["id"])
         except Exception as exc:
             self._learning_job=None
@@ -470,6 +471,7 @@ class NativeController(HeatingClimate):
         if result.get("power_learning") is not None:
             self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
         self._apply_learning_result(issued,result)
+        self._update_solar_credit(issued,result)
         self._store_solar_risk_candidate(issued,result)
         if self._learning_status.get("status") not in ("accepted","rolled_back"):
             checkpoint=self.memory.setdefault("online_learning",{})
@@ -477,13 +479,21 @@ class NativeController(HeatingClimate):
                 checkpoint,self._learning_status["status"],self._learning_status.get("reason"))
 
     def active_solar_risk_certificate(self):
-        certificate=(self.memory.get("online_learning") or {}).get("solar_risk_candidate") or {}
+        checkpoint=self.memory.get("online_learning") or {}
+        certificate=checkpoint.get("solar_risk_candidate") or {}
         identity=[self.model.get("version"),self.memory.get("equipment_version",0),
                   self.cfg.get("boiler_power_mode","unconfirmed")]
         coefficient=number(certificate.get("coefficient"))
         if (certificate.get("identity")==identity and certificate.get("status")=="holdout_passed"
                 and certificate.get("ventilation_model")== (self.memory.get("ventilation_model") or {})
-                and certificate.get("comfort_credit") is False and coefficient is not None and 0<coefficient<=.8):
+                and type(certificate.get("comfort_credit")) is bool
+                and number(certificate.get("stored_at")) is not None
+                and certificate["stored_at"]>=checkpoint.get("evidence_after",0)
+                and coefficient is not None and 0<coefficient<=.8):
+            if certificate["comfort_credit"] and (number(certificate.get("nominal_at")) is None
+                    or certificate.get("nominal_revoked_at") is not None
+                    or (certificate.get("nominal_validation") or {}).get("status")!="passed"):
+                return {}
             return certificate
         return {}
 
@@ -503,7 +513,9 @@ class NativeController(HeatingClimate):
             return
         checkpoint=self.memory.setdefault("online_learning",{})
         old=checkpoint.get("solar_risk_candidate")
-        if old and old.get("holdout_end",0)>=solar.get("holdout_end",0):
+        if old and (old.get("holdout_end",0)>=solar.get("holdout_end",0)
+                    or self.now().timestamp()<old.get("nominal_frozen_until",0)
+                    or old.get("nominal_revoked_at",0)>=solar.get("holdout_end",0)):
             return
         checkpoint["solar_risk_candidate"]={**solar,"comfort_credit":False,
             "ventilation_model":deepcopy(self.memory.get("ventilation_model") or {}),
@@ -514,6 +526,48 @@ class NativeController(HeatingClimate):
             if old is None:checkpoint.pop("solar_risk_candidate",None)
             else:checkpoint["solar_risk_candidate"]=old
             self._learning_status["solar"]={**solar,"status":"storage_failed"}
+            return
+        self.next_compute=0
+
+    def _update_solar_credit(self, issued, result):
+        """One fixed coefficient; guarded promotion or safety rollback."""
+        report=result.get("solar_prospective") or {}
+        active=self.active_solar_risk_certificate()
+        if (not active or active!=issued.get("solar_risk")
+                or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
+                or issued["equipment"]!=self.memory.get("equipment_version",0)
+                or issued.get("solar_ventilation")!=(self.memory.get("ventilation_model") or {})
+                or time.monotonic()-issued["started"]>120
+                or self.memory.get("state_load_error") or getattr(self,"settings_transaction",False)
+                or report.get("identity")!=active["identity"]
+                or report.get("coefficient")!=active["coefficient"]):
+            return
+        stamp=self.now().timestamp()
+        checkpoint=self.memory["online_learning"]
+        next_certificate=dict(active)
+        if (report.get("status")=="passed" and not active["comfort_credit"]
+                and active.get("nominal_revoked_at") is None
+                and report.get("issued_after")==active["stored_at"]
+                and not result.get("proposed") and not result.get("proposed_power") and not result.get("rollback")
+                and stamp>=checkpoint.get("frozen_until",0)
+                and self._learning_eligible()):
+            next_certificate.update(comfort_credit=True,nominal_at=stamp,
+                                    nominal_validation=deepcopy(report))
+        elif (report.get("status")=="rollback_required" and active["comfort_credit"]
+                and report.get("issued_after")==active.get("nominal_at")):
+            # A conservative removal of credit needs no actuator permission,
+            # but the exact issued identity and successful durable write do.
+            next_certificate.update(comfort_credit=False,nominal_revoked_at=stamp,
+                nominal_frozen_until=stamp+7*86400,
+                nominal_rollback_reason=report.get("rollback_reason"))
+        else:
+            return
+        checkpoint["solar_risk_candidate"]=next_certificate
+        try:
+            self.save()
+        except (OSError,TypeError,ValueError,MemoryError):
+            checkpoint["solar_risk_candidate"]=active
+            self._learning_status["solar_prospective"]={**report,"status":"storage_failed"}
             return
         self.next_compute=0
 
@@ -1859,7 +1913,8 @@ class NativeController(HeatingClimate):
                 solar_learning=report.get("solar") or {},
                 solar_prospective=report.get("solar_prospective") or {},
                 solar_risk_active={k:v for k,v in self.active_solar_risk_certificate().items()
-                    if k in ("coefficient","stored_at","holdout_days","holdout_windows","comfort_credit")},
+                    if k in ("coefficient","stored_at","holdout_days","holdout_windows","comfort_credit",
+                             "nominal_at","nominal_revoked_at","nominal_frozen_until","nominal_rollback_reason")},
                 candidate_holdout_mae_1h=metrics.get("1",{}).get("new",{}).get("mae"),
                 candidate_holdout_mae_3h=metrics.get("3",{}).get("new",{}).get("mae"),
                 active_version=self.model.get("version"),rollback_reason=checkpoint.get("rollback_reason"),
