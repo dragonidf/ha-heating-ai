@@ -179,7 +179,16 @@ def modulation_interval(a,b,power_source):
     return dt,ra,rb,pb,kw
 
 
-def learn_modulation(samples, *, power_source='balance', prior_kw=3., pairs=None):
+def modulation_observations(pairs,power_source):
+    for a,b in pairs:
+        if a.get('power_source')!=power_source or b.get('power_source')!=power_source:
+            continue
+        interval=modulation_interval(a,b,power_source)
+        if interval is not None:
+            yield interval
+
+
+def learn_modulation(samples, *, power_source='balance', prior_kw=3., observations=None):
     """Fit effective demand power in 2°C return bands from trustworthy intervals.
 
     Rebuilt from the rolling telemetry, so reloads cannot double-count evidence.
@@ -188,13 +197,9 @@ def learn_modulation(samples, *, power_source='balance', prior_kw=3., pairs=None
     Legacy rows require confirmed heating at both ends (no inferred off duty).
     """
     bands = {}
-    for a,b in pairs if pairs is not None else zip(samples,samples[1:]):
-        if a.get('power_source')!=power_source or b.get('power_source')!=power_source:
-            continue
-        interval=modulation_interval(a,b,power_source)
-        if interval is None:
-            continue
-        dt,ra,rb,pb,kw=interval
+    if observations is None:
+        observations=modulation_observations(zip(samples,samples[1:]),power_source)
+    for dt,ra,rb,pb,kw in observations:
         key=int(math.floor((ra+rb)/4))*2
         band=bands.setdefault(key,dict(minutes=0.,kwh=0.,intervals=0,stages={'3':0.,'6':0.,'9':0.}))
         band['minutes']+=dt
@@ -1315,17 +1320,17 @@ def learn_power_modes(samples,model=None):
             # Never bridge an excluded row by zipping a filtered time series.
             # Both endpoints must belong to the same qualified equipment/session.
             selected={id(r) for r in rows}
-            physical_pairs=[(a,b) for a,b in zip(samples,samples[1:])
+            physical_pairs=[(a,b,interval) for a,b in zip(samples,samples[1:])
                             if id(a) in selected and id(b) in selected and
-                            modulation_interval(a,b,source) is not None]
-            sessions=sorted({a['heat_command_at'] for a,b in physical_pairs})
+                            (interval:=modulation_interval(a,b,source)) is not None]
+            sessions=sorted({a['heat_command_at'] for a,b,interval in physical_pairs})
         if len(sessions)<3:continue
         split=sessions[-1];train=[r for r in rows if r.get('heat_command_at')!=split];test=[r for r in rows if r.get('heat_command_at')==split]
         evaluation_model=(test[0].get('thermal_model') or model) if test else model
         baseline=3. if mode=='auto' else float(mode[-1])
-        training_pairs=None if physical_pairs is None else [(a,b) for a,b in physical_pairs if a['heat_command_at']!=split]
-        testing_pairs=zip(test,test[1:]) if physical_pairs is None else [(a,b) for a,b in physical_pairs if a['heat_command_at']==split]
-        candidate=learn_modulation(train,power_source=source,prior_kw=baseline if source=='kws_phases' else 3.,pairs=training_pairs)
+        training_observations=None if physical_pairs is None else (interval for a,b,interval in physical_pairs if a['heat_command_at']!=split)
+        testing_pairs=zip(test,test[1:]) if physical_pairs is None else ((a,b) for a,b,interval in physical_pairs if a['heat_command_at']==split)
+        candidate=learn_modulation(train,power_source=source,prior_kw=baseline if source=='kws_phases' else 3.,observations=training_observations)
         errors=[];base=[];thermal=[];base_thermal=[];holdout_minutes=0.
         simulated=None;reference=None
         for a,b in testing_pairs:
@@ -1343,7 +1348,7 @@ def learn_power_modes(samples,model=None):
                 simulated=step(*simulated,a['outside'],predicted,a.get('fire',0.),evaluation_model,dt)
                 reference=step(*reference,a['outside'],baseline,a.get('fire',0.),evaluation_model,dt)
                 thermal.append(abs(simulated[0]-b['room']));base_thermal.append(abs(reference[0]-b['room']))
-        days=len({datetime.fromtimestamp(r['ts']).date() for r in rows}) if physical_pairs is None else len({datetime.fromtimestamp(a['ts']).date() for a,b in physical_pairs})
+        days=len({datetime.fromtimestamp(r['ts']).date() for r in rows}) if physical_pairs is None else len({datetime.fromtimestamp(a['ts']).date() for a,b,interval in physical_pairs})
         electrical_ok=(days>=2 and len(errors)>=6 and candidate['minutes']>=60
                        and (source!='kws_phases' or holdout_minutes>=30-1e-9)
                        and statistics.mean(errors)<statistics.mean(base)*.95)
