@@ -137,6 +137,40 @@ class DecisionHistoryTests(unittest.TestCase):
             self.assertFalse(list(restored.directory.glob('*.json.gz')))
             for digest,value in zip(ids,values):self.assertEqual(restored.read_snapshot(digest),value)
 
+    def test_pack_encoding_does_not_hold_journal_lock_and_stale_publication_is_rejected(self):
+        from unittest.mock import patch
+        from threading import Thread,Event
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            ids=[journal.snapshot(dict(i=i,data=list(range(1000))),stamp) for i in range(2)]
+            original=journal._prepare_snapshot_pack
+            prepared=Event();release=Event();errors=[]
+            def slow_prepare(keys):
+                result=original(keys)
+                prepared.set()
+                if not release.wait(5):raise RuntimeError('test timeout')
+                return result
+            def stage():
+                try:journal.stage_snapshot_pack(ids)
+                except Exception as exc:errors.append(exc)
+            with patch.object(journal,'_prepare_snapshot_pack',side_effect=slow_prepare):
+                worker=Thread(target=stage)
+                worker.start()
+                try:
+                    self.assertTrue(prepared.wait(5))
+                    self.assertTrue(journal.lock.acquire(timeout=1))
+                    try:
+                        journal.snapshot(dict(i=0,data=list(range(1000))),stamp+60)
+                    finally:journal.lock.release()
+                finally:
+                    release.set();worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors),1)
+            self.assertIsInstance(errors[0],ValueError)
+            self.assertFalse((journal.directory/'packed_v1').exists())
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),2)
+
     def test_pack_savings_gate_keeps_tiny_originals(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)
