@@ -228,6 +228,40 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app._learning_zero_seconds,15.)
             hass.services.async_call.assert_not_called()
 
+    async def test_solar_risk_candidate_is_bound_to_current_context_and_persisted(self):
+        import time
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.memory["equipment_version"]=1
+            app._learning_eligible=Mock(return_value=True)
+            issued=dict(model=dict(app.model),equipment=1,generation=app._learning_generation,
+                        solar_ventilation={},started=time.monotonic())
+            outcome={"solar":dict(status="holdout_passed",risk_eligible=True,coefficient=.5,
+                identity=[6,1,"fixed_6"],holdout_end=1000.,holdout_days=2,holdout_windows=8)}
+            app.memory["ventilation_model"]={"validated":False,"reason":"changed"}
+            app._store_solar_risk_candidate(issued,outcome)
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app.memory["ventilation_model"]={}
+            with patch.object(app,"save",side_effect=OSError):
+                app._store_solar_risk_candidate(issued,outcome)
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app._store_solar_risk_candidate(issued,outcome)
+            active=app.active_solar_risk_certificate()
+            self.assertEqual(active["coefficient"],.5)
+            self.assertFalse(active["comfort_credit"])
+            self.assertEqual(json.loads(app.statefile.read_text())["online_learning"]["solar_risk_candidate"],active)
+            app.memory["equipment_version"]=2
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app.memory["equipment_version"]=1
+            app.cfg["boiler_power_mode"]="fixed_9"
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.model={"version":7}
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            self.assertEqual(app.command_ledger.calls,[])
+            hass.services.async_call.assert_not_called()
+
     async def test_single_scheduled_learning_job_keeps_v6_without_evidence(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)

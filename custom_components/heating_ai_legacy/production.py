@@ -434,6 +434,7 @@ class NativeController(HeatingClimate):
         eligible=self._learning_eligible()
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
                     generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
+                    solar_ventilation=deepcopy(self.memory.get("ventilation_model") or {}),
                     schedule=dict(day=now.date().isoformat(),slot=slot,
                                   room_report=self._learning_last_report,eligible_at_issue=eligible))
         self._learning_job=issued
@@ -441,7 +442,7 @@ class NativeController(HeatingClimate):
         try:
             self.submit_to_executor(learning.run_learning,self.directory/"online_learning_v1.json",
                 tuple(self._learning_rows),tuple(self._learning_forecasts),issued["model"],
-                deepcopy(self.memory.get("ventilation_model") or {}),
+                issued["solar_ventilation"],
                 deepcopy(self.memory.get("online_learning") or {}),now,eligible,
                 dict(mode=self.cfg.get("boiler_power_mode","unconfirmed"),equipment=issued["equipment"],
                      calibrations=deepcopy(self.memory.get("power_calibrations") or {}),
@@ -493,6 +494,7 @@ class NativeController(HeatingClimate):
                 or solar.get("risk_eligible") is not True or solar.get("status")!="holdout_passed"
                 or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
                 or issued["equipment"]!=self.memory.get("equipment_version",0)
+                or issued.get("solar_ventilation")!=(self.memory.get("ventilation_model") or {})
                 or time.monotonic()-issued["started"]>120 or not self._learning_eligible()):
             return
         identity=[self.model.get("version"),issued["equipment"],self.cfg.get("boiler_power_mode","unconfirmed")]
