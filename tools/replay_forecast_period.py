@@ -57,12 +57,22 @@ def matched_reports(snapshot, rows):
         key = (horizon, at)
         value = dict(horizon=horizon, issued_at=issue, actual_at=at, actual_temperature=actual,
                      model_version=model, physical_mode=mode, equipment_version=equipment,
-                     equipment_provenance=provenance, weather_known=plan.get("weather_complete"),
+                     equipment_provenance=provenance, forecast_temperature=finite(row.get("forecast_temperature")),
+                     weather_known=plan.get("weather_complete"),
                      schedule_known=plan.get("schedule_complete"))
         if key in unique and unique[key] != value:
             conflicting.add(key)
         unique[key] = value
     return [value for key, value in sorted(unique.items()) if key not in conflicting]
+
+
+def original_parity(reports, reproduced):
+    """Archived original prediction is mandatory; replay may not substitute it."""
+    if len(reports) != len(reproduced):
+        raise ValueError("Mismatched worker response length")
+    return [finite(row.get("forecast_temperature")) is not None and finite(value) is not None
+            and abs(row["forecast_temperature"]-value)<=.005
+            for row,value in zip(reports,reproduced)]
 
 
 def pair_errors(reports, baseline, candidate):
@@ -138,10 +148,13 @@ def snapshots(data, first, last, errors):
     issues = sorted(errors)
     start_day = datetime.fromtimestamp(first-48*3600, timezone.utc).date().isoformat()
     end_day = datetime.fromtimestamp(last, timezone.utc).date().isoformat()
-    paths = {p.name[:10]: p for p in journal.directory.glob("????-??-??.jsonl.gz")}
-    paths.update({p.name[:10]: p for p in journal.directory.glob("????-??-??.jsonl")})
+    paths = list(journal.directory.glob("????-??-??.jsonl.gz"))
+    paths.extend(journal.directory.glob("????-??-??.jsonl"))
     seen = set()
-    for day, path in sorted(paths.items()):
+    # Archived prefix before the active file for a date. A duplicated
+    # digest across interrupted rotation is filtered without dropping either.
+    for path in sorted(paths,key=lambda p:(p.name[:10],p.suffix!=".gz")):
+        day=path.name[:10]
         if not start_day <= day <= end_day:
             continue
         try:
@@ -191,6 +204,9 @@ def main():
         parser.error("Baseline must be exact v0.5.24 commit")
     if subprocess.check_output(["git","-C",str(baseline),"status","--porcelain","--untracked-files=no"],text=True).strip():
         parser.error("Baseline tracked files must be clean")
+    candidate_head = subprocess.check_output(["git","-C",str(ROOT),"rev-parse","HEAD"],text=True).strip()
+    if subprocess.check_output(["git","-C",str(ROOT),"status","--porcelain","--untracked-files=no"],text=True).strip():
+        parser.error("Candidate tracked files must be clean")
     data = args.data_directory.resolve()
     state = json.loads((data/"state.json").read_text())
     rows = [r for r in state.get("temperature_errors",[]) if isinstance(r,dict)
@@ -222,13 +238,19 @@ def main():
         selected.add(bucket)
         try:
             a = replay(baseline, snapshot["inputs"], reports)
+            parity = original_parity(reports,a)
+            rejected["original_forecast_mismatch"]+=parity.count(False)
+            if not any(parity):
+                continue
             b = replay(ROOT, snapshot["inputs"], reports)
-            matches = pair_errors(reports,a,b)
+            matched = [(row,old,new) for row,old,new,ok in zip(reports,a,b,parity) if ok]
+            matches = pair_errors([r[0] for r in matched],[r[1] for r in matched],[r[2] for r in matched])
             paired.extend(matches)
-            rejected["missing_paired_prediction"]+=len(reports)-len(matches)
+            rejected["missing_paired_prediction"]+=len(matched)-len(matches)
         except (OSError, ValueError, subprocess.SubprocessError):
             rejected["replay_failed"]+=1
     output = dict(status="fixed_input_comparison" if paired else "insufficient_matched_evidence",
+        baseline_commit=head, candidate_commit=candidate_head, original_parity_tolerance_c=.005,
         period_days=args.days, end_utc=datetime.fromtimestamp(last,timezone.utc).isoformat(),
         eligible_issue_count=len(errors), matched_issue_count=len(matched_issues), selected_issue_count=len(selected),
         rejected=dict(rejected), groups=summarize_pairs(paired,ZoneInfo("Europe/Kyiv")),
