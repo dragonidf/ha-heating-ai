@@ -1,7 +1,7 @@
 {
   "module_hashes": {
     "heating_climate.py": "f2318ac1d99999c35a47dec50c1595012b053735f1da80cc686bbdd5179a9abe",
-    "heating_environment.py": "b7aff448e6b6f03e40251e9b432923973a9435f45570b22513e2709a754bd674",
+    "heating_environment.py": "66c8a986ce699fb14405183b89dd662d20236e4cb745be09ee9e6c214f2ec79b",
     "heating_fallback.py": "da872cbf269bbae62eb2ee79dd2b4ace6fe00cce9e23f8a2a792024ac8c34389",
     "heating_learning_windows.py": "ce74e1011c2aeadd8798052d069fc3cd9ec20485b7543638fc06b2201c105a01",
     "heating_model.py": "46530983c37904543c018b1ab7b9f748330764916e2da198f3cc538d0d7a4e9e",

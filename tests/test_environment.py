@@ -253,6 +253,7 @@ class EnvironmentTests(unittest.TestCase):
             strategy='Комфорт протягом доби',morning_min_minutes=0,night_price=1.,day_price=2.,
             environment={'astronomy':solar_geometry(when),
                 'solar':dict(coefficient=.5,validated=False,risk_coefficient=.5)})
+        settings['environment']['residual']=dict(at=when.timestamp(),rate=.12)
         credited=deepcopy(settings)
         credited['environment']['solar'].update(validated=True,control_no_sun=True)
         self.assertEqual(gain_at(when,weather,credited),0.)

@@ -222,7 +222,10 @@ def _weather_gains(when, row, environment):
     # A validated solar estimate improves a conditional temperature outlook,
     # but unguaranteed future heat must not satisfy the control lower bound.
     nominal=0. if solar.get('control_no_sun') is True else min(.8,learned)
-    return nominal,min(.8,max(learned,observed,learned+residual,risk_solar))
+    # Risk certificate and residual can represent the same sunlight; granting
+    # nominal advisory credit must not change the already qualified envelope.
+    combined=residual if risk_coefficient is not None and 0<risk_coefficient<=.8 else learned+residual
+    return nominal,min(.8,max(learned,observed,combined,risk_solar))
 
 
 def room_source_check(previous,stamp,readings):
