@@ -689,6 +689,63 @@ def save_evidence(path, payload):
             temporary.unlink(missing_ok=True)
 
 
+def solar_nominal_settings(settings):
+    """Conditional prediction only; never pass this copy to the planner."""
+    environment=settings.get("environment") or {}
+    solar=environment.get("solar") or {}
+    if solar.get("control_no_sun") is not True or solar.get("validated") is not True:
+        return None
+    return {**settings,"environment":{**environment,"solar":{**solar,"control_no_sun":False}}}
+
+
+def project_solar_nominal(now, room, floor, outside, fire, weather, settings, forecast, model):
+    """One linear rollout on the exact selected plan, not another search."""
+    nominal=solar_nominal_settings(settings)
+    if nominal is None or not weather:
+        return None
+    rows=forecast.get("_calculation_curve") or forecast.get("curve") or []
+    if not rows:
+        return None
+    start=now.timestamp()
+    cursor=start
+    segments=sorted((s for row in rows for s in row.get("heat_segments",[])),
+                    key=lambda s:s["start"])
+    if any(number(s.get("power_kw")) is None or not 0<=s["power_kw"]<=10.5
+           or not s["start"]<s["end"] for s in segments) or any(
+               a["end"]>b["start"]+.001 for a,b in zip(segments,segments[1:])):
+        return None
+    index=0
+    fine=[];public=[]
+    for row in rows:
+        for point in row.get("_fine",[row]):
+            end=point["ts"]
+            if not 0<end-cursor<=301 or end>start+48*3600+.001:
+                return None  # do not pretend coarse or incomplete control traces are exact
+            while cursor<end-.001:
+                while index<len(segments) and segments[index]["end"]<=cursor+.001:
+                    index+=1
+                active=segments[index] if index<len(segments) else None
+                kw=0.;stop=end
+                if active:
+                    if active["start"]<=cursor+.001:
+                        kw=active["power_kw"];stop=min(stop,active["end"])
+                    else:
+                        stop=min(stop,active["start"])
+                when=datetime.fromtimestamp(cursor,now.tzinfo)
+                room,floor=forecast_step(room,floor,outdoor_at(weather,when,outside),kw,
+                    fire*math.exp(-(cursor-start)/7200),model,(stop-cursor)/3600,
+                    when,weather,nominal)
+                cursor=stop
+            cursor=end
+            fine.append({**point,"temperature":room})
+        if not fine or abs(fine[-1]["ts"]-row["ts"])>.001:
+            return None
+        if row["ts"]<=start+86400+.001:
+            public.append(dict(ts=row["ts"],temperature=round(room,2),
+                               no_sun_temperature=row["temperature"],weather_known=row.get("weather_known")))
+    return dict(fine=fine,curve=public)
+
+
 def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, forecast, model,
                     candidate, epoch):
     """Capture immutable issue-time inputs and the original predictions."""
@@ -704,6 +761,14 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
         known=max(known,row["ts"]+3600)
     fine = [point for row in forecast.get("_calculation_curve", forecast["curve"])
             for point in row.get("_fine",[row])]
+    nominal_settings=solar_nominal_settings(settings)
+    if nominal_settings is not None:
+        # Monitor the actually issued advisory nominal, never label a
+        # no-sun control forecast as a credited prediction.
+        fine=forecast.get("_solar_nominal_fine") or []
+        if not fine:
+            return None
+        settings=nominal_settings
     points = {}
     for horizon in (1,3,6):
         due = start+3600*horizon

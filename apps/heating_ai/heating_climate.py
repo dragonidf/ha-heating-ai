@@ -1816,7 +1816,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             if certificate:
                 forecast_solar['risk_coefficient']=certificate['coefficient']
                 if certificate.get('comfort_credit') is True:
-                    forecast_solar.update(validated=True,coefficient=certificate['coefficient'])
+                    forecast_solar.update(validated=True,coefficient=certificate['coefficient'],
+                                          control_no_sun=True)
             settings['environment']={'solar':forecast_solar,'astronomy':astronomy,'timezone':str(self.climate_tz),
                                      'last_heated_at':thermal.get('last_heated_at')}
             # Quantise the safety reserve so tiny MAE changes do not replan.
@@ -1983,6 +1984,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.publish("sensor.heating_forecast",forecast["minimum"],friendly_name="Клімат — мінімум прогнозу",
                          unit_of_measurement="°C",device_class="temperature",curve=panel_forecast["curve"],
                          actual_curve=[{"ts":r["ts"],"temperature":r["room"] if r.get('room_valid',r.get('quality')) else None} for r in self.samples[-1:]],
+                         solar_nominal_curve=forecast.get('solar_nominal_curve',[]),
+                         solar_nominal_assumption=forecast.get('solar_nominal_assumption'),
                          public_projection_version=2,history_entity='sensor.heating_history_page',
                          cycle_energy=forecast['cycle_energy'],
                          stress_scenarios=forecast['stress_scenarios'],

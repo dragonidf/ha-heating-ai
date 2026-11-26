@@ -560,7 +560,7 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
         equipment_version=settings.get('equipment_version'),ventilation_model=settings.get('ventilation_model'),
         ventilation_expected=settings.get('ventilation_expected'),profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
         actuator=settings.get('actuator'),
-        environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain','observed_at','risk_coefficient')},
+        environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain','observed_at','risk_coefficient','control_no_sun')},
         astronomy=(settings.get('environment') or {}).get('astronomy'),
         residual=(settings.get('environment') or {}).get('residual'))
     upper=certified_upper_power(settings.get('modulation_profile'))

@@ -219,7 +219,10 @@ def _weather_gains(when, row, environment):
     # an observed gain or another solar estimate from the same heat source.
     risk_coefficient=finite(solar.get('risk_coefficient'))
     risk_solar=risk_coefficient*light*factor if risk_coefficient is not None and 0<risk_coefficient<=.8 else 0.
-    return min(.8,learned),min(.8,max(learned,observed,learned+residual,risk_solar))
+    # A validated solar estimate improves a conditional temperature outlook,
+    # but unguaranteed future heat must not satisfy the control lower bound.
+    nominal=0. if solar.get('control_no_sun') is True else min(.8,learned)
+    return nominal,min(.8,max(learned,observed,learned+residual,risk_solar))
 
 
 def room_source_check(previous,stamp,readings):
