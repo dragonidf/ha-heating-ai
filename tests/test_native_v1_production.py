@@ -948,6 +948,57 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await runtime.close()
 
+    async def test_stalled_archive_does_not_block_shutdown_and_keeps_lease_until_worker_exits(self):
+        import threading
+        import time
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            started=threading.Event(); release=threading.Event(); finished=threading.Event()
+            lease=Mock()
+            def compact(stamp, *, allow_remove, stop):
+                started.set()
+                if not release.wait(10):
+                    raise RuntimeError("fixture timed out")
+                self.assertTrue(stop.is_set())
+                finished.set()
+                return dict(status="stopped",snapshots=0)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=compact)
+            app._kws_idle_since=1000.
+            app.calculation_jobs={}
+            app.terminate=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            app.ARCHIVE_CLOSE_TIMEOUT=.05
+            try:
+                app.schedule_archive_maintenance(1061.)
+                self.assertTrue(await asyncio.to_thread(started.wait,2))
+                start=time.monotonic()
+                await asyncio.wait_for(runtime.close(),1.)
+                self.assertLess(time.monotonic()-start,.9)
+                self.assertTrue(app._archive_stop.is_set())
+                self.assertTrue(app._closed)
+                lease.close.assert_not_called()
+                self.assertFalse(finished.is_set())
+                release.set()
+                await asyncio.wait_for(app._archive_job,2.)
+                self.assertTrue(finished.is_set())
+                lease.close.assert_called_once()
+            finally:
+                release.set()
+                await runtime.close()
+
+    async def test_archive_worker_cannot_start_writes_after_lease_release(self):
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            journal=SimpleNamespace(compact_cold_snapshot_batch=Mock())
+            lease=Mock()
+            app.terminate=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            await runtime.close()
+            result=await asyncio.to_thread(app._archive_worker,journal,1061.)
+            self.assertEqual(result["status"],"stopped")
+            journal.compact_cold_snapshot_batch.assert_not_called()
+            lease.close.assert_called_once()
+
     async def test_archive_schedule_defers_heat_and_pending_calculation(self):
         with package(self.root / "package") as (component, _):
             _,app=self.controller(component)
