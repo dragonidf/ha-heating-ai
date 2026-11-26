@@ -255,6 +255,30 @@ class WindowsTest(unittest.TestCase):
             altered[-1].update(change)
             self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"])
 
+    def test_verified_outage_is_thermal_only_and_needs_full_continuous_proof(self):
+        from heating_learning_windows import row_reasons
+        rows=samples(60)
+        for row in rows:
+            row.update(grid="off",power=None,power_quality="unknown",power_source="unknown",
+                interval_kw=None,voltage_qualified=False,thermal_inputs_ok=True,
+                zero_heat_provenance="verified_mains_isolation",zero_heat_interval_verified=True,
+                shadow_reasons=["unqualified_outage","unqualified_kws","equipment_not_ready",
+                                "unavailable_physical_input","temporary_fallback"])
+        result=build_observation_windows(rows,timezone.utc)
+        self.assertEqual(len(result["windows"]),1)
+        self.assertTrue(result["windows"][0]["outage_physics"])
+        self.assertEqual(result["windows"][0]["idle"],3600)
+        self.assertEqual(result["eligibility_counts"]["electrical_intervals"],0)
+        self.assertEqual(result["eligibility_counts"]["outage_physics_minutes"],60)
+        self.assertIn("unqualified_outage",row_reasons(rows[0],strict=True))
+        for change in (dict(zero_heat_interval_verified=False),dict(zero_heat_provenance=None),
+                       dict(grid="unknown"),dict(power=3.),dict(power_quality="contradictory"),
+                       dict(thermal_inputs_ok=False),dict(shadow_ventilation=None),
+                       dict(fire_active=True),dict(shadow_reasons=["tick_gap_or_restart"])):
+            altered=[dict(row) for row in rows]
+            altered[5].update(change)
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"],change)
+
     def test_large_gap_and_shared_endpoint_are_not_counted(self):
         rows = samples(120)
         self.assertEqual(build_observation_windows(rows, timezone.utc)["eligible_minutes"], 60)

@@ -59,6 +59,15 @@ def ventilation_interval_duty(evidence):
     return duty if duty in (0., 1.) else None
 
 
+def proven_outage_row(row):
+    """Thermal-only zero input; never a KWS measurement."""
+    power=number(row.get("power"))
+    return (row.get("zero_heat_provenance")=="verified_mains_isolation"
+            and row.get("grid")=="off" and row.get("thermal_inputs_ok") is True
+            and row.get("power_quality")!="contradictory"
+            and (row.get("power") is None or power is not None and 0<=power<=.05))
+
+
 def row_reasons(row, *, strict, physics=False):
     reasons = set(row.get("shadow_reasons") or ())
     power = number(row.get("power"))
@@ -117,6 +126,10 @@ def row_reasons(row, *, strict, physics=False):
         reasons.add("missing_solar_context")
     if row.get("interpolated") or row.get("duplicate"):
         reasons.add("interpolation_or_duplicate")
+    if physics and proven_outage_row(row):
+        reasons.difference_update(("missing_kws","estimated_power","unqualified_kws",
+            "unqualified_outage","unknown_or_unqualified_voltage","equipment_not_ready",
+            "temporary_fallback","unavailable_physical_input"))
     return reasons
 
 
@@ -218,10 +231,18 @@ def _continuous(rows, times, start, end, identity, *, physics=False):
         # after either boundary is used to extend the measured trajectory.
         left, right = max(start,x), min(end,y)
         if right>left:
-            measured = number(b.get("interval_kw")) if left==x and right==y else None
-            if "interval_kw" in b and number(b["interval_kw"]) is None:
-                reasons.add("missing_measured_interval")
-            kw = measured if measured is not None else a.get("power")
+            zero_a,zero_b=proven_outage_row(a),proven_outage_row(b)
+            if physics and (zero_a or zero_b):
+                if zero_a and zero_b and b.get("zero_heat_interval_verified") is True:
+                    kw=0.
+                else:
+                    kw=None
+                    reasons.add("unverified_zero_heat_interval")
+            else:
+                measured = number(b.get("interval_kw")) if left==x and right==y else None
+                if "interval_kw" in b and number(b["interval_kw"]) is None:
+                    reasons.add("missing_measured_interval")
+                kw = measured if measured is not None else a.get("power")
             if number(kw) is None or not 0<=kw<=10.5:
                 reasons.add("invalid_interval_energy")
             steps.append([right-left,a.get("outside"),kw,a.get("solar_factor"),a.get("return")])
@@ -299,6 +320,8 @@ def build_observation_windows(samples, tz):
                             equipment=list(identity[2:]),vent=first["shadow_ventilation"]))
         if solar_only:
             windows[-1]["solar_only"]=True
+        if proven_outage_row(first) and proven_outage_row(row):
+            windows[-1]["outage_physics"]=True
         anchor = None  # an independent physical report belongs to at most one window
     anchor_at = None
     if anchor and rows and rows[-1]["ts"]-anchor[0]<=7200:
@@ -309,6 +332,8 @@ def build_observation_windows(samples, tz):
     observation = rows[-1] if rows else {}
     eligibility_counts = dict(manual_physics_windows=sum(w["manual"] and not w.get("solar_only") for w in windows),
                               automatic_physics_windows=sum(not w["manual"] and not w.get("solar_only") for w in windows),
+                              outage_physics_windows=sum(bool(w.get("outage_physics")) for w in windows),
+                              outage_physics_minutes=round(sum((w["end"]-w["start"])/60 for w in windows if w.get("outage_physics")),1),
                               solar_only_windows=sum(bool(w.get("solar_only")) for w in windows),
                               solar_windows=sum(w["sun"]>.05 and w["idle"]>=w["end"]-w["start"] for w in windows),
                               primary_reports=len(reports),

@@ -81,6 +81,9 @@ class NativeController(HeatingClimate):
         self._learning_breaks = set()
         self._learning_last_tick = None
         self._learning_previous_kw = None
+        self._learning_zero_now = False
+        self._learning_zero_seconds = 0.
+        self._learning_zero_interval = False
         self._learning_kw_seconds = 0.
         self._learning_kw_integral = 0.
         self._learning_control_mode = None
@@ -107,6 +110,29 @@ class NativeController(HeatingClimate):
             self.log("Adaptive sample skipped: %s", type(exc).__name__, level="WARNING")
         return result
 
+    def _learning_proven_zero_heat(self, power):
+        """Read-only thermal proof; exact opt-in isolation, two OFF indicators.
+        
+        The configured breaker must be confirmed physically incapable of
+        supplying the boiler on backup or partial mains under this condition.
+        """
+        relay=self.cfg.get("boiler_outage_isolation_relay")
+        if (not isinstance(relay,str) or not relay.startswith("switch.")
+                or relay!=self.cfg.get("kws_relay","switch.energy_meter_kotel")
+                or self.cfg.get("power_accounting_method")!="kws"
+                or getattr(self,"planning_grid_state",None)!="off"):
+            return False
+        helper=self.args.get("grid_presence_helper")
+        if not helper or self.get_state(helper) not in ("off","Відсутня мережа"):
+            return False
+        phases=(self.voltage_status or {}).get("phases_v") or []
+        if any((v:=number(value)) is not None and v>=50 for value in phases):
+            return False
+        if getattr(self,"power_quality",None)=="contradictory":
+            return False
+        kw=number(power)
+        return power is None or kw is not None and 0<=kw<=.05
+
     def _capture_sample_power(self,power):
         stamp = time.time()
         previous = self._learning_last_tick
@@ -118,6 +144,10 @@ class NativeController(HeatingClimate):
         previous_kw = self._learning_previous_kw
         self._learning_previous_kw = kw
         gap = previous is None or not 0 < stamp-previous<=45
+        zero=self._learning_proven_zero_heat(power)
+        if not gap and zero and self._learning_zero_now:
+            self._learning_zero_seconds += stamp-previous
+        self._learning_zero_now=zero
         if not gap and kw is not None and previous_kw is not None:
             duration = stamp-previous
             self._learning_kw_seconds += duration
@@ -177,8 +207,14 @@ class NativeController(HeatingClimate):
             return
         try:
             interval_kw = self.measured_sample_power(before,self.last_sample)
+            duration=self.last_sample-before
+            self._learning_zero_interval=bool(duration>=240 and self._learning_zero_now
+                and self._learning_zero_seconds>=duration-1.
+                and "tick_gap_or_restart" not in self._learning_breaks)
             self._learning_append(self.samples[-1], voltage, self._learning_breaks, interval_kw)
         finally:
+            self._learning_zero_seconds=0.
+            self._learning_zero_interval=False
             self._learning_kw_integral = self._learning_kw_seconds = 0.
             self._learning_breaks.clear()
 
@@ -291,7 +327,10 @@ class NativeController(HeatingClimate):
         issue = number(self.memory.get("weather_at"))
         solar = learning.solar_context_at(stamp,self.climate_tz,self.weather,issue,
                                          getattr(self,"solar_geometry",{}))
-        compact.update(circulation_role="internal_redistribution",
+        compact.update(zero_heat_provenance="verified_mains_isolation" if self._learning_zero_now else None,
+            zero_heat_interval_verified=self._learning_zero_interval,
+            thermal_inputs_ok=getattr(self,"_learning_thermal_inputs_ok",False) is True,
+            circulation_role="internal_redistribution",
             circulation_active=self.raw("fan")=="on" if self.cfg.get("fan") else None,
             report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
             voltage_qualified=voltage,

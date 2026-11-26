@@ -1737,6 +1737,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             'thermostat':thermostat is None or not 5<=thermostat<=40 or self.raw('thermostat') in ('unknown','unavailable',None),
             'settings':not valid,'model':not self.model.get('validated'),'grid':grid!='on'}.items() if failed])
         astronomy,room_check=self.learning_environment(now,primary,thermostat)
+        # Thermal observations are independent of actuator permission.
+        self._learning_thermal_inputs_ok=bool(room is not None and probe_ok and outside is not None
+                                              and outside_fresh and source=='Вітальня')
         self.sample(room,probe,outside,None if measured_power is None else measured_power/1000,fire,source,primary,thermostat,quality and outside_fresh and not reserve_active,settings)
         self.energy_tick()
         self.run_diagnostic('cycle_energy',self.observe_cycle_energy,now,settings,measured_power,self.val('energy'),grid,automatic,
