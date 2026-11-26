@@ -986,6 +986,55 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await runtime.close()
 
+    async def test_default_archive_timeout_real_flock_retains_ownership(self):
+        import fcntl
+        import threading
+        import time
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            started=threading.Event(); release=threading.Event()
+            lease_path=self.root/"archive-timeout-writer.lock"
+            lease=lease_path.open("a")
+            fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            def compact(stamp, *, allow_remove, stop):
+                started.set()
+                if not release.wait(12):
+                    raise RuntimeError("fixture timeout")
+                return dict(status="stopped",snapshots=0)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=compact)
+            app._kws_idle_since=1000.
+            app.calculation_jobs={}
+            app.terminate=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            try:
+                self.assertEqual(app.ARCHIVE_CLOSE_TIMEOUT,4.)
+                app.schedule_archive_maintenance(1061.)
+                self.assertTrue(await asyncio.to_thread(started.wait,2))
+                job=app._archive_job
+                start=time.monotonic()
+                await runtime.close()
+                elapsed=time.monotonic()-start
+                print("Archive stalled-worker close wall seconds: %.3f"%elapsed)
+                self.assertLessEqual(elapsed,5.)
+                self.assertTrue(app._closed)
+                self.assertTrue(app._archive_stop.is_set())
+                self.assertFalse(lease.closed)
+                with lease_path.open("a") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                release.set()
+                await asyncio.wait_for(job,2.)
+                self.assertTrue(lease.closed)
+                with lease_path.open("a") as contender:
+                    fcntl.flock(contender,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            finally:
+                release.set()
+                await runtime.close()
+                if app._archive_job is not None:
+                    await asyncio.wait_for(app._archive_job,2.)
+                if not lease.closed:
+                    lease.close()
+
     async def test_archive_worker_cannot_start_writes_after_lease_release(self):
         with package(self.root / "package") as (component, _):
             _,app=self.controller(component)
