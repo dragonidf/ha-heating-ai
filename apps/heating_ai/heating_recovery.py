@@ -28,6 +28,62 @@ def wire_values(value):
     if value is False:return 'false'
     return '0' if isinstance(value,(int,float)) and value==0 else value
 
+def forecast_accuracy_periods(rows, now):
+    """Read-only statistics of actual issued forecasts, grouped by provenance.
+
+    Calendar periods include today (which may be partial). Counts are unique
+    report timestamps within each cohort, not independent disjoint forecasts.
+    Unknown historical provenance is never assigned to current equipment.
+    """
+    periods=(7,14,30)
+    today=now.date()
+    starts={n:today-timedelta(days=n-1) for n in periods}
+    stamp=now.timestamp()
+    earliest=datetime.combine(starts[30],datetime.min.time(),tzinfo=now.tzinfo).timestamp()
+    groups={}
+    def label(value):
+        return value if type(value) in (str,int) else None
+    def flag(value):
+        return value if type(value) is bool else None
+    for row in rows if isinstance(rows,(list,tuple)) else ():
+        if not isinstance(row,dict):continue
+        horizon,issued,reported,lead,error=(number(row.get(k)) for k in
+            ('horizon','issued_at','actual_at','actual_horizon_hours','error'))
+        if (horizon not in (1,3,6,12,24,36,48) or None in (issued,reported,lead,error)
+                or not earliest<=reported<=stamp or issued>=reported or abs(lead-horizon)>.5):
+            continue
+        key=(int(horizon),label(row.get('model_version')),label(row.get('equipment_version')),
+             label(row.get('physical_mode')),label(row.get('actual_temperature_basis')),
+             flag(row.get('weather_known')),flag(row.get('schedule_known')))
+        cohort=groups.setdefault(key,{})
+        score=(abs(lead-horizon),-issued)
+        old=cohort.get(reported)
+        if old is None or score<old[0]:
+            cohort[reported]=(score,error)
+    result=[]
+    for key,reports in sorted(groups.items(),key=lambda pair:tuple(str(k) for k in pair[0])):
+        daily={}
+        for reported,(_,error) in reports.items():
+            day=datetime.fromtimestamp(reported,now.tzinfo).date()
+            bucket=daily.setdefault(day,[0,0.,0.])
+            bucket[0]+=1;bucket[1]+=abs(error);bucket[2]+=error
+        metrics={}
+        for days in periods:
+            buckets=[bucket for day,bucket in daily.items() if day>=starts[days]]
+            count=sum(b[0] for b in buckets)
+            metrics[str(days)]=dict(count=count,days=len(buckets),missing_days=days-len(buckets),
+                mae=sum(b[1] for b in buckets)/count if count else None,
+                bias=sum(b[2] for b in buckets)/count if count else None)
+        horizon,model,equipment,mode,basis,weather,schedule_known=key
+        result.append(dict(horizon=horizon,model_version=model,equipment_version=equipment,
+            physical_mode=mode,basis=basis,weather_known=weather,schedule_known=schedule_known,
+            periods=metrics))
+    return dict(groups=result,period_days=list(periods),as_of=stamp,
+        period_basis='local_calendar_including_partial_today',
+        count_basis='unique_report_per_cohort',lead_tolerance_minutes=30,
+        provenance_basis='issued_full_forecast_coverage')
+
+
 def cycle_energy_allowance(entry):
     if not entry:return None
     initial=entry.get('initial_plan') or entry.get('baseline')
@@ -391,6 +447,16 @@ class HeatingRecovery:
             pending_calculations={k:v['at'] for k,v in getattr(self,'calculation_jobs',{}).items() if not v.get('completed')},
             last_validation_rejection=(self.memory.get('validation_quarantine') or [None])[-1],**extra)
 
+    def forecast_accuracy_view(self,now):
+        # At most once per hour, including after a restart or local-day change.
+        # No archive reads, polling, worker or fitting; existing retained errors only.
+        key=(int(now.timestamp()//3600),now.date(),now.tzinfo)
+        cached=getattr(self,'_forecast_accuracy_cache',None)
+        if cached is None or cached[0]!=key:
+            cached=(key,forecast_accuracy_periods(self.memory.get('temperature_errors',[]),now))
+            self._forecast_accuracy_cache=cached
+        return cached[1]
+
     def publish_controller_quality(self,now):
         completed=sorted((e for e in (self.memory.get('cycle_energy') or {}).values() if e['end']<=now.timestamp()),key=lambda e:e['end'])
         latest=(completed[-1].get('quality_report') or cycle_quality_summary(completed[-1],now.timestamp())) if completed else None
@@ -410,6 +476,7 @@ class HeatingRecovery:
         journal=getattr(self,'decision_journal',None)
         self.publish('sensor.heating_controller_quality','Цикл завершено' if latest else 'Очікуємо завершення циклу',
             last_completed_cycle=latest,horizons=horizons,model_version=self.model.get('version'),
+            accuracy_periods=self.forecast_accuracy_view(now),
             archive_health=journal.health() if journal and hasattr(journal,'health') else {},
             prospective_only=True,independent_energy_measurement=False)
 
@@ -986,6 +1053,8 @@ class HeatingRecovery:
                 if expected is not None:
                     errors.append(dict(horizon=check['horizon'],issued_at=check['issued_at'],actual_at=reported,
                         model_version=check['model_version'],physical_mode=check['physical_mode'],
+                        equipment_version=check.get('equipment_version'),weather_known=check.get('weather_known'),
+                        schedule_known=check.get('schedule_known'),
                         actual_horizon_hours=(actual_at-check['issued_at'])/3600,
                         actual_temperature_basis=basis,comparison_at=actual_at,
                         report_before=before if basis=='interpolated_reports' else None,
@@ -1020,7 +1089,10 @@ class HeatingRecovery:
                         target=stamp+horizon*3600
                         if temperature_at(curve,target) is not None:
                             self.memory['temperature_checks'].append(dict(issued_at=issued_at,target_at=target,horizon=horizon,
-                                model_version=self.model.get('version'),physical_mode=getattr(self,'cfg',{}).get('boiler_power_mode','unconfirmed'),forecast=source))
+                                model_version=self.model.get('version'),physical_mode=getattr(self,'cfg',{}).get('boiler_power_mode','unconfirmed'),
+                                equipment_version=self.memory.get('equipment_version',0),
+                                weather_known=forecast.get('weather_complete'),
+                                schedule_known=forecast.get('schedule_complete'),forecast=source))
         candidates[:]=[x for x in candidates if x['at']>=stamp-36*3600]
         cycle=heating_cycle(now,settings)
         last=self.memory.get('temperature_history_power') or {}
