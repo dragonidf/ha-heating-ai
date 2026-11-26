@@ -163,10 +163,14 @@ def measure_core(app, tick, mode, root, *, full_ring=False, profile=False, group
     assert len(timings["tick"])==groups*20
     if active:
         assert len(timings["aggregation"])==len(timings["training"])==groups
-    # The native tick includes capture on its sample ticks. Do not add the
-    # separately timed diagnostic aggregation a second time.
+    # This fixture replaces sample() during tick measurement, so native
+    # _learning_append is NOT included in the measured tick. Add the capture
+    # once at its actual simulated five-minute cadence (288/day).
+    output["daily_capture_cpu_s"]=288*statistics.mean(
+        row[0] for row in timings["aggregation"]) if timings["aggregation"] else 0.
     output["daily_tick_training_cpu_s"]=(
         statistics.mean(row[0] for row in timings["tick"])*5760+
+        output["daily_capture_cpu_s"]+
         (2*statistics.mean(row[0] for row in timings["training"]) if timings["training"] else 0.))
     for name,profiler in profiles.items():
         print(f"CPU profile: {mode}, full_ring={full_ring}, phase={name}",file=sys.stderr)
