@@ -352,6 +352,7 @@ def check_compact_tabs(page):
             count:10,days:8,mae:0.2,age_hours:2}],rejected:{measurement_gap:3}}}}})""")
     assert 'Потрібний' in page.locator('.model-advanced .validation-table').inner_text()
     assert '10 / 8' in page.locator('.model-advanced .validation-table').inner_text()
+    assert 'Прогалина — 3' in page.locator('.model-advanced').inner_text()
     page.evaluate("""setHeatingScenario({'sensor.heating_controller_quality':{attributes:{
         accuracy_periods:{as_of:1795708800,groups:[{horizon:6,model_version:6,equipment_version:2,physical_mode:'fixed_6',
             basis:'sensor_report',weather_known:true,schedule_known:false,periods:{
@@ -367,8 +368,6 @@ def check_compact_tabs(page):
     page.locator('.advisory-accuracy summary').click()
     assert 'Умовний повтор нагріву' in page.locator('.advisory-accuracy').inner_text()
     assert '0,650' in page.locator('.advisory-accuracy').inner_text()
-    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
-    assert 'Прогалина — 3' in page.locator('.model-advanced').inner_text()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.locator('.model-advanced summary').click()
     page.locator('nav [data-tab="overview"]').click()
