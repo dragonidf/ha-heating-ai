@@ -1097,7 +1097,28 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     return result
 
 
-def advisory_outlook_48(now, room, floor, outside, fire, model, weather, settings, forecast):
+def advisory_ventilation(settings, data, start, end):
+    """Use the published physical slots, never boiler pre-stop padding."""
+    duty=dict(settings.get('ventilation_expected') or {})
+    topology=settings.get('ventilation_grid_only') or {}
+    if not topology or not data.get('valid') or data.get('mode')!='scheduled':
+        return duty,'empirical'
+    if not schedule_covered(data,start,end):
+        return duty,'unknown_supply_empirical'
+    slots=data.get('slots') or []
+    off=covered(start,end,[s for s in slots if s.get('off') is True])
+    on=covered(start,end,[s for s in slots if s.get('off') is False])
+    if not (off or on):
+        return duty,'mixed_supply_empirical'
+    for key in ('recuperator','bath'):
+        if key in topology:
+            # No supplied power means no forced airflow. When supplied, use
+            # independently estimated powered duty, never double-discount.
+            duty[key]=0. if off else topology[key].get('when_powered')
+    return duty,'published_off' if off else 'published_on'
+
+
+def advisory_outlook_48(now, room, floor, outside, fire, model, weather, settings, forecast, *, step_seconds=900):
     """48 elapsed hours, read-only scenario on the existing model/plan.
 
     Keep the complete operational trace. Beyond it repeat only already
@@ -1105,6 +1126,8 @@ def advisory_outlook_48(now, room, floor, outside, fire, model, weather, setting
     as new commands. Known interruptions veto hypothetical heat. Unknown
     weather/supply remains marked, not silently certified.
     """
+    if step_seconds not in (300,900):
+        raise ValueError('advisory step must be 300 or 900 seconds')
     start=now.timestamp(); finish=start+172800
     rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
     if not rows or not weather:
@@ -1160,12 +1183,17 @@ def advisory_outlook_48(now, room, floor, outside, fire, model, weather, setting
     # 15-minute maximum integration step, 60-minute output; use exact heat,
     # outage and weather boundaries. No beam search or new daily schedule.
     cuts={cursor,finish}
-    cuts.update(start+i*900 for i in range(1,192) if cursor<start+i*900<finish)
+    cuts.update(start+i*step_seconds for i in range(1,172800//step_seconds)
+                if cursor<start+i*step_seconds<finish)
+    cuts.update(start+i*3600 for i in range(1,48) if cursor<start+i*3600<finish)
+    if settings.get('ventilation_grid_only'):
+        cuts.update(t for slot in data.get('slots',[]) for t in (slot['start'],slot['end']) if cursor<t<finish)
     cuts.update(t for a,b,_ in pattern for t in (a,b) if cursor<t<finish)
     cuts.update(t for row in outages for t in (row['start'],row['end']) if cursor<t<finish)
     cuts.update(row['ts'] for row in weather if cursor<row['ts']<finish)
     cuts=sorted(cuts)
     assumed=0.;unknown_heat=0.;skipped=0.;index=0;report_start=cursor
+    ventilation_minutes={};loss_cache={}
     for a,b in zip(cuts,cuts[1:]):
         while index<len(pattern) and pattern[index][1]<=a+.001:index+=1
         kw=pattern[index][2] if index<len(pattern) and pattern[index][0]<=a+.001 and b<=pattern[index][1]+.001 else 0.
@@ -1177,9 +1205,16 @@ def advisory_outlook_48(now, room, floor, outside, fire, model, weather, setting
         _,elapsed,out,gains=context.at(when)
         fire_gain=model['fire_gain']*max(0.,fire*math.exp(-elapsed/120))
         dt=(b-a)/3600
-        nr,nf=context.integrate(r,f,out,kw,fire_gain,dt,gains[0])
+        duty,basis=advisory_ventilation(settings,data,a,b)
+        ventilation_minutes[basis]=ventilation_minutes.get(basis,0.)+dt*60
+        key=tuple(duty.get(k) for k in ('recuperator','bath'))
+        if key not in loss_cache:
+            loss_cache[key]=prepare_ventilation(model.get('room_loss'),dict(settings,ventilation_expected=duty))[0]
+        adjustment=loss_cache[key]
+        loss=0. if adjustment is None else adjustment*(r-out)
+        nr,nf=_integrate_forecast(r,f,out,kw,model,dt,fire_gain,gains[0],loss)
         if kw and (nf>50 or nr>safe_upper(hi,zone,settings)):
-            kw=0.;nr,nf=context.integrate(r,f,out,0.,fire_gain,dt,gains[0])
+            kw=0.;nr,nf=_integrate_forecast(r,f,out,0.,model,dt,fire_gain,gains[0],loss)
         r,f=nr,nf
         if not math.isfinite(r) or not math.isfinite(f):
             return dict(status='unavailable',reason='nonfinite_projection',curve=[])
@@ -1197,6 +1232,7 @@ def advisory_outlook_48(now, room, floor, outside, fire, model, weather, setting
                 schedule_complete=schedule_covered(data,start,finish),
                 assumed_tail_kwh=round(assumed,3),unknown_supply_tail_kwh=round(unknown_heat,3),
                 omitted_tail_kwh=round(skipped,3),clock_change=clock_change,
+                integration_step_seconds=step_seconds,ventilation_basis_minutes={k:round(v,2) for k,v in ventilation_minutes.items()},
                 assumption='repeat_first_day_heat_if_available_no_control_commands',
                 curve=curve)
 

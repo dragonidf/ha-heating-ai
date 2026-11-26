@@ -20,7 +20,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,retain_kws_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
-from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,effective_ventilation_duty,room_reporting_limits,gain_at,
+from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,ventilation_powered_expectation,effective_ventilation_duty,room_reporting_limits,gain_at,
                                  solar_context,room_source_check,observe_residual,residual_at,ENVIRONMENT_POLICY_VERSION)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
@@ -1979,8 +1979,10 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['plan_reference']=reference
             self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status=plan_execution_state)
             panel_forecast=forecast_for_panel(forecast)
+            advisory_settings=dict(settings,ventilation_grid_only=ventilation_powered_expectation(
+                self.samples,getattr(self,'ventilation_states',{})))
             long_outlook=self.run_diagnostic('advisory_48h',advisory_outlook_48,
-                now,room,floor,outside,fire,self.model,usable_weather,settings,forecast,
+                now,room,floor,outside,fire,self.model,usable_weather,advisory_settings,forecast,
                 default=dict(status='unavailable',reason='projection_failed',curve=[]))
             self.publish('sensor.heating_forecast_outlook','Прогноз температури',
                 advisory_48h=long_outlook,**forecast_outlook_for_panel(forecast,now,settings))

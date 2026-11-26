@@ -473,3 +473,25 @@ def ventilation_expectation(samples,current):
             current=device.get('relay','unknown'),effective_duty=device.get('effective_duty'),
             future='empirical_powered_duty' if len(known)>=12 else 'unknown')
     return result,support
+
+
+def ventilation_powered_expectation(samples,current):
+    """Grid-only duty conditional on confirmed supply ON, not all-day duty."""
+    result={}
+    for key in ('recuperator','bath'):
+        device=current.get(key) or {}
+        if device.get('supply_provenance')!='verified_grid_topology' or not device.get('entity'):
+            continue
+        values=[]
+        for sample in samples[-288:]:
+            row=(sample.get('ventilation') or {}).get(key) or {}
+            if (row.get('entity')!=device['entity'] or finite(row.get('supply_on_fraction'))!=1.
+                    or finite(row.get('supply_unknown_fraction'))!=0.
+                    or finite(row.get('grid_on_fraction'))!=1.
+                    or finite(row.get('grid_unknown_fraction'))!=0.):
+                continue
+            duty=effective_ventilation_duty(row)
+            if duty is not None:values.append(duty)
+        result[key]=dict(entity=device['entity'],when_powered=statistics.mean(values) if len(values)>=12 else None,
+                         intervals=len(values))
+    return result

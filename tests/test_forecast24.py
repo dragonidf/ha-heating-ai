@@ -91,3 +91,43 @@ class Advisory48Tests(unittest.TestCase):
         self.assertFalse(result["weather_complete"])
         self.assertFalse(result["curve"][-1]["weather_known"])
         self.assertEqual(advisory_outlook_48(now,r,f,5.,0.,DEFAULT_MODEL,[],settings,forecast)["status"],"unavailable")
+
+
+    def test_advisory_ventilation_uses_physical_slots_not_boiler_padding(self):
+        from heating_model import advisory_ventilation,advisory_outlook_48
+        from heating_environment import ventilation_powered_expectation
+        now,r,f,weather,settings,forecast=self.fixture();start=now.timestamp()
+        device=dict(entity="switch.recup",supply_provenance="verified_grid_topology")
+        def evidence(on):
+            return dict(ventilation={"recuperator":dict(entity="switch.recup",seconds=300,
+                effective_on_fraction=on,effective_unknown_fraction=0.,supply_on_fraction=on,
+                supply_unknown_fraction=0.,grid_on_fraction=on,grid_unknown_fraction=0.)})
+        topology=ventilation_powered_expectation([evidence(1.)]*12+[evidence(0.)]*20,{"recuperator":device})
+        self.assertEqual(topology["recuperator"]["when_powered"],1.)
+        self.assertNotIn("bath",topology)
+        self.assertIsNone(ventilation_powered_expectation([evidence(0.)]*20,{"recuperator":device})["recuperator"]["when_powered"])
+        settings.update(ventilation_grid_only=topology,ventilation_expected={"recuperator":.375,"bath":.2})
+        a=start+86400;b=a+3600;c=b+3600
+        data=dict(valid=True,mode="scheduled",outages=[dict(start=a-600,end=b)],
+             slots=[dict(start=start,end=a,off=False),dict(start=a,end=b,off=True),dict(start=b,end=c,off=False)])
+        self.assertEqual(advisory_ventilation(settings,data,a-600,a),({"recuperator":1.,"bath":.2},"published_on"))
+        self.assertEqual(advisory_ventilation(settings,data,a,b),({"recuperator":0.,"bath":.2},"published_off"))
+        self.assertEqual(advisory_ventilation(settings,data,c,c+600),({"recuperator":.375,"bath":.2},"unknown_supply_empirical"))
+        self.assertEqual(advisory_ventilation(settings,data,b-300,b+300)[1],"mixed_supply_empirical")
+        settings["outage_schedule"]=data
+        settings["thermal_model_version"]=DEFAULT_MODEL["version"]
+        settings["ventilation_model"]=dict(validated=True,model_version=DEFAULT_MODEL["version"],
+            base_room_loss=.015,recuperator=.006,bath=.004)
+        result=advisory_outlook_48(now,r,f,5.,0.,DEFAULT_MODEL,weather,settings,forecast)
+        self.assertEqual(result["ventilation_basis_minutes"]["published_off"],60.)
+        self.assertEqual(result["ventilation_basis_minutes"]["published_on"],60.)
+        self.assertEqual(result["ventilation_basis_minutes"]["unknown_supply_empirical"],1320.)
+
+    def test_advisory_coarse_step_against_five_minute_reference(self):
+        from heating_model import advisory_outlook_48
+        now,r,f,weather,settings,forecast=self.fixture()
+        coarse=advisory_outlook_48(now,r,f,5.,0.,DEFAULT_MODEL,weather,settings,forecast)
+        fine=advisory_outlook_48(now,r,f,5.,0.,DEFAULT_MODEL,weather,settings,forecast,step_seconds=300)
+        self.assertEqual(coarse["assumed_tail_kwh"],fine["assumed_tail_kwh"])
+        self.assertEqual(coarse["curve"][:48],fine["curve"][:48])
+        self.assertLess(max(abs(a["temperature"]-b["temperature"]) for a,b in zip(coarse["curve"],fine["curve"])),.1)
