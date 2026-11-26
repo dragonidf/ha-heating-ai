@@ -1681,6 +1681,7 @@ class DecisionJournal:
             packed_snapshot_count=getattr(self,'packed_snapshot_count',0),
             packed_blocks=getattr(self,'packed_blocks',0),
             packed_gc_error=getattr(self,'packed_gc_error',None),
+            cold_pack_maintenance=getattr(self,'cold_pack_maintenance',None),
             pressure=self.used_bytes is not None and self.used_bytes>=self.max_bytes*.9,
             retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error,
             capacity_policy='retention_headroom' if self.auto_capacity else 'fixed',
@@ -1976,12 +1977,13 @@ class DecisionJournal:
         return dict(ids=ids,stats=stats,blob=blob,manifest=manifest,pointer_raw=pointer_raw,
                     key=key,legacy_bytes=legacy_bytes,total_bytes=total_bytes)
 
-    def stage_snapshot_pack(self,digests,*,require_savings=False,cold_at=None):
+    def stage_snapshot_pack(self,digests,*,require_savings=False,cold_at=None,stop=None):
         """Additive staging; expensive encoding is outside the journal lock.
 
         The locked publication still performs disk I/O and fsync. It is not
         certified nonblocking and must not be invoked by the safety tick.
         """
+        if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before preparation')
         pack=self._prepare_snapshot_pack(digests)
         ids=pack['ids'];key=pack['key'];legacy_bytes=pack['legacy_bytes']
         total_bytes=pack['total_bytes'];blob=pack['blob'];manifest=pack['manifest']
@@ -1990,6 +1992,7 @@ class DecisionJournal:
             return dict(status='insufficient_savings',snapshots=len(ids),
                         legacy_bytes=legacy_bytes,packed_bytes=total_bytes)
         with self.lock:
+            if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before publication')
             # A rotation, replacement or reuse since preparation invalidates
             # this attempt. Never publish stale references or shorten lifetime.
             for digest,expected in zip(ids,pack['stats']):
@@ -1999,13 +2002,25 @@ class DecisionJournal:
                         or (self.directory/(digest+'.snapshot-ref')).exists()):
                     raise ValueError('Cold snapshot no longer eligible')
             folder=self.directory/'packed_v1'
-            existing_bytes=sum(p.stat().st_size for p in self.directory.iterdir() if p.is_file())
-            if folder.is_dir():existing_bytes+=sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
+            if stop is not None:
+                # Online maintenance uses already reconciled journal counters;
+                # never add an unbounded directory scan to a locked section.
+                if self.used_bytes is None or cold_at is None:
+                    raise ValueError('Archive accounting not ready')
+                existing_bytes=self.used_bytes
+            else:
+                existing_bytes=sum(p.stat().st_size for p in self.directory.iterdir() if p.is_file())
+                if folder.is_dir():existing_bytes+=sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
             space=self.health()
+            if stop is not None and space.get('free_bytes') is None:
+                raise OSError('Disk headroom unknown')
             reserve=max(self.MIN_FREE_BYTES,int((space.get('disk_total_bytes') or 0)*.1))
             if existing_bytes+total_bytes>self.max_bytes or (space.get('free_bytes') is not None
                     and space['free_bytes']-total_bytes<reserve):
                 raise OSError('Insufficient staging headroom; original snapshots retained')
+            new_block=not (folder/(key+'.xz')).exists()
+            added_bytes=(len(blob) if new_block else 0)+(len(manifest) if not (folder/(key+'.pack.json')).exists() else 0)
+            added_bytes+=len(pointer_raw)*len(ids)
             self.used_bytes=None
             folder.mkdir(exist_ok=True)
             self._sync_directory(self.directory)
@@ -2019,6 +2034,14 @@ class DecisionJournal:
                     (folder/(key+'.pack.json')).read_bytes()!=manifest or any(
                     self._pack_pointer(self.directory/(digest+'.snapshot-ref'))!=key for digest in ids)):
                 raise ValueError('Packed snapshot verification failed')
+            if stop is not None:
+                # Cold eligibility guaranteed every pointer was absent.
+                # Originals still exist, so unique snapshot count is unchanged.
+                self.used_bytes=existing_bytes+added_bytes
+                self.snapshot_bytes+=added_bytes
+                self.packed_bytes=getattr(self,'packed_bytes',0)+added_bytes
+                self.packed_snapshot_count=getattr(self,'packed_snapshot_count',0)+len(ids)
+                self.packed_blocks=getattr(self,'packed_blocks',0)+int(new_block)
             return dict(status='staged',pack=key,snapshots=len(ids),packed_bytes=total_bytes,
                         legacy_bytes=legacy_bytes)
 
@@ -2055,7 +2078,7 @@ class DecisionJournal:
         return dict(ids=ids,fences=fences,absent=absent,originals=originals,
                     remaining_bytes=remaining_bytes,packed_bytes=packed_bytes,legacy_bytes=legacy_bytes)
 
-    def promote_snapshot_pack(self,key,*,allow_remove=False):
+    def promote_snapshot_pack(self,key,*,allow_remove=False,stop=None):
         """Explicit promotion, never invoked by the control loop.
 
         The expensive decode and full byte comparison run outside the lock.
@@ -2065,8 +2088,10 @@ class DecisionJournal:
         """
         if allow_remove is not True:
             raise PermissionError('Packed archive promotion requires explicit opt-in')
+        if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before verification')
         prepared=self._prepare_pack_promotion(key)
         with self.lock:
+            if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before removal')
             if (any(self._snapshot_stat(p)!=info for p,info in prepared['fences'].items())
                     or any(p.exists() for p in prepared['absent'])):
                 raise ValueError('Archive changed before promotion')
@@ -2076,9 +2101,13 @@ class DecisionJournal:
                     os.utime(pointer,ns=(latest,latest))
                     with pointer.open('rb') as stream:os.fsync(stream.fileno())
             self._sync_directory(self.directory/'packed_v1');self._sync_directory(self.directory)
+            previous_bytes=self.used_bytes
             self.used_bytes=None
             for path,_,_ in originals:path.unlink()
             self._sync_directory(self.directory)
+            if stop is not None and previous_bytes is not None:
+                self.used_bytes=previous_bytes-prepared['remaining_bytes']
+                self.snapshot_bytes-=prepared['remaining_bytes']
             return dict(status='promoted',pack=key,snapshots=len(prepared['ids']),removed=len(originals),
                         removed_bytes=prepared['remaining_bytes'],packed_bytes=prepared['packed_bytes'],
                         legacy_bytes=prepared['legacy_bytes'])
@@ -2114,25 +2143,26 @@ class DecisionJournal:
                     continue
         return [digest for _,digest in nsmallest(self.PACK_ROWS,candidates())]
 
-    def compact_cold_snapshot_batch(self,stamp,*,allow_remove=False):
-        """One bounded maintenance attempt on a stopped controller or backup.
+    def compact_cold_snapshot_batch(self,stamp,*,allow_remove=False,stop=None):
+        """One bounded maintenance attempt on a backup or native executor.
 
-        Explicitly opt in to replacement. No call from the safety tick or
-        automatic production schedule. A rejected group is not retried in a
-        tight loop; the in-process skip list is bounded.
+        Explicitly opt in to replacement; online callers provide a stop event
+        and hold the runtime lease until completion. Never run on the safety
+        tick. Rejected groups are skipped in a bounded in-process list.
         """
         if allow_remove is not True:
             raise PermissionError('Cold archive compaction requires explicit opt-in')
+        if stop is not None and stop.is_set():return dict(status='stopped',snapshots=0)
         skipped=list(getattr(self,'_cold_pack_skipped',()))
         ids=self.cold_pack_candidates(stamp,skip=skipped)
         if len(ids)<2:return dict(status='no_eligible_batch',snapshots=0)
         try:
             # The source-age fence is also checked inside staging publication.
-            staged=self.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp)
+            staged=self.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp,**({'stop':stop} if stop is not None else {}))
             if staged['status']!='staged':
                 self._cold_pack_skipped=(skipped+ids)[-self.COLD_PACK_RECENT_FAILURES:]
                 return staged
-            result=self.promote_snapshot_pack(staged['pack'],allow_remove=True)
+            result=self.promote_snapshot_pack(staged['pack'],allow_remove=True,**({'stop':stop} if stop is not None else {}))
             return result
         except (OSError,ValueError,TypeError) as exc:
             # A partially published pack remains additive and can be checked

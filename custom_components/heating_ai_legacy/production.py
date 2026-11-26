@@ -74,6 +74,9 @@ class NativeController(HeatingClimate):
         self._manual_energy_ending = False
         self.manual_energy_demand = False
         self._kws_idle_since = None
+        self._archive_job = None
+        self._archive_next_at = 0.
+        self._archive_stop = threading.Event()
 
         self._learning_epoch = uuid4().hex
         self._learning_rows = deque(maxlen=340)
@@ -762,6 +765,61 @@ class NativeController(HeatingClimate):
         # Marketplace unload/reload revokes this bridge before replacing code.
         return False
 
+    ARCHIVE_MAINTENANCE_INTERVAL = 900
+
+    def schedule_archive_maintenance(self, stamp):
+        """Use the existing tick only to dispatch a bounded cold archive job."""
+        if (self._closing or not self._running or not self._writer
+                or stamp < self._archive_next_at or self._archive_job is not None
+                or self._kws_idle_since is None or stamp-self._kws_idle_since < 60
+                or self._learning_job is not None or any(not job.get("completed")
+                    for job in getattr(self,"calculation_jobs",{}).values())):
+            return
+        journal=getattr(self,"decision_journal",None)
+        if journal is None:
+            return
+
+        def launch():
+            if self._closing or not self._running or not self._writer or self._archive_job is not None:
+                return
+            self._archive_next_at=stamp+self.ARCHIVE_MAINTENANCE_INTERVAL
+            self._archive_stop.clear()
+            self._archive_job=self.hass.async_create_task(
+                self._maintain_archive(journal,stamp),"Heating AI cold archive maintenance")
+        self._on_loop(launch)
+
+    async def _maintain_archive(self,journal,stamp):
+        # Not in _jobs: those callbacks are cancelled during bridge shutdown.
+        # Cancelling a future does not stop its executor thread. Shield it
+        # and drain the actual I/O before releasing the writer lease.
+        worker=asyncio.ensure_future(self.hass.async_add_executor_job(
+            lambda: journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=self._archive_stop)))
+        try:
+            result=await asyncio.shield(worker)
+            journal.cold_pack_maintenance=dict(at=stamp,**result)
+        except asyncio.CancelledError:
+            self._archive_stop.set()
+            await asyncio.shield(worker)
+            raise
+        except Exception as exc:
+            journal.cold_pack_maintenance=dict(at=stamp,status="deferred",reason=type(exc).__name__)
+            self.log("Cold archive maintenance deferred: %s",type(exc).__name__,level="WARNING")
+        finally:
+            self._archive_job=None
+
+    async def async_close(self):
+        self._closing=True
+        self._writer=False
+        self._archive_stop.set()
+        job=self._archive_job
+        if job is not None:
+            try:
+                await asyncio.shield(job)
+            except asyncio.CancelledError:
+                await asyncio.shield(job)
+                raise
+        await super().async_close()
+
     def tick(self, kwargs=None, **extra):
         """Recover on the existing tick; never create another polling task."""
         try:
@@ -795,6 +853,9 @@ class NativeController(HeatingClimate):
                     self._kws_idle_since = time.time()
             else:
                 self._kws_idle_since = None
+                if self._archive_job is not None:
+                    self._archive_stop.set()
+            self.schedule_archive_maintenance(time.time())
             return result
         finally:
             # An unconfirmed manual-only STOP must be retried on subsequent
