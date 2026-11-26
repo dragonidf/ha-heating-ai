@@ -33,7 +33,7 @@ def rss_kib():
     return int(Path("/proc/self/statm").read_text().split()[1])*os.sysconf("SC_PAGE_SIZE")//1024
 
 
-def measure_core(app, tick, mode, root, *, full_ring=False):
+def measure_core(app, tick, mode, root, *, full_ring=False, profile=False):
     initial_rss=rss_kib()
     history=fixture(58)
     # Legacy sample ring is 4032 rows. The sidecar job processes its 400-row
@@ -42,6 +42,12 @@ def measure_core(app, tick, mode, root, *, full_ring=False):
     sample=history[0]
     now=datetime.fromtimestamp(history[-1]["ts"]+300,TZ)
     timings={"tick":[],"aggregation":[],"training":[]}
+    if profile:
+        import cProfile
+        import pstats
+        profiles={name:cProfile.Profile(timer=process_time) for name in timings}
+    else:
+        profiles={}
     output=dict(mode=mode,resident_start=initial_rss)
     issue=sample["ts"]
     app.last_sample=issue
@@ -120,13 +126,15 @@ def measure_core(app, tick, mode, root, *, full_ring=False):
             with patch.object(time_module,"time",return_value=stamp), patch.object(
                     type(app).__mro__[1],"sample",side_effect=fake_sample):
                 wall,cpu=perf_counter(),process_time()
-                tick(app)
+                if profile: profiles["tick"].runcall(tick,app)
+                else: tick(app)
                 elapsed=(process_time()-cpu,perf_counter()-wall)
             batch_times.append(elapsed)
             # Isolate the added aggregation from the full legacy control slot.
             if due and active:
                 wall,cpu=perf_counter(),process_time()
-                app._learning_append(sample,True,(),0.)
+                if profile: profiles["aggregation"].runcall(app._learning_append,sample,True,(),0.)
+                else: app._learning_append(sample,True,(),0.)
                 elapsed_aggregation=(process_time()-cpu,perf_counter()-wall)
                 if batch:
                     timings["aggregation"].append(elapsed_aggregation)
@@ -135,7 +143,9 @@ def measure_core(app, tick, mode, root, *, full_ring=False):
     output["resident_after_tick"]=rss_kib()
     for i in range(11) if active else ():
         wall,cpu=perf_counter(),process_time()
-        result=adaptive.run_learning(sidecar,recent,(),MODEL,{},{},now,True)
+        args=(sidecar,recent,(),MODEL,{},{},now,True)
+        result=(profiles["training"].runcall(adaptive.run_learning,*args) if profile else
+                adaptive.run_learning(*args))
         elapsed=(process_time()-cpu,perf_counter()-wall)
         if result["status"]=="frozen":
             raise RuntimeError(result["reason"])
@@ -155,16 +165,21 @@ def measure_core(app, tick, mode, root, *, full_ring=False):
     output["daily_tick_training_cpu_s"]=(
         statistics.mean(row[0] for row in timings["tick"])*5760+
         (2*statistics.mean(row[0] for row in timings["training"]) if timings["training"] else 0.))
+    for name,profiler in profiles.items():
+        print(f"CPU profile: {mode}, full_ring={full_ring}, phase={name}",file=sys.stderr)
+        stats=pstats.Stats(profiler,stream=sys.stderr).strip_dirs()
+        stats.sort_stats("cumulative").print_stats(40)
+        stats.sort_stats("tottime").print_stats(25)
     return output
 
 
-async def child(package_path,mode,root,*,full_ring=False):
+async def child(package_path,mode,root,*,full_ring=False,profile=False):
     with package(package_path) as (component,_):
         fixture_app,_=BackgroundTickSafetyTests().app()
         app=component.NativeController(FakeHA(),{})
         app.__dict__.update(fixture_app.__dict__)
         app.__dict__.pop("sample",None)
-        return measure_core(app,component.HeatingClimate.tick_inner,mode,root,full_ring=full_ring)
+        return measure_core(app,component.HeatingClimate.tick_inner,mode,root,full_ring=full_ring,profile=profile)
 
 
 def controlled_runtime(root,baseline,repeat,*,full_ring=False):
@@ -225,18 +240,10 @@ def main():
     if opts.profile or opts.controlled:opts.both_online=True
     if opts.child:
         path,mode=opts.child
-        task=child(Path(path),mode,Path(path).parent,full_ring=opts.full_ring)
         if opts.profile:
-            import cProfile
-            import pstats
-            profiler=cProfile.Profile(timer=process_time)
-            result=profiler.runcall(asyncio.run,task)
-            print(f"CPU profile: {Path(path).name}, full_ring={opts.full_ring}",file=sys.stderr)
-            stats=pstats.Stats(profiler,stream=sys.stderr).strip_dirs()
-            stats.sort_stats("cumulative").print_stats(45)
-            stats.sort_stats("tottime").print_stats(45)
-        else:
-            result=asyncio.run(task)
+            print(f"CPU profile package: {Path(path).name}",file=sys.stderr)
+        result=asyncio.run(child(Path(path),mode,Path(path).parent,
+                                 full_ring=opts.full_ring,profile=opts.profile))
         print(json.dumps(result))
         return
     with TemporaryDirectory() as folder:
