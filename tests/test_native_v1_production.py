@@ -908,6 +908,69 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(component.source_writer_active(hass, 1020))
 
 
+    async def test_archive_job_is_bounded_and_lease_waits_for_executor_exit(self):
+        import threading
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            started=threading.Event()
+            release=threading.Event()
+            calls=[]
+            def compact(stamp, *, allow_remove, stop):
+                calls.append((stamp,allow_remove,stop))
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("fixture timed out")
+                return dict(status="deferred",snapshots=0)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=compact)
+            app._kws_idle_since=1000.
+            app.calculation_jobs={}
+            app.terminate=Mock()
+            app._archive_next_at=0.
+            lease=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            try:
+                app.schedule_archive_maintenance(1061.)
+                app.schedule_archive_maintenance(1062.)
+                self.assertTrue(await asyncio.to_thread(started.wait,2))
+                self.assertEqual(len(calls),1)
+                self.assertTrue(calls[0][1])
+                close=asyncio.create_task(runtime.close())
+                await asyncio.sleep(.03)
+                self.assertTrue(calls[0][2].is_set())
+                lease.close.assert_not_called()
+                app.schedule_archive_maintenance(99999.)
+                self.assertEqual(len(calls),1)
+                release.set()
+                await asyncio.wait_for(close,3)
+                lease.close.assert_called_once()
+                self.assertTrue(app._closed)
+            finally:
+                release.set()
+                await runtime.close()
+
+    async def test_archive_schedule_defers_heat_and_pending_calculation(self):
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=Mock())
+            app.calculation_jobs={}
+            app._archive_next_at=0.
+            app._kws_idle_since=None
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app._kws_idle_since=800.
+            app.calculation_jobs={"plan":{"completed":False}}
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app.calculation_jobs={}
+            app._learning_job={"started":0.}
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app._learning_job=None
+            app._archive_next_at=1100.
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app.decision_journal.compact_cold_snapshot_batch.assert_not_called()
+
     async def test_runtime_close_is_idempotent_and_releases_lease_once(self):
         with package(self.root / "package") as (component, _):
             controller = SimpleNamespace(async_close=AsyncMock())
