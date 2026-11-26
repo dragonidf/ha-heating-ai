@@ -455,6 +455,33 @@ class WindowsTest(unittest.TestCase):
         self.assertEqual(expired["expired"],{"24":1,"36":1,"48":1})
         self.assertEqual(expired["completed"],[])
 
+    def test_advisory_periods_keep_independent_checks_and_conditional_cohorts_separate(self):
+        from heating_learning_windows import advisory_validation_summary
+        stamp=BASE+29*86400+3600;identity=[6,1,"fixed_6"]
+        def row(days,error,**extra):
+            reported=stamp-days*86400
+            return dict(issued=reported-48*3600,reported=reported,horizon=48,identity=identity,
+                        basis="conditional_repeat",weather_known=False,schedule_known=False,
+                        error=error,lead_hours=48.) | extra
+        state=dict(completed=[row(1,.5),row(2,-.25),row(5,.75),row(8,1.),row(20,-.5),
+                              row(1,9.,weather_known=True),row(1,99.,identity=[7,1,"fixed_6"]),
+                              row(-1,99.)])
+        result=advisory_validation_summary(state,identity,timezone.utc,stamp)
+        self.assertEqual(len(result["groups"]),2)
+        group=next(g for g in result["groups"] if not g["weather_known"])
+        p=group["periods"]
+        self.assertEqual(p["7"]["all_count"],3)
+        self.assertEqual(p["7"]["count"],2)
+        self.assertAlmostEqual(p["7"]["mae"],.5)
+        self.assertAlmostEqual(p["7"]["bias"],.25)
+        self.assertEqual(p["7"]["missing_days"],4)
+        self.assertEqual(p["14"]["all_count"],4)
+        self.assertEqual(p["14"]["count"],3)
+        self.assertEqual(p["30"]["all_count"],5)
+        self.assertEqual(p["30"]["count"],4)
+        empty=advisory_validation_summary(dict(completed=[row(20,.5)]),identity,timezone.utc,stamp)
+        self.assertIsNone(empty["groups"][0]["periods"]["7"]["mae"])
+
     def test_solar_missing_condition_future_issue_and_missing_geometry(self):
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Kyiv")
