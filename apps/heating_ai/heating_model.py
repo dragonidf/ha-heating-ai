@@ -189,6 +189,8 @@ def learn_modulation(samples, *, power_source='balance', prior_kw=3., pairs=None
     """
     bands = {}
     for a,b in pairs if pairs is not None else zip(samples,samples[1:]):
+        if a.get('power_source')!=power_source or b.get('power_source')!=power_source:
+            continue
         interval=modulation_interval(a,b,power_source)
         if interval is None:
             continue
@@ -1307,7 +1309,9 @@ def learn_power_modes(samples,model=None):
         rows=[r for r in rows if r.get('power_source')==source]
         sessions=sorted({r.get('heat_command_at') for r in rows if number(r.get('heat_command_at')) is not None})
         physical_pairs=None
+        if len(sessions)<3:continue
         if source=='kws_phases':
+            if not any(r.get('measured_interval_kw') is not None for r in rows):continue
             # Never bridge an excluded row by zipping a filtered time series.
             # Both endpoints must belong to the same qualified equipment/session.
             selected={id(r) for r in rows}
