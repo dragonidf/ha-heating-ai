@@ -157,6 +157,24 @@ class WindowsTest(unittest.TestCase):
         self.assertIsNone(ventilation_interval_duty({**active,"supply_unknown_fraction":.2}))
         self.assertIsNone(ventilation_interval_duty({**active,"powered_relay_on_fraction":.5}))
 
+    def test_verified_zero_ventilation_supply_with_unavailable_relay(self):
+        from heating_learning_windows import ventilation_current_qualified, ventilation_interval_duty
+        bath={"relay":"off","supply":"unknown"}
+        for relay in ("on","off","unavailable","unknown",None):
+            self.assertTrue(ventilation_current_qualified({
+                "recuperator":{"relay":relay,"supply":"off"}, "bath":bath}))
+        for supply in ("on","unknown",None):
+            self.assertFalse(ventilation_current_qualified({
+                "recuperator":{"relay":"unavailable","supply":supply}, "bath":bath}))
+        zero=dict(seconds=300,on_fraction=0.,unknown_fraction=1.,
+                  supply_unknown_fraction=0.,supply_on_fraction=0.,
+                  powered_relay_on_fraction=0.)
+        self.assertEqual(ventilation_interval_duty(zero),0.)
+        for changed in ({"supply_unknown_fraction":.1},{"supply_on_fraction":.1},
+                        {"powered_relay_on_fraction":.1},{"powered_relay_on_fraction":None},
+                        {"supply_on_fraction":None},{"seconds":100}):
+            self.assertIsNone(ventilation_interval_duty({**zero,**changed}))
+
     def test_blackout_evaluates_history_without_promoting_model(self):
         from tools.replay_adaptive_learning import MODEL, TZ, fixture
         rows=fixture(8)
