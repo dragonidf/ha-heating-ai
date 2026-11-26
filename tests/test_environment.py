@@ -225,6 +225,25 @@ class EnvironmentTests(unittest.TestCase):
         weather=[dict(ts=when.timestamp(),temperature=15,condition='sunny')]
         self.assertEqual(gain_at(when,weather,settings),0)
         self.assertEqual(gain_at(when,weather,settings,upper=True),0)  # Unconfirmed sunshine cannot remove night heat.
+    def test_held_out_solar_risk_is_not_nominal_or_double_counted(self):
+        from heating_environment import has_upper_risk
+        from heating_model import ForecastContext
+        when=self.at.replace(hour=12)
+        settings={'environment':{'astronomy':solar_geometry(when),
+            'solar':dict(coefficient=.6,validated=False,risk_coefficient=.5)}}
+        weather=[dict(ts=when.timestamp(),temperature=15,condition='sunny')]
+        self.assertTrue(has_upper_risk(settings))
+        self.assertEqual(gain_at(when,weather,settings),0.)
+        upper=gain_at(when,weather,settings,upper=True)
+        self.assertGreater(upper,0.)
+        self.assertLessEqual(upper,.5)
+        self.assertEqual(ForecastContext(when,weather,15.,DEFAULT_MODEL,settings).at(when)[-1],(0.,upper))
+        settings['environment']['solar'].update(observed_gain=upper,observed_at=when.timestamp())
+        self.assertEqual(gain_at(when,weather,settings,upper=True),upper)
+        self.assertEqual(gain_at(when.replace(hour=0),weather,settings,upper=True),0.)
+        self.assertEqual(gain_at(when,[],{'environment':{'astronomy':solar_geometry(when),
+                    'solar':dict(risk_coefficient=.5)}},upper=True),0.)
+
     def test_learned_gain_is_zero_at_night_and_unknown_weather(self):
         settings={'environment':{'solar':dict(coefficient=.6,validated=True)}}
         self.assertEqual(gain_at(self.at.replace(hour=0),[],settings),0)

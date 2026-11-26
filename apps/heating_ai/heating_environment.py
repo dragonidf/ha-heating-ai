@@ -214,9 +214,12 @@ def _weather_gains(when, row, environment):
     observed=(solar.get('observed_gain',0.)*math.exp(-elapsed/2)
               if elapsed<3 and light>0 and datetime.fromtimestamp(solar.get('observed_at',0),when.tzinfo).date()==when.date() else 0.)
     residual=residual_at(when,environment.get('residual') or {})
-    # The same unexplained room rise must not count twice as solar and bias.
-    # No comfort credit until independent 1h/3h field validation is available.
-    return min(.8,learned),min(.8,max(learned,observed,learned+residual))
+    # An independently held-out observational candidate is only a risk
+    # scenario. It never supplies nominal comfort credit. Do not add it to
+    # an observed gain or another solar estimate from the same heat source.
+    risk_coefficient=finite(solar.get('risk_coefficient'))
+    risk_solar=risk_coefficient*light*factor if risk_coefficient is not None and 0<risk_coefficient<=.8 else 0.
+    return min(.8,learned),min(.8,max(learned,observed,learned+residual,risk_solar))
 
 
 def room_source_check(previous,stamp,readings):
@@ -313,6 +316,7 @@ def has_upper_risk(settings):
     profile=settings.get('modulation_profile') or {}
     return bool(profile.get('power_source')=='kws_phases' and profile.get('validated') is True and
                 profile.get('conservative_upper_kw') or solar.get('observed_gain') or solar.get('validated') and solar.get('coefficient') or
+                solar.get('risk_coefficient') or
                 (environment.get('residual') or {}).get('rate',0)>0 or (settings.get('ventilation_model') or {}).get('validated'))
 
 

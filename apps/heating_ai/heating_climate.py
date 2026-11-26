@@ -1809,7 +1809,13 @@ class HeatingClimate(HeatingRecovery,Hass):
                                    grid=='on' and equipment.get('ready') is True and quiet_ventilation and
                                    self.memory.get('fire_phase')=='Неактивний')
             self.memory['solar_observer']=solar
-            settings['environment']={'solar':dict(solar),'astronomy':astronomy,'timezone':str(self.climate_tz),
+            # Bind the read-only candidate to the current thermal/equipment
+            # identity on every existing tick; stale certificates are inert.
+            certificate=self.active_solar_risk_certificate() if hasattr(self,'active_solar_risk_certificate') else {}
+            forecast_solar=dict(solar)
+            if certificate:
+                forecast_solar['risk_coefficient']=certificate['coefficient']
+            settings['environment']={'solar':forecast_solar,'astronomy':astronomy,'timezone':str(self.climate_tz),
                                      'last_heated_at':thermal.get('last_heated_at')}
             # Quantise the safety reserve so tiny MAE changes do not replan.
             settings['upper_margin']=round(environment_quality['upper_margin'],1)
@@ -1819,6 +1825,11 @@ class HeatingClimate(HeatingRecovery,Hass):
                 external_gain_c_per_hour=round(solar.get('observed_gain',0.),3),
                 solar_learning_days=solar['days'],solar_validated=solar['validated'],
                 solar_coefficient=round(solar['coefficient'],3),weather_condition=condition,
+                solar_observation_quality=solar.get('observation_quality'),
+                solar_risk_coefficient=forecast_solar.get('risk_coefficient'),
+                solar_risk_holdout_days=certificate.get('holdout_days',0),
+                solar_risk_holdout_windows=certificate.get('holdout_windows',0),
+                solar_risk_only=bool(certificate),
                 astronomy_available=bool(astronomy),room_source_check=room_check['status'],
                 recent_mae=environment_quality['recent_mae'],upper_margin=settings['upper_margin'],
                 note='Еквівалент запасу тепла, не температура поверхні; зовнішній прогрів не доводить сонце')
