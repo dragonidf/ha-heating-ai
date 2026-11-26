@@ -38,16 +38,18 @@ def report_time(row):
 
 
 def ventilation_current_qualified(devices):
-    """An OFF relay proves zero commanded airflow without a supply sensor.
+    """Either a known OFF relay or a known OFF supply proves zero powered duty.
 
-    An ON relay is qualified only when its independent supply is known.
-    Missing device bindings and unknown relays are never considered valid.
+    A running relay needs independent supply evidence; an unavailable relay
+    does not erase independently verified absence of supply. Unknown supply
+    and relay together are never interpreted as zero.
     """
     if not isinstance(devices, dict):
         return False
     return all(isinstance(devices.get(key), dict) and (
+        devices[key].get("supply") == "off" or
         devices[key].get("relay") == "off" or (
-            devices[key].get("relay") == "on" and devices[key].get("supply") in ("on", "off"))
+            devices[key].get("relay") == "on" and devices[key].get("supply") == "on")
     ) for key in ("recuperator", "bath"))
 
 
@@ -58,7 +60,16 @@ def ventilation_interval_duty(evidence):
     seconds = number(evidence.get("seconds"))
     on = number(evidence.get("on_fraction"))
     unknown = number(evidence.get("unknown_fraction"))
-    if seconds is None or seconds < 240 or unknown != 0 or on is None:
+    if seconds is None or seconds < 240:
+        return None
+    # Only full, independently observed zero supply proves zero powered duty
+    # even when the relay cannot report. A coverage gap, missing supply
+    # fraction, or contradictory powered-on evidence cannot establish this.
+    if (number(evidence.get("supply_unknown_fraction")) == 0.
+            and number(evidence.get("supply_on_fraction")) == 0.
+            and number(evidence.get("powered_relay_on_fraction")) == 0.):
+        return 0.
+    if unknown != 0 or on is None:
         return None
     # A relay that is always OFF contributes zero ventilation regardless
     # of supply evidence. An ON relay must have independently known supply.
