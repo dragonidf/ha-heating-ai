@@ -77,6 +77,10 @@ class NativeController(HeatingClimate):
         self._archive_job = None
         self._archive_next_at = 0.
         self._archive_stop = threading.Event()
+        # This lock guards only the worker/lease handoff, never disk I/O.
+        self._archive_lease_lock = threading.Lock()
+        self._archive_worker_active = False
+        self._archive_deferred_lease = None
 
         self._learning_epoch = uuid4().hex
         self._learning_rows = deque(maxlen=340)
@@ -766,6 +770,7 @@ class NativeController(HeatingClimate):
         return False
 
     ARCHIVE_MAINTENANCE_INTERVAL = 900
+    ARCHIVE_CLOSE_TIMEOUT = 4.
 
     def schedule_archive_maintenance(self, stamp):
         """Use the existing tick only to dispatch a bounded cold archive job."""
@@ -788,18 +793,39 @@ class NativeController(HeatingClimate):
                 self._maintain_archive(journal,stamp),"Heating AI cold archive maintenance")
         self._on_loop(launch)
 
-    async def _maintain_archive(self,journal,stamp):
-        # Not in _jobs: those callbacks are cancelled during bridge shutdown.
-        # Cancelling a future does not stop its executor thread. Shield it
-        # and drain the actual I/O before releasing the writer lease.
-        worker=asyncio.ensure_future(self.hass.async_add_executor_job(
-            lambda: journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=self._archive_stop)))
+    def _archive_worker(self,journal,stamp):
+        # Ownership is tied to the actual executor thread, not a cancellable
+        # asyncio future. A worker queued behind shutdown cannot enter.
+        with self._archive_lease_lock:
+            if self._archive_stop.is_set() or self._closing or self._archive_worker_active:
+                return dict(status="stopped",snapshots=0)
+            self._archive_worker_active=True
         try:
-            result=await asyncio.shield(worker)
+            return journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=self._archive_stop)
+        finally:
+            with self._archive_lease_lock:
+                self._archive_worker_active=False
+                lease,self._archive_deferred_lease=self._archive_deferred_lease,None
+            if lease is not None:
+                lease.close()
+
+    def close_archive_lease(self,lease):
+        # Even repeated cancellation cannot unlock a live archive writer.
+        # Transfer the open file to the worker on timeout; a new writer will
+        # fail the existing nonblocking flock until the old worker exits.
+        self._archive_stop.set()
+        with self._archive_lease_lock:
+            if self._archive_worker_active:
+                self._archive_deferred_lease=lease
+                return
+        lease.close()
+
+    async def _maintain_archive(self,journal,stamp):
+        try:
+            result=await self.hass.async_add_executor_job(self._archive_worker,journal,stamp)
             journal.cold_pack_maintenance=dict(at=stamp,**result)
         except asyncio.CancelledError:
             self._archive_stop.set()
-            await asyncio.shield(worker)
             raise
         except Exception as exc:
             journal.cold_pack_maintenance=dict(at=stamp,status="deferred",reason=type(exc).__name__)
@@ -813,11 +839,9 @@ class NativeController(HeatingClimate):
         self._archive_stop.set()
         job=self._archive_job
         if job is not None:
-            try:
-                await asyncio.shield(job)
-            except asyncio.CancelledError:
-                await asyncio.shield(job)
-                raise
+            done,_=await asyncio.wait({job},timeout=self.ARCHIVE_CLOSE_TIMEOUT)
+            if not done:
+                self.log("Cold archive shutdown budget reached; writer lease retained until executor exits",level="WARNING")
         await super().async_close()
 
     def tick(self, kwargs=None, **extra):
@@ -2080,7 +2104,11 @@ class ProductionRuntime:
             try:
                 await self.controller.async_close()
             finally:
-                self.lease.close()
+                close_archive_lease=getattr(self.controller,"close_archive_lease",None)
+                if close_archive_lease is None:
+                    self.lease.close()
+                else:
+                    close_archive_lease(self.lease)
 
 
 async def async_setup_production(hass, entry):
