@@ -226,6 +226,35 @@ class WindowsTest(unittest.TestCase):
             altered[5][field]=value
             self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"])
 
+    def test_daylight_idle_residual_is_solar_only_not_base_model_evidence(self):
+        rows=samples(60)
+        for row in rows:
+            row.update(solar_factor=.5,external_gain=.2)
+        rows[-1]["room"]=21.4
+        result=build_observation_windows(rows,timezone.utc)
+        self.assertEqual(len(result["windows"]),1)
+        self.assertTrue(result["windows"][0]["solar_only"])
+        self.assertEqual(result["eligibility_counts"]["automatic_physics_windows"],0)
+        self.assertEqual(result["eligibility_counts"]["solar_only_windows"],1)
+        self.assertEqual(evaluate_windows(result["windows"],dict(DEFAULT_MODEL,version=6))["status"],"insufficient_data")
+        for change in (dict(solar_factor=0.),dict(power=6.),dict(fire_active=True),
+                       dict(room_source_disagreement=True),dict(shadow_ventilation=None),
+                       dict(power_quality="estimated"),dict(grid="unknown")):
+            altered=[{**row,**change} for row in rows]
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"],change)
+
+    def test_fast_daytime_rise_requires_corroboration_and_plausible_rate(self):
+        rows=samples(60)
+        for row in rows:
+            row.update(solar_factor=.5,external_gain=.2,room_source_status="agree")
+        rows[-1]["room"]=22.
+        result=build_observation_windows(rows,timezone.utc)
+        self.assertTrue(result["windows"][0]["solar_only"])
+        for change in (dict(room_source_status="unconfirmed"),dict(room=24.9)):
+            altered=[dict(row) for row in rows]
+            altered[-1].update(change)
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"])
+
     def test_large_gap_and_shared_endpoint_are_not_counted(self):
         rows = samples(120)
         self.assertEqual(build_observation_windows(rows, timezone.utc)["eligible_minutes"], 60)

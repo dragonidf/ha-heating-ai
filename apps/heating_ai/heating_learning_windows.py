@@ -230,6 +230,30 @@ def _continuous(rows, times, start, end, identity, *, physics=False):
     return steps, reasons
 
 
+def _solar_only_window(first, last, steps, reasons, duration):
+    """Allow a separate daytime idle cohort without weakening thermal fits.
+
+    Only the residual/gain or endpoint jump exclusion may be reconsidered.
+    Electrical, fireplace, weather, room conflicts, gaps and other reasons
+    stay fail-closed. Fast rises need independent secondary corroboration;
+    a plausible observation is not yet a validated solar coefficient.
+    """
+    if not reasons or not reasons.issubset({"unexplained_gain", "room_jump"}) or not steps:
+        return False
+    if any(number(kw) is None or not 0<=kw<=.05 or number(factor) is None
+           or not 0<=factor<=1. for _,_,kw,factor,_ in steps):
+        return False
+    if sum(seconds*factor for seconds,_,_,factor,_ in steps)/duration<=.05:
+        return False
+    rise=last["room"]-first["room"]
+    if rise<-.1:
+        return False
+    if "room_jump" in reasons:
+        return (rise>0. and rise<=.5+1.5*duration/3600
+                and all(r.get("room_source_status")=="agree" for r in (first,last)))
+    return True
+
+
 def build_observation_windows(samples, tz):
     rows = [row for row in samples if number(row.get("ts")) is not None]
     times = [row["ts"] for row in rows]
@@ -262,7 +286,8 @@ def build_observation_windows(samples, tz):
         reasons |= row_reasons(first,strict=True,physics=True) | row_reasons(row,strict=True,physics=True)
         if abs(row["room"]-first["room"]) > .6:
             reasons.add("room_jump")
-        if reasons:
+        solar_only = _solar_only_window(first,row,steps,reasons,end-start)
+        if reasons and not solar_only:
             counts.update(reasons)
             continue
         heating = sum(seconds for seconds, _, kw, _, _ in steps if kw >= 1.5)
@@ -272,6 +297,8 @@ def build_observation_windows(samples, tz):
                             floor=steps[0][4],steps=steps,heat=heating,idle=idle,sun=sun,
                             manual=first.get("manual_measurement_id") is not None,
                             equipment=list(identity[2:]),vent=first["shadow_ventilation"]))
+        if solar_only:
+            windows[-1]["solar_only"]=True
         anchor = None  # an independent physical report belongs to at most one window
     anchor_at = None
     if anchor and rows and rows[-1]["ts"]-anchor[0]<=7200:
@@ -280,8 +307,10 @@ def build_observation_windows(samples, tz):
         if not issues and not row_reasons(row,strict=True):
             anchor_at = at
     observation = rows[-1] if rows else {}
-    eligibility_counts = dict(manual_physics_windows=sum(w["manual"] for w in windows),
-                              automatic_physics_windows=sum(not w["manual"] for w in windows),
+    eligibility_counts = dict(manual_physics_windows=sum(w["manual"] and not w.get("solar_only") for w in windows),
+                              automatic_physics_windows=sum(not w["manual"] and not w.get("solar_only") for w in windows),
+                              solar_only_windows=sum(bool(w.get("solar_only")) for w in windows),
+                              solar_windows=sum(w["sun"]>.05 and w["idle"]>=w["end"]-w["start"] for w in windows),
                               primary_reports=len(reports),
                               electrical_intervals=sum(
                                   r.get("power_source")=="kws_phases" and r.get("power_quality")=="measured"
@@ -410,7 +439,7 @@ def evaluate_windows(windows, model, ventilation=None):
     latest = windows[-1]["equipment"]
     windows = [w for w in windows if w["equipment"] == latest and latest[0] == model.get("version")]
     qualified_vent = ventilation and ventilation.get("validated") and ventilation.get("model_version")==model.get("version")
-    thermal = [w for w in windows if w["sun"]<=.02 and
+    thermal = [w for w in windows if not w.get("solar_only") and w["sun"]<=.02 and
                (qualified_vent or max(w["vent"])==0.)]
     # Over short intervals sensor rounding can dominate the thermal response.
     # Prefer longer observations when they already cover both regimes and days.
