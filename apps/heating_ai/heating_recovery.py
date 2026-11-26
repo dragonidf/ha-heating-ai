@@ -5,8 +5,10 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from threading import RLock
+from bisect import insort
 from uuid import uuid4
 import gzip
+import lzma
 import hashlib
 import json
 import os
@@ -26,6 +28,62 @@ def wire_values(value):
     if isinstance(value,list):return [wire_values(v) for v in value]
     if value is False:return 'false'
     return '0' if isinstance(value,(int,float)) and value==0 else value
+
+def forecast_accuracy_periods(rows, now):
+    """Read-only statistics of actual issued forecasts, grouped by provenance.
+
+    Calendar periods include today (which may be partial). Counts are unique
+    report timestamps within each cohort, not independent disjoint forecasts.
+    Unknown historical provenance is never assigned to current equipment.
+    """
+    periods=(7,14,30)
+    today=now.date()
+    starts={n:today-timedelta(days=n-1) for n in periods}
+    stamp=now.timestamp()
+    earliest=datetime.combine(starts[30],datetime.min.time(),tzinfo=now.tzinfo).timestamp()
+    groups={}
+    def label(value):
+        return value if type(value) in (str,int) else None
+    def flag(value):
+        return value if type(value) is bool else None
+    for row in rows if isinstance(rows,(list,tuple)) else ():
+        if not isinstance(row,dict):continue
+        horizon,issued,reported,lead,error=(number(row.get(k)) for k in
+            ('horizon','issued_at','actual_at','actual_horizon_hours','error'))
+        if (horizon not in (1,3,6,12,24,36,48) or None in (issued,reported,lead,error)
+                or not earliest<=reported<=stamp or issued>=reported or abs(lead-horizon)>.5):
+            continue
+        key=(int(horizon),label(row.get('model_version')),label(row.get('equipment_version')),
+             label(row.get('physical_mode')),label(row.get('actual_temperature_basis')),
+             flag(row.get('weather_known')),flag(row.get('schedule_known')))
+        cohort=groups.setdefault(key,{})
+        score=(abs(lead-horizon),-issued)
+        old=cohort.get(reported)
+        if old is None or score<old[0]:
+            cohort[reported]=(score,error)
+    result=[]
+    for key,reports in sorted(groups.items(),key=lambda pair:tuple(str(k) for k in pair[0])):
+        daily={}
+        for reported,(_,error) in reports.items():
+            day=datetime.fromtimestamp(reported,now.tzinfo).date()
+            bucket=daily.setdefault(day,[0,0.,0.])
+            bucket[0]+=1;bucket[1]+=abs(error);bucket[2]+=error
+        metrics={}
+        for days in periods:
+            buckets=[bucket for day,bucket in daily.items() if day>=starts[days]]
+            count=sum(b[0] for b in buckets)
+            metrics[str(days)]=dict(count=count,days=len(buckets),missing_days=days-len(buckets),
+                mae=sum(b[1] for b in buckets)/count if count else None,
+                bias=sum(b[2] for b in buckets)/count if count else None)
+        horizon,model,equipment,mode,basis,weather,schedule_known=key
+        result.append(dict(horizon=horizon,model_version=model,equipment_version=equipment,
+            physical_mode=mode,basis=basis,weather_known=weather,schedule_known=schedule_known,
+            periods=metrics))
+    return dict(groups=result,period_days=list(periods),as_of=stamp,
+        period_basis='local_calendar_including_partial_today',
+        count_basis='unique_report_per_cohort',lead_tolerance_minutes=30,
+        provenance_basis='issued_full_forecast_coverage')
+
 
 def cycle_energy_allowance(entry):
     if not entry:return None
@@ -390,6 +448,16 @@ class HeatingRecovery:
             pending_calculations={k:v['at'] for k,v in getattr(self,'calculation_jobs',{}).items() if not v.get('completed')},
             last_validation_rejection=(self.memory.get('validation_quarantine') or [None])[-1],**extra)
 
+    def forecast_accuracy_view(self,now):
+        # At most once per hour, including after a restart or local-day change.
+        # No archive reads, polling, worker or fitting; existing retained errors only.
+        key=(int(now.timestamp()//3600),now.date(),now.tzinfo)
+        cached=getattr(self,'_forecast_accuracy_cache',None)
+        if cached is None or cached[0]!=key:
+            cached=(key,forecast_accuracy_periods(self.memory.get('temperature_errors',[]),now))
+            self._forecast_accuracy_cache=cached
+        return cached[1]
+
     def publish_controller_quality(self,now):
         completed=sorted((e for e in (self.memory.get('cycle_energy') or {}).values() if e['end']<=now.timestamp()),key=lambda e:e['end'])
         latest=(completed[-1].get('quality_report') or cycle_quality_summary(completed[-1],now.timestamp())) if completed else None
@@ -409,6 +477,7 @@ class HeatingRecovery:
         journal=getattr(self,'decision_journal',None)
         self.publish('sensor.heating_controller_quality','Цикл завершено' if latest else 'Очікуємо завершення циклу',
             last_completed_cycle=latest,horizons=horizons,model_version=self.model.get('version'),
+            accuracy_periods=self.forecast_accuracy_view(now),
             archive_health=journal.health() if journal and hasattr(journal,'health') else {},
             prospective_only=True,independent_energy_measurement=False)
 
@@ -985,6 +1054,8 @@ class HeatingRecovery:
                 if expected is not None:
                     errors.append(dict(horizon=check['horizon'],issued_at=check['issued_at'],actual_at=reported,
                         model_version=check['model_version'],physical_mode=check['physical_mode'],
+                        equipment_version=check.get('equipment_version'),weather_known=check.get('weather_known'),
+                        schedule_known=check.get('schedule_known'),
                         actual_horizon_hours=(actual_at-check['issued_at'])/3600,
                         actual_temperature_basis=basis,comparison_at=actual_at,
                         report_before=before if basis=='interpolated_reports' else None,
@@ -1019,7 +1090,10 @@ class HeatingRecovery:
                         target=stamp+horizon*3600
                         if temperature_at(curve,target) is not None:
                             self.memory['temperature_checks'].append(dict(issued_at=issued_at,target_at=target,horizon=horizon,
-                                model_version=self.model.get('version'),physical_mode=getattr(self,'cfg',{}).get('boiler_power_mode','unconfirmed'),forecast=source))
+                                model_version=self.model.get('version'),physical_mode=getattr(self,'cfg',{}).get('boiler_power_mode','unconfirmed'),
+                                equipment_version=self.memory.get('equipment_version',0),
+                                weather_known=forecast.get('weather_complete'),
+                                schedule_known=forecast.get('schedule_complete'),forecast=source))
         candidates[:]=[x for x in candidates if x['at']>=stamp-36*3600]
         cycle=heating_cycle(now,settings)
         last=self.memory.get('temperature_history_power') or {}
@@ -1591,6 +1665,7 @@ class DecisionJournal:
         self.snapshot_bytes=None
         self.daily_log_bytes=None
         self.snapshot_count=None
+        self._cold_queue=()
         self.lock=RLock()
 
     def health(self):
@@ -1604,6 +1679,11 @@ class DecisionJournal:
         return dict(cached,used_bytes=self.used_bytes,max_bytes=self.max_bytes,
             snapshot_bytes=self.snapshot_bytes,daily_log_bytes=self.daily_log_bytes,
             snapshot_count=self.snapshot_count,
+            packed_bytes=getattr(self,'packed_bytes',0),
+            packed_snapshot_count=getattr(self,'packed_snapshot_count',0),
+            packed_blocks=getattr(self,'packed_blocks',0),
+            packed_gc_error=getattr(self,'packed_gc_error',None),
+            cold_pack_maintenance=getattr(self,'cold_pack_maintenance',None),
             pressure=self.used_bytes is not None and self.used_bytes>=self.max_bytes*.9,
             retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error,
             capacity_policy='retention_headroom' if self.auto_capacity else 'fixed',
@@ -1631,25 +1711,65 @@ class DecisionJournal:
     def _prepare(self,stamp):
         self.directory.mkdir(parents=True,exist_ok=True)
         if self.used_bytes is None or stamp-self.last_rotation>3600:
-            for p in self.directory.iterdir():
-                if p.is_file() and p.stat().st_mtime<stamp-self.retention:
-                    p.unlink()
+            # Reference lifetime belongs to each digest, not to its shared block.
+            # Reconcile references before legacy rotation so a newer gzip mtime
+            # can protect an older staged pointer.
+            self._rotate_packed(stamp)
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    if (entry.is_file() and not entry.name.endswith('.snapshot-ref')
+                            and not (self.packed_gc_error and entry.name.endswith('.json.gz'))
+                            and entry.stat().st_mtime<stamp-self.retention):
+                        Path(entry.path).unlink()
             self.last_rotation=stamp
             # Single streaming scan: do not retain thousands of Path/stat pairs
             # in RAM just to publish archive composition once per hour.
             self.used_bytes=self.snapshot_bytes=self.daily_log_bytes=self.snapshot_count=0
             self.oldest_at=stamp
-            for path in self.directory.iterdir():
-                if not path.is_file():
-                    continue
-                info=path.stat()
-                self.used_bytes+=info.st_size
-                self.oldest_at=min(self.oldest_at,info.st_mtime)
-                if path.name.endswith('.json.gz'):
-                    self.snapshot_bytes+=info.st_size
-                    self.snapshot_count+=1
-                elif path.name.endswith(('.jsonl','.jsonl.gz')):
-                    self.daily_log_bytes+=info.st_size
+            cold=[]
+            rejected=set(getattr(self,'_cold_pack_skipped',()))
+            self._cold_queue=()
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    info=entry.stat()
+                    self.used_bytes+=info.st_size
+                    self.oldest_at=min(self.oldest_at,info.st_mtime)
+                    if entry.name.endswith('.json.gz'):
+                        self.snapshot_bytes+=info.st_size
+                        self.snapshot_count+=1
+                        # Reuse the existing stat; the shortlist stays bounded.
+                        # Only potential oldest entries need a pointer lookup.
+                        if (self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES
+                                and stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE):
+                            digest=entry.name[:-8]
+                            item=(info.st_mtime,digest)
+                            if (digest not in rejected and (len(cold)<self.COLD_QUEUE_LIMIT or item<cold[-1])
+                                    and self._valid_digest(digest) and not entry.is_symlink()
+                                    and not (self.directory/(digest+'.snapshot-ref')).exists()):
+                                insort(cold,item)
+                                if len(cold)>self.COLD_QUEUE_LIMIT:cold.pop()
+                    elif entry.name.endswith(('.jsonl','.jsonl.gz')):
+                        self.daily_log_bytes+=info.st_size
+                    elif entry.name.endswith('.snapshot-ref'):
+                        self.snapshot_bytes+=info.st_size
+                        if not (self.directory/(entry.name[:-13]+'.json.gz')).exists():
+                            self.snapshot_count+=1
+            folder=self.directory/'packed_v1'
+            self.packed_bytes=self.packed_snapshot_count=self.packed_blocks=0
+            if folder.is_dir():
+                for path in folder.iterdir():
+                    if path.is_file():
+                        self.packed_bytes+=path.stat().st_size
+                        self.packed_blocks+=int(path.name.endswith('.xz'))
+                for path in self.directory.glob('*.snapshot-ref'):
+                    self.packed_bytes+=path.stat().st_size
+                    self.packed_snapshot_count+=1
+                # Pointers already counted in the top-level scan.
+                block_bytes=sum(path.stat().st_size for path in folder.iterdir() if path.is_file())
+                self.used_bytes+=block_bytes;self.snapshot_bytes+=block_bytes
+            self._cold_queue=tuple(digest for _,digest in cold)
         # On a restart the archive may already exceed the 256 MiB initial
         # budget. Restore a safe disk-backed headroom limit *before* treating
         # that transient budget as critical; otherwise all closed days get
@@ -1710,6 +1830,19 @@ class DecisionJournal:
         raw=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')
         digest=hashlib.sha256(raw).hexdigest()
         path=self.directory/(digest+'.json.gz')
+        pointer=self.directory/(digest+'.snapshot-ref')
+        if pointer.exists():
+            try:
+                if self._packed_snapshot(digest)!=raw:raise ValueError('Packed snapshot differs')
+                # Never shorten the lifetime of existing evidence.
+                latest=max(stamp,pointer.stat().st_mtime,path.stat().st_mtime if path.exists() else 0.)
+                os.utime(pointer,(latest,latest))
+                if path.exists():os.utime(path,(latest,latest))
+                return digest
+            except (OSError,ValueError,TypeError):
+                # A damaged staged copy must not prevent safe legacy writes.
+                # Keep its reference for diagnosis; a valid gzip wins on read.
+                pass
         if not path.exists():
             self._prepare(stamp)
             compressed=gzip.compress(raw,mtime=0)
@@ -1724,13 +1857,379 @@ class DecisionJournal:
         os.utime(path,(stamp,stamp))
         return digest
 
+    PACK_RAW_LIMIT=8*1024*1024
+    PACK_SIZE_LIMIT=9*1024*1024
+    PACK_MEMORY_LIMIT=16*1024*1024
+    PACK_ROWS=8
+
+    @staticmethod
+    def _valid_digest(value):
+        return isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
+
+    @staticmethod
+    def _sync_directory(path):
+        fd=os.open(path,os.O_RDONLY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
+
+    @classmethod
+    def _atomic_pack_file(cls,path,raw,mtime=None):
+        # Immutable content addresses: never overwrite conflicting bytes.
+        if path.exists():
+            if path.read_bytes()!=raw:raise ValueError('Conflicting packed evidence')
+            return
+        temporary=path.with_name(path.name+'.'+uuid4().hex+'.tmp')
+        try:
+            with temporary.open('xb') as stream:
+                stream.write(raw);stream.flush();os.fsync(stream.fileno())
+            if mtime is not None:os.utime(temporary,(mtime,mtime))
+            temporary.replace(path);cls._sync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _decode_snapshot_pack(cls,blob,ids):
+        if (not 1<=len(ids)<=cls.PACK_ROWS or len(set(ids))!=len(ids)
+                or not all(cls._valid_digest(v) for v in ids) or len(blob)>cls.PACK_SIZE_LIMIT):
+            raise ValueError('Invalid snapshot pack bounds')
+        try:
+            decoder=lzma.LZMADecompressor(format=lzma.FORMAT_XZ,memlimit=cls.PACK_MEMORY_LIMIT)
+            raw=decoder.decompress(blob,max_length=cls.PACK_RAW_LIMIT+1)
+        except lzma.LZMAError as exc:raise ValueError('Invalid compressed snapshot pack') from exc
+        if len(raw)>cls.PACK_RAW_LIMIT or not decoder.eof or decoder.unused_data or not raw.endswith(b'\n'):
+            raise ValueError('Incomplete or oversized snapshot pack')
+        rows=raw[:-1].split(b'\n')
+        if len(rows)!=len(ids) or any(hashlib.sha256(row).hexdigest()!=key for row,key in zip(rows,ids)):
+            raise ValueError('Snapshot pack checksum mismatch')
+        return rows
+
+    def _pack_pointer(self,pointer):
+        if pointer.stat().st_size>2048:raise ValueError('Oversized snapshot pointer')
+        ref=json.loads(pointer.read_bytes())
+        if not isinstance(ref,dict):raise ValueError('Invalid snapshot pointer')
+        key=ref.get('pack')
+        if ref.get('schema')!=1 or not self._valid_digest(key):
+            raise ValueError('Invalid snapshot pointer')
+        return key
+
+    def _rotate_packed(self,stamp):
+        folder=self.directory/'packed_v1'
+        self.packed_gc_error=None
+        if not folder.is_dir():return
+        live=set();expired=[]
+        try:
+            # Validate every pointer before deleting any shared block. On
+            # malformed evidence fail conservatively and retain all packs.
+            for pointer in self.directory.glob('*.snapshot-ref'):
+                digest=pointer.name[:-13]
+                if not self._valid_digest(digest):raise ValueError('Invalid snapshot pointer name')
+                key=self._pack_pointer(pointer)
+                legacy=self.directory/(digest+'.json.gz')
+                latest=max(pointer.stat().st_mtime,legacy.stat().st_mtime if legacy.exists() else 0.)
+                if latest>=stamp-self.retention:
+                    live.add(key)
+                    if pointer.stat().st_mtime<latest:os.utime(pointer,(latest,latest))
+                else:expired.append(pointer)
+            for pointer in expired:pointer.unlink()
+            if expired:self._sync_directory(self.directory)
+            # A valid pointer is the only shared-block ownership reference.
+            # Grace period preserves recently interrupted additive stages.
+            for path in folder.iterdir():
+                if not path.is_file() or path.stat().st_mtime>=stamp-self.retention:continue
+                key=path.name[:-10] if path.name.endswith('.pack.json') else path.name[:-3] if path.name.endswith('.xz') else None
+                if self._valid_digest(key) and key not in live:path.unlink()
+            self._sync_directory(folder)
+        except (OSError,ValueError,TypeError) as exc:
+            self.packed_gc_error=str(exc)
+
+    def _load_snapshot_pack(self,key):
+        if not self._valid_digest(key):raise ValueError('Invalid pack identifier')
+        folder=self.directory/'packed_v1'
+        manifest=folder/(key+'.pack.json')
+        blob_path=folder/(key+'.xz')
+        if manifest.stat().st_size>16384 or blob_path.stat().st_size>self.PACK_SIZE_LIMIT:
+            raise ValueError('Oversized snapshot pack')
+        header=json.loads(manifest.read_bytes())
+        ids=header.get('snapshots') if isinstance(header,dict) else None
+        if (not isinstance(header,dict) or header.get('schema')!=1
+                or header.get('sha256')!=key or not isinstance(ids,list)):
+            raise ValueError('Invalid snapshot pack manifest')
+        blob=blob_path.read_bytes()
+        if hashlib.sha256(blob).hexdigest()!=key:raise ValueError('Snapshot block checksum mismatch')
+        rows=self._decode_snapshot_pack(blob,ids)
+        return ids,rows,manifest.stat().st_size+len(blob)
+
+    def _packed_snapshot(self,digest):
+        key=self._pack_pointer(self.directory/(digest+'.snapshot-ref'))
+        ids,rows,_=self._load_snapshot_pack(key)
+        if digest not in ids:raise ValueError('Snapshot missing from pack')
+        return rows[ids.index(digest)]
+
+    @staticmethod
+    def _snapshot_stat(path):
+        info=path.stat()
+        return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+    def _prepare_snapshot_pack(self,digests):
+        """Read immutable originals and encode outside the control journal lock."""
+        ids=list(digests)
+        if not 2<=len(ids)<=self.PACK_ROWS or len(set(ids))!=len(ids) or not all(self._valid_digest(v) for v in ids):
+            raise ValueError('Invalid snapshot pack selection')
+        rows=[];stats=[];size=0
+        for digest in ids:
+            path=self.directory/(digest+'.json.gz')
+            before=self._snapshot_stat(path)
+            with gzip.open(path,'rb') as stream:raw=stream.read(self.PACK_RAW_LIMIT+1)
+            if before!=self._snapshot_stat(path):raise ValueError('Snapshot changed during packing')
+            size+=len(raw)+1
+            if size>self.PACK_RAW_LIMIT or b'\n' in raw or hashlib.sha256(raw).hexdigest()!=digest:
+                raise ValueError('Invalid or oversized source snapshot')
+            json.loads(raw);rows.append(raw);stats.append(before)
+        blob=lzma.compress(b'\n'.join(rows)+b'\n',format=lzma.FORMAT_XZ,preset=1)
+        if self._decode_snapshot_pack(blob,ids)!=rows:raise ValueError('Snapshot pack roundtrip mismatch')
+        legacy_bytes=sum(s[2] for s in stats)
+        key=hashlib.sha256(blob).hexdigest()
+        encode=lambda v:json.dumps(v,sort_keys=True,separators=(',',':')).encode()
+        manifest=encode(dict(schema=1,sha256=key,snapshots=ids,legacy_bytes=legacy_bytes))
+        pointer_raw=encode(dict(schema=1,pack=key))
+        total_bytes=len(blob)+len(manifest)+len(pointer_raw)*len(ids)
+        return dict(ids=ids,stats=stats,blob=blob,manifest=manifest,pointer_raw=pointer_raw,
+                    key=key,legacy_bytes=legacy_bytes,total_bytes=total_bytes)
+
+    def stage_snapshot_pack(self,digests,*,require_savings=False,cold_at=None,stop=None):
+        """Additive staging; expensive encoding is outside the journal lock.
+
+        The locked publication still performs disk I/O and fsync. It is not
+        certified nonblocking and must not be invoked by the safety tick.
+        """
+        if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before preparation')
+        pack=self._prepare_snapshot_pack(digests)
+        ids=pack['ids'];key=pack['key'];legacy_bytes=pack['legacy_bytes']
+        total_bytes=pack['total_bytes'];blob=pack['blob'];manifest=pack['manifest']
+        pointer_raw=pack['pointer_raw']
+        if require_savings and total_bytes*2>legacy_bytes:
+            return dict(status='insufficient_savings',snapshots=len(ids),
+                        legacy_bytes=legacy_bytes,packed_bytes=total_bytes)
+        with self.lock:
+            if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before publication')
+            # A rotation, replacement or reuse since preparation invalidates
+            # this attempt. Never publish stale references or shorten lifetime.
+            for digest,expected in zip(ids,pack['stats']):
+                if self._snapshot_stat(self.directory/(digest+'.json.gz'))!=expected:
+                    raise ValueError('Snapshot changed before pack publication')
+                if cold_at is not None and (not cold_at-self.retention<=expected[3]/1e9<=cold_at-self.COLD_PACK_MIN_AGE
+                        or (self.directory/(digest+'.snapshot-ref')).exists()):
+                    raise ValueError('Cold snapshot no longer eligible')
+            folder=self.directory/'packed_v1'
+            if stop is not None:
+                # Online maintenance uses already reconciled journal counters;
+                # never add an unbounded directory scan to a locked section.
+                if self.used_bytes is None or cold_at is None:
+                    raise ValueError('Archive accounting not ready')
+                existing_bytes=self.used_bytes
+            else:
+                existing_bytes=sum(p.stat().st_size for p in self.directory.iterdir() if p.is_file())
+                if folder.is_dir():existing_bytes+=sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
+            space=self.health()
+            if stop is not None and space.get('free_bytes') is None:
+                raise OSError('Disk headroom unknown')
+            reserve=max(self.MIN_FREE_BYTES,int((space.get('disk_total_bytes') or 0)*.1))
+            if existing_bytes+total_bytes>self.max_bytes or (space.get('free_bytes') is not None
+                    and space['free_bytes']-total_bytes<reserve):
+                raise OSError('Insufficient staging headroom; original snapshots retained')
+            new_block=not (folder/(key+'.xz')).exists()
+            added_bytes=(len(blob) if new_block else 0)+(len(manifest) if not (folder/(key+'.pack.json')).exists() else 0)
+            added_bytes+=len(pointer_raw)*len(ids)
+            self.used_bytes=None
+            folder.mkdir(exist_ok=True)
+            self._sync_directory(self.directory)
+            self._atomic_pack_file(folder/(key+'.xz'),blob)
+            self._atomic_pack_file(folder/(key+'.pack.json'),manifest)
+            for digest,info in zip(ids,pack['stats']):
+                self._atomic_pack_file(self.directory/(digest+'.snapshot-ref'),pointer_raw,info[3]/1e9)
+            # Verify immutable stored bytes without repeatedly decompressing
+            # the block under the shared lock. Promotion independently decodes.
+            if ((folder/(key+'.xz')).read_bytes()!=blob or
+                    (folder/(key+'.pack.json')).read_bytes()!=manifest or any(
+                    self._pack_pointer(self.directory/(digest+'.snapshot-ref'))!=key for digest in ids)):
+                raise ValueError('Packed snapshot verification failed')
+            if stop is not None:
+                # Cold eligibility guaranteed every pointer was absent.
+                # Originals still exist, so unique snapshot count is unchanged.
+                self.used_bytes=existing_bytes+added_bytes
+                self.snapshot_bytes+=added_bytes
+                self.packed_bytes=getattr(self,'packed_bytes',0)+added_bytes
+                self.packed_snapshot_count=getattr(self,'packed_snapshot_count',0)+len(ids)
+                self.packed_blocks=getattr(self,'packed_blocks',0)+int(new_block)
+            return dict(status='staged',pack=key,snapshots=len(ids),packed_bytes=total_bytes,
+                        legacy_bytes=legacy_bytes)
+
+    def _prepare_pack_promotion(self,key):
+        """Verify immutable block, pointers and original bytes outside the lock."""
+        if not self._valid_digest(key):raise ValueError('Invalid pack identifier')
+        folder=self.directory/'packed_v1'
+        manifest=folder/(key+'.pack.json');blob=folder/(key+'.xz')
+        fences={p:self._snapshot_stat(p) for p in (manifest,blob)}
+        ids,rows,packed_bytes=self._load_snapshot_pack(key)
+        header=json.loads(manifest.read_bytes())
+        legacy_bytes=header.get('legacy_bytes')
+        if type(legacy_bytes) is not int or legacy_bytes<=0:
+            raise ValueError('Missing original archive byte count')
+        originals=[];remaining_bytes=0;absent=[]
+        for digest,raw in zip(ids,rows):
+            pointer=self.directory/(digest+'.snapshot-ref')
+            fences[pointer]=self._snapshot_stat(pointer)
+            if self._pack_pointer(pointer)!=key:raise ValueError('Snapshot pointer differs')
+            packed_bytes+=fences[pointer][2]
+            path=self.directory/(digest+'.json.gz')
+            try:info=self._snapshot_stat(path)
+            except FileNotFoundError:
+                absent.append(path);continue
+            with gzip.open(path,'rb') as stream:source=stream.read(self.PACK_RAW_LIMIT+1)
+            if source!=raw:raise ValueError('Original snapshot differs')
+            fences[path]=info
+            originals.append((path,pointer,max(info[3],fences[pointer][3])))
+            remaining_bytes+=info[2]
+        if packed_bytes*2>legacy_bytes or remaining_bytes>legacy_bytes:
+            raise ValueError('Packed snapshot savings below required 50%')
+        if any(self._snapshot_stat(p)!=info for p,info in fences.items()) or any(p.exists() for p in absent):
+            raise ValueError('Archive changed during promotion verification')
+        return dict(ids=ids,fences=fences,absent=absent,originals=originals,
+                    remaining_bytes=remaining_bytes,packed_bytes=packed_bytes,legacy_bytes=legacy_bytes)
+
+    def promote_snapshot_pack(self,key,*,allow_remove=False,stop=None):
+        """Explicit promotion, never invoked by the control loop.
+
+        The expensive decode and full byte comparison run outside the lock.
+        All source fingerprints and absent files are rechecked before removal.
+        Durable pointer mtimes and fsync still require a bounded I/O section.
+        Interrupted unlinks leave verified readable mixed storage.
+        """
+        if allow_remove is not True:
+            raise PermissionError('Packed archive promotion requires explicit opt-in')
+        if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before verification')
+        prepared=self._prepare_pack_promotion(key)
+        with self.lock:
+            if stop is not None and stop.is_set():raise ValueError('Maintenance stopped before removal')
+            if (any(self._snapshot_stat(p)!=info for p,info in prepared['fences'].items())
+                    or any(p.exists() for p in prepared['absent'])):
+                raise ValueError('Archive changed before promotion')
+            originals=prepared['originals']
+            for path,pointer,latest in originals:
+                if latest>prepared['fences'][pointer][3]:
+                    os.utime(pointer,ns=(latest,latest))
+                    with pointer.open('rb') as stream:os.fsync(stream.fileno())
+            self._sync_directory(self.directory/'packed_v1');self._sync_directory(self.directory)
+            previous_bytes=self.used_bytes
+            self.used_bytes=None
+            for path,_,_ in originals:path.unlink()
+            self._sync_directory(self.directory)
+            if stop is not None and previous_bytes is not None:
+                self.used_bytes=previous_bytes-prepared['remaining_bytes']
+                self.snapshot_bytes-=prepared['remaining_bytes']
+            return dict(status='promoted',pack=key,snapshots=len(prepared['ids']),removed=len(originals),
+                        removed_bytes=prepared['remaining_bytes'],packed_bytes=prepared['packed_bytes'],
+                        legacy_bytes=prepared['legacy_bytes'])
+
+    COLD_PACK_MIN_AGE=72*3600
+    COLD_PACK_MIN_BYTES=16*1024
+    COLD_PACK_MAX_BYTES=256*1024
+    COLD_PACK_RECENT_FAILURES=64
+    COLD_QUEUE_LIMIT=64
+
+    def cold_pack_candidates(self,stamp,*,skip=(),stop=None):
+        """Bounded selection from cold, large, unreferenced legacy snapshots.
+
+        Scan without the shared lock; keep only the eight oldest candidates.
+        Live input references are protected by their last-use mtime. Staging
+        rechecks identity and age before publication. Never choose hot/tiny
+        input references or snapshots already represented by a packed pointer.
+        """
+        from heapq import nsmallest
+        rejected=set(skip)
+        def candidates():
+            if stop is not None and stop.is_set():
+                return
+            try:
+                # Path.glob may materialize the directory listing before the
+                # first yield. Stream it, observing shutdown on each entry.
+                with os.scandir(self.directory) as entries:
+                    for entry in entries:
+                        if stop is not None and stop.is_set():
+                            return
+                        if not entry.name.endswith('.json.gz'):
+                            continue
+                        digest=entry.name[:-8]
+                        if not self._valid_digest(digest) or digest in rejected:
+                            continue
+                        try:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            info=entry.stat(follow_symlinks=False)
+                            if not (stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE
+                                    and self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES):
+                                continue
+                            if (self.directory/(digest+'.snapshot-ref')).exists():continue
+                            yield (info.st_mtime,digest)
+                        except FileNotFoundError:
+                            continue
+            except FileNotFoundError:
+                return
+        selected=nsmallest(self.PACK_ROWS,candidates())
+        if stop is not None and stop.is_set():
+            return []
+        return [digest for _,digest in selected]
+
+    def compact_cold_snapshot_batch(self,stamp,*,allow_remove=False,stop=None):
+        """One bounded maintenance attempt on a backup or native executor.
+
+        Explicitly opt in to replacement; online callers provide a stop event
+        and hold the runtime lease until completion. Never run on the safety
+        tick. Rejected groups are skipped in a bounded in-process list.
+        """
+        if allow_remove is not True:
+            raise PermissionError('Cold archive compaction requires explicit opt-in')
+        if stop is not None and stop.is_set():return dict(status='stopped',snapshots=0)
+        skipped=list(getattr(self,'_cold_pack_skipped',()))
+        if stop is None:
+            ids=self.cold_pack_candidates(stamp,skip=skipped)
+        else:
+            # Online maintenance must not repeat the hourly full-directory
+            # scan. A stale shortlist is harmless: staging verifies each
+            # original fingerprint, current age, and pointer absence.
+            with self.lock:
+                if stop.is_set():return dict(status='stopped',snapshots=0)
+                if self.used_bytes is None:return dict(status='deferred',snapshots=0,reason='Archive accounting not ready')
+                ids=list(self._cold_queue[:self.PACK_ROWS])
+                self._cold_queue=self._cold_queue[self.PACK_ROWS:]
+        if stop is not None and stop.is_set():return dict(status='stopped',snapshots=0)
+        if len(ids)<2:return dict(status='no_eligible_batch',snapshots=0)
+        try:
+            # The source-age fence is also checked inside staging publication.
+            staged=self.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp,**({'stop':stop} if stop is not None else {}))
+            if staged['status']!='staged':
+                self._cold_pack_skipped=(skipped+ids)[-self.COLD_PACK_RECENT_FAILURES:]
+                return staged
+            result=self.promote_snapshot_pack(staged['pack'],allow_remove=True,**({'stop':stop} if stop is not None else {}))
+            return result
+        except (OSError,ValueError,TypeError) as exc:
+            # A partially published pack remains additive and can be checked
+            # by the explicit promotion/rollback tools. No blind cleanup.
+            self._cold_pack_skipped=(skipped+ids)[-self.COLD_PACK_RECENT_FAILURES:]
+            return dict(status='deferred',snapshots=len(ids),reason=str(exc))
+
     def read_snapshot(self,digest):
-        if len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):
+        if not self._valid_digest(digest):
             raise ValueError('Invalid snapshot identifier')
-        raw=gzip.decompress((self.directory/(digest+'.json.gz')).read_bytes())
-        if hashlib.sha256(raw).hexdigest()!=digest:
-            raise ValueError('Snapshot checksum mismatch')
-        return json.loads(raw)
+        with self.lock:
+            path=self.directory/(digest+'.json.gz')
+            if path.exists():
+                raw=gzip.decompress(path.read_bytes())
+            else:
+                raw=self._packed_snapshot(digest)
+            if hashlib.sha256(raw).hexdigest()!=digest:
+                raise ValueError('Snapshot checksum mismatch')
+            return json.loads(raw)
 
     def _recent_telemetry_lines(self,path,minimum_ts):
         """Stream the bounded tail from one descriptor, even during a rotation."""

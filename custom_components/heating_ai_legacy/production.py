@@ -74,6 +74,13 @@ class NativeController(HeatingClimate):
         self._manual_energy_ending = False
         self.manual_energy_demand = False
         self._kws_idle_since = None
+        self._archive_job = None
+        self._archive_next_at = 0.
+        self._archive_stop = threading.Event()
+        # This lock guards only the worker/lease handoff, never disk I/O.
+        self._archive_lease_lock = threading.Lock()
+        self._archive_worker_active = False
+        self._archive_deferred_lease = None
 
         self._learning_epoch = uuid4().hex
         self._learning_rows = deque(maxlen=340)
@@ -81,6 +88,9 @@ class NativeController(HeatingClimate):
         self._learning_breaks = set()
         self._learning_last_tick = None
         self._learning_previous_kw = None
+        self._learning_zero_now = False
+        self._learning_zero_seconds = 0.
+        self._learning_zero_interval = False
         self._learning_kw_seconds = 0.
         self._learning_kw_integral = 0.
         self._learning_control_mode = None
@@ -107,6 +117,29 @@ class NativeController(HeatingClimate):
             self.log("Adaptive sample skipped: %s", type(exc).__name__, level="WARNING")
         return result
 
+    def _learning_proven_zero_heat(self, power):
+        """Read-only thermal proof; exact opt-in isolation, two OFF indicators.
+        
+        The configured breaker must be confirmed physically incapable of
+        supplying the boiler on backup or partial mains under this condition.
+        """
+        relay=self.cfg.get("boiler_outage_isolation_relay")
+        if (not isinstance(relay,str) or not relay.startswith("switch.")
+                or relay!=self.cfg.get("kws_relay","switch.energy_meter_kotel")
+                or self.cfg.get("power_accounting_method")!="kws"
+                or getattr(self,"planning_grid_state",None)!="off"):
+            return False
+        helper=self.args.get("grid_presence_helper")
+        if not helper or self.get_state(helper) not in ("off","Відсутня мережа"):
+            return False
+        phases=(self.voltage_status or {}).get("phases_v") or []
+        if any((v:=number(value)) is not None and v>=50 for value in phases):
+            return False
+        if getattr(self,"power_quality",None)=="contradictory":
+            return False
+        kw=number(power)
+        return power is None or kw is not None and 0<=kw<=.05
+
     def _capture_sample_power(self,power):
         stamp = time.time()
         previous = self._learning_last_tick
@@ -118,6 +151,10 @@ class NativeController(HeatingClimate):
         previous_kw = self._learning_previous_kw
         self._learning_previous_kw = kw
         gap = previous is None or not 0 < stamp-previous<=45
+        zero=self._learning_proven_zero_heat(power)
+        if not gap and zero and self._learning_zero_now:
+            self._learning_zero_seconds += stamp-previous
+        self._learning_zero_now=zero
         if not gap and kw is not None and previous_kw is not None:
             duration = stamp-previous
             self._learning_kw_seconds += duration
@@ -142,6 +179,8 @@ class NativeController(HeatingClimate):
             reasons.add("equipment_not_ready")
         if not quality or source != "Вітальня":
             reasons.add("unavailable_physical_input")
+        if self._learning_zero_now and not getattr(self,"_learning_thermal_inputs_ok",False):
+            reasons.add("unavailable_thermal_input")
         if (self.memory.get("room_source_check") or {}).get("status") in ("pending","room_source_disagreement"):
             reasons.add("room_conflict")
         try:
@@ -163,9 +202,9 @@ class NativeController(HeatingClimate):
         if ((number(fire) or 0.)>.2 or self.memory.get("fire_phase")=="Датчик недоступний"
                 or (self.memory.get("fire_circulation") or {}).get("active")):
             reasons.add("fireplace")
-        fan = self.raw("fan") if self.cfg.get("fan") else None
-        if fan!="off":
-            reasons.add("circulation_or_unknown")
+        # Internal circulation is not external airflow or a heat source.
+        # Fireplace activity/unknown temperature and room conflicts retain
+        # their own independent qualification gates above.
         sensed = getattr(self, "ventilation_states", {})
         if not learning.ventilation_current_qualified(sensed):
             reasons.add("unknown_ventilation")
@@ -177,8 +216,14 @@ class NativeController(HeatingClimate):
             return
         try:
             interval_kw = self.measured_sample_power(before,self.last_sample)
+            duration=self.last_sample-before
+            self._learning_zero_interval=bool(duration>=240 and self._learning_zero_now
+                and self._learning_zero_seconds>=duration-1.
+                and "tick_gap_or_restart" not in self._learning_breaks)
             self._learning_append(self.samples[-1], voltage, self._learning_breaks, interval_kw)
         finally:
+            self._learning_zero_seconds=0.
+            self._learning_zero_interval=False
             self._learning_kw_integral = self._learning_kw_seconds = 0.
             self._learning_breaks.clear()
 
@@ -289,16 +334,51 @@ class NativeController(HeatingClimate):
                 break
             ventilation.append(duty)
         issue = number(self.memory.get("weather_at"))
-        solar = learning.solar_context_at(stamp,self.climate_tz,self.weather,issue,
-                                         getattr(self,"solar_geometry",{}))
-        compact.update(report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
+        weather_state=self.raw("weather",attribute="all") if self.cfg.get("weather") else None
+        solar_weather=learning.solar_weather_evidence(stamp,self.climate_tz,self.weather,issue,
+                                getattr(self,"solar_geometry",{}),weather_state)
+        solar=solar_weather["forecast_factor"]
+        compact.update(zero_heat_provenance="verified_mains_isolation" if self._learning_zero_now else None,
+            zero_heat_interval_verified=self._learning_zero_interval,
+            thermal_inputs_ok=getattr(self,"_learning_thermal_inputs_ok",False) is True,
+            circulation_role="internal_redistribution",
+            circulation_active=self.raw("fan")=="on" if self.cfg.get("fan") else None,
+            report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
             voltage_qualified=voltage,
             shadow_ventilation=ventilation, epoch=self._learning_epoch, weather_issue_at=issue,
-            solar_factor=solar, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
+            solar_factor=solar, solar_weather=solar_weather, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
         self._learning_rows.append(compact)
         if verified:
+            if "advisory_validation" in self.memory:
+                self.memory["advisory_validation"]=learning.advisory_validation_update(
+                    self.memory.get("advisory_validation"),stamp,self._advisory_identity(),report=compact)
             self._monitor_learning(observed)
+
+    def _advisory_identity(self):
+        return [self.model.get("version"),self.memory.get("equipment_version",0),
+                self.cfg.get("boiler_power_mode","unconfirmed")]
+
+    def advisory_validation_view(self):
+        # The ledger is replaced, never mutated, by advisory_validation_update.
+        # Recompute on identity change or exact 30-day expiry, not on every tick.
+        state=self.memory.get("advisory_validation")
+        identity=self._advisory_identity()
+        now=self.now();stamp=now.timestamp()
+        cached=getattr(self,"_advisory_view_cache",None)
+        if (cached is not None and cached[0] is state and cached[1]==identity
+                and cached[2]==now.tzinfo and cached[3]<=stamp<=cached[4]
+                and datetime.fromtimestamp(cached[3],now.tzinfo).date()==now.date()):
+            return cached[5]
+        result=learning.advisory_validation_summary(state,identity,now.tzinfo,stamp)
+        next_expiry=min((p["reported"]+30*86400 for p in (state or {}).get("completed",[])
+                         if p.get("identity")==identity and p["reported"]+30*86400>=stamp),default=float("inf"))
+        self._advisory_view_cache=(state,identity,now.tzinfo,stamp,next_expiry,result)
+        return result
+
+    def remember_advisory_outlook(self, now, outlook):
+        self.memory["advisory_validation"]=learning.advisory_validation_update(
+            self.memory.get("advisory_validation"),now.timestamp(),self._advisory_identity(),outlook=outlook)
 
     def _monitor_learning(self, reported):
         checkpoint=self.memory.get("online_learning") or {}
@@ -329,6 +409,18 @@ class NativeController(HeatingClimate):
 
     def remember_plan_inputs(self, now, room, floor, outside, fire, weather, settings, forecast, previous):
         result = super().remember_plan_inputs(now,room,floor,outside,fire,weather,settings,forecast,previous)
+        if isinstance(forecast,dict) and learning.solar_nominal_settings(settings) is not None:
+            try:
+                nominal=learning.project_solar_nominal(now,room,floor,outside,fire,weather,settings,forecast,self.model)
+                if nominal is not None:
+                    forecast["_solar_nominal_fine"]=nominal["fine"]
+                    forecast["solar_nominal_curve"]=nominal["curve"]
+                    forecast["solar_nominal_assumption"]="conditional_solar_same_plan_no_control_credit"
+                else:
+                    forecast["solar_nominal_assumption"]="unavailable_exact_trace_required"
+            except (ValueError,TypeError,KeyError,ArithmeticError,MemoryError) as exc:
+                forecast["solar_nominal_assumption"]="unavailable_projection_failed"
+                self.log("Conditional solar outlook skipped: %s",type(exc).__name__,level="WARNING")
         stamp = now.timestamp()
         if self._learning_current_ok and stamp-self._learning_last_issue>=10920:
             try:
@@ -391,6 +483,8 @@ class NativeController(HeatingClimate):
         eligible=self._learning_eligible()
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
                     generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
+                    solar_ventilation=deepcopy(self.active_ventilation_model()),
+                    solar_risk=deepcopy(self.active_solar_risk_certificate()),
                     schedule=dict(day=now.date().isoformat(),slot=slot,
                                   room_report=self._learning_last_report,eligible_at_issue=eligible))
         self._learning_job=issued
@@ -398,11 +492,12 @@ class NativeController(HeatingClimate):
         try:
             self.submit_to_executor(learning.run_learning,self.directory/"online_learning_v1.json",
                 tuple(self._learning_rows),tuple(self._learning_forecasts),issued["model"],
-                deepcopy(self.memory.get("ventilation_model") or {}),
+                issued["solar_ventilation"],
                 deepcopy(self.memory.get("online_learning") or {}),now,eligible,
                 dict(mode=self.cfg.get("boiler_power_mode","unconfirmed"),equipment=issued["equipment"],
                      calibrations=deepcopy(self.memory.get("power_calibrations") or {}),
-                     active=deepcopy(self.memory.get("kws_forecast_profile"))),
+                     active=deepcopy(self.memory.get("kws_forecast_profile")),
+                     solar_risk=issued["solar_risk"]),
                 callback=self._learning_finished,job_id=issued["id"])
         except Exception as exc:
             self._learning_job=None
@@ -421,14 +516,109 @@ class NativeController(HeatingClimate):
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
                                         "verified_reports","rejection_counts","current_reasons","eligibility_counts",
-                                        "analysis_status","analysis_blockers")}
+                                        "analysis_status","analysis_blockers","parameter_support","solar","solar_prospective","solar_weather")}
         if result.get("power_learning") is not None:
             self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
         self._apply_learning_result(issued,result)
+        self._update_solar_credit(issued,result)
+        self._store_solar_risk_candidate(issued,result)
         if self._learning_status.get("status") not in ("accepted","rolled_back"):
             checkpoint=self.memory.setdefault("online_learning",{})
             checkpoint["changes_history"]=self._learning_history(
                 checkpoint,self._learning_status["status"],self._learning_status.get("reason"))
+
+    def active_solar_risk_certificate(self):
+        checkpoint=self.memory.get("online_learning") or {}
+        certificate=checkpoint.get("solar_risk_candidate") or {}
+        identity=[self.model.get("version"),self.memory.get("equipment_version",0),
+                  self.cfg.get("boiler_power_mode","unconfirmed")]
+        coefficient=number(certificate.get("coefficient"))
+        if (certificate.get("identity")==identity and certificate.get("status")=="holdout_passed"
+                and certificate.get("ventilation_model")== self.active_ventilation_model()
+                and type(certificate.get("comfort_credit")) is bool
+                and number(certificate.get("stored_at")) is not None
+                and certificate["stored_at"]>=checkpoint.get("evidence_after",0)
+                and coefficient is not None and 0<coefficient<=.8):
+            if certificate["comfort_credit"] and (number(certificate.get("nominal_at")) is None
+                    or certificate.get("nominal_revoked_at") is not None
+                    or (certificate.get("nominal_validation") or {}).get("status")!="passed"):
+                return {}
+            return certificate
+        return {}
+
+    def _store_solar_risk_candidate(self, issued, result):
+        """Persist evaluated solar evidence, not an authorization to heat less."""
+        solar=result.get("solar") or {}
+        if (result.get("proposed") or result.get("proposed_power") or result.get("rollback")
+                or solar.get("risk_eligible") is not True or solar.get("status")!="holdout_passed"
+                or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
+                or issued["equipment"]!=self.memory.get("equipment_version",0)
+                or issued.get("solar_ventilation")!=self.active_ventilation_model()
+                or time.monotonic()-issued["started"]>120 or not self._learning_eligible()):
+            return
+        identity=[self.model.get("version"),issued["equipment"],self.cfg.get("boiler_power_mode","unconfirmed")]
+        coefficient=number(solar.get("coefficient"))
+        if solar.get("identity")!=identity or coefficient is None or not 0<coefficient<=.8:
+            return
+        checkpoint=self.memory.setdefault("online_learning",{})
+        old=checkpoint.get("solar_risk_candidate")
+        if old and (old.get("holdout_end",0)>=solar.get("holdout_end",0)
+                    or self.now().timestamp()<old.get("nominal_frozen_until",0)
+                    or old.get("nominal_revoked_at",0)>=solar.get("holdout_end",0)):
+            return
+        checkpoint["solar_risk_candidate"]={**solar,"comfort_credit":False,
+            "ventilation_model":deepcopy(self.active_ventilation_model()),
+            "stored_at":self.now().timestamp()}
+        try:
+            self.save()
+        except (OSError,TypeError,ValueError,MemoryError):
+            if old is None:checkpoint.pop("solar_risk_candidate",None)
+            else:checkpoint["solar_risk_candidate"]=old
+            self._learning_status["solar"]={**solar,"status":"storage_failed"}
+            return
+        self.next_compute=0
+
+    def _update_solar_credit(self, issued, result):
+        """One fixed coefficient; guarded promotion or safety rollback."""
+        report=result.get("solar_prospective") or {}
+        active=self.active_solar_risk_certificate()
+        if (not active or active!=issued.get("solar_risk")
+                or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
+                or issued["equipment"]!=self.memory.get("equipment_version",0)
+                or issued.get("solar_ventilation")!=self.active_ventilation_model()
+                or time.monotonic()-issued["started"]>120
+                or self.memory.get("state_load_error") or getattr(self,"settings_transaction",False)
+                or report.get("identity")!=active["identity"]
+                or report.get("coefficient")!=active["coefficient"]):
+            return
+        stamp=self.now().timestamp()
+        checkpoint=self.memory["online_learning"]
+        next_certificate=dict(active)
+        if (report.get("status")=="passed" and not active["comfort_credit"]
+                and active.get("nominal_revoked_at") is None
+                and report.get("issued_after")==active["stored_at"]
+                and not result.get("proposed") and not result.get("proposed_power") and not result.get("rollback")
+                and stamp>=checkpoint.get("frozen_until",0)
+                and self._learning_eligible()):
+            next_certificate.update(comfort_credit=True,nominal_at=stamp,
+                                    nominal_validation=deepcopy(report))
+        elif (report.get("status")=="rollback_required" and active["comfort_credit"]
+                and report.get("issued_after")==active.get("nominal_at")):
+            # A conservative removal of credit needs no actuator permission,
+            # but the exact issued identity and successful durable write do.
+            next_certificate.update(comfort_credit=False,nominal_revoked_at=stamp,
+                nominal_frozen_until=stamp+7*86400,
+                nominal_rollback_reason=report.get("rollback_reason"))
+        else:
+            return
+        checkpoint["solar_risk_candidate"]=next_certificate
+        try:
+            self.save()
+        except (OSError,TypeError,ValueError,MemoryError):
+            checkpoint["solar_risk_candidate"]=active
+            self._learning_status["solar_prospective"]={**report,"status":"storage_failed"}
+            return
+        self.next_compute=0
 
     def _apply_learning_result(self, issued, result):
         if not (result.get("proposed") or result.get("proposed_power") or result.get("rollback")):
@@ -484,8 +674,9 @@ class NativeController(HeatingClimate):
     def _commit_learning_model(self, model, checkpoint, status, reason):
         """Commit the model and its rollback evidence at one filesystem boundary."""
         ventilation=self.memory.get("ventilation_model")
-        active_vent=bool(ventilation and ventilation.get("validated")
-                         and ventilation.get("model_version")==self.model.get("version"))
+        qualified_ventilation=self.active_ventilation_model()
+        active_vent=bool(qualified_ventilation.get("validated")
+                         and qualified_ventilation.get("model_version")==self.model.get("version"))
         if status=="accepted" and active_vent and model.get("room_loss")!=self.model.get("room_loss"):
             self._learning_status.update(status="rejected",reason="room_loss_not_identifiable_with_ventilation")
             return False
@@ -578,6 +769,81 @@ class NativeController(HeatingClimate):
         # Marketplace unload/reload revokes this bridge before replacing code.
         return False
 
+    ARCHIVE_MAINTENANCE_INTERVAL = 900
+    ARCHIVE_CLOSE_TIMEOUT = 4.
+
+    def schedule_archive_maintenance(self, stamp):
+        """Use the existing tick only to dispatch a bounded cold archive job."""
+        if (self._closing or not self._running or not self._writer
+                or stamp < self._archive_next_at or self._archive_job is not None
+                or self._kws_idle_since is None or stamp-self._kws_idle_since < 60
+                or self._learning_job is not None or any(not job.get("completed")
+                    for job in getattr(self,"calculation_jobs",{}).values())):
+            return
+        journal=getattr(self,"decision_journal",None)
+        if journal is None:
+            return
+
+        def launch():
+            if self._closing or not self._running or not self._writer or self._archive_job is not None:
+                return
+            self._archive_next_at=stamp+self.ARCHIVE_MAINTENANCE_INTERVAL
+            self._archive_stop.clear()
+            self._archive_job=self.hass.async_create_task(
+                self._maintain_archive(journal,stamp),"Heating AI cold archive maintenance")
+        self._on_loop(launch)
+
+    def _archive_worker(self,journal,stamp):
+        # Ownership is tied to the actual executor thread, not a cancellable
+        # asyncio future. A worker queued behind shutdown cannot enter.
+        with self._archive_lease_lock:
+            if self._archive_stop.is_set() or self._closing or self._archive_worker_active:
+                return dict(status="stopped",snapshots=0)
+            self._archive_worker_active=True
+        try:
+            return journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=self._archive_stop)
+        finally:
+            with self._archive_lease_lock:
+                self._archive_worker_active=False
+                lease,self._archive_deferred_lease=self._archive_deferred_lease,None
+            if lease is not None:
+                lease.close()
+
+    def close_archive_lease(self,lease):
+        # Even repeated cancellation cannot unlock a live archive writer.
+        # Transfer the open file to the worker on timeout; a new writer will
+        # fail the existing nonblocking flock until the old worker exits.
+        self._archive_stop.set()
+        with self._archive_lease_lock:
+            if self._archive_worker_active:
+                self._archive_deferred_lease=lease
+                return
+        lease.close()
+
+    async def _maintain_archive(self,journal,stamp):
+        try:
+            result=await self.hass.async_add_executor_job(self._archive_worker,journal,stamp)
+            journal.cold_pack_maintenance=dict(at=stamp,**result)
+        except asyncio.CancelledError:
+            self._archive_stop.set()
+            raise
+        except Exception as exc:
+            journal.cold_pack_maintenance=dict(at=stamp,status="deferred",reason=type(exc).__name__)
+            self.log("Cold archive maintenance deferred: %s",type(exc).__name__,level="WARNING")
+        finally:
+            self._archive_job=None
+
+    async def async_close(self):
+        self._closing=True
+        self._writer=False
+        self._archive_stop.set()
+        job=self._archive_job
+        if job is not None:
+            done,_=await asyncio.wait({job},timeout=self.ARCHIVE_CLOSE_TIMEOUT)
+            if not done:
+                self.log("Cold archive shutdown budget reached; writer lease retained until executor exits",level="WARNING")
+        await super().async_close()
+
     def tick(self, kwargs=None, **extra):
         """Recover on the existing tick; never create another polling task."""
         try:
@@ -611,6 +877,9 @@ class NativeController(HeatingClimate):
                     self._kws_idle_since = time.time()
             else:
                 self._kws_idle_since = None
+                if self._archive_job is not None:
+                    self._archive_stop.set()
+            self.schedule_archive_maintenance(time.time())
             return result
         finally:
             # An unconfirmed manual-only STOP must be retried on subsequent
@@ -1746,7 +2015,7 @@ class NativeController(HeatingClimate):
             accepted_metrics=checkpoint.get("metrics",{})
             previous=checkpoint.get("prior_model") or {}
             changes=[dict(parameter=key,before=previous[key],after=self.model[key])
-                     for key in ("floor_air","room_loss")
+                     for key in learning.FIT_FIELDS
                      if key in previous and key in self.model and previous[key]!=self.model[key]]
             attributes.update(last_accepted_changes=changes,
                 last_completed_analysis=(self.memory.get("adaptive_schedule") or {}).get("completed_at"),
@@ -1769,10 +2038,19 @@ class NativeController(HeatingClimate):
                 current_reasons=report.get("current_reasons",[]),
                 analysis_status=report.get("analysis_status","pending"),
                 analysis_blockers=report.get("analysis_blockers",[]),
+                parameter_support=report.get("parameter_support",{}),
+                solar_learning=report.get("solar") or {},
+                solar_prospective=report.get("solar_prospective") or {},
+                solar_weather=report.get("solar_weather") or {},
+                solar_risk_active={k:v for k,v in self.active_solar_risk_certificate().items()
+                    if k in ("coefficient","stored_at","holdout_days","holdout_windows","comfort_credit",
+                             "nominal_at","nominal_revoked_at","nominal_frozen_until","nominal_rollback_reason")},
                 candidate_holdout_mae_1h=metrics.get("1",{}).get("new",{}).get("mae"),
                 candidate_holdout_mae_3h=metrics.get("3",{}).get("new",{}).get("mae"),
                 active_version=self.model.get("version"),rollback_reason=checkpoint.get("rollback_reason"),
                 next_learning=upcoming.isoformat())
+        if entity == "sensor.heating_controller_quality":
+            attributes["advisory_validation"]=self.advisory_validation_view()
         if entity == "sensor.heating_diagnostics":
             now = time.time()
             observation = getattr(self, "power_observation", {})
@@ -1826,7 +2104,11 @@ class ProductionRuntime:
             try:
                 await self.controller.async_close()
             finally:
-                self.lease.close()
+                close_archive_lease=getattr(self.controller,"close_archive_lease",None)
+                if close_archive_lease is None:
+                    self.lease.close()
+                else:
+                    close_archive_lease(self.lease)
 
 
 async def async_setup_production(hass, entry):
@@ -1851,6 +2133,10 @@ async def async_setup_production(hass, entry):
                voltage_entities=entry.data.get("voltage_entities", [SOURCE_HINTS[f"voltage_l{i}"] for i in (1,2,3)]))
     cfg.update({key: entry.options.get(key, default) for key, default in (
         ("min_voltage_v", 190), ("max_voltage_v", 260), ("voltage_recovery_seconds", 30))})
+    # Keep the confirmation bound to the exact entity selected in native
+    # options. Empty or legacy options do not infer any supply topology.
+    cfg["grid_only_ventilation_entities"] = entry.options.get("grid_only_ventilation_entities", [])
+    cfg["boiler_outage_isolation_relay"] = entry.options.get("boiler_outage_isolation_relay","")
     missing = [cfg[key] for key in ("thermostat", "room", "return", "mode", "armed")
                if hass.states.get(cfg[key]) is None]
     if missing:

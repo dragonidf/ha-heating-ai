@@ -16,11 +16,11 @@ from copy import deepcopy
 from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation,partial_balance_bounds,reserve_control_prior,inlet_power,inlet_entities,reconcile_energy)
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
-                           nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
+                           nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,advisory_outlook_48,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,retain_kws_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
-from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at,
+from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,ventilation_powered_expectation,effective_ventilation_duty,ventilation_binding_identity,compatible_ventilation_fit,VENTILATION_DUTY_POLICY,room_reporting_limits,gain_at,
                                  solar_context,room_source_check,observe_residual,residual_at,ENVIRONMENT_POLICY_VERSION)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
@@ -502,7 +502,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 entities.extend(inlet_entities(config.get('power_inlet_config') or {}))
                 if any(self.get_state(entity,attribute='all') is None for entity in entities):raise ValueError('Сутність не існує в Home Assistant')
             before=deepcopy((self.cfg,self.model,self.memory,self.next_compute))
-            volatile=('ventilation_totals','ventilation_at','stage_totals','inlet_accounting_started','inlet_stage_candidate','inlet_power_window')
+            volatile=('ventilation_totals','ventilation_at','ventilation_states','stage_totals','inlet_accounting_started','inlet_stage_candidate','inlet_power_window')
             previous_runtime={k:deepcopy(getattr(self,k)) for k in volatile if hasattr(self,k)}
             estimator=deepcopy(self.power_estimator.__dict__) if hasattr(self,'power_estimator') else None
             self.settings_transaction=True
@@ -515,7 +515,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.decision_event('equipment_change',reason='Змінено опис фізичного обладнання',force=True,
                     snapshot=dict(previous={k:self.cfg.get(k) for k in changed},values=changed,pending_hourly=self.memory.get('predictions',[])))
                 self.memory['predictions']=[]
-                self.ventilation_totals={};self.ventilation_at=time.time();self.stage_totals={}
+                self.ventilation_totals={};self.ventilation_states={};self.ventilation_at=time.time();self.stage_totals={}
                 history=self.memory.setdefault('equipment_history',[])
                 history.append(dict(at=self.now().isoformat(),previous={k:self.cfg.get(k,'unconfirmed') for k in changed},values=changed))
                 del history[:-32]
@@ -619,12 +619,43 @@ class HeatingClimate(HeatingRecovery,Hass):
                 if entity not in tracked:tracked[entity]=self.listen_state(self.ventilation_changed,entity)
             self.equipment_listeners=tracked
 
+    def ventilation_forecast_inputs(self):
+        """Memoize immutable sample-ring summaries, not live actuator evidence.
+
+        Sampling/recovery replaces the ring; live relay, entity and supply
+        changes are independent cache invalidators. No elapsed-time throttle.
+        """
+        samples=self.samples
+        states=getattr(self,'ventilation_states',{})
+        last=samples[-1] if samples else None
+        key=tuple((k,tuple((states.get(k) or {}).get(f) for f in
+                  ('entity','relay','effective_duty','supply_provenance'))) for k in ('recuperator','bath'))
+        cached=getattr(self,'_ventilation_forecast_cache',None)
+        if cached is not None and cached[0] is samples and cached[1]==len(samples) and cached[2] is last and cached[3]==key:
+            return cached[4]
+        expected,support=ventilation_expectation(samples,states)
+        powered=ventilation_powered_expectation(samples,states)
+        result=(expected,support,powered)
+        self._ventilation_forecast_cache=(samples,len(samples),last,key,result)
+        return result
+
+    def active_ventilation_model(self):
+        return compatible_ventilation_fit(self.memory.get('ventilation_model') or {},
+                                         ventilation_binding_identity(self.cfg))
+
     def refresh_equipment_models(self):
         self.memory['power_calibrations']=retain_kws_profile(learn_power_modes(self.samples,self.model),
             self.memory.get('kws_forecast_profile'),self.model,self.memory.get('equipment_version',0))
-        fit=fit_ventilation(self.samples,self.model,self.climate_tz)
-        previous=self.memory.get('ventilation_model') or {}
+        bindings=ventilation_binding_identity(self.cfg)
+        fit=fit_ventilation(self.samples,self.model,self.climate_tz,bindings or None)
+        stored=self.memory.get('ventilation_model') or {}
+        previous=self.active_ventilation_model()
         today=self.now().date().isoformat()
+        if stored.get('validated') and not previous and not fit.get('validated'):
+            # Preserve the old certificate and expose the migration blocker.
+            # Until independently fitted, the controller uses its base model.
+            self.memory['ventilation_candidate']=fit
+            return
         if previous.get('validated') and previous.get('model_version')==self.model.get('version'):
             if not fit['validated'] or previous.get('fit_day')==today:return
             clipped=False
@@ -637,6 +668,10 @@ class HeatingClimate(HeatingRecovery,Hass):
                 fit.update(validated=False,reason='daily_bound_requires_revalidation')
                 self.memory['ventilation_candidate']=fit;return
         self.memory['ventilation_model']=dict(fit,fit_day=today)
+        if fit.get('validated'):
+            self.memory.pop('ventilation_candidate',None)
+            if stored.get('validated') and not previous:
+                self.memory['ventilation_legacy_certificate']=stored
 
     def read_power_snapshot(self,entities):
         template="""{% set ns=namespace(rows={}) %}{% for id in entities %}{% set s=states[id] %}{% if s is not none %}{% set ns.rows=dict(ns.rows,**{id:dict(value=s.state,at=as_timestamp(s.last_reported if s.last_reported is defined else s.last_updated,none),unit=s.attributes.get('unit_of_measurement'),temperature=s.attributes.get('current_temperature'),target=s.attributes.get('temperature'),kind='active')}) %}{% endif %}{% endfor %}{{ ns.rows|tojson }}"""
@@ -833,9 +868,13 @@ class HeatingClimate(HeatingRecovery,Hass):
             recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
             energy=self.memory.get('kws_energy') if self.cfg.get('power_accounting_method')=='kws' else self.memory.get('inlet_energy') if self.cfg.get('power_accounting_method')=='inlet' else self.memory.get('power_observation_ledger'),
             accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')))
-        self.publish('sensor.heating_ventilation','Враховано' if (self.memory.get('ventilation_model') or {}).get('validated') else 'Навчання; чинна базова модель',
+        active_ventilation=self.active_ventilation_model()
+        self.publish('sensor.heating_ventilation','Враховано' if active_ventilation.get('validated') else 'Навчання; чинна базова модель',
             **wire(dict(friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
-            model=self.memory.get('ventilation_model') or {},candidate=self.memory.get('ventilation_candidate'),
+            model=active_ventilation,candidate=self.memory.get('ventilation_candidate'),
+            stored_certificate_compatible=bool(active_ventilation),
+            legacy_certificate_retained=bool(self.memory.get('ventilation_legacy_certificate') or
+                self.memory.get('ventilation_model') and not active_ventilation),
             note='Реле не доводить витрату повітря; майбутній duty — сценарій, не точний розклад')))
 
     def ai_report_changed(self,entity,attribute,old,new,kwargs=None,**extra):
@@ -934,43 +973,73 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.ventilation_tick()
     def ventilation_tick(self,stamp=None):
         stamp=time.time() if stamp is None else stamp
-        states=getattr(self,'ventilation_states',{})
-        elapsed=max(0.,stamp-getattr(self,'ventilation_at',stamp))
+        previous_at=getattr(self,'ventilation_at',stamp)
+        if stamp<previous_at:
+            return  # late callback must not move the integration clock backwards
+        old_states=getattr(self,'ventilation_states',{})
+        elapsed=stamp-previous_at
         totals=getattr(self,'ventilation_totals',{})
-        for name,old in states.items():
-            row=totals.setdefault(name,dict(seconds=0.,on=0.,unknown=0.,supply_on=0.,supply_unknown=0.,
-                                            powered_on=0.,grid_on=0.,grid_unknown=0.))
-            row['seconds']+=elapsed
-            known=elapsed<=45
-            row['on']+=elapsed if known and old['relay']=='on' else 0.
-            row['unknown']+=elapsed if not known or old['relay'] not in ('on','off') else 0.
-            row['supply_on']+=elapsed if known and old['supply']=='on' else 0.
-            row['supply_unknown']+=elapsed if not known or old['supply'] not in ('on','off') else 0.
-            row['powered_on']+=elapsed if known and old['relay']=='on' and old['supply']=='on' else 0.
-            row['grid_on']+=elapsed if known and old['grid']=='on' else 0.
-            row['grid_unknown']+=elapsed if not known or old['grid']=='unknown' else 0.
         bindings=self.cfg.get('ventilation',{})
         states={}
-        if isinstance(bindings,dict):
+        if isinstance(bindings,dict) and bindings:
+            grid=self.grid_state()
             for name,binding in bindings.items():
                 if not isinstance(binding,dict) or not isinstance(binding.get('entity'),str):continue
-                states[name]=dict(relay=self.get_state(binding['entity']),
-                    supply=self.get_state(binding['power_entity']) if isinstance(binding.get('power_entity'),str) else 'unknown',
-                    grid=self.grid_state(),entity=binding['entity'])
+                # An explicit supply sensor has priority. Grid-only topology is
+                # opt-in per physical binding; never infer it from a relay name.
+                power_entity=binding.get('power_entity')
+                if isinstance(power_entity,str):
+                    supply=self.get_state(power_entity);provenance='supply_sensor'
+                elif (binding.get('supply_kind')=='grid_only' or
+                      isinstance(self.cfg.get('grid_only_ventilation_entities'),(list,tuple)) and
+                      binding['entity'] in self.cfg['grid_only_ventilation_entities']):
+                    supply=grid;provenance='verified_grid_topology'
+                else:
+                    supply='unknown';provenance='unknown'
+                relay=self.get_state(binding['entity'])
+                duty=0. if supply=='off' or relay=='off' else 1. if supply=='on' and relay=='on' else None
+                states[name]=dict(relay=relay,supply=supply,grid=grid,entity=binding['entity'],
+                                  supply_provenance=provenance,effective_duty=duty)
+        for name,old in old_states.items():
+            row=totals.setdefault(name,dict(seconds=0.,on=0.,unknown=0.,supply_on=0.,supply_unknown=0.,
+                                            powered_on=0.,grid_on=0.,grid_unknown=0.,effective_on=0.,effective_unknown=0.))
+            row['seconds']+=elapsed
+            known=elapsed<=45
+            current=states.get(name) or {}
+            # Grid transitions observed by polling are not timestamped airflow
+            # events. Do not assign the entire preceding interval to either side.
+            supply_known=known and not (old.get('supply_provenance')=='verified_grid_topology'
+                                        and old['grid']!=current.get('grid'))
+            row['on']+=elapsed if known and old['relay']=='on' else 0.
+            row['unknown']+=elapsed if not known or old['relay'] not in ('on','off') else 0.
+            row['supply_on']+=elapsed if supply_known and old['supply']=='on' else 0.
+            row['supply_unknown']+=elapsed if not supply_known or old['supply'] not in ('on','off') else 0.
+            row['powered_on']+=elapsed if supply_known and old['relay']=='on' and old['supply']=='on' else 0.
+            row['grid_on']+=elapsed if known and old['grid']=='on' else 0.
+            row['grid_unknown']+=elapsed if not known or old['grid']=='unknown' else 0.
+            duty=old.get('effective_duty')
+            if not known or (not supply_known and old['relay']!='off'):
+                duty=None
+            row['effective_on']+=elapsed if duty==1. else 0.
+            row['effective_unknown']+=elapsed if duty is None else 0.
         self.ventilation_states=states;self.ventilation_totals=totals;self.ventilation_at=stamp
     def ventilation_sample(self,stamp):
         self.ventilation_tick(stamp)
         result={}
+        bindings=ventilation_binding_identity(self.cfg)
         for name,row in self.ventilation_totals.items():
             seconds=row['seconds']
-            result[name]=dict(entity=self.ventilation_states.get(name,{}).get('entity'),seconds=round(seconds,1),
+            identity=bindings.get(name) or {}
+            result[name]=dict(**identity,duty_policy=VENTILATION_DUTY_POLICY,seconds=round(seconds,1),
                 on_fraction=round(row['on']/seconds,4) if seconds else None,
                 unknown_fraction=round(row['unknown']/seconds,4) if seconds else None,
                 supply_on_fraction=round(row['supply_on']/seconds,4) if seconds else None,
                 supply_unknown_fraction=round(row['supply_unknown']/seconds,4) if seconds else None,
                 powered_relay_on_fraction=round(row['powered_on']/seconds,4) if seconds and row['supply_unknown']==0 else None,
                 grid_on_fraction=round(row['grid_on']/seconds,4) if seconds else None,
-                grid_unknown_fraction=round(row['grid_unknown']/seconds,4) if seconds else None)
+                grid_unknown_fraction=round(row['grid_unknown']/seconds,4) if seconds else None,
+                effective_on_fraction=round(row['effective_on']/seconds,4) if seconds else None,
+                effective_unknown_fraction=round(row['effective_unknown']/seconds,4) if seconds else None)
         self.ventilation_totals={}
         return result
 
@@ -1709,6 +1778,9 @@ class HeatingClimate(HeatingRecovery,Hass):
             'thermostat':thermostat is None or not 5<=thermostat<=40 or self.raw('thermostat') in ('unknown','unavailable',None),
             'settings':not valid,'model':not self.model.get('validated'),'grid':grid!='on'}.items() if failed])
         astronomy,room_check=self.learning_environment(now,primary,thermostat)
+        # Thermal observations are independent of actuator permission.
+        self._learning_thermal_inputs_ok=bool(room is not None and probe_ok and outside is not None
+                                              and outside_fresh and source=='Вітальня')
         self.sample(room,probe,outside,None if measured_power is None else measured_power/1000,fire,source,primary,thermostat,quality and outside_fresh and not reserve_active,settings)
         self.energy_tick()
         self.run_diagnostic('cycle_energy',self.observe_cycle_energy,now,settings,measured_power,self.val('energy'),grid,automatic,
@@ -1739,16 +1811,16 @@ class HeatingClimate(HeatingRecovery,Hass):
             settings['unknown_power_components']=list(self.control_power_bounds.get('unknown_components',[]))
         settings['equipment_version']=self.memory.get('equipment_version',0)
         settings['thermal_model_version']=self.model.get('version')
-        settings['ventilation_model']=self.memory.get('ventilation_model') or {}
-        settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
+        settings['ventilation_model']=self.active_ventilation_model()
+        settings['ventilation_expected'],ventilation_support,settings['ventilation_grid_only']=self.ventilation_forecast_inputs()
         floor=forecast_probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
         ventilation=getattr(self,'ventilation_states',{})
         recent_ventilation=(self.samples[-1].get('ventilation') or {}) if self.samples else {}
         totals=getattr(self,'ventilation_totals',{})
-        quiet_ventilation=all((ventilation.get(k) or {}).get('relay')=='off' and
-            not any((totals.get(k) or {}).get(field,0)>0 for field in ('on','unknown')) and
-            all((recent_ventilation.get(k) or {}).get(field)==0 for field in ('on_fraction','unknown_fraction'))
+        quiet_ventilation=all((ventilation.get(k) or {}).get('effective_duty')==0 and
+            not any((totals.get(k) or {}).get(field,0)>0 for field in ('effective_on','effective_unknown')) and
+            effective_ventilation_duty(recent_ventilation.get(k))==0
             for k,v in (self.cfg.get('ventilation') or {}).items() if isinstance(v,dict) and v.get('entity'))
         equipment=getattr(self,'equipment_status',{}) or {}
         if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason=settings['control_power_basis'])
@@ -1778,7 +1850,16 @@ class HeatingClimate(HeatingRecovery,Hass):
                                    grid=='on' and equipment.get('ready') is True and quiet_ventilation and
                                    self.memory.get('fire_phase')=='Неактивний')
             self.memory['solar_observer']=solar
-            settings['environment']={'solar':dict(solar),'astronomy':astronomy,'timezone':str(self.climate_tz),
+            # Bind the read-only candidate to the current thermal/equipment
+            # identity on every existing tick; stale certificates are inert.
+            certificate=self.active_solar_risk_certificate() if hasattr(self,'active_solar_risk_certificate') else {}
+            forecast_solar=dict(solar)
+            if certificate:
+                forecast_solar['risk_coefficient']=certificate['coefficient']
+                if certificate.get('comfort_credit') is True:
+                    forecast_solar.update(validated=True,coefficient=certificate['coefficient'],
+                                          control_no_sun=True)
+            settings['environment']={'solar':forecast_solar,'astronomy':astronomy,'timezone':str(self.climate_tz),
                                      'last_heated_at':thermal.get('last_heated_at')}
             # Quantise the safety reserve so tiny MAE changes do not replan.
             settings['upper_margin']=round(environment_quality['upper_margin'],1)
@@ -1786,8 +1867,14 @@ class HeatingClimate(HeatingRecovery,Hass):
                 friendly_name='Клімат — оцінка запасу тепла підлоги',unit_of_measurement='°C',
                 estimated=True,raw_return=probe if probe_ok else None,return_estimated=not probe_ok,floor_source=thermal['source'],
                 external_gain_c_per_hour=round(solar.get('observed_gain',0.),3),
-                solar_learning_days=solar['days'],solar_validated=solar['validated'],
-                solar_coefficient=round(solar['coefficient'],3),weather_condition=condition,
+                solar_learning_days=certificate.get('days',solar['days']),solar_validated=forecast_solar['validated'],
+                solar_coefficient=round(forecast_solar['coefficient'],3),weather_condition=condition,
+                solar_observation_quality=solar.get('observation_quality'),
+                solar_risk_coefficient=forecast_solar.get('risk_coefficient'),
+                solar_risk_holdout_days=certificate.get('holdout_days',0),
+                solar_risk_holdout_windows=certificate.get('holdout_windows',0),
+                solar_risk_only=bool(certificate and not certificate.get('comfort_credit')),
+                solar_nominal_validated=bool(certificate.get('comfort_credit')),
                 astronomy_available=bool(astronomy),room_source_check=room_check['status'],
                 recent_mae=environment_quality['recent_mae'],upper_margin=settings['upper_margin'],
                 note='Еквівалент запасу тепла, не температура поверхні; зовнішній прогрів не доводить сонце')
@@ -1833,8 +1920,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         if forecast_quality and valid:
             guard_floor=max(floor,probe) if reserve_active else floor
             peak=max(r['temperature'] for r in coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings))
-            upper_peak=max(r['temperature'] for r in coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings,upper=True))
-            coast_overheat=coast_exceeds_profile(now,room,guard_floor,outside,fire,self.model,settings)
+            upper_rows=coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings,upper=True)
+            upper_peak=max(r['temperature'] for r in upper_rows)
+            coast_overheat=coast_exceeds_profile(now,room,guard_floor,outside,fire,self.model,settings,
+                                                upper_rows=upper_rows)
         manual_requested=bool(getattr(self,'manual_extra_demand',lambda *_:False)(
             now.timestamp(),grid,outage_now,room,upper,coast_overheat,permitted))
         manual_ending=bool(getattr(self,'_manual_energy_ending',False)
@@ -1933,11 +2022,19 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['plan_reference']=reference
             self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status=plan_execution_state)
             panel_forecast=forecast_for_panel(forecast)
+            advisory_settings=settings
+            long_outlook=self.run_diagnostic('advisory_48h',advisory_outlook_48,
+                now,room,floor,outside,fire,self.model,usable_weather,advisory_settings,forecast,
+                default=dict(status='unavailable',reason='projection_failed',curve=[]))
+            if source=='Вітальня' and room_check['status'] not in ('pending','room_source_disagreement') and hasattr(self,'remember_advisory_outlook'):
+                self.run_diagnostic('advisory_validation_issue',self.remember_advisory_outlook,now,long_outlook)
             self.publish('sensor.heating_forecast_outlook','Прогноз температури',
-                **forecast_outlook_for_panel(forecast,now,settings))
+                advisory_48h=long_outlook,**forecast_outlook_for_panel(forecast,now,settings))
             self.publish("sensor.heating_forecast",forecast["minimum"],friendly_name="Клімат — мінімум прогнозу",
                          unit_of_measurement="°C",device_class="temperature",curve=panel_forecast["curve"],
                          actual_curve=[{"ts":r["ts"],"temperature":r["room"] if r.get('room_valid',r.get('quality')) else None} for r in self.samples[-1:]],
+                         solar_nominal_curve=forecast.get('solar_nominal_curve',[]),
+                         solar_nominal_assumption=forecast.get('solar_nominal_assumption'),
                          public_projection_version=2,history_entity='sensor.heating_history_page',
                          cycle_energy=forecast['cycle_energy'],
                          stress_scenarios=forecast['stress_scenarios'],

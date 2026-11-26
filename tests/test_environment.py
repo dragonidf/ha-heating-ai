@@ -29,6 +29,23 @@ class AdaptiveSolarRegressions(unittest.TestCase):
         summer=self.at.replace(month=6,day=21,hour=20)
         self.assertGreater(daylight(summer,solar_geometry(summer)),0.)
         self.assertEqual(daylight(self.at,{}),0.)
+    def test_solar_heat_stays_in_existing_thermal_states_after_sunset(self):
+        from heating_environment import forecast_step
+        start=self.at.replace(hour=12)
+        weather=[dict(ts=start.timestamp()+i*3600,temperature=5.,condition="sunny",cloud_coverage=0) for i in range(9)]
+        base={"environment":{"astronomy":self.geometry,"solar":{"validated":False,"coefficient":.5}}}
+        sunny={"environment":{"astronomy":self.geometry,"solar":{"validated":True,"coefficient":.5}}}
+        cold=warm=(21.,23.)
+        for i in range(8*12):
+            when=start+timedelta(minutes=i*5)
+            cold=forecast_step(*cold,5.,0.,0.,DEFAULT_MODEL,1/12,when,weather,base)
+            warm=forecast_step(*warm,5.,0.,0.,DEFAULT_MODEL,1/12,when,weather,sunny)
+            if when.hour>=17:
+                self.assertEqual(gain_at(when,weather,sunny),0.)
+                self.assertGreater(warm[0],cold[0])
+                self.assertGreater(warm[1],cold[1])
+        self.assertGreater(warm[0],cold[0])
+
     def test_clouds_are_smooth_and_do_not_cross_hourly_coverage(self):
         from heating_environment import weather_factor
         values=[weather_factor('sunny',x) for x in (0,10,50,90,100)]
@@ -82,8 +99,29 @@ class AdaptiveSolarRegressions(unittest.TestCase):
         self.assertLess(max(r['temperature'] for r in normal),settings['upper'])
         self.assertGreater(max(r['temperature'] for r in upper),settings['upper'])
         self.assertTrue(coast_exceeds_profile(at,21.1,22.,8.,0.,model,settings))
+        self.assertTrue(coast_exceeds_profile(at,21.1,22.,8.,0.,model,settings,upper_rows=upper))
         self.assertIsNone(replay(at,21.1,22.,8.,0.,model,[],settings,
             [dict(start=at.timestamp(),end=at.timestamp()+900)],False,3.))
+    def test_missing_observation_preserves_qualified_solar_not_pending_gain(self):
+        from heating_environment import ENVIRONMENT_POLICY_VERSION
+        t=self.at.timestamp()
+        prior=dict(coefficient=.3,validated=True,commissioned=True,days=4,
+                   factor_policy=ENVIRONMENT_POLICY_VERSION,last={'at':t-900},
+                   pending_gain={'at':t-600},observed_gain=.2,observed_at=t-600)
+        for fit in (False,True):
+            state=observe_gain(prior,t,22.,22.,8.,0.,False,DEFAULT_MODEL,
+                               self.at.tzinfo,quality=False,fit_coefficients=fit)
+            self.assertTrue(state['validated'])
+            self.assertFalse(state['observation_quality'])
+            self.assertEqual(state['coefficient'],.3)
+            self.assertEqual(state['days'],4)
+            self.assertNotIn('last',state)
+            self.assertNotIn('pending_gain',state)
+        for invalid in ({**prior,'validated':False},{**prior,'factor_policy':-1}):
+            state=observe_gain(invalid,t,22.,22.,8.,0.,False,DEFAULT_MODEL,
+                               self.at.tzinfo,quality=False,fit_coefficients=False)
+            self.assertFalse(state['validated'])
+
     def test_solar_candidate_cannot_replace_a_better_current_holdout(self):
         t=self.at.timestamp();rows=[]
         for day in range(3):
@@ -205,6 +243,46 @@ class EnvironmentTests(unittest.TestCase):
         weather=[dict(ts=when.timestamp(),temperature=15,condition='sunny')]
         self.assertEqual(gain_at(when,weather,settings),0)
         self.assertEqual(gain_at(when,weather,settings,upper=True),0)  # Unconfirmed sunshine cannot remove night heat.
+    def test_held_out_solar_risk_is_not_nominal_or_double_counted(self):
+        from heating_environment import has_upper_risk
+        from heating_model import ForecastContext
+        when=self.at.replace(hour=12)
+        settings={'environment':{'astronomy':solar_geometry(when),
+            'solar':dict(coefficient=.6,validated=False,risk_coefficient=.5)}}
+        weather=[dict(ts=when.timestamp(),temperature=15,condition='sunny')]
+        self.assertTrue(has_upper_risk(settings))
+        self.assertEqual(gain_at(when,weather,settings),0.)
+        upper=gain_at(when,weather,settings,upper=True)
+        self.assertGreater(upper,0.)
+        self.assertLessEqual(upper,.5)
+        self.assertEqual(ForecastContext(when,weather,15.,DEFAULT_MODEL,settings).at(when)[-1],(0.,upper))
+        settings['environment']['solar'].update(observed_gain=upper,observed_at=when.timestamp())
+        self.assertEqual(gain_at(when,weather,settings,upper=True),upper)
+        self.assertEqual(gain_at(when.replace(hour=0),weather,settings,upper=True),0.)
+        self.assertEqual(gain_at(when,[],{'environment':{'astronomy':solar_geometry(when),
+                    'solar':dict(risk_coefficient=.5)}},upper=True),0.)
+
+    def test_solar_credit_does_not_change_control_gain_or_search(self):
+        from heating_model import _plan,ForecastContext
+        from copy import deepcopy
+        when=self.at.replace(hour=12)
+        weather=[dict(ts=when.timestamp()+i*3600,temperature=5.,condition='sunny') for i in range(4)]
+        settings=dict(target=22.,lower=20.,upper=25.,start='00:00',end='23:59',
+            strategy='Комфорт протягом доби',morning_min_minutes=0,night_price=1.,day_price=2.,
+            environment={'astronomy':solar_geometry(when),
+                'solar':dict(coefficient=.5,validated=False,risk_coefficient=.5)})
+        settings['environment']['residual']=dict(at=when.timestamp(),rate=.12)
+        credited=deepcopy(settings)
+        credited['environment']['solar'].update(validated=True,control_no_sun=True)
+        self.assertEqual(gain_at(when,weather,credited),0.)
+        self.assertEqual(gain_at(when,weather,credited,upper=True),gain_at(when,weather,settings,upper=True))
+        self.assertEqual(ForecastContext(when,weather,5.,self.model,credited).at(when)[-1],
+                         ForecastContext(when,weather,5.,self.model,settings).at(when)[-1])
+        before=_plan(when,21.,23.,5.,0.,self.model,weather,settings,6.,hours_override=3.)
+        after=_plan(when,21.,23.,5.,0.,self.model,weather,credited,6.,hours_override=3.)
+        self.assertIsNotNone(before)
+        self.assertEqual(before,after)
+
     def test_learned_gain_is_zero_at_night_and_unknown_weather(self):
         settings={'environment':{'solar':dict(coefficient=.6,validated=True)}}
         self.assertEqual(gain_at(self.at.replace(hour=0),[],settings),0)

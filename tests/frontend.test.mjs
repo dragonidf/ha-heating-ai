@@ -762,3 +762,55 @@ test('frontend loader keeps HA registration stable while fetching a new local as
 });
 
 test('inline KWS toggle cannot save another draft or bypass existing revision save',async()=>{const p=Object.create(HeatingAIPanel.prototype);p.attrs=()=>({values:{kws_auto_restore:'disabled'}});p.systemDraft={boiler_power_mode:'fixed_9'};let calls=0;p.saveSystemSettings=async()=>{calls++;assert.deepEqual(p.systemDraft,{kws_auto_restore:'enabled'});};await p.changeKwsRestore('enabled');assert.equal(calls,0);p.systemDraft={};await p.changeKwsRestore('bogus');assert.equal(calls,0);await p.changeKwsRestore('enabled');assert.equal(calls,1);});
+
+test('learning reports real support for all four thermal coefficients without claiming promotion',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);
+  p.attrs=()=>({learning_status:'collecting',parameters:{floor_air:.044,room_loss:.0128,floor_decay:.12,heat_gain:.5},
+    parameter_support:{floor_air:{available:{windows:12,minutes:180,days:3},training:{windows:8,minutes:120,days:2},holdout:{windows:4,minutes:60,days:1},selected_for_candidate:true,status:'candidate_evaluated',basis:'thermal_windows'},
+      room_loss:{available:{windows:12,minutes:180,days:3},status:'not_identifiable_with_ventilation',basis:'thermal_windows'},
+      floor_decay:{available:{windows:0,minutes:0,days:0},status:'insufficient_support',basis:'warm_idle'},
+      heat_gain:{available:{windows:2,minutes:60,days:1},status:'not_selected',basis:'measured_heat'}}});
+  p.section=(title,body)=>body;p.compactMetric=()=>'';p.time=()=> '12:00';
+  const markup=p.learningProgress();
+  assert.match(markup,/Докази за коефіцієнтами/);
+  for(const label of ['Передача тепла в кімнату','Тепловтрати','Охолодження підлоги','Потужність нагріву підлоги'])assert.ok(markup.includes(label));
+  assert.match(markup,/12 \/ 180 \/ 3/);
+  assert.match(markup,/8 \/ 120 \/ 2/);
+  assert.match(markup,/4 \/ 60 \/ 1/);
+  assert.match(markup,/Не відокремлено від вентиляції/);
+  assert.match(markup,/0 \/ 0 \/ 0/);
+  assert.doesNotMatch(markup,/NaN|undefined|Коефіцієнти оновлено/);
+});
+test('quality distinguishes advisory 48h conditional cohorts and independent counts',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.section=(title,body)=>body;
+  p.attrs=()=>({advisory_validation:{groups:[
+    {horizon:48,basis:'conditional_repeat',weather_known:false,schedule_known:false,days:3,independent:{n:2,mae:.65,bias:-.25},all_reports:{n:16,mae:.35},minimum_lead_hours:47.5,maximum_lead_hours:48.3},
+    {horizon:24,basis:'calculated_plan',weather_known:true,schedule_known:true,days:1,independent:{n:1,mae:.4,bias:.4},all_reports:{n:4}}],pending:{24:0,36:2,48:3},used_for_control:false}});
+  const markup=p.controllerQuality();
+  assert.match(markup,/Дорадчий прогноз · 24–48 год/);
+  assert.match(markup,/Умовний повтор нагріву/);assert.match(markup,/Розрахований план/);
+  assert.match(markup,/0,650/);assert.match(markup,/-0,250/);
+  assert.match(markup,/2 \/ 16 \/ 3/);
+  assert.match(markup,/36 год: 2/);assert.match(markup,/48 год: 3/);
+  assert.match(markup,/не керує котлом/);
+  assert.doesNotMatch(markup,/NaN|undefined/);
+});
+
+test('accuracy period table compares the same cohort, preserves gaps and signed bias',()=>{
+  const p=Object.create(HeatingAIPanel.prototype);p.section=(title,body)=>body;p.time=()=> '26.11 18:00';
+  const cohort={horizon:6,model_version:6,equipment_version:2,physical_mode:'fixed_6',
+    basis:'sensor_report',weather_known:true,schedule_known:false,
+    periods:{7:{count:2,days:1,missing_days:6,mae:.125,bias:-.125},14:{count:4,days:3,missing_days:11,mae:.25,bias:0},30:{count:8,days:5,missing_days:25,mae:.375,bias:.2}}};
+  p.attrs=()=>({advisory_validation:{groups:[{horizon:48,basis:'conditional_repeat',weather_known:false,schedule_known:false,periods:{7:{count:2,days:3,missing_days:4,mae:.625,bias:-.25}}}]},accuracy_periods:{groups:[cohort,{...cohort,equipment_version:null,
+    periods:{7:{count:0,days:0,missing_days:7,mae:null,bias:null},30:{count:1,days:1,missing_days:29,mae:1.2,bias:1.2}}}],as_of:1795708800}});
+  const markup=p.controllerQuality();
+  assert.match(markup,/Точність за 7\/14\/30 діб/);
+  assert.match(markup,/0,125/);assert.match(markup,/-0,125/);
+  assert.match(markup,/0,250/);assert.match(markup,/0,375/);
+  assert.match(markup,/6 без даних/);
+  assert.match(markup,/Обладнання невідоме/);
+  assert.match(markup,/v6/);assert.match(markup,/6 год/);
+  assert.match(markup,/48 год · Умовний повтор нагріву/);assert.match(markup,/0,625/);
+  assert.doesNotMatch(markup,/NaN|undefined|покращилася/);
+  p.attrs=()=>({});assert.match(p.controllerQuality(),/Немає зіставних перевірок/);
+});

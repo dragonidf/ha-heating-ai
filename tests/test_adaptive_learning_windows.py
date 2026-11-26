@@ -70,6 +70,17 @@ class StorageLearningTest(unittest.TestCase):
                 self.assertFalse(promotion_allowed(self.model,self.model,result['coefficients'],
                     {'status':'rejected'},{},now))
 
+    def test_parameter_support_reflects_actual_selected_storage_cohort(self):
+        result=evaluate_windows(self.windows("floor_decay"),self.model)
+        support=result["parameter_support"]
+        self.assertEqual(set(support),{"floor_air","room_loss","floor_decay","heat_gain"})
+        self.assertTrue(support["floor_decay"]["selected_for_candidate"])
+        self.assertEqual(support["floor_decay"]["basis"],"warm_idle")
+        self.assertGreater(support["floor_decay"]["holdout"]["minutes"],0)
+        self.assertFalse(support["heat_gain"]["selected_for_candidate"])
+        self.assertIsNone(support["heat_gain"]["holdout"])
+        self.assertEqual(evaluate_windows([],self.model)["parameter_support"]["floor_air"]["available"]["windows"],0)
+
     def test_storage_fit_rejects_weak_support_and_conflicting_later_days(self):
         from heating_learning_windows import _storage_candidate,evaluate_windows
         self.assertIsNone(_storage_candidate(self.windows('heat_gain',days=2),self.model,self.model,None))
@@ -157,6 +168,24 @@ class WindowsTest(unittest.TestCase):
         self.assertIsNone(ventilation_interval_duty({**active,"supply_unknown_fraction":.2}))
         self.assertIsNone(ventilation_interval_duty({**active,"powered_relay_on_fraction":.5}))
 
+    def test_verified_zero_ventilation_supply_with_unavailable_relay(self):
+        from heating_learning_windows import ventilation_current_qualified, ventilation_interval_duty
+        bath={"relay":"off","supply":"unknown"}
+        for relay in ("on","off","unavailable","unknown",None):
+            self.assertTrue(ventilation_current_qualified({
+                "recuperator":{"relay":relay,"supply":"off"}, "bath":bath}))
+        for supply in ("on","unknown",None):
+            self.assertFalse(ventilation_current_qualified({
+                "recuperator":{"relay":"unavailable","supply":supply}, "bath":bath}))
+        zero=dict(seconds=300,on_fraction=0.,unknown_fraction=1.,
+                  supply_unknown_fraction=0.,supply_on_fraction=0.,
+                  powered_relay_on_fraction=0.)
+        self.assertEqual(ventilation_interval_duty(zero),0.)
+        for changed in ({"supply_unknown_fraction":.1},{"supply_on_fraction":.1},
+                        {"powered_relay_on_fraction":.1},{"powered_relay_on_fraction":None},
+                        {"supply_on_fraction":None},{"seconds":100}):
+            self.assertIsNone(ventilation_interval_duty({**zero,**changed}))
+
     def test_blackout_evaluates_history_without_promoting_model(self):
         from tools.replay_adaptive_learning import MODEL, TZ, fixture
         rows=fixture(8)
@@ -196,6 +225,70 @@ class WindowsTest(unittest.TestCase):
                 rows = samples(60)
                 rows[-1 if 'report_verified' in fields else 5].update(fields)
                 self.assertFalse(build_observation_windows(rows, timezone.utc)["windows"])
+
+    def test_internal_circulation_does_not_block_no_fire_windows(self):
+        rows=samples(60)
+        for row in rows:
+            row.update(circulation_active=True,circulation_role="internal_redistribution")
+        self.assertEqual(len(build_observation_windows(rows,timezone.utc)["windows"]),1)
+        for field,value in (("fire_active",True),("fire_valid",False),
+                            ("room_source_disagreement",True),("circulation_role","unknown")):
+            altered=[dict(row) for row in rows]
+            altered[5][field]=value
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"])
+
+    def test_daylight_idle_residual_is_solar_only_not_base_model_evidence(self):
+        rows=samples(60)
+        for row in rows:
+            row.update(solar_factor=.5,external_gain=.2)
+        rows[-1]["room"]=21.4
+        result=build_observation_windows(rows,timezone.utc)
+        self.assertEqual(len(result["windows"]),1)
+        self.assertTrue(result["windows"][0]["solar_only"])
+        self.assertEqual(result["eligibility_counts"]["automatic_physics_windows"],0)
+        self.assertEqual(result["eligibility_counts"]["solar_only_windows"],1)
+        self.assertEqual(evaluate_windows(result["windows"],dict(DEFAULT_MODEL,version=6))["status"],"insufficient_data")
+        for change in (dict(solar_factor=0.),dict(power=6.),dict(fire_active=True),
+                       dict(room_source_disagreement=True),dict(shadow_ventilation=None),
+                       dict(power_quality="estimated"),dict(grid="unknown")):
+            altered=[{**row,**change} for row in rows]
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"],change)
+
+    def test_fast_daytime_rise_requires_corroboration_and_plausible_rate(self):
+        rows=samples(60)
+        for row in rows:
+            row.update(solar_factor=.5,external_gain=.2,room_source_status="agree")
+        rows[-1]["room"]=22.
+        result=build_observation_windows(rows,timezone.utc)
+        self.assertTrue(result["windows"][0]["solar_only"])
+        for change in (dict(room_source_status="unconfirmed"),dict(room=24.9)):
+            altered=[dict(row) for row in rows]
+            altered[-1].update(change)
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"])
+
+    def test_verified_outage_is_thermal_only_and_needs_full_continuous_proof(self):
+        from heating_learning_windows import row_reasons
+        rows=samples(60)
+        for row in rows:
+            row.update(grid="off",power=None,power_quality="unknown",power_source="unknown",
+                interval_kw=None,voltage_qualified=False,thermal_inputs_ok=True,
+                zero_heat_provenance="verified_mains_isolation",zero_heat_interval_verified=True,
+                shadow_reasons=["unqualified_outage","unqualified_kws","equipment_not_ready",
+                                "unavailable_physical_input","temporary_fallback"])
+        result=build_observation_windows(rows,timezone.utc)
+        self.assertEqual(len(result["windows"]),1)
+        self.assertTrue(result["windows"][0]["outage_physics"])
+        self.assertEqual(result["windows"][0]["idle"],3600)
+        self.assertEqual(result["eligibility_counts"]["electrical_intervals"],0)
+        self.assertEqual(result["eligibility_counts"]["outage_physics_minutes"],60)
+        self.assertIn("unqualified_outage",row_reasons(rows[0],strict=True))
+        for change in (dict(zero_heat_interval_verified=False),dict(zero_heat_provenance=None),
+                       dict(grid="unknown"),dict(power=3.),dict(power_quality="contradictory"),
+                       dict(thermal_inputs_ok=False),dict(shadow_ventilation=None),
+                       dict(fire_active=True),dict(shadow_reasons=["tick_gap_or_restart"])):
+            altered=[dict(row) for row in rows]
+            altered[5].update(change)
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"],change)
 
     def test_large_gap_and_shared_endpoint_are_not_counted(self):
         rows = samples(120)
@@ -285,6 +378,135 @@ class WindowsTest(unittest.TestCase):
                     row[field]+=offset
             self.assertEqual(build_observation_windows(rows,local)["eligible_minutes"],expected)
 
+    def test_solar_fit_uses_later_independent_days_and_real_baseline(self):
+        from heating_learning_windows import evaluate_solar
+        from heating_model import step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        rows=[]
+        for day in range(6):
+            for slot in range(4):
+                start=BASE+day*86400+slot*3600
+                sun=.3+.1*slot
+                room,floor=21.,23.
+                steps=[]
+                for _ in range(12):
+                    steps.append([300,8.,0.,sun,floor])
+                    next_room,next_floor=step(room,floor,8.,0.,0.,model,1/12)
+                    room,floor=next_room+.5*sun/12,next_floor
+                rows.append(dict(start=start,end=start+3600,day=f"2026-11-{day+1:02}",
+                    room_start=21.,room_end=room,floor=23.,steps=steps,
+                    heat=0,idle=3600,sun=sun,vent=[0.,0.],equipment=[6,1,"fixed_6"]))
+        fit=evaluate_solar(rows,model,commissioning=0.)
+        self.assertEqual(fit["status"],"holdout_passed")
+        self.assertAlmostEqual(fit["coefficient"],.5)
+        self.assertFalse(fit["comfort_credit"])
+        self.assertLessEqual(fit["training_until"],fit["holdout_start"])
+        self.assertEqual(evaluate_solar(rows,model,commissioning=.5)["status"],"holdout_rejected")
+        self.assertEqual(evaluate_solar(rows[:12],model,commissioning=0.)["status"],"insufficient_data")
+
+    def test_solar_weather_keeps_current_estimate_separate_from_issued_predictor(self):
+        from heating_learning_windows import solar_weather_evidence
+        at=datetime(2026,11,1,12,tzinfo=timezone.utc);stamp=at.timestamp()
+        geometry={"latitude":50.,"days":{at.date().isoformat():{"noon":stamp,
+                   "sunrise":stamp-18000,"sunset":stamp+18000,"declination":-12.}}}
+        weather=[dict(ts=stamp,condition="sunny",cloud_coverage=5)]
+        current={"state":"cloudy","last_reported":at.isoformat(),"attributes":{"cloud_coverage":95}}
+        report=solar_weather_evidence(stamp,timezone.utc,weather,stamp,geometry,current)
+        self.assertGreater(report["forecast_factor"],report["current_factor"])
+        self.assertEqual(report["forecast_basis"],"cloud_coverage")
+        self.assertEqual(report["current_cloud"],95)
+        self.assertEqual(report["forecast_cloud"],5)
+        future={**current,"last_reported":datetime.fromtimestamp(stamp+1,timezone.utc).isoformat()}
+        self.assertIsNone(solar_weather_evidence(stamp,timezone.utc,weather,stamp,geometry,future)["current_factor"])
+        stale={**current,"last_reported":datetime.fromtimestamp(stamp-10801,timezone.utc).isoformat()}
+        self.assertIsNone(solar_weather_evidence(stamp,timezone.utc,weather,stamp,geometry,stale)["current_factor"])
+        self.assertIsNone(solar_weather_evidence(stamp,timezone.utc,weather,stamp+1,geometry,current)["forecast_factor"])
+        self.assertIsNone(solar_context_at(stamp,timezone.utc,weather,stamp,{"days":geometry["days"]}))
+
+    def test_advisory_validation_uses_real_reports_and_separate_horizon_cohorts(self):
+        from heating_learning_windows import advisory_validation_update,advisory_validation_summary
+        start=BASE;identity=[6,1,"fixed_6"]
+        curve=[dict(ts=start+i*3600,temperature=20.+i*.01,
+            basis="calculated_plan" if i<=24 else "conditional_repeat",
+            weather_known=i<=36,schedule_known=i<=24) for i in range(1,49)]
+        outlook=dict(status="conditional",curve=curve)
+        state=advisory_validation_update({},start,identity,outlook=outlook)
+        self.assertEqual(len(state["pending"]),3)
+        self.assertEqual(advisory_validation_update(state,start+300,identity,outlook=outlook),state)
+        for h in (24,36,48):
+            at=start+h*3600-900
+            report=dict(ts=at,room=20.,room_reported_at=at,room_valid=True,
+                        source="Вітальня",report_verified=True)
+            rejected=advisory_validation_update(state,at,identity,report={**report,"report_verified":False})
+            self.assertEqual(rejected["completed"],state["completed"])
+            state=advisory_validation_update(state,at,identity,report=report)
+        self.assertEqual(len(state["pending"]),0)
+        self.assertEqual(len(state["completed"]),3)
+        summary=advisory_validation_summary(state,identity,timezone.utc,start+172800)
+        self.assertEqual(len(summary["groups"]),3)
+        self.assertEqual(summary["groups"][-1]["horizon"],48)
+        self.assertEqual(summary["groups"][-1]["basis"],"conditional_repeat")
+        self.assertFalse(summary["groups"][-1]["weather_known"])
+        self.assertEqual(summary["groups"][-1]["independent"]["n"],1)
+        self.assertAlmostEqual(summary["groups"][-1]["all_reports"]["mae"],.4775)
+        self.assertFalse(advisory_validation_summary(state,[7,1,"fixed_6"],timezone.utc,start+172800)["groups"])
+        pending=advisory_validation_update({},start,identity,outlook=outlook)
+        expired=advisory_validation_update(pending,start+172800+301,identity)
+        self.assertEqual(expired["expired"],{"24":1,"36":1,"48":1})
+        self.assertEqual(expired["completed"],[])
+
+    def test_advisory_periods_keep_independent_checks_and_conditional_cohorts_separate(self):
+        from heating_learning_windows import advisory_validation_summary
+        stamp=BASE+29*86400+3600;identity=[6,1,"fixed_6"]
+        def row(days,error,**extra):
+            reported=stamp-days*86400
+            return dict(issued=reported-48*3600,reported=reported,horizon=48,identity=identity,
+                        basis="conditional_repeat",weather_known=False,schedule_known=False,
+                        error=error,lead_hours=48.) | extra
+        state=dict(completed=[row(1,.5),row(2,-.25),row(5,.75),row(8,1.),row(20,-.5),
+                              row(1,9.,weather_known=True),row(1,99.,identity=[7,1,"fixed_6"]),
+                              row(-1,99.)])
+        result=advisory_validation_summary(state,identity,timezone.utc,stamp)
+        self.assertEqual(len(result["groups"]),2)
+        group=next(g for g in result["groups"] if not g["weather_known"])
+        p=group["periods"]
+        self.assertEqual(p["7"]["all_count"],3)
+        self.assertEqual(p["7"]["count"],2)
+        self.assertAlmostEqual(p["7"]["mae"],.5)
+        self.assertAlmostEqual(p["7"]["bias"],.25)
+        self.assertEqual(p["7"]["missing_days"],4)
+        self.assertEqual(p["14"]["all_count"],4)
+        self.assertEqual(p["14"]["count"],3)
+        self.assertEqual(p["30"]["all_count"],5)
+        self.assertEqual(p["30"]["count"],4)
+        empty=advisory_validation_summary(dict(completed=[row(20,.5)]),identity,timezone.utc,stamp)
+        self.assertIsNone(empty["groups"][0]["periods"]["7"]["mae"])
+
+    def test_unavailable_solar_geometry_skips_time_conversion_without_losing_provenance(self):
+        from heating_learning_windows import solar_weather_evidence
+        from unittest.mock import patch
+        expected=dict(forecast_factor=None,forecast_basis="unknown",current_factor=None,
+                      current_basis="unknown",current_cloud=None,forecast_cloud=None)
+        with patch("heating_learning_windows.datetime") as clock:
+            result=solar_weather_evidence(BASE,timezone.utc,[],BASE-300,{},None)
+        self.assertEqual(result,expected)
+        clock.fromtimestamp.assert_not_called()
+
+    def test_verified_off_legacy_relay_does_not_read_irrelevant_supply_values(self):
+        from heating_environment import effective_ventilation_duty
+        class Evidence(dict):
+            def get(self,key,default=None):
+                if key in ("supply_unknown_fraction","powered_relay_on_fraction","supply_on_fraction"):
+                    raise AssertionError("Supply is irrelevant to a confirmed OFF relay")
+                return super().get(key,default)
+        self.assertEqual(effective_ventilation_duty(Evidence(seconds=300,on_fraction=0.,
+                         unknown_fraction=0.)),0.)
+        self.assertIsNone(effective_ventilation_duty(dict(seconds=300,on_fraction=0.,
+                         unknown_fraction=1.)))
+        self.assertEqual(effective_ventilation_duty(dict(seconds=300,on_fraction=None,
+                         unknown_fraction=1.,supply_unknown_fraction=0.,
+                         supply_on_fraction=0.,powered_relay_on_fraction=0.)),0.)
+
     def test_solar_missing_condition_future_issue_and_missing_geometry(self):
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Kyiv")
@@ -361,6 +583,160 @@ class WindowsTest(unittest.TestCase):
                 epoch='boot',thermal_model_version=6,equipment_version=1,boiler_power_mode='fixed_6',
                 weather_issue_at=stamp-60,solar_factor=0.,**{'return':23.}))
         return snapshot,rows
+
+    def test_frozen_forecast_keeps_issued_ventilation_topology_and_relevant_slots(self):
+        from copy import deepcopy
+        from heating_learning_windows import freeze_forecast
+        snapshot,rows=self.asynchronous_report_fixture(0)
+        start=snapshot["start"]
+        now=datetime.fromtimestamp(start,timezone.utc)
+        settings=dict(target=22.,lower=19.,upper=25.,equipment_version=1,
+            modulation_profile={"physical_mode":"fixed_6"},
+            ventilation_grid_only={"recuperator":{"entity":"switch.recup","when_powered":.8}},
+            ventilation_expected={"recuperator":.4,"bath":.1},
+            outage_schedule=dict(valid=True,mode="scheduled",slots=[
+                dict(start=start-3600,end=start+1800,off=False),
+                dict(start=start+1800,end=start+3600,off=True),
+                dict(start=start+86400,end=start+90000,off=True)]))
+        weather=[dict(ts=start+i*3600,temperature=5.,condition="cloudy") for i in range(8)]
+        fine=[dict(ts=start+i*300,temperature=21.,upper_temperature=22.) for i in range(1,73)]
+        forecast=dict(curve=[dict(ts=fine[-1]["ts"],_fine=fine)],heat_segments=[])
+        frozen=freeze_forecast(now,21.,23.,5.,0.,weather,start-60,settings,forecast,
+                               snapshot["model"],None,"boot")
+        self.assertIsNotNone(frozen)
+        self.assertEqual(len(frozen["settings"]["outage_schedule"]["slots"]),2)
+        original=deepcopy(frozen)
+        settings["ventilation_grid_only"]["recuperator"]["when_powered"]=0.
+        settings["outage_schedule"]["slots"][1]["off"]=False
+        self.assertEqual(frozen,original)
+
+    def test_conditional_solar_projection_keeps_control_plan_and_freezes_actual_issue(self):
+        from copy import deepcopy
+        from heating_learning_windows import project_solar_nominal,freeze_forecast
+        from heating_environment import forecast_step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        start=BASE+9*3600
+        now=datetime.fromtimestamp(start,timezone.utc)
+        noon=start+3*3600
+        geometry=dict(latitude=50.,days={now.date().isoformat():dict(
+            noon=noon,sunrise=noon-21600,sunset=noon+21600,declination=-10.)})
+        settings=dict(target=22.,lower=19.,upper=25.,equipment_version=1,
+            modulation_profile={"physical_mode":"fixed_6"},
+            environment=dict(astronomy=geometry,solar=dict(validated=True,coefficient=.5,
+                risk_coefficient=.5,control_no_sun=True)))
+        weather=[dict(ts=start+i*3600,temperature=5.,condition="sunny") for i in range(7)]
+        room,floor=21.,23.
+        control=(room,floor);upper=(room,floor)
+        blocks=[];segments=[]
+        for j in range(12):
+            fine=[];heat=[]
+            for i in range(6):
+                a=start+(j*6+i)*300;b=a+300
+                when=datetime.fromtimestamp(a,timezone.utc)
+                kw=6. if j==0 else 0.
+                control=forecast_step(*control,5.,kw,0.,model,1/12,when,weather,settings)
+                upper=forecast_step(*upper,5.,kw,0.,model,1/12,when,weather,settings,upper=True)
+                fine.append(dict(ts=b,temperature=control[0],upper_temperature=upper[0]))
+                if kw:
+                    heat.append(dict(start=a,end=b,power_kw=kw))
+            segments+=heat
+            blocks.append(dict(ts=b,temperature=control[0],_fine=fine,heat_segments=heat))
+        forecast=dict(curve=blocks,heat_segments=segments)
+        original=deepcopy(forecast)
+        self.assertIsNone(freeze_forecast(now,room,floor,5.,0.,weather,start-60,settings,
+            forecast,model,None,"boot"))
+        projection=project_solar_nominal(now,room,floor,5.,0.,weather,settings,forecast,model)
+        self.assertEqual(forecast,original)
+        self.assertEqual(len(projection["curve"]),12)
+        self.assertTrue(all(p["temperature"]>=p["no_sun_temperature"]-.005 for p in projection["curve"]))
+        self.assertGreater(projection["curve"][5]["temperature"],blocks[5]["temperature"])
+        forecast["_solar_nominal_fine"]=projection["fine"]
+        snapshot=freeze_forecast(now,room,floor,5.,0.,weather,start-60,settings,forecast,model,None,"boot")
+        self.assertFalse(snapshot["settings"]["environment"]["solar"]["control_no_sun"])
+        self.assertTrue(settings["environment"]["solar"]["control_no_sun"])
+        self.assertEqual(snapshot["points"]["3"][1],projection["fine"][35]["temperature"])
+        self.assertEqual(snapshot["segments"],[[s["start"],s["end"],s["power_kw"]] for s in segments])
+        bad=deepcopy(original);bad["curve"][0].pop("_fine")
+        self.assertIsNone(project_solar_nominal(now,room,floor,5.,0.,weather,settings,bad,model))
+
+    def test_solar_prospective_requires_new_issue_and_explicit_idle_evidence(self):
+        from heating_learning_windows import solar_prospective_evidence,qualify_frozen
+        from heating_environment import forecast_step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        archive=[]
+        certificate=dict(coefficient=.5,stored_at=BASE,identity=[6,1,"fixed_6"],
+                         ventilation_model={})
+        for day in range(6):
+            for hour in (8,12):
+                start=BASE+day*86400+hour*3600
+                at=datetime.fromtimestamp(start,timezone.utc)
+                date=at.date().isoformat()
+                noon=BASE+day*86400+12*3600
+                geometry=dict(latitude=50.,days={date:dict(noon=noon,sunrise=noon-21600,
+                    sunset=noon+21600,declination=-10.)})
+                settings=dict(environment=dict(astronomy=geometry,
+                    solar=dict(risk_coefficient=.5,validated=False)))
+                truth=dict(environment=dict(astronomy=geometry,
+                    solar=dict(risk_coefficient=.5,validated=True,coefficient=.5)))
+                weather=[dict(ts=start+i*3600,temperature=5.,condition="sunny") for i in range(4)]
+                states=[(21.,23.)]*3
+                guards=[];checks=[];points={}
+                for i in range(1,37):
+                    when=datetime.fromtimestamp(start+(i-1)*300,timezone.utc)
+                    for j,(room,floor) in enumerate(states):
+                        states[j]=forecast_step(room,floor,5.,0.,0.,model,1/12,when,weather,
+                            truth if j==2 else settings,upper=j==1)
+                    due=start+i*300
+                    old,upper,actual=[r[0] for r in states]
+                    guards.append([due,old,upper,15.,30.])
+                    if i in (12,36):
+                        h=i//12
+                        points[str(h)]=[due,old,upper,15.,30.,"День"]
+                        checks.append([h,due,old,upper,15.,30.,"День",actual,
+                            ["unexplained_gain"],0.,0.,0.,0.,{"solar_idle_qualified":True}])
+                snapshot=dict(start=start,model=model,identity=["boot","Вітальня",6,1,"fixed_6"],
+                    room=21.,floor=23.,outside=5.,fire=0.,segments=[],weather=weather,
+                    settings=settings,weather_known_until=start+14400,points=points,guards=guards)
+                archive.append(dict(snapshot=snapshot,checks=checks))
+        report=solar_prospective_evidence(certificate,archive,model,timezone.utc,{})
+        self.assertEqual(report["status"],"passed")
+        self.assertFalse(report["comfort_credit"])
+        self.assertGreaterEqual(report["metrics"]["1"]["new"]["n"],12)
+        # Monitor only the forecasts actually issued after activation with
+        # credit, against the same plan and zero-credit counterfactual.
+        from copy import deepcopy
+        active={**certificate,"comfort_credit":True,"nominal_at":BASE}
+        credited=deepcopy(archive)
+        for item in credited:
+            solar=item["snapshot"]["settings"]["environment"]["solar"]
+            solar.update(validated=True,coefficient=.5)
+            for check in item["checks"]:
+                check[2]=check[7]  # truth was generated with this exact credit
+        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc,{})["status"],"stable")
+        for item,original in zip(credited,archive):
+            for check,prior in zip(item["checks"],original["checks"]):
+                check[7]=prior[2]  # actual now follows the zero-credit trajectory
+        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc,{})["status"],
+                         "rollback_required")
+        self.assertEqual(solar_prospective_evidence({**active,"nominal_at":BASE+7*86400},credited,
+            model,timezone.utc,{})["status"],"monitoring")
+        self.assertEqual(solar_prospective_evidence({**certificate,"nominal_revoked_at":BASE},archive,
+            model,timezone.utc,{})["status"],"rejected")
+        self.assertEqual(solar_prospective_evidence({**certificate,"stored_at":BASE+7*86400},
+            archive,model,timezone.utc,{})["status"],"insufficient_data")
+        legacy=[dict(snapshot=i["snapshot"],checks=[r[:13] for r in i["checks"]]) for i in archive]
+        self.assertEqual(solar_prospective_evidence(certificate,legacy,model,timezone.utc,{})["status"],
+                         "insufficient_data")
+        snapshot,rows=self.asynchronous_report_fixture(0)
+        snapshot["settings"]["environment"]={"solar":{"risk_coefficient":.5}}
+        for row in rows:
+            row.update(solar_factor=.5,external_gain=.2)
+        checks=qualify_frozen(snapshot,rows,timezone.utc)
+        self.assertTrue(all(c[13]["solar_idle_qualified"] for c in checks))
+        for row in rows:
+            row.update(power=1.,interval_kw=1.)
+        self.assertTrue(all(len(c)==13 or not c[13].get("solar_idle_qualified")
+                            for c in qualify_frozen(snapshot,rows,timezone.utc)))
 
     def test_asynchronous_reports_use_actual_time_and_keep_guards(self):
         from heating_learning_windows import qualify_frozen,score_frozen

@@ -1,7 +1,7 @@
 """Private evidence and bounded policy for the single scheduled learner."""
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 import json
 import math
@@ -11,7 +11,7 @@ from statistics import median
 from tempfile import NamedTemporaryFile
 from threading import Lock
 
-from heating_environment import daylight, forecast_step, weather_factor
+from heating_environment import daylight, forecast_step, weather_factor, effective_ventilation_duty
 from heating_model import BOUNDS, comfort_at, number, outdoor_at, transitions, modulation_power, certified_upper_power
 
 SCHEMA = 1
@@ -38,39 +38,34 @@ def report_time(row):
 
 
 def ventilation_current_qualified(devices):
-    """An OFF relay proves zero commanded airflow without a supply sensor.
+    """Either a known OFF relay or a known OFF supply proves zero powered duty.
 
-    An ON relay is qualified only when its independent supply is known.
-    Missing device bindings and unknown relays are never considered valid.
+    A running relay needs independent supply evidence; an unavailable relay
+    does not erase independently verified absence of supply. Unknown supply
+    and relay together are never interpreted as zero.
     """
     if not isinstance(devices, dict):
         return False
     return all(isinstance(devices.get(key), dict) and (
+        devices[key].get("supply") == "off" or
         devices[key].get("relay") == "off" or (
-            devices[key].get("relay") == "on" and devices[key].get("supply") in ("on", "off"))
+            devices[key].get("relay") == "on" and devices[key].get("supply") == "on")
     ) for key in ("recuperator", "bath"))
 
 
 def ventilation_interval_duty(evidence):
-    """Return observed 5-minute duty, or None for an uncertain interval."""
-    if not isinstance(evidence, dict):
-        return None
-    seconds = number(evidence.get("seconds"))
-    on = number(evidence.get("on_fraction"))
-    unknown = number(evidence.get("unknown_fraction"))
-    if seconds is None or seconds < 240 or unknown != 0 or on is None:
-        return None
-    # A relay that is always OFF contributes zero ventilation regardless
-    # of supply evidence. An ON relay must have independently known supply.
-    if on == 0:
-        return 0.
-    powered = number(evidence.get("powered_relay_on_fraction"))
-    supply_unknown = number(evidence.get("supply_unknown_fraction"))
-    if supply_unknown != 0 or powered is None or powered > on + 0.001:
-        return None
-    # The existing fitter assumes constant duty across an observation.
-    # Reject mixed intervals rather than pretending to know their airflow.
-    return powered if powered in (0., 1.) else None
+    """Constant powered duty required by the adaptive window fitter."""
+    duty = effective_ventilation_duty(evidence)
+    return duty if duty in (0., 1.) else None
+
+
+def proven_outage_row(row):
+    """Thermal-only zero input; never a KWS measurement."""
+    power=number(row.get("power"))
+    return (row.get("zero_heat_provenance")=="verified_mains_isolation"
+            and row.get("grid")=="off" and row.get("thermal_inputs_ok") is True
+            and row.get("power_quality")!="contradictory"
+            and (row.get("power") is None or power is not None and 0<=power<=.05))
 
 
 def row_reasons(row, *, strict, physics=False):
@@ -113,7 +108,10 @@ def row_reasons(row, *, strict, physics=False):
         reasons.add("fireplace")
     if row.get("shadow_ventilation") is None:
         reasons.add("unknown_ventilation")
-    if strict and row.get("circulation_active"):
+    # The reserve-powered circulation fan redistributes indoor heat. Only
+    # legacy/unclassified circulation remains a blanket exclusion; actual
+    # fireplace activity or conflicting room measurements are checked above.
+    if strict and row.get("circulation_active") and row.get("circulation_role")!="internal_redistribution":
         reasons.add("circulation")
     if (number(row.get("external_gain")) or 0.) > .1 or abs(number(row.get("residual_gain")) or 0.) > .1:
         reasons.add("unexplained_gain")
@@ -128,6 +126,10 @@ def row_reasons(row, *, strict, physics=False):
         reasons.add("missing_solar_context")
     if row.get("interpolated") or row.get("duplicate"):
         reasons.add("interpolation_or_duplicate")
+    if physics and proven_outage_row(row):
+        reasons.difference_update(("missing_kws","estimated_power","unqualified_kws",
+            "unqualified_outage","unknown_or_unqualified_voltage","equipment_not_ready",
+            "temporary_fallback","unavailable_physical_input"))
     return reasons
 
 
@@ -229,16 +231,48 @@ def _continuous(rows, times, start, end, identity, *, physics=False):
         # after either boundary is used to extend the measured trajectory.
         left, right = max(start,x), min(end,y)
         if right>left:
-            measured = number(b.get("interval_kw")) if left==x and right==y else None
-            if "interval_kw" in b and number(b["interval_kw"]) is None:
-                reasons.add("missing_measured_interval")
-            kw = measured if measured is not None else a.get("power")
+            zero_a,zero_b=proven_outage_row(a),proven_outage_row(b)
+            if physics and (zero_a or zero_b):
+                if zero_a and zero_b and b.get("zero_heat_interval_verified") is True:
+                    kw=0.
+                else:
+                    kw=None
+                    reasons.add("unverified_zero_heat_interval")
+            else:
+                measured = number(b.get("interval_kw")) if left==x and right==y else None
+                if "interval_kw" in b and number(b["interval_kw"]) is None:
+                    reasons.add("missing_measured_interval")
+                kw = measured if measured is not None else a.get("power")
             if number(kw) is None or not 0<=kw<=10.5:
                 reasons.add("invalid_interval_energy")
             steps.append([right-left,a.get("outside"),kw,a.get("solar_factor"),a.get("return")])
     if sum(step[0] for step in steps)<.95*(end-start):
         reasons.add("coverage_below_95_percent")
     return steps, reasons
+
+
+def _solar_only_window(first, last, steps, reasons, duration):
+    """Allow a separate daytime idle cohort without weakening thermal fits.
+
+    Only the residual/gain or endpoint jump exclusion may be reconsidered.
+    Electrical, fireplace, weather, room conflicts, gaps and other reasons
+    stay fail-closed. Fast rises need independent secondary corroboration;
+    a plausible observation is not yet a validated solar coefficient.
+    """
+    if not reasons or not reasons.issubset({"unexplained_gain", "room_jump"}) or not steps:
+        return False
+    if any(number(kw) is None or not 0<=kw<=.05 or number(factor) is None
+           or not 0<=factor<=1. for _,_,kw,factor,_ in steps):
+        return False
+    if sum(seconds*factor for seconds,_,_,factor,_ in steps)/duration<=.05:
+        return False
+    rise=last["room"]-first["room"]
+    if rise<-.1:
+        return False
+    if "room_jump" in reasons:
+        return (rise>0. and rise<=.5+1.5*duration/3600
+                and all(r.get("room_source_status")=="agree" for r in (first,last)))
+    return True
 
 
 def build_observation_windows(samples, tz):
@@ -273,7 +307,8 @@ def build_observation_windows(samples, tz):
         reasons |= row_reasons(first,strict=True,physics=True) | row_reasons(row,strict=True,physics=True)
         if abs(row["room"]-first["room"]) > .6:
             reasons.add("room_jump")
-        if reasons:
+        solar_only = _solar_only_window(first,row,steps,reasons,end-start)
+        if reasons and not solar_only:
             counts.update(reasons)
             continue
         heating = sum(seconds for seconds, _, kw, _, _ in steps if kw >= 1.5)
@@ -283,6 +318,10 @@ def build_observation_windows(samples, tz):
                             floor=steps[0][4],steps=steps,heat=heating,idle=idle,sun=sun,
                             manual=first.get("manual_measurement_id") is not None,
                             equipment=list(identity[2:]),vent=first["shadow_ventilation"]))
+        if solar_only:
+            windows[-1]["solar_only"]=True
+        if proven_outage_row(first) and proven_outage_row(row):
+            windows[-1]["outage_physics"]=True
         anchor = None  # an independent physical report belongs to at most one window
     anchor_at = None
     if anchor and rows and rows[-1]["ts"]-anchor[0]<=7200:
@@ -291,15 +330,27 @@ def build_observation_windows(samples, tz):
         if not issues and not row_reasons(row,strict=True):
             anchor_at = at
     observation = rows[-1] if rows else {}
-    eligibility_counts = dict(manual_physics_windows=sum(w["manual"] for w in windows),
-                              automatic_physics_windows=sum(not w["manual"] for w in windows),
+    weather_pairs=[r["solar_weather"] for r in rows if isinstance(r.get("solar_weather"),dict)
+                   and number(r["solar_weather"].get("forecast_factor")) is not None
+                   and number(r["solar_weather"].get("current_factor")) is not None]
+    weather_deltas=[p["forecast_factor"]-p["current_factor"] for p in weather_pairs
+                    if max(p["forecast_factor"],p["current_factor"])>.05]
+    weather_report=dict(latest=observation.get("solar_weather") or {},
+        paired_daylight_samples=len(weather_deltas),factor_mae=(round(sum(map(abs,weather_deltas))/len(weather_deltas),4)
+            if weather_deltas else None),basis="provider_current_estimate_not_irradiance")
+    eligibility_counts = dict(manual_physics_windows=sum(w["manual"] and not w.get("solar_only") for w in windows),
+                              automatic_physics_windows=sum(not w["manual"] and not w.get("solar_only") for w in windows),
+                              outage_physics_windows=sum(bool(w.get("outage_physics")) for w in windows),
+                              outage_physics_minutes=round(sum((w["end"]-w["start"])/60 for w in windows if w.get("outage_physics")),1),
+                              solar_only_windows=sum(bool(w.get("solar_only")) for w in windows),
+                              solar_windows=sum(w["sun"]>.05 and w["idle"]>=w["end"]-w["start"] for w in windows),
                               primary_reports=len(reports),
                               electrical_intervals=sum(
                                   r.get("power_source")=="kws_phases" and r.get("power_quality")=="measured"
                                   and (kw:=number(r.get("interval_kw"))) is not None
                                   and 0<=kw<=10.5 for r in rows))
     return dict(windows=windows,rejection_counts=dict(counts),unique_primary_reports=len(reports),
-                eligibility_counts=eligibility_counts,
+                eligibility_counts=eligibility_counts,solar_weather=weather_report,
                 last_verified_anchor=anchor_at,
                 current_observation_quality={
                     "primary_fresh": observation.get("primary_fresh",False),
@@ -310,6 +361,104 @@ def build_observation_windows(samples, tz):
                 independent_days=len({w["day"] for w in windows}),
                 heat_minutes=sum(w["heat"] for w in windows)/60,
                 idle_minutes=sum(w["idle"] for w in windows)/60)
+
+
+def advisory_validation_update(previous, stamp, identity, *, outlook=None, report=None):
+    """Small separate prospective ledger, no archive snapshots or fit input.
+
+    Issue at most every six hours. Compare a real independent room report
+    within the final 30 minutes before each horizon, interpolating ONLY the
+    previously issued temperature curve. Never extrapolate 48h past its end.
+    """
+    state=dict(previous) if isinstance(previous,dict) else {}
+    pending=[p for p in state.get("pending",[]) if isinstance(p,dict)
+             and number(p.get("due")) is not None and number(p.get("issued")) is not None][-36:]
+    completed=[p for p in state.get("completed",[]) if isinstance(p,dict)
+               and number(p.get("reported")) is not None and p["reported"]>=stamp-30*86400
+               and number(p.get("error")) is not None][-384:]
+    expired=dict(state.get("expired") or {})
+    observed=report_time(report) if isinstance(report,dict) else None
+    actual=number(report.get("room")) if observed is not None else None
+    if report and (report.get("room_source_disagreement") or report.get("room_sources_suspect")
+                   or report.get("room_source_status") in ("pending","room_source_disagreement")):
+        observed=None
+    kept=[]
+    for p in pending:
+        due=p["due"];h=str(p["horizon"])
+        # A qualified report may arrive at the next existing sample tick.
+        if (observed is not None and actual is not None and due-1800<=observed<=due
+                and observed>p["issued"] and observed<=stamp):
+            left,right=p["bracket"]
+            if left[0]<=observed<=right[0] and right[0]>left[0]:
+                expected=left[1]+(right[1]-left[1])*(observed-left[0])/(right[0]-left[0])
+                completed.append({k:p[k] for k in ("issued","horizon","identity","basis","weather_known","schedule_known")}
+                    |dict(reported=observed,error=expected-actual,lead_hours=(observed-p["issued"])/3600))
+                continue
+        if stamp>due+REPORT_ALIGNMENT_SECONDS:
+            expired[h]=expired.get(h,0)+1
+        else:
+            kept.append(p)
+    last=number(state.get("last_issued")) or 0.
+    if isinstance(outlook,dict) and outlook.get("status")=="conditional" and stamp-last>=21600:
+        curve=outlook.get("curve") or []
+        added=[]
+        for h in (24,36,48):
+            due=stamp+h*3600
+            right=next((p for p in curve if abs(p["ts"]-due)<.001),None)
+            left=next((p for p in reversed(curve) if p["ts"]<due-1799),None)
+            if not left or not right or not 0<right["ts"]-left["ts"]<=3600.001:
+                continue
+            if any(number(p.get("temperature")) is None for p in (left,right)):
+                continue
+            covered=[p for p in curve if p["ts"]<=due]
+            added.append(dict(issued=stamp,due=due,horizon=h,identity=list(identity),
+                basis=right["basis"],weather_known=all(p.get("weather_known") is True for p in covered),
+                schedule_known=all(p.get("schedule_known") is True for p in covered),
+                bracket=[[p["ts"],p["temperature"]] for p in (left,right)]))
+        if added:
+            kept.extend(added);last=stamp
+    return dict(pending=kept[-36:],completed=completed[-384:],expired=expired,last_issued=last)
+
+
+def advisory_validation_summary(state, identity, tz, stamp):
+    """Current identity only; keep conditional cohorts distinct."""
+    state=state or {};groups={}
+    for p in state.get("completed",[]):
+        if p.get("identity")!=list(identity) or not stamp-30*86400<=p["reported"]<=stamp:
+            continue
+        key=(p["horizon"],p["basis"],p["weather_known"],p["schedule_known"])
+        groups.setdefault(key,[]).append(p)
+    metrics=[]
+    for (h,basis,weather,schedule),rows in sorted(groups.items()):
+        ordered=sorted(rows,key=lambda p:p["reported"])
+        def independent_rows(items):
+            accepted=[];end=-math.inf
+            for p in items:
+                if p["issued"]>=end:
+                    accepted.append(p);end=p["reported"]
+            return accepted
+        independent=independent_rows(ordered)
+        today=datetime.fromtimestamp(stamp,tz).date()
+        dated=[(datetime.fromtimestamp(p["reported"],tz).date(),p) for p in ordered]
+        periods={}
+        for days in (7,14,30):
+            start=today-timedelta(days=days-1)
+            selected=[p for day,p in dated if day>=start]
+            unique=independent_rows(selected)
+            covered=len({day for day,p in dated if day>=start})
+            stats=_metrics([p["error"] for p in unique])
+            periods[str(days)]=dict(count=stats["n"],all_count=len(selected),days=covered,
+                missing_days=days-covered,mae=stats["mae"],bias=stats["bias"])
+        metrics.append(dict(horizon=h,basis=basis,weather_known=weather,schedule_known=schedule,periods=periods,
+            days=len({_local_day(p["reported"],tz) for p in ordered}),
+            all_reports=_metrics([p["error"] for p in ordered]),
+            independent=_metrics([p["error"] for p in independent]),
+            minimum_lead_hours=min(p["lead_hours"] for p in ordered),
+            maximum_lead_hours=max(p["lead_hours"] for p in ordered)))
+    return dict(groups=metrics,pending={str(h):sum(p.get("horizon")==h and p.get("identity")==list(identity)
+                       for p in state.get("pending",[])) for h in (24,36,48)},
+                expired=state.get("expired",{}),validation_basis="real_report_frozen_advisory",
+                target_tolerance_minutes=30,used_for_control=False)
 
 
 def _metrics(errors):
@@ -413,15 +562,42 @@ def _storage_candidate(train, model, base_best, ventilation):
     return field,candidate
 
 
+def thermal_parameter_support(thermal, qualified_vent, train=(), holdout=(), selected=(), blockers=()):
+    """Report the actual candidate cohorts, not sample counts as proof of fit."""
+    def describe(rows):
+        coverage=_coverage(rows)
+        return dict(windows=len(rows),minutes=round(coverage["seconds"]/60,1),
+                    days=coverage["days"])
+    def warm(rows):
+        return [w for w in rows if w["end"]-w["start"]>=1800
+                and w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.]
+    def heat(rows):
+        return [w for w in rows if w["end"]-w["start"]>=1800 and w["heat"]>=.75*(w["end"]-w["start"])]
+    result={}
+    for field in FIT_FIELDS:
+        cohort=warm if field=="floor_decay" else heat if field=="heat_gain" else lambda rows: rows
+        identified=not (field=="room_loss" and qualified_vent)
+        active=field in selected
+        result[field]=dict(available=describe(cohort(thermal)),
+            training=describe(cohort(train)) if active else None,
+            holdout=describe(cohort(holdout)) if active else None,
+            selected_for_candidate=active,
+            status=("not_identifiable_with_ventilation" if not identified else
+                    "candidate_evaluated" if active else "not_selected" if not blockers else "insufficient_support"),
+            basis=("warm_idle" if field=="floor_decay" else "measured_heat" if field=="heat_gain" else "thermal_windows"))
+    return result
+
+
 def evaluate_windows(windows, model, ventilation=None):
     """Bounded offline fit. Holdout is selected by whole, later local days."""
     # Fit v6 only with one current equipment and mode identity.
     if not windows or any(number(model.get(k)) is None for k in BOUNDS):
-        return dict(status="insufficient_data", blockers=["no_windows"])
+        return dict(status="insufficient_data", blockers=["no_windows"],
+                    parameter_support=thermal_parameter_support([],False,blockers=["no_windows"]))
     latest = windows[-1]["equipment"]
     windows = [w for w in windows if w["equipment"] == latest and latest[0] == model.get("version")]
     qualified_vent = ventilation and ventilation.get("validated") and ventilation.get("model_version")==model.get("version")
-    thermal = [w for w in windows if w["sun"]<=.02 and
+    thermal = [w for w in windows if not w.get("solar_only") and w["sun"]<=.02 and
                (qualified_vent or max(w["vent"])==0.)]
     # Over short intervals sensor rounding can dominate the thermal response.
     # Prefer longer observations when they already cover both regimes and days.
@@ -454,7 +630,8 @@ def evaluate_windows(windows, model, ventilation=None):
         support = _coverage(train)
         if (qualified_vent or not holdout or support["seconds"]<8*3600 or support["days"]<2
                 or not outside or max(outside)-min(outside)<2.):
-            return dict(status="insufficient_data", blockers=blockers, coverage=coverage)
+            return dict(status="insufficient_data", blockers=blockers, coverage=coverage,
+                        parameter_support=thermal_parameter_support(thermal,qualified_vent,blockers=blockers))
         fields = ("room_loss",)
     # Bound both the grid and per-candidate displacement; widening belongs to a
     # separate qualification for equipment gain and decay.
@@ -495,7 +672,8 @@ def evaluate_windows(windows, model, ventilation=None):
                 coverage=coverage, train_windows=len(train), holdout_days=len({w["day"] for w in holdout}),
                 holdout_start=min(w["day"] for w in holdout),
                 old=baseline,shadow=shadow, coefficients={k:best[k] for k in fields} if qualified else None,
-                equipment=latest)
+                equipment=latest,
+                parameter_support=thermal_parameter_support(thermal,qualified_vent,train,holdout,fields,blockers))
 
 
 def evaluate_solar(windows, model, commissioning=.283, ventilation=None):
@@ -504,33 +682,70 @@ def evaluate_solar(windows, model, commissioning=.283, ventilation=None):
                 and ventilation.get("model_version")==model.get("version"))]
     train, holdout = _split(windows)
     days = len({w["day"] for w in train})
-    result = dict(days=days,windows=len(train),comfort_credit=False,model_certificate_validated=False)
-    if days<3 or len(train)<12 or not holdout:
+    support=_coverage(holdout)
+    result = dict(days=days,windows=len(train),holdout_days=support["days"],
+                  holdout_windows=len(holdout),comfort_credit=False,model_certificate_validated=False)
+    if days<3 or len(train)<12 or support["days"]<2 or len(holdout)<6:
         return dict(result,status="insufficient_data")
     coefficient = min((.025*i for i in range(33)),key=lambda c:_score(train,model,c,ventilation)["mae"])
     zero, previous, shadow = (_score(holdout,model,c,ventilation) for c in (0.,commissioning,coefficient))
-    qualified = (shadow["mae"]<=.9*min(zero["mae"],previous["mae"])
-                 and shadow["p95"]<=min(zero["p95"],previous["p95"]))
+    qualified = (coefficient>0. and min(zero["mae"],previous["mae"])-shadow["mae"]>=
+                 max(.005,.1*min(zero["mae"],previous["mae"]))
+                 and shadow["p95"]<=min(zero["p95"],previous["p95"])
+                 and abs(shadow["bias"])<=min(abs(zero["bias"]),abs(previous["bias"])))
     return dict(result,status="holdout_passed" if qualified else "holdout_rejected",coefficient=coefficient,
-                zero=zero,commissioning=previous,shadow=shadow,holdout_days=len({w["day"] for w in holdout}))
+                zero=zero,commissioning=previous,shadow=shadow,
+                training_until=max(w["end"] for w in train),
+                holdout_start=min(w["start"] for w in holdout),
+                holdout_end=max(w["end"] for w in holdout))
+
+
+def solar_weather_evidence(stamp, tz, weather, issue, geometry, current_state=None):
+    """Separate issue-time hourly predictor from current provider estimate.
+
+    Neither cloud estimate is a physical irradiance measurement. The current
+    estimate is diagnostics only; do not substitute it into frozen forecasts.
+    """
+    result=dict(forecast_factor=None,forecast_basis="unknown",current_factor=None,
+                current_basis="unknown",current_cloud=None,forecast_cloud=None)
+    if not geometry:
+        return result
+    when=datetime.fromtimestamp(stamp,tz)
+    day=((geometry or {}).get("days") or {}).get(when.date().isoformat()) or {}
+    latitude=number((geometry or {}).get("latitude"))
+    sunrise,sunset,noon,declination=(number(day.get(k)) for k in
+                                     ("sunrise","sunset","noon","declination"))
+    if (latitude is None or not -90<=latitude<=90 or None in (sunrise,sunset,noon,declination)
+            or not sunrise<noon<sunset or not -90<=declination<=90):
+        return result
+    sun=daylight(when,geometry)
+    def factor(condition,cloud):
+        if cloud is not None and 0<=cloud<=100:
+            return sun*weather_factor(condition,cloud),"cloud_coverage"
+        if condition in ("sunny","clear","clear-night","partlycloudy","cloudy","rainy","pouring","snowy"):
+            return sun*weather_factor(condition,None),"condition"
+        return (0.,"astronomical_night") if sun==0. else (None,"unknown")
+    if weather and issue is not None and 0<=stamp-issue<=MAX_WEATHER_AGE:
+        current=next((r for r in reversed(weather) if 0<=stamp-r["ts"]<3600),None)
+        if current is not None:
+            cloud=number(current.get("cloud_coverage"))
+            result["forecast_factor"],result["forecast_basis"]=factor(current.get("condition"),cloud)
+            result["forecast_cloud"]=cloud if cloud is not None and 0<=cloud<=100 else None
+    if isinstance(current_state,dict) and current_state.get("state") not in (None,"unknown","unavailable"):
+        try:
+            at=datetime.fromisoformat(current_state.get("last_reported") or current_state["last_updated"])
+            age=stamp-at.timestamp() if at.tzinfo is not None else math.inf
+        except (KeyError,ValueError,TypeError,OverflowError):
+            age=math.inf
+        if 0<=age<=MAX_WEATHER_AGE:
+            cloud=number((current_state.get("attributes") or {}).get("cloud_coverage"))
+            result["current_factor"],result["current_basis"]=factor(current_state.get("state"),cloud)
+            result["current_cloud"]=cloud if cloud is not None and 0<=cloud<=100 else None
+    return result
 
 
 def solar_context_at(stamp, tz, weather, issue, geometry):
-    if (not weather or not geometry or issue is None or not 0<=stamp-issue<=MAX_WEATHER_AGE):
-        return None
-    current = next((r for r in reversed(weather) if 0<=stamp-r["ts"]<3600),None)
-    if current is None:
-        return None
-    when = datetime.fromtimestamp(stamp,tz)
-    if when.date().isoformat() not in (geometry.get("days") or {}):
-        return None
-    sun = daylight(when,geometry)
-    clouds = number(current.get("cloud_coverage"))
-    if (sun and not (clouds is not None and 0<=clouds<=100)
-            and current.get("condition") not in
-            ("sunny","clear","clear-night","partlycloudy","cloudy","rainy","pouring","snowy")):
-        return None
-    return sun*weather_factor(current.get("condition"),current.get("cloud_coverage"))
+    return solar_weather_evidence(stamp,tz,weather,issue,geometry)["forecast_factor"]
 
 
 def prospective_gate(rows, *, issued_at, now, observation_days=None):
@@ -639,6 +854,63 @@ def save_evidence(path, payload):
             temporary.unlink(missing_ok=True)
 
 
+def solar_nominal_settings(settings):
+    """Conditional prediction only; never pass this copy to the planner."""
+    environment=settings.get("environment") or {}
+    solar=environment.get("solar") or {}
+    if solar.get("control_no_sun") is not True or solar.get("validated") is not True:
+        return None
+    return {**settings,"environment":{**environment,"solar":{**solar,"control_no_sun":False}}}
+
+
+def project_solar_nominal(now, room, floor, outside, fire, weather, settings, forecast, model):
+    """One linear rollout on the exact selected plan, not another search."""
+    nominal=solar_nominal_settings(settings)
+    if nominal is None or not weather:
+        return None
+    rows=forecast.get("_calculation_curve") or forecast.get("curve") or []
+    if not rows:
+        return None
+    start=now.timestamp()
+    cursor=start
+    segments=sorted((s for row in rows for s in row.get("heat_segments",[])),
+                    key=lambda s:s["start"])
+    if any(number(s.get("power_kw")) is None or not 0<=s["power_kw"]<=10.5
+           or not s["start"]<s["end"] for s in segments) or any(
+               a["end"]>b["start"]+.001 for a,b in zip(segments,segments[1:])):
+        return None
+    index=0
+    fine=[];public=[]
+    for row in rows:
+        for point in row.get("_fine",[row]):
+            end=point["ts"]
+            if not 0<end-cursor<=301 or end>start+48*3600+.001:
+                return None  # do not pretend coarse or incomplete control traces are exact
+            while cursor<end-.001:
+                while index<len(segments) and segments[index]["end"]<=cursor+.001:
+                    index+=1
+                active=segments[index] if index<len(segments) else None
+                kw=0.;stop=end
+                if active:
+                    if active["start"]<=cursor+.001:
+                        kw=active["power_kw"];stop=min(stop,active["end"])
+                    else:
+                        stop=min(stop,active["start"])
+                when=datetime.fromtimestamp(cursor,now.tzinfo)
+                room,floor=forecast_step(room,floor,outdoor_at(weather,when,outside),kw,
+                    fire*math.exp(-(cursor-start)/7200),model,(stop-cursor)/3600,
+                    when,weather,nominal)
+                cursor=stop
+            cursor=end
+            fine.append({**point,"temperature":room})
+        if not fine or abs(fine[-1]["ts"]-row["ts"])>.001:
+            return None
+        if row["ts"]<=start+86400+.001:
+            public.append(dict(ts=row["ts"],temperature=round(room,2),
+                               no_sun_temperature=row["temperature"],weather_known=row.get("weather_known")))
+    return dict(fine=fine,curve=public)
+
+
 def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, forecast, model,
                     candidate, epoch):
     """Capture immutable issue-time inputs and the original predictions."""
@@ -654,6 +926,14 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
         known=max(known,row["ts"]+3600)
     fine = [point for row in forecast.get("_calculation_curve", forecast["curve"])
             for point in row.get("_fine",[row])]
+    nominal_settings=solar_nominal_settings(settings)
+    if nominal_settings is not None:
+        # Monitor the actually issued advisory nominal, never label a
+        # no-sun control forecast as a credited prediction.
+        fine=forecast.get("_solar_nominal_fine") or []
+        if not fine:
+            return None
+        settings=nominal_settings
     points = {}
     for horizon in (1,3,6):
         due = start+3600*horizon
@@ -671,7 +951,11 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
     segments = [[max(start,s["start"]),min(last,s["end"]),s["power_kw"]]
                 for s in forecast.get("heat_segments",[]) if s["end"]>start and s["start"]<last]
     climate = {k:settings[k] for k in ("environment","thermal_model_version","ventilation_model",
-                                      "ventilation_expected") if k in settings}
+                                      "ventilation_expected","ventilation_grid_only") if k in settings}
+    if climate.get("ventilation_grid_only"):
+        schedule=settings.get("outage_schedule") or {}
+        climate["outage_schedule"]={k:schedule[k] for k in ("valid","mode","known_until","runtime_supply_override") if k in schedule}
+        climate["outage_schedule"]["slots"]=[s for s in schedule.get("slots",[]) if s["end"]>start and s["start"]<last]
     # Forecast/reference settings are immutable to the controller after issue.
     # Round-trip the small selected fields to keep the sidecar independent.
     climate = json.loads(_encode(climate))
@@ -707,6 +991,14 @@ def _frozen_predictions(snapshot, tz, finish, *, evaluated_targets=()):
     models = (snapshot["model"],{**snapshot["model"],**(snapshot["candidate"] or {}).get("coefficients",{})})
     predictions, peaks = {}, [room,room]
     profile=(snapshot["candidate"] or {}).get("power_profile")
+    solar_candidate=number((snapshot["candidate"] or {}).get("solar_coefficient"))
+    candidate_settings=settings
+    if solar_candidate is not None:
+        # Shadow calculation only: do not modify the immutable issue snapshot.
+        environment=settings.get("environment") or {}
+        solar=environment.get("solar") or {}
+        candidate_settings={**settings,"environment":{**environment,
+            "solar":{**solar,"validated":True,"coefficient":solar_candidate}}}
     prior_upper=number(snapshot.get("power_upper_kw"))
     next_upper=certified_upper_power(profile) if profile else prior_upper
     risk=prior_upper is not None or next_upper is not None
@@ -721,14 +1013,15 @@ def _frozen_predictions(snapshot, tz, finish, *, evaluated_targets=()):
         outside = outdoor_at(weather,when,snapshot["outside"])
         for i,(model, (r,f)) in enumerate(zip(models,states)):
             power=(modulation_power(f,profile) if i==1 and profile and segment is not None else kw)
-            states[i] = forecast_step(r,f,outside,power,fire,model,(b-a)/3600,when,weather,settings)
+            context=candidate_settings if i==1 else settings
+            states[i] = forecast_step(r,f,outside,power,fire,model,(b-a)/3600,when,weather,context)
             peaks[i] = max(peaks[i],states[i][0])
             if risk:
                 bound=(prior_upper,next_upper)[i]
                 upper_kw=max(power,bound) if segment is not None and bound is not None else power
                 ur,uf=upper_states[i]
                 upper_states[i]=forecast_step(ur,uf,outside,upper_kw,fire,model,(b-a)/3600,
-                                              when,weather,settings,upper=True)
+                                              when,weather,context,upper=True)
                 upper_peaks[i]=max(upper_peaks[i],upper_states[i][0])
                 if i==1 and segment is not None and upper_states[i][1]>50:
                     storage_ok=False
@@ -847,8 +1140,21 @@ def qualify_frozen(snapshot, rows, tz):
             cursor=right
         check=(int(horizon), due, old, upper, low, high, zone, row["room"], sorted(reasons),
                planned_kwh,actual_kwh,planned_minutes,actual_minutes)
+        meta={}
         if command_verified:
-            check+=({"command_verified":True},)
+            meta["command_verified"]=True
+        solar=(snapshot.get("settings",{}).get("environment",{}).get("solar") or {})
+        # Store the distinct evidence at observation time; legacy checks
+        # cannot acquire this qualification retrospectively by default.
+        if (number(solar.get("risk_coefficient")) is not None and horizon in ("1","3")
+                and not reasons.difference({"unexplained_gain"}) and planned_kwh==0.
+                and actual_minutes==0 and steps and
+                all(number(kw) is not None and 0<=kw<=.05 and number(factor) is not None
+                    and 0<=factor<=1. for _,_,kw,factor,_ in steps)
+                and sum(s[0]*s[3] for s in steps)>.05*(due-start)):
+            meta["solar_idle_qualified"]=True
+        if meta:
+            check+=(meta,)
         checks.append(check)
     return checks
 
@@ -926,6 +1232,92 @@ def independent_checks(rows, horizon):
                 and all(number(row.get(k)) is not None for k in ("old_error","shadow_error"))):
             yield row
             end=row["end"]
+
+
+def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
+    """Paired issue-time solar shadow; no command or comfort credit is granted.
+
+    Only observations issued AFTER the fixed candidate was stored qualify.
+    Existing risk bounds, real independent reports and measured idle inputs
+    are mandatory. Never reuse the coefficient-fitting holdout as this test.
+    """
+    coefficient=number(certificate.get("coefficient"))
+    monitoring=certificate.get("comfort_credit") is True
+    if certificate.get("nominal_revoked_at") is not None and not monitoring:
+        return dict(status="rejected",reason="nominal_revoked",metrics={},comfort_credit=False)
+    stored=number(certificate.get("nominal_at" if monitoring else "stored_at"))
+    identity=certificate.get("identity")
+    if (coefficient is None or not 0<coefficient<=.8 or stored is None
+            or not isinstance(identity,list) or len(identity)!=3
+            or certificate.get("ventilation_model")!=(ventilation or {})):
+        return dict(status="no_candidate",metrics={},comfort_credit=False)
+    scored=[]
+    for item in archive:
+        snapshot=item["snapshot"]
+        start=snapshot["start"]
+        climate=snapshot.get("settings") or {}
+        solar=(climate.get("environment") or {}).get("solar") or {}
+        if (start<stored or snapshot.get("model")!=model or snapshot.get("identity",[])[2:]!=identity
+                or solar.get("risk_coefficient")!=coefficient
+                or bool(solar.get("validated"))!=monitoring
+                or monitoring and solar.get("coefficient")!=coefficient
+                or (climate.get("ventilation_model") or {})!=(ventilation or {})):
+            continue
+        checks=[r for r in item["checks"] if r[0] in (1,3) and len(r)>13
+                and r[13].get("solar_idle_qualified") is True and not set(r[8]).difference({"unexplained_gain"})]
+        if not checks:
+            continue
+        proposed={**snapshot,"candidate":{"solar_coefficient":0. if monitoring else coefficient}}
+        deltas=_frozen_predictions(proposed,tz,max(r[1] for r in checks),
+                                   evaluated_targets=[r[1] for r in checks])
+        for check in checks:
+            h,due,old,upper,low,high,zone,actual,*_=check
+            if due<=start or due>snapshot["weather_known_until"] or due not in deltas:
+                continue
+            guards=[g for g in snapshot.get("guards",()) if g[0]<=due]
+            if guards and guards[-1][0]<due:
+                guards.append([due,old,upper,low,high])
+            guarded=bool(guards and guards[-1][0]==due and
+                all(0<b-a<=301 for a,b in zip([start]+[g[0] for g in guards],[g[0] for g in guards])))
+            # The candidate nominal trajectory must stay inside the already
+            # issued upper risk envelope and not worsen a lower-bound deficit.
+            guarded=guarded and all(t in deltas and bound is not None
+                and nominal+deltas[t][0]<=bound+1e-6
+                and max(0.,lo-nominal-deltas[t][0])<=max(0.,lo-nominal)+1e-6
+                for t,nominal,bound,lo,_ in guards)
+            delta=deltas[due][0]
+            scored.append(dict(start=start,end=due,day=_local_day(start,tz),horizon=h,
+                old_error=old-actual,shadow_error=old+delta-actual,valid=True,
+                guard_ok=guarded,comfort_miss=bool(monitoring and actual<low-.2
+                    and old>=low-.1 and old+delta<low-.1)))
+    metrics={}
+    status="stable" if monitoring else "passed"
+    rollback_reason=None
+    for horizon,minimum,days in ((1,12,3),(3,6,2)):
+        cohort=list(independent_checks(scored,horizon))
+        old,new=(_metrics([r[key] for r in cohort]) for key in ("old_error","shadow_error"))
+        count_days=len({r["day"] for r in cohort})
+        metrics[str(horizon)]=dict(old=old,new=new,days=count_days,
+            guard_failures=sum(not r["guard_ok"] for r in cohort))
+        misses=[r for r in cohort if r["comfort_miss"]]
+        metrics[str(horizon)]["comfort_misses"]=len(misses)
+        if monitoring and len({r["day"] for r in misses})>=2:
+            status="rollback_required";rollback_reason="measured_comfort_deficit"
+        elif len(cohort)<minimum or count_days<days:
+            if status not in ("rejected","rollback_required"):
+                status="monitoring" if monitoring else "insufficient_data"
+        elif monitoring:
+            # Here old is the actually issued credited forecast, new is
+            # its zero-credit counterfactual; do not use pre-activation checks.
+            if (old["mae"]-new["mae"]>=max(.02,.1*new["mae"])
+                    or old["p95"]-new["p95"]>.10 or old["bias"]-new["bias"]>.15 and old["bias"]>.15):
+                status="rollback_required";rollback_reason=rollback_reason or "forecast_quality_regression"
+        elif (old["mae"]-new["mae"]<max(.005,.1*old["mae"]) or new["p95"]>old["p95"]
+                or abs(new["bias"])>abs(old["bias"]) or any(not r["guard_ok"] for r in cohort)):
+            status="rejected"
+    return dict(status=status,metrics=metrics,coefficient=coefficient,
+                issued_after=stored,comfort_credit=monitoring,rollback_reason=rollback_reason,
+                identity=identity)
 
 
 def promotion_evidence(rows):
@@ -1136,8 +1528,9 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                 rejection_counts=dict(sorted(window_report["rejection_counts"].items(),
                                              key=lambda item:(-item[1],item[0]))[:12]),
                 current_reasons=window_report["current_observation_quality"]["reasons"],
+                solar_weather=window_report.get("solar_weather",{}),
                 analysis_status="pending", analysis_blockers=[])
-    evidence_key = sha256(_encode([now.date().isoformat(),model,eligible,cooldown,power_context,
+    evidence_key = sha256(_encode(["parameter_support_v1",now.date().isoformat(),model,eligible,cooldown,power_context,ventilation,
                                   [(w['start'],w['end']) for w in windows],
                                   [(f['snapshot']['start'],f['checks']) for f in archive]])).hexdigest()
     previous_report = saved["report"]
@@ -1145,7 +1538,10 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         return dict(result,status=previous_report["status"],reason=previous_report["reason"],
                     analysis_status=previous_report.get("analysis_status","pending"),
                     analysis_blockers=previous_report.get("analysis_blockers",[]),
-                    power_learning=previous_report.get("power_learning"))
+                    parameter_support=previous_report.get("parameter_support",{}),
+                    power_learning=previous_report.get("power_learning"),
+                    solar=previous_report.get("solar"),
+                    solar_prospective=previous_report.get("solar_prospective"))
     monitoring=checkpoint.get("monitoring")
     if monitoring and monitoring["version"]==model.get("version"):
         assessments={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
@@ -1171,7 +1567,8 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         # Promotion still needs the unchanged real-time eligibility gate.
         thermal=evaluate_windows(windows,model,ventilation)
         blockers=thermal.get("blockers",[])
-        result.update(analysis_status=thermal["status"],analysis_blockers=blockers)
+        result.update(analysis_status=thermal["status"],analysis_blockers=blockers,
+                      parameter_support=thermal.get("parameter_support",{}))
         if eligible:
             result.update(status=thermal["status"] if thermal["status"]=="insufficient_data" else "rejected",
                           reason=",".join(blockers) or "holdout_forecasts_required")
@@ -1191,8 +1588,19 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
             if gate["status"]=="accepted" and eligible:
                 result.update(proposed=thermal["coefficients"],evidence=gate,
                               evidence_fingerprint=sha256(_encode(scored)).hexdigest())
-        result["solar"]=evaluate_solar([w for w in windows if w["equipment"][0]==model.get("version")],
-                                      model,ventilation=ventilation)
+        context=power_context or {}
+        identity=[model.get("version"),context.get("equipment"),context.get("mode")]
+        solar_windows=[w for w in windows if w["equipment"]==identity]
+        active_solar=context.get("solar_risk") or {}
+        baseline=number(active_solar.get("coefficient")) or 0.
+        result["solar"]=evaluate_solar(solar_windows,model,commissioning=baseline,ventilation=ventilation)
+        result["solar"]["identity"]=identity
+        result["solar_prospective"]=solar_prospective_evidence(active_solar,archive,model,now.tzinfo,ventilation)
+        # Freeze a candidate while it accumulates independent future checks.
+        result["solar"]["risk_eligible"]=bool(eligible and not result.get("proposed")
+            and result["solar"]["status"]=="holdout_passed"
+            and (not active_solar or result["solar_prospective"]["status"]=="rejected")
+            and stamp>=active_solar.get("nominal_frozen_until",0))
         if power_context and not result.get("proposed"):
             power=qualify_power_candidate(power_context,archive,model,now.tzinfo,checkpoint.get("evidence_after",0.))
             result["power_learning"]={k:v for k,v in power.items() if k in ("status","reason","metrics")}
@@ -1202,8 +1610,10 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
     payload=dict(windows=windows,forecasts=archive,comparisons=[],report={
         "status":result["status"], "reason":result["reason"], "updated_at":stamp,
         "evidence_key":None if result.get("proposed") or result.get("proposed_power") or result.get("rollback") else evidence_key,
-        "power_learning":result.get("power_learning"),
+        "power_learning":result.get("power_learning"),"solar":result.get("solar"),
+        "solar_prospective":result.get("solar_prospective"),
         "analysis_status":result["analysis_status"],"analysis_blockers":result["analysis_blockers"],
+        "parameter_support":result.get("parameter_support",{}),
         "independent_windows":len(windows), "qualified_minutes":result["qualified_minutes"]})
     # Keep more than a week of compact issue snapshots where the byte cap permits.
     while len(_encode(payload))>MAX_BYTES-256:

@@ -192,6 +192,118 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             boot_id="fixture-boot",owner_epoch=1,fenced=False))
         return hass, app
 
+    async def test_outage_zero_heat_needs_exact_topology_and_no_conflicting_evidence(self):
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            app.cfg.update(power_accounting_method="kws",kws_relay="switch.kws")
+            app.planning_grid_state="off"
+            hass.rows["sensor.grid"].state="Відсутня мережа"
+            app.voltage_status={"phases_v":[None,None,None]}
+            app.power_quality="unknown"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.cfg["boiler_outage_isolation_relay"]="switch.kws"
+            self.assertTrue(app._learning_proven_zero_heat(None))
+            self.assertFalse(app._learning_proven_zero_heat(3.))
+            app.voltage_status={"phases_v":[230.,None,None]}
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.voltage_status={"phases_v":[None,None,None]}
+            hass.rows["sensor.grid"].state="Наявна мережа"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            hass.rows["sensor.grid"].state="Відсутня мережа"
+            app.planning_grid_state="unknown"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.planning_grid_state="off"
+            app.cfg["kws_relay"]="switch.other"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.cfg["kws_relay"]="switch.kws"
+            with patch.object(component.time,"time",return_value=1000.):
+                self.assertTrue(app._capture_sample_power(None))
+            with patch.object(component.time,"time",return_value=1015.):
+                self.assertFalse(app._capture_sample_power(None))
+            self.assertEqual(app._learning_zero_seconds,15.)
+            self.assertEqual(app._learning_kw_seconds,0.)
+            self.assertIsNone(app.measured_sample_power(1000.,1015.))
+            with patch.object(component.time,"time",return_value=1070.):
+                self.assertTrue(app._capture_sample_power(None))
+            self.assertEqual(app._learning_zero_seconds,15.)
+            hass.services.async_call.assert_not_called()
+
+    async def test_solar_risk_candidate_is_bound_to_current_context_and_persisted(self):
+        import time
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.memory["equipment_version"]=1
+            app.climate_tz=timezone.utc
+            app._learning_eligible=Mock(return_value=True)
+            issued=dict(model=dict(app.model),equipment=1,generation=app._learning_generation,
+                        solar_ventilation={},started=time.monotonic())
+            outcome={"solar":dict(status="holdout_passed",risk_eligible=True,coefficient=.5,
+                identity=[6,1,"fixed_6"],holdout_end=1000.,holdout_days=2,holdout_windows=8)}
+            app.memory["ventilation_model"]={"validated":False,"reason":"changed"}
+            app._store_solar_risk_candidate(issued,outcome)
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app.memory["ventilation_model"]={}
+            with patch.object(app,"save",side_effect=OSError):
+                app._store_solar_risk_candidate(issued,outcome)
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app._store_solar_risk_candidate(issued,outcome)
+            active=app.active_solar_risk_certificate()
+            self.assertEqual(active["coefficient"],.5)
+            self.assertFalse(active["comfort_credit"])
+            self.assertEqual(json.loads(app.statefile.read_text())["online_learning"]["solar_risk_candidate"],active)
+            app.memory["equipment_version"]=2
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app.memory["equipment_version"]=1
+            app.cfg["boiler_power_mode"]="fixed_9"
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.model={"version":7}
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            self.assertEqual(app.command_ledger.calls,[])
+            hass.services.async_call.assert_not_called()
+
+    async def test_solar_credit_is_promoted_once_and_rolled_back_atomically(self):
+        import time
+        from copy import deepcopy
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            app.climate_tz=timezone.utc
+            app.cfg["boiler_power_mode"]="fixed_6"
+            app.memory["equipment_version"]=1
+            app._learning_eligible=Mock(return_value=True)
+            risk=dict(identity=[6,1,"fixed_6"],status="holdout_passed",coefficient=.5,
+                      comfort_credit=False,stored_at=1000.,holdout_end=900.,ventilation_model={})
+            app.memory["online_learning"]={"solar_risk_candidate":deepcopy(risk)}
+            issued=dict(model=dict(app.model),equipment=1,generation=app._learning_generation,
+                        solar_ventilation={},solar_risk=deepcopy(risk),started=time.monotonic())
+            report=dict(status="passed",identity=risk["identity"],coefficient=.5,issued_after=1000.)
+            app._update_solar_credit(issued,{"solar_prospective":{**report,"issued_after":999.}})
+            self.assertFalse(app.active_solar_risk_certificate()["comfort_credit"])
+            with patch.object(app,"save",side_effect=OSError):
+                app._update_solar_credit(issued,{"solar_prospective":report})
+            self.assertFalse(app.active_solar_risk_certificate()["comfort_credit"])
+            app._update_solar_credit(issued,{"solar_prospective":report})
+            active=app.active_solar_risk_certificate()
+            self.assertTrue(active["comfort_credit"])
+            self.assertEqual(active,json.loads(app.statefile.read_text())["online_learning"]["solar_risk_candidate"])
+            issued["solar_risk"]=deepcopy(active)
+            rollback=dict(status="rollback_required",identity=risk["identity"],coefficient=.5,
+                          issued_after=active["nominal_at"],rollback_reason="forecast_quality_regression")
+            app._learning_eligible=Mock(return_value=False)
+            app._update_solar_credit(issued,{"solar_prospective":rollback})
+            revoked=app.active_solar_risk_certificate()
+            self.assertFalse(revoked["comfort_credit"])
+            self.assertGreater(revoked["nominal_frozen_until"],revoked["nominal_revoked_at"])
+            issued["solar_risk"]=deepcopy(revoked)
+            app._learning_eligible=Mock(return_value=True)
+            app._update_solar_credit(issued,{"solar_prospective":report})
+            self.assertFalse(app.active_solar_risk_certificate()["comfort_credit"])
+            app.memory["online_learning"]["evidence_after"]=1001.
+            self.assertEqual(app.active_solar_risk_certificate(),{})
+            self.assertEqual(app.command_ledger.calls,[])
+            hass.services.async_call.assert_not_called()
+
     async def test_single_scheduled_learning_job_keeps_v6_without_evidence(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)
@@ -795,6 +907,169 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             hass.rows["sensor.heating_heartbeat"].attributes["runtime"] = "native_v1"
             self.assertFalse(component.source_writer_active(hass, 1020))
 
+
+    async def test_archive_job_is_bounded_and_lease_waits_for_executor_exit(self):
+        import threading
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            started=threading.Event()
+            release=threading.Event()
+            calls=[]
+            def compact(stamp, *, allow_remove, stop):
+                calls.append((stamp,allow_remove,stop))
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("fixture timed out")
+                return dict(status="deferred",snapshots=0)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=compact)
+            app._kws_idle_since=1000.
+            app.calculation_jobs={}
+            app.terminate=Mock()
+            app._archive_next_at=0.
+            lease=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            try:
+                app.schedule_archive_maintenance(1061.)
+                app.schedule_archive_maintenance(1062.)
+                self.assertTrue(await asyncio.to_thread(started.wait,2))
+                self.assertEqual(len(calls),1)
+                self.assertTrue(calls[0][1])
+                close=asyncio.create_task(runtime.close())
+                await asyncio.sleep(.03)
+                self.assertTrue(calls[0][2].is_set())
+                lease.close.assert_not_called()
+                app.schedule_archive_maintenance(99999.)
+                self.assertEqual(len(calls),1)
+                release.set()
+                await asyncio.wait_for(close,3)
+                lease.close.assert_called_once()
+                self.assertTrue(app._closed)
+            finally:
+                release.set()
+                await runtime.close()
+
+    async def test_stalled_archive_does_not_block_shutdown_and_keeps_lease_until_worker_exits(self):
+        import threading
+        import time
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            started=threading.Event(); release=threading.Event(); finished=threading.Event()
+            lease=Mock()
+            def compact(stamp, *, allow_remove, stop):
+                started.set()
+                if not release.wait(10):
+                    raise RuntimeError("fixture timed out")
+                self.assertTrue(stop.is_set())
+                finished.set()
+                return dict(status="stopped",snapshots=0)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=compact)
+            app._kws_idle_since=1000.
+            app.calculation_jobs={}
+            app.terminate=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            app.ARCHIVE_CLOSE_TIMEOUT=.05
+            try:
+                app.schedule_archive_maintenance(1061.)
+                self.assertTrue(await asyncio.to_thread(started.wait,2))
+                start=time.monotonic()
+                await asyncio.wait_for(runtime.close(),1.)
+                self.assertLess(time.monotonic()-start,.9)
+                self.assertTrue(app._archive_stop.is_set())
+                self.assertTrue(app._closed)
+                lease.close.assert_not_called()
+                self.assertFalse(finished.is_set())
+                release.set()
+                await asyncio.wait_for(app._archive_job,2.)
+                self.assertTrue(finished.is_set())
+                lease.close.assert_called_once()
+            finally:
+                release.set()
+                await runtime.close()
+
+    async def test_default_archive_timeout_real_flock_retains_ownership(self):
+        import fcntl
+        import threading
+        import time
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            started=threading.Event(); release=threading.Event()
+            lease_path=self.root/"archive-timeout-writer.lock"
+            lease=lease_path.open("a")
+            fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            def compact(stamp, *, allow_remove, stop):
+                started.set()
+                if not release.wait(12):
+                    raise RuntimeError("fixture timeout")
+                return dict(status="stopped",snapshots=0)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=compact)
+            app._kws_idle_since=1000.
+            app.calculation_jobs={}
+            app.terminate=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            try:
+                self.assertEqual(app.ARCHIVE_CLOSE_TIMEOUT,4.)
+                app.schedule_archive_maintenance(1061.)
+                self.assertTrue(await asyncio.to_thread(started.wait,2))
+                job=app._archive_job
+                start=time.monotonic()
+                await runtime.close()
+                elapsed=time.monotonic()-start
+                print("Archive stalled-worker close wall seconds: %.3f"%elapsed)
+                self.assertLessEqual(elapsed,5.)
+                self.assertTrue(app._closed)
+                self.assertTrue(app._archive_stop.is_set())
+                self.assertFalse(lease.closed)
+                with lease_path.open("a") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                release.set()
+                await asyncio.wait_for(job,2.)
+                self.assertTrue(lease.closed)
+                with lease_path.open("a") as contender:
+                    fcntl.flock(contender,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            finally:
+                release.set()
+                await runtime.close()
+                if app._archive_job is not None:
+                    await asyncio.wait_for(app._archive_job,2.)
+                if not lease.closed:
+                    lease.close()
+
+    async def test_archive_worker_cannot_start_writes_after_lease_release(self):
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            journal=SimpleNamespace(compact_cold_snapshot_batch=Mock())
+            lease=Mock()
+            app.terminate=Mock()
+            runtime=component.ProductionRuntime(app,lease)
+            await runtime.close()
+            result=await asyncio.to_thread(app._archive_worker,journal,1061.)
+            self.assertEqual(result["status"],"stopped")
+            journal.compact_cold_snapshot_batch.assert_not_called()
+            lease.close.assert_called_once()
+
+    async def test_archive_schedule_defers_heat_and_pending_calculation(self):
+        with package(self.root / "package") as (component, _):
+            _,app=self.controller(component)
+            app.decision_journal=SimpleNamespace(compact_cold_snapshot_batch=Mock())
+            app.calculation_jobs={}
+            app._archive_next_at=0.
+            app._kws_idle_since=None
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app._kws_idle_since=800.
+            app.calculation_jobs={"plan":{"completed":False}}
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app.calculation_jobs={}
+            app._learning_job={"started":0.}
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app._learning_job=None
+            app._archive_next_at=1100.
+            app.schedule_archive_maintenance(1000.)
+            self.assertIsNone(app._archive_job)
+            app.decision_journal.compact_cold_snapshot_batch.assert_not_called()
 
     async def test_runtime_close_is_idempotent_and_releases_lease_once(self):
         with package(self.root / "package") as (component, _):

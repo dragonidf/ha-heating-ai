@@ -88,6 +88,365 @@ class DecisionHistoryTests(unittest.TestCase):
             self.assertTrue(failed['storage_degraded'])
             self.assertTrue(protected.exists())
 
+    def test_staged_pack_is_additive_and_reader_accepts_exact_packed_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            values=[dict(i=i,data=list(range(2000))) for i in range(8)]
+            stamp=time.time()
+            ids=[journal.snapshot(v,stamp) for v in values]
+            before={p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')}
+            result=journal.stage_snapshot_pack(ids)
+            self.assertEqual(result['snapshots'],8)
+            self.assertEqual(before,{p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')})
+            restored=DecisionJournal(directory)
+            for key,value in zip(ids,values):
+                self.assertEqual(restored.read_snapshot(key),value)
+                self.assertEqual(restored._packed_snapshot(key),gzip.decompress(before[key+'.json.gz']))
+            # Simulate a future authorized promotion, not done by staging.
+            (journal.directory/(ids[0]+'.json.gz')).unlink()
+            self.assertEqual(restored.read_snapshot(ids[0]),values[0])
+            blob=journal.directory/'packed_v1'/(result['pack']+'.xz')
+            blob.write_bytes(blob.read_bytes()[:-4])
+            with self.assertRaises(ValueError):restored.read_snapshot(ids[0])
+            # A damaged staged copy never makes existing originals unreadable.
+            self.assertEqual(restored.read_snapshot(ids[1]),values[1])
+
+    def test_pack_promotion_requires_savings_and_survives_partial_removal(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            values=[dict(i=i,data=list(range(10000))) for i in range(8)]
+            ids=[journal.snapshot(v,stamp) for v in values]
+            staged=journal.stage_snapshot_pack(ids,require_savings=True)
+            self.assertEqual(staged['status'],'staged')
+            self.assertLessEqual(staged['packed_bytes']*2,staged['legacy_bytes'])
+            key=staged['pack']
+            with self.assertRaises(PermissionError):journal.promote_snapshot_pack(key)
+            original_unlink=Path.unlink
+            def interrupt(path,*args,**kwargs):
+                if path.name==ids[1]+'.json.gz':raise OSError('interrupted promotion')
+                return original_unlink(path,*args,**kwargs)
+            with patch.object(Path,'unlink',interrupt):
+                with self.assertRaises(OSError):journal.promote_snapshot_pack(key,allow_remove=True)
+            restored=DecisionJournal(directory)
+            for digest,value in zip(ids,values):self.assertEqual(restored.read_snapshot(digest),value)
+            result=restored.promote_snapshot_pack(key,allow_remove=True)
+            self.assertEqual(result['removed'],7)
+            self.assertEqual(restored.promote_snapshot_pack(key,allow_remove=True)['removed'],0)
+            self.assertFalse(list(restored.directory.glob('*.json.gz')))
+            for digest,value in zip(ids,values):self.assertEqual(restored.read_snapshot(digest),value)
+
+    def test_pack_encoding_does_not_hold_journal_lock_and_stale_publication_is_rejected(self):
+        from unittest.mock import patch
+        from threading import Thread,Event
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            ids=[journal.snapshot(dict(i=i,data=list(range(1000))),stamp) for i in range(2)]
+            original=journal._prepare_snapshot_pack
+            prepared=Event();release=Event();errors=[]
+            def slow_prepare(keys):
+                result=original(keys)
+                prepared.set()
+                if not release.wait(5):raise RuntimeError('test timeout')
+                return result
+            def stage():
+                try:journal.stage_snapshot_pack(ids)
+                except Exception as exc:errors.append(exc)
+            with patch.object(journal,'_prepare_snapshot_pack',side_effect=slow_prepare):
+                worker=Thread(target=stage)
+                worker.start()
+                try:
+                    self.assertTrue(prepared.wait(5))
+                    self.assertTrue(journal.lock.acquire(timeout=1))
+                    try:
+                        journal.snapshot(dict(i=0,data=list(range(1000))),stamp+60)
+                    finally:journal.lock.release()
+                finally:
+                    release.set();worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors),1)
+            self.assertIsInstance(errors[0],ValueError)
+            self.assertFalse((journal.directory/'packed_v1').exists())
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),2)
+
+    def test_promotion_verification_outside_lock_rejects_concurrent_reuse(self):
+        from unittest.mock import patch
+        from threading import Thread,Event
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            values=[dict(i=i,data=list(range(5000))) for i in range(8)]
+            ids=[journal.snapshot(v,stamp) for v in values]
+            key=journal.stage_snapshot_pack(ids,require_savings=True)['pack']
+            original=journal._prepare_pack_promotion
+            prepared=Event();release=Event();errors=[]
+            def slow_prepare(pack):
+                result=original(pack);prepared.set()
+                if not release.wait(5):raise RuntimeError('test timeout')
+                return result
+            def promote():
+                try:journal.promote_snapshot_pack(key,allow_remove=True)
+                except Exception as exc:errors.append(exc)
+            with patch.object(journal,'_prepare_pack_promotion',side_effect=slow_prepare):
+                worker=Thread(target=promote);worker.start()
+                try:
+                    self.assertTrue(prepared.wait(5))
+                    self.assertTrue(journal.lock.acquire(timeout=1))
+                    try:journal.snapshot(values[0],stamp+60)
+                    finally:journal.lock.release()
+                finally:
+                    release.set();worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors),1)
+            self.assertIsInstance(errors[0],ValueError)
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),8)
+            for key,value in zip(ids,values):self.assertEqual(journal.read_snapshot(key),value)
+
+    def test_cold_batch_compaction_preserves_hot_tiny_and_expired_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,retention_days=14)
+            stamp=time.time()
+            # Generate large deterministic overlapping data and distinct hashes.
+            from random import Random
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            cold=[dict(i=i,values=shared) for i in range(9)]
+            hot=dict(i=100,values=shared)
+            tiny=dict(i=101)
+            old=dict(i=102,values=shared)
+            cold_ids=[journal.snapshot(v,stamp-4*86400+i) for i,v in enumerate(cold)]
+            hot_id=journal.snapshot(hot,stamp-3600)
+            tiny_id=journal.snapshot(tiny,stamp-5*86400)
+            old_id=journal.snapshot(old,stamp-15*86400)
+            # No rotation is performed by selection or compaction.
+            self.assertEqual(journal.cold_pack_candidates(stamp),cold_ids[:8])
+            with self.assertRaises(PermissionError):journal.compact_cold_snapshot_batch(stamp)
+            result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True)
+            self.assertEqual(result['status'],'promoted',result)
+            self.assertEqual(result['removed'],8)
+            for key,value in zip(cold_ids,cold):self.assertEqual(journal.read_snapshot(key),value)
+            for key in (cold_ids[-1],hot_id,tiny_id,old_id):
+                self.assertTrue((journal.directory/(key+'.json.gz')).exists())
+            self.assertEqual(journal.compact_cold_snapshot_batch(stamp,allow_remove=True)['status'],'no_eligible_batch')
+
+    def test_online_cold_pack_updates_accounting_and_preserves_rollback(self):
+        from random import Random
+        from threading import Event
+        from unittest.mock import patch
+        from tools.pack_decision_archive import restore_mixed_archive
+        with tempfile.TemporaryDirectory() as directory:
+            stamp=time.time()
+            journal=DecisionJournal(directory,retention_days=14,max_bytes=32*1024*1024)
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            values=[dict(i=i,values=shared) for i in range(8)]
+            ids=[journal.snapshot(value,stamp-4*86400+i) for i,value in enumerate(values)]
+            journal._prepare(stamp)
+            before=journal.used_bytes
+            # No whole-directory scan under the online publication lock.
+            with patch.object(Path,'iterdir',side_effect=AssertionError('online rescan')):
+                result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=Event())
+            self.assertEqual(result['status'],'promoted',result)
+            self.assertEqual(result['removed'],8)
+            self.assertEqual(journal.used_bytes,before-result['removed_bytes']+result['packed_bytes'])
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+            self.assertEqual(journal.snapshot_bytes,journal.used_bytes)
+            self.assertEqual(journal.packed_bytes,journal.used_bytes)
+            self.assertEqual(journal.snapshot_count,8)
+            self.assertEqual(journal.packed_snapshot_count,8)
+            self.assertEqual(journal.packed_blocks,1)
+            restored=DecisionJournal(directory)
+            for key,value in zip(ids,values):
+                self.assertEqual(restored.read_snapshot(key),value)
+            target=Path(directory)/'legacy'
+            self.assertEqual(restore_mixed_archive(journal.directory,target)['restored_packed_snapshots'],8)
+            for key,value in zip(ids,values):
+                self.assertEqual(json.loads(gzip.decompress((target/(key+'.json.gz')).read_bytes())),value)
+
+    def test_hourly_inventory_streams_without_path_list_and_preserves_retention(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,max_bytes=32*1024*1024)
+            stamp=time.time()
+            journal.directory.mkdir()
+            hot=journal.directory/('a'*64+'.json.gz')
+            old=journal.directory/('b'*64+'.json.gz')
+            cold=journal.directory/('c'*64+'.json.gz')
+            for path,size,age in ((hot,1000,0),(old,2000,15),(cold,32768,4)):
+                path.write_bytes(b'x'*size)
+                os.utime(path,(stamp-age*86400,stamp-age*86400))
+            with patch.object(Path,'iterdir',side_effect=AssertionError('materialized directory listing')):
+                journal._prepare(stamp)
+            self.assertFalse(old.exists())
+            self.assertTrue(hot.exists())
+            self.assertTrue(cold.exists())
+            self.assertEqual(journal.used_bytes,33768)
+            self.assertEqual(journal.snapshot_count,2)
+            self.assertEqual(journal._cold_queue,('c'*64,))
+
+    def test_online_batches_reuse_hourly_scan_and_do_not_rescan_empty_queue(self):
+        from random import Random
+        from threading import Event
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,max_bytes=32*1024*1024)
+            stamp=time.time()
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            values=[dict(i=i,values=shared) for i in range(16)]
+            ids=[journal.snapshot(value,stamp-4*86400+i) for i,value in enumerate(values)]
+            journal._prepare(stamp)
+            with patch.object(journal,'cold_pack_candidates',side_effect=AssertionError('redundant scan')):
+                for _ in range(2):
+                    result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=Event())
+                    self.assertEqual(result['status'],'promoted',result)
+                    self.assertEqual(result['removed'],8)
+                result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=Event())
+                self.assertEqual(result['status'],'no_eligible_batch',result)
+            for key,value in zip(ids,values):
+                self.assertEqual(journal.read_snapshot(key),value)
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+
+    def test_online_stop_fences_publication_and_removal(self):
+        from random import Random
+        from threading import Event
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            stamp=time.time()
+            journal=DecisionJournal(directory,retention_days=14,max_bytes=32*1024*1024)
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            values=[dict(i=i,values=shared) for i in range(8)]
+            ids=[journal.snapshot(value,stamp-4*86400+i) for i,value in enumerate(values)]
+            journal._prepare(stamp)
+            original=journal._prepare_snapshot_pack
+            stop=Event()
+            def prepare(keys):
+                result=original(keys)
+                stop.set()
+                return result
+            with patch.object(journal,'_prepare_snapshot_pack',side_effect=prepare):
+                with self.assertRaisesRegex(ValueError,'stopped'):
+                    journal.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp,stop=stop)
+            self.assertFalse(list(journal.directory.glob('*.snapshot-ref')))
+            stop.clear()
+            staged=journal.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp,stop=stop)
+            self.assertEqual(staged['status'],'staged')
+            verify=journal._prepare_pack_promotion
+            def prepare_promotion(key):
+                result=verify(key)
+                stop.set()
+                return result
+            with patch.object(journal,'_prepare_pack_promotion',side_effect=prepare_promotion):
+                with self.assertRaisesRegex(ValueError,'stopped'):
+                    journal.promote_snapshot_pack(staged['pack'],allow_remove=True,stop=stop)
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),8)
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+            for key,value in zip(ids,values):self.assertEqual(journal.read_snapshot(key),value)
+
+    def test_cold_scan_stops_without_publishing_partial_selection(self):
+        from threading import Event
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            stop=Event()
+            visited=[]
+            class Entries:
+                def __enter__(self):return self
+                def __exit__(self,*args):return False
+                def __iter__(self):
+                    for i in range(100000):
+                        visited.append(i)
+                        if i==3:stop.set()
+                        yield SimpleNamespace(name=('%064x'%i)+'.json.gz',
+                            is_file=lambda **kw:True,stat=lambda **kw:
+                            SimpleNamespace(st_mtime=stamp-4*86400,st_size=32768))
+            with patch('heating_recovery.os.scandir',return_value=Entries()), \
+                 patch.object(journal,'stage_snapshot_pack') as stage:
+                selected=journal.cold_pack_candidates(stamp,stop=stop)
+            self.assertEqual(selected,[])
+            self.assertEqual(len(visited),4)
+            stage.assert_not_called()
+            self.assertEqual(journal.cold_pack_candidates(stamp,stop=stop),[])
+
+    def test_cold_publication_rejects_recently_reused_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            ids=[journal.snapshot(dict(i=i,data=list(range(10000))),stamp-4*86400) for i in range(2)]
+            journal.snapshot(dict(i=0,data=list(range(10000))),stamp)
+            with self.assertRaises(ValueError):
+                journal.stage_snapshot_pack(ids,cold_at=stamp)
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),2)
+            self.assertFalse((journal.directory/'packed_v1').exists())
+
+    def test_pack_savings_gate_keeps_tiny_originals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            ids=[journal.snapshot(dict(i=i),time.time()) for i in range(2)]
+            result=journal.stage_snapshot_pack(ids,require_savings=True)
+            self.assertEqual(result['status'],'insufficient_savings')
+            self.assertFalse((journal.directory/'packed_v1').exists())
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),2)
+
+    def test_packed_retention_accounts_for_shared_block_and_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,retention_days=7,max_bytes=8*1024*1024)
+            stamp=time.time()
+            values=[dict(i=i,data=list(range(500))) for i in range(2)]
+            ids=[journal.snapshot(v,stamp) for v in values]
+            result=journal.stage_snapshot_pack(ids)
+            folder=journal.directory/'packed_v1'
+            # Simulate authorized future promotion: both originals removed.
+            for key in ids:(journal.directory/(key+'.json.gz')).unlink()
+            journal._prepare(stamp)
+            self.assertEqual(journal.snapshot_count,2)
+            self.assertEqual(journal.packed_snapshot_count,2)
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+            self.assertEqual(journal.snapshot_bytes,journal.used_bytes)
+            refreshed=stamp+6*86400
+            self.assertEqual(journal.snapshot(values[0],refreshed),ids[0])
+            self.assertFalse((journal.directory/(ids[0]+'.json.gz')).exists())
+            journal._prepare(stamp+8*86400)
+            self.assertEqual(journal.read_snapshot(ids[0]),values[0])
+            self.assertTrue((folder/(result['pack']+'.xz')).exists())
+            self.assertFalse((journal.directory/(ids[1]+'.snapshot-ref')).exists())
+            self.assertEqual(journal.snapshot_count,1)
+            journal._prepare(stamp+14*86400)
+            self.assertFalse((folder/(result['pack']+'.xz')).exists())
+            self.assertEqual(journal.used_bytes,0)
+
+    def test_packed_gc_fails_closed_on_invalid_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            ids=[journal.snapshot(dict(i=i),stamp) for i in range(2)]
+            result=journal.stage_snapshot_pack(ids)
+            pointer=journal.directory/(ids[0]+'.snapshot-ref')
+            pointer.write_text('broken')
+            journal._prepare(stamp+16*86400)
+            self.assertTrue(journal.packed_gc_error)
+            self.assertTrue((journal.directory/'packed_v1'/(result['pack']+'.xz')).exists())
+            self.assertTrue(pointer.exists())
+
+    def test_staging_failure_keeps_all_legacy_snapshots(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            ids=[journal.snapshot(dict(i=i),time.time()) for i in range(2)]
+            before={p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')}
+            original=journal._atomic_pack_file
+            def interrupted(path,raw,mtime=None):
+                if path.name.endswith('.snapshot-ref'):raise OSError('interrupted')
+                return original(path,raw,mtime)
+            with patch.object(journal,'_atomic_pack_file',side_effect=interrupted):
+                with self.assertRaises(OSError):journal.stage_snapshot_pack(ids)
+            self.assertEqual(before,{p.name:p.read_bytes() for p in journal.directory.glob('*.json.gz')})
+
     def test_snapshot_corruption_and_bad_identifiers_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)

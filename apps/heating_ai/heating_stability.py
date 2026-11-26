@@ -23,6 +23,7 @@ def policy(settings):
           'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin','equipment_version','ventilation_model','ventilation_expected',
           'day_insurance','day_insurance_kwh','day_insurance_start','day_insurance_end','day_insurance_deficit')
     return {**{k:settings.get(k) for k in keys},'environment_policy_version':ENVIRONMENT_POLICY_VERSION,
+            'ventilation_topology':{k:v.get('entity') for k,v in (settings.get('ventilation_grid_only') or {}).items()},
             'energy_budget_policy_version':1,
             'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
             'runtime_supply_override':(settings.get('outage_schedule') or {}).get('runtime_supply_override'),
@@ -176,9 +177,9 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 _,_,out,gains=forecast.at(tm)
                 fire_gain=model['fire_gain']*max(0.,fire*math.exp(-(t-start)/7200))
                 delivered_kw=kw if active else 0.
-                r,f=forecast.integrate(r,f,out,delivered_kw,fire_gain,dt,gains[0])
+                r,f=forecast.integrate(r,f,out,delivered_kw,fire_gain,dt,gains[0],interval=(t,u))
                 risk_kw=max(delivered_kw,upper_power) if active and upper_power is not None else delivered_kw
-                ur,uf=(forecast.integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True)
+                ur,uf=(forecast.integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True,interval=(t,u))
                        if risk_enabled else (r,f))
                 low=min(low,r); high=max(high,r)
                 fine.append(dict(ts=u,temperature=r,upper_temperature=max(r,ur),**{'return':f}))

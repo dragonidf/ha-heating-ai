@@ -5,7 +5,7 @@ import math
 import hashlib
 import json
 from heating_environment import (forecast_step,safe_upper,has_upper_risk,ENVIRONMENT_POLICY_VERSION,
-                                 _weather_gains,_integrate_forecast,prepare_ventilation)
+                                 _weather_gains,_integrate_forecast,prepare_ventilation,ventilation_for_interval)
 import statistics
 from heating_outages import blocked, covered, availability, schedule_covered
 
@@ -64,6 +64,8 @@ class ForecastContext:
         self.ordered_weather = all(a<=b for a,b in zip(self.weather_times,self.weather_times[1:]))
         self.known_until = max(self.weather_times)+3600 if self.weather_times else None
         self.ventilation = prepare_ventilation(model.get('room_loss'),settings)
+        self.ventilation_settings = settings if settings.get('ventilation_grid_only') and self.ventilation[1] is not None else None
+        self.ventilation_by_interval = {}
         self.by_time = {}
 
     def at(self, when):
@@ -85,8 +87,14 @@ class ForecastContext:
             self.by_time[key] = stamp,elapsed,outside,gains
         return self.by_time[key]
 
-    def integrate(self, room, floor, outside, power, fire_gain, hours, gain, upper=False):
-        normal,cold,warm = self.ventilation
+    def integrate(self, room, floor, outside, power, fire_gain, hours, gain, upper=False, interval=None):
+        coefficients=self.ventilation
+        if self.ventilation_settings is not None and interval is not None:
+            coefficients=self.ventilation_by_interval.get(interval)
+            if coefficients is None:
+                coefficients=prepare_ventilation(self.model.get('room_loss'),self.ventilation_settings,interval)
+                self.ventilation_by_interval[interval]=coefficients
+        normal,cold,warm = coefficients
         coefficient = (cold if room>=outside else warm) if upper else normal
         loss = 0. if coefficient is None else coefficient*(room-outside)
         return _integrate_forecast(room,floor,outside,power,self.model,hours,fire_gain,gain,loss)
@@ -110,8 +118,12 @@ def coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours=3,up
     return rows
 
 
-def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours=3):
-    for row in coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours,upper=True)[1:]:
+def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours=3,*,upper_rows=None):
+    # The control tick already calculates this exact risk trajectory for its peak.
+    # Reuse only within that tick; callers without rows keep the original path.
+    if upper_rows is None:
+        upper_rows=coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours,upper=True)
+    for row in upper_rows[1:]:
         profile=comfort_at(datetime.fromtimestamp(row['ts'],now.tzinfo),settings)
         if row['temperature']>=safe_upper(profile[2],profile[3],settings):return True
     return False
@@ -558,9 +570,9 @@ def search_input_key(now,room,floor,outside,fire,model,weather,settings):
         settings={k:settings.get(k) for k in keys},outage={k:outage.get(k) for k in ('mode','valid','outages','slots','known_until')},
         physical_mode=(settings.get('modulation_profile') or {}).get('physical_mode'),
         equipment_version=settings.get('equipment_version'),ventilation_model=settings.get('ventilation_model'),
-        ventilation_expected=settings.get('ventilation_expected'),profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
+        ventilation_expected=settings.get('ventilation_expected'),ventilation_grid_only=settings.get('ventilation_grid_only'),profile=(settings.get('modulation_profile') or {}).get('bands'),anchor=settings.get('modulation_anchor'),
         actuator=settings.get('actuator'),
-        environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain','observed_at')},
+        environment={k:solar.get(k) for k in ('validated','coefficient','observed_gain','observed_at','risk_coefficient','control_no_sun')},
         astronomy=(settings.get('environment') or {}).get('astronomy'),
         residual=(settings.get('environment') or {}).get('residual'))
     upper=certified_upper_power(settings.get('modulation_profile'))
@@ -791,9 +803,9 @@ def _plan(now, room, floor, outside, fire_delta, model, forecast, settings, powe
                         effective_kw=(fixed_kw if fixed_kw is not None else
                                       modulation_power(nf,profile,3.,anchor,elapsed_minutes)) if active else 0.
                         delivered_kw=effective_kw
-                        nr,nf=integrate(nr,nf,out,delivered_kw,fire_gain,dt,gains[0])
+                        nr,nf=integrate(nr,nf,out,delivered_kw,fire_gain,dt,gains[0],interval=(stamp,stop_stamp))
                         risk_kw=max(delivered_kw,upper_power) if active and upper_power is not None else delivered_kw
-                        ur,uf=(integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True)
+                        ur,uf=(integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True,interval=(stamp,stop_stamp))
                                if risk_enabled else (nr,nf))
                         # A session remains unsafe if its stored heat overshoots
                         # later, after the boiler has stopped (including daytime).
@@ -1095,6 +1107,128 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     result['curve']=[{k:v for k,v in r.items() if k!='_fine'} for r in result['curve']]
     apply_search_diagnostics(now,settings,result)
     return result
+
+
+def advisory_ventilation(settings, data, start, end):
+    return ventilation_for_interval(settings,data,start,end)
+
+def advisory_outlook_48(now, room, floor, outside, fire, model, weather, settings, forecast, *, step_seconds=900):
+    """48 elapsed hours, read-only scenario on the existing model/plan.
+
+    Keep the complete operational trace. Beyond it repeat only already
+    calculated first-day heat intervals, as a conditional scenario, never
+    as new commands. Known interruptions veto hypothetical heat. Unknown
+    weather/supply remains marked, not silently certified.
+    """
+    if step_seconds not in (300,900):
+        raise ValueError('advisory step must be 300 or 900 seconds')
+    start=now.timestamp(); finish=start+172800
+    rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
+    if not rows or not weather:
+        return dict(status='unavailable',reason='exact_plan_and_weather_required',curve=[])
+    context=ForecastContext(now,weather,outside,model,settings)
+    data=availability(settings.get('outage_schedule') or {},start,finish)
+    outages=data.get('outages',[]) if data.get('valid') else []
+    # Unlike max(timestamp), this detects holes inside hourly weather coverage.
+    known=start
+    for ts in sorted(set(row['ts'] for row in weather if number(row.get('temperature')) is not None)):
+        if ts>known+.001:
+            break
+        known=max(known,ts+3600)
+    curve=[];cursor=start;r,f=room,floor
+    for row in rows:
+        end=number(row.get('ts'))
+        if end is None or end>finish:
+            break
+        fine=row.get('_fine') or []
+        if (not fine or abs(fine[-1]['ts']-end)>.001
+                or any(not 0<b-a<=301 for a,b in zip([cursor]+[p['ts'] for p in fine[:-1]],
+                                                     [p['ts'] for p in fine]))):
+            return dict(status='unavailable',reason='incomplete_operational_trace',curve=[])
+        r,f=number(fine[-1].get('temperature')),number(fine[-1].get('return'))
+        if r is None or f is None:
+            return dict(status='unavailable',reason='missing_terminal_state',curve=[])
+        target,lo,hi,_=comfort_at(datetime.fromtimestamp(end-.001,now.tzinfo),settings)
+        curve.append(dict(ts=end,temperature=round(r,2),lower=lo,upper=hi,target=target,
+                          basis='calculated_plan',weather_known=end<=known,
+                          schedule_known=schedule_covered(data,cursor,end)))
+        cursor=end
+    planned_until=cursor
+    if cursor<start+86400-.001:
+        return dict(status='unavailable',reason='less_than_24h_calculated_trace',curve=[])
+    pattern=[]
+    # Never assume a 24-hour elapsed shift represents the same local tariff
+    # window across a clock change. In that case use coast-only extension.
+    clock_change=any(datetime.fromtimestamp(start+h*3600,now.tzinfo).utcoffset()!=now.utcoffset()
+                     for h in range(49))
+    if not clock_change:
+        for row in rows:
+            for seg in row.get('heat_segments',[]):
+                a,b,kw=(number(seg.get(k)) for k in ('start','end','power_kw'))
+                if None in (a,b,kw) or not 0<=kw<=10.5 or b<=a:
+                    return dict(status='unavailable',reason='invalid_heat_pattern',curve=[])
+                a=max(start,a);b=min(start+86400,b)
+                if b>a:
+                    a=max(cursor,a+86400);b=min(finish,b+86400)
+                    if b>a:pattern.append((a,b,kw))
+    pattern.sort()
+    if any(a[1]>b[0]+.001 for a,b in zip(pattern,pattern[1:])):
+        return dict(status='unavailable',reason='overlapping_heat_pattern',curve=[])
+    # 15-minute maximum integration step, 60-minute output; use exact heat,
+    # outage and weather boundaries. No beam search or new daily schedule.
+    cuts={cursor,finish}
+    cuts.update(start+i*step_seconds for i in range(1,172800//step_seconds)
+                if cursor<start+i*step_seconds<finish)
+    cuts.update(start+i*3600 for i in range(1,48) if cursor<start+i*3600<finish)
+    if settings.get('ventilation_grid_only'):
+        cuts.update(t for slot in data.get('slots',[]) for t in (slot['start'],slot['end']) if cursor<t<finish)
+    cuts.update(t for a,b,_ in pattern for t in (a,b) if cursor<t<finish)
+    cuts.update(t for row in outages for t in (row['start'],row['end']) if cursor<t<finish)
+    cuts.update(row['ts'] for row in weather if cursor<row['ts']<finish)
+    cuts=sorted(cuts)
+    assumed=0.;unknown_heat=0.;skipped=0.;index=0;report_start=cursor
+    ventilation_minutes={};loss_cache={}
+    for a,b in zip(cuts,cuts[1:]):
+        while index<len(pattern) and pattern[index][1]<=a+.001:index+=1
+        kw=pattern[index][2] if index<len(pattern) and pattern[index][0]<=a+.001 and b<=pattern[index][1]+.001 else 0.
+        when=datetime.fromtimestamp(a,now.tzinfo)
+        _,_,hi,zone=comfort_at(when,settings)
+        planned_kw=kw
+        if kw and (blocked(a,b,outages) or r>=safe_upper(hi,zone,settings) or f>=50):
+            kw=0.
+        _,elapsed,out,gains=context.at(when)
+        fire_gain=model['fire_gain']*max(0.,fire*math.exp(-elapsed/120))
+        dt=(b-a)/3600
+        duty,basis=advisory_ventilation(settings,data,a,b)
+        ventilation_minutes[basis]=ventilation_minutes.get(basis,0.)+dt*60
+        key=tuple(duty.get(k) for k in ('recuperator','bath'))
+        if key not in loss_cache:
+            loss_cache[key]=prepare_ventilation(model.get('room_loss'),dict(settings,ventilation_expected=duty))[0]
+        adjustment=loss_cache[key]
+        loss=0. if adjustment is None else adjustment*(r-out)
+        nr,nf=_integrate_forecast(r,f,out,kw,model,dt,fire_gain,gains[0],loss)
+        if kw and (nf>50 or nr>safe_upper(hi,zone,settings)):
+            kw=0.;nr,nf=_integrate_forecast(r,f,out,0.,model,dt,fire_gain,gains[0],loss)
+        r,f=nr,nf
+        if not math.isfinite(r) or not math.isfinite(f):
+            return dict(status='unavailable',reason='nonfinite_projection',curve=[])
+        assumed+=kw*dt;skipped+=(planned_kw-kw)*dt
+        if not schedule_covered(data,a,b):
+            unknown_heat+=kw*dt
+        if abs((b-start)%3600)<.001 or b==finish:
+            target,lo,hi,_=comfort_at(datetime.fromtimestamp(b-.001,now.tzinfo),settings)
+            curve.append(dict(ts=b,temperature=round(r,2),lower=lo,upper=hi,target=target,
+                              basis='conditional_repeat' if not clock_change else 'conditional_coast',
+                              weather_known=b<=known,schedule_known=schedule_covered(data,report_start,b)))
+            report_start=b
+    return dict(status='conditional',horizon_hours=48.,calculated_until=planned_until,
+                weather_contiguous_until=known,weather_complete=known>=finish,
+                schedule_complete=schedule_covered(data,start,finish),
+                assumed_tail_kwh=round(assumed,3),unknown_supply_tail_kwh=round(unknown_heat,3),
+                omitted_tail_kwh=round(skipped,3),clock_change=clock_change,
+                integration_step_seconds=step_seconds,ventilation_basis_minutes={k:round(v,2) for k,v in ventilation_minutes.items()},
+                assumption='repeat_first_day_heat_if_available_no_control_commands',
+                curve=curve)
 
 
 def solve(rows, outputs, prior):

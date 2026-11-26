@@ -8,6 +8,7 @@ import math
 import statistics
 from datetime import datetime,timedelta
 from zoneinfo import ZoneInfo
+from heating_outages import schedule_covered, covered
 
 ENVIRONMENT_POLICY_VERSION=6
 
@@ -114,9 +115,14 @@ def observe_gain(previous, stamp, room, floor, outside, fire, heating,
                  astronomy=None,cloud_coverage=None,quality=True,settings=None,fit_coefficients=True):
     state=dict(previous or {})
     state.setdefault('days',0);state.setdefault('coefficient',0.)
+    # A temporary observation outage cannot revoke a previously qualified
+    # coefficient. Do not bridge the gap or promote a provisional estimate.
+    # An incompatible factor policy still invalidates the old certificate.
+    state['observation_quality']=bool(quality)
     if not quality:
         state.pop('last',None);state.pop('pending_gain',None)
-        state['validated']=False
+        state['validated']=bool(state.get('validated') is True and
+                                state.get('factor_policy')==ENVIRONMENT_POLICY_VERSION)
         return state
     observations=list(state.get('observations',[]))
     last=state.get('last')
@@ -209,9 +215,18 @@ def _weather_gains(when, row, environment):
     observed=(solar.get('observed_gain',0.)*math.exp(-elapsed/2)
               if elapsed<3 and light>0 and datetime.fromtimestamp(solar.get('observed_at',0),when.tzinfo).date()==when.date() else 0.)
     residual=residual_at(when,environment.get('residual') or {})
-    # The same unexplained room rise must not count twice as solar and bias.
-    # No comfort credit until independent 1h/3h field validation is available.
-    return min(.8,learned),min(.8,max(learned,observed,learned+residual))
+    # An independently held-out observational candidate is only a risk
+    # scenario. It never supplies nominal comfort credit. Do not add it to
+    # an observed gain or another solar estimate from the same heat source.
+    risk_coefficient=finite(solar.get('risk_coefficient'))
+    risk_solar=risk_coefficient*light*factor if risk_coefficient is not None and 0<risk_coefficient<=.8 else 0.
+    # A validated solar estimate improves a conditional temperature outlook,
+    # but unguaranteed future heat must not satisfy the control lower bound.
+    nominal=0. if solar.get('control_no_sun') is True else min(.8,learned)
+    # Risk certificate and residual can represent the same sunlight; granting
+    # nominal advisory credit must not change the already qualified envelope.
+    combined=residual if risk_coefficient is not None and 0<risk_coefficient<=.8 else learned+residual
+    return nominal,min(.8,max(learned,observed,combined,risk_solar))
 
 
 def room_source_check(previous,stamp,readings):
@@ -280,7 +295,8 @@ def observe_residual(previous,stamp,room,floor,outside,model,reported_at,quality
 
 def forecast_step(room,floor,outside,power,fire,model,hours,when,weather,settings,upper=False):
     gain=gain_at(when,weather,settings,upper=upper)
-    loss=ventilation_loss(room,outside,model['room_loss'],settings,upper=upper)
+    loss=ventilation_loss(room,outside,model['room_loss'],settings,upper=upper,
+                          interval=(when.timestamp(),when.timestamp()+hours*3600))
     return _integrate_forecast(room,floor,outside,power,model,hours,
                                model['fire_gain']*max(0.,fire),gain,loss)
 
@@ -291,15 +307,40 @@ def _integrate_forecast(room,floor,outside,power,model,hours,fire_gain,gain,loss
     return room+dr*hours,floor+df*hours
 
 
-def prepare_ventilation(base_loss,settings):
+def ventilation_for_interval(settings,data,start,end):
+    """Conditional airflow based on published physical slots, not boiler mask."""
+    duty=dict(settings.get('ventilation_expected') or {})
+    topology=settings.get('ventilation_grid_only') or {}
+    if not topology or not data.get('valid') or data.get('mode')!='scheduled':
+        return duty,'empirical'
+    if end<=start or not schedule_covered(data,start,end):
+        return duty,'unknown_supply_empirical'
+    slots=data.get('slots') or []
+    off=covered(start,end,[s for s in slots if s.get('off') is True])
+    on=covered(start,end,[s for s in slots if s.get('off') is False])
+    if not (off or on):
+        return duty,'mixed_supply_empirical'
+    for key in ('recuperator','bath'):
+        if key in topology:
+            duty[key]=0. if off else topology[key].get('when_powered')
+    return duty,'published_off' if off else 'published_on'
+
+
+def prepare_ventilation(base_loss,settings,interval=None):
     fit=settings.get('ventilation_model') or {}
     if not fit.get('validated') or fit.get('model_version')!=settings.get('thermal_model_version'):
         return None,None,None
     expected=settings.get('ventilation_expected') or {}
+    warm=dict(recuperator=1.,bath=1.)
+    if interval is not None and settings.get('ventilation_grid_only'):
+        expected,basis=ventilation_for_interval(settings,settings.get('outage_schedule') or {},*interval)
+        if basis=='published_off':
+            for key in warm:
+                if key in settings['ventilation_grid_only']:warm[key]=0.
     nominal=(_ventilation_adjustment(fit,base_loss,expected)
              if all(finite(expected.get(k)) is not None for k in ('recuperator','bath')) else None)
     return (nominal,_ventilation_adjustment(fit,base_loss,dict(recuperator=0.,bath=0.)),
-            _ventilation_adjustment(fit,base_loss,dict(recuperator=1.,bath=1.)))
+            _ventilation_adjustment(fit,base_loss,warm))
 
 
 def has_upper_risk(settings):
@@ -308,6 +349,7 @@ def has_upper_risk(settings):
     profile=settings.get('modulation_profile') or {}
     return bool(profile.get('power_source')=='kws_phases' and profile.get('validated') is True and
                 profile.get('conservative_upper_kw') or solar.get('observed_gain') or solar.get('validated') and solar.get('coefficient') or
+                solar.get('risk_coefficient') or
                 (environment.get('residual') or {}).get('rate',0)>0 or (settings.get('ventilation_model') or {}).get('validated'))
 
 
@@ -342,15 +384,11 @@ def anchor_weather(weather, stamp, outside):
 
 
 
-def ventilation_loss(room,outside,base_loss,settings,upper=False):
+def ventilation_loss(room,outside,base_loss,settings,upper=False,interval=None):
     """Replace the previously averaged loss, rather than adding it twice."""
-    fit=settings.get('ventilation_model') or {}
-    if not fit.get('validated') or fit.get('model_version')!=settings.get('thermal_model_version'):return 0.
-    expected=settings.get('ventilation_expected') or {}
-    if upper:
-        expected={k:0. if room>=outside else 1. for k in ('recuperator','bath')}
-    elif any(finite(expected.get(k)) is None for k in ('recuperator','bath')):return 0.
-    return _ventilation_adjustment(fit,base_loss,expected)*(room-outside)
+    normal,cold,warm=prepare_ventilation(base_loss,settings,interval)
+    coefficient=(cold if room>=outside else warm) if upper else normal
+    return 0. if coefficient is None else coefficient*(room-outside)
 
 
 def _ventilation_adjustment(fit,base_loss,expected):
@@ -360,7 +398,70 @@ def _ventilation_adjustment(fit,base_loss,expected):
     return effective-base_loss
 
 
-def fit_ventilation(samples,model,timezone=None):
+def effective_ventilation_duty(evidence):
+    """Observed powered duty, not commanded relay fraction; unknown is None.
+
+    Mixed duty is usable for a mean ventilation estimate, but not by the
+    constant-duty adaptive window fitter. Legacy ON without supply evidence
+    is never promoted to measured airflow. This measures powered operation,
+    not the actual volume of air exchanged.
+    """
+    if not isinstance(evidence,dict) or (finite(evidence.get('seconds')) or 0)<240:
+        return None
+    if 'effective_on_fraction' in evidence or 'effective_unknown_fraction' in evidence:
+        duty=finite(evidence.get('effective_on_fraction'))
+        return duty if duty is not None and 0<=duty<=1 and finite(evidence.get('effective_unknown_fraction'))==0 else None
+    on=finite(evidence.get('on_fraction'))
+    unknown=finite(evidence.get('unknown_fraction'))
+    # A confirmed OFF relay throughout the interval has zero powered duty,
+    # independently of supply. Preserve the separate proven-isolation path.
+    if on==0 and unknown==0:
+        return 0.
+    supply_unknown=finite(evidence.get('supply_unknown_fraction'))
+    powered=finite(evidence.get('powered_relay_on_fraction'))
+    if supply_unknown==0 and finite(evidence.get('supply_on_fraction'))==0 and powered==0:
+        return 0.
+    if unknown!=0 or on is None or not 0<=on<=1:
+        return None
+    return powered if supply_unknown==0 and powered is not None and 0<=powered<=on+.001 and powered<=1 else None
+
+
+VENTILATION_DUTY_POLICY=2
+
+
+def ventilation_binding_identity(cfg):
+    """Stable physical identity; no dependence on temporary relay/supply state."""
+    result={}
+    bindings=cfg.get('ventilation') or {}
+    confirmed=cfg.get('grid_only_ventilation_entities')
+    for key in ('recuperator','bath'):
+        binding=bindings.get(key) or {}
+        entity=binding.get('entity')
+        if not isinstance(entity,str):continue
+        power=binding.get('power_entity')
+        if isinstance(power,str):
+            provenance='supply_sensor'
+        elif binding.get('supply_kind')=='grid_only' or isinstance(confirmed,(list,tuple)) and entity in confirmed:
+            provenance='verified_grid_topology';power=None
+        else:
+            provenance='unknown';power=None
+        result[key]=dict(entity=entity,supply_provenance=provenance,power_entity=power)
+    return result
+
+
+def compatible_ventilation_fit(fit,bindings):
+    if not fit:
+        return {}
+    # Legacy fits remain readable. Do not reinterpret their averaged relay
+    # coefficient as a certified physical topology after explicit opt-in.
+    if fit.get('duty_policy')==VENTILATION_DUTY_POLICY:
+        return fit if fit.get('binding_identity')==bindings else {}
+    if any(v.get('supply_provenance')=='verified_grid_topology' for v in bindings.values()):
+        return {}
+    return fit
+
+
+def fit_ventilation(samples,model,timezone=None,bindings=None):
     """Joint base/recuperator/bath effective loss, independent held-out days.
 
     Unknown duty, correlated relays and daylight/fire disturbances cannot
@@ -385,8 +486,14 @@ def fit_ventilation(samples,model,timezone=None):
         u={};valid=True
         for key in ('recuperator','bath'):
             vals=[(r.get('ventilation') or {}).get(key) or {} for r in chunk[1:]]
-            if any(finite(v.get('on_fraction')) is None or v.get('unknown_fraction',1)>.05 for v in vals):valid=False;break
-            u[key]=statistics.mean(v['on_fraction'] for v in vals)
+            if bindings is not None:
+                identity=bindings.get(key)
+                if not identity or any(v.get('duty_policy')!=VENTILATION_DUTY_POLICY
+                        or any(v.get(k)!=value for k,value in identity.items()) for v in vals):
+                    valid=False;break
+            duties=[effective_ventilation_duty(v) for v in vals]
+            if any(d is None for d in duties):valid=False;break
+            u[key]=statistics.mean(duties)
         if not valid:continue
         delta=room-outside;rate=(b['room']-room)/dt
         drive=model['floor_air']*(floor-room)+model['fire_gain']*a.get('fire',0)
@@ -395,6 +502,8 @@ def fit_ventilation(samples,model,timezone=None):
     days=sorted(day for day in {r['day'] for r in records} if sum(r['day']==day for r in records)>=6)
     records=[r for r in records if r['day'] in days]
     result=dict(validated=False,model_version=model.get('version'),days=len(days),samples=len(records),reason='insufficient_independent_days')
+    if bindings is not None:
+        result.update(duty_policy=VENTILATION_DUTY_POLICY,binding_identity=bindings)
     if len(days)<3:return result
     train=[r for r in records if r['day']!=days[-1]];hold=[r for r in records if r['day']==days[-1]]
     if len(train)<12 or len(hold)<6:return result
@@ -422,8 +531,34 @@ def ventilation_expectation(samples,current):
     result={};support={}
     for key in ('recuperator','bath'):
         rows=[(r.get('ventilation') or {}).get(key) or {} for r in samples[-288:]]
-        known=[v['on_fraction'] for v in rows if finite(v.get('on_fraction')) is not None and v.get('unknown_fraction',1)<=.05]
+        device=current.get(key) or {}
+        entity=device.get('entity')
+        known=[d for v in rows if (not entity or v.get('entity')==entity)
+               and (d:=effective_ventilation_duty(v)) is not None]
         result[key]=statistics.mean(known) if len(known)>=12 else None
         support[key]=dict(intervals=len(known),unknown_fraction=1-len(known)/len(rows) if rows else 1,
-            current=(current.get(key) or {}).get('relay','unknown'),future='empirical_duty' if len(known)>=12 else 'unknown')
+            current=device.get('relay','unknown'),effective_duty=device.get('effective_duty'),
+            future='empirical_powered_duty' if len(known)>=12 else 'unknown')
     return result,support
+
+
+def ventilation_powered_expectation(samples,current):
+    """Grid-only duty conditional on confirmed supply ON, not all-day duty."""
+    result={}
+    for key in ('recuperator','bath'):
+        device=current.get(key) or {}
+        if device.get('supply_provenance')!='verified_grid_topology' or not device.get('entity'):
+            continue
+        values=[]
+        for sample in samples[-288:]:
+            row=(sample.get('ventilation') or {}).get(key) or {}
+            if (row.get('entity')!=device['entity'] or finite(row.get('supply_on_fraction'))!=1.
+                    or finite(row.get('supply_unknown_fraction'))!=0.
+                    or finite(row.get('grid_on_fraction'))!=1.
+                    or finite(row.get('grid_unknown_fraction'))!=0.):
+                continue
+            duty=effective_ventilation_duty(row)
+            if duty is not None:values.append(duty)
+        result[key]=dict(entity=device['entity'],when_powered=statistics.mean(values) if len(values)>=12 else None,
+                         intervals=len(values))
+    return result

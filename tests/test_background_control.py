@@ -100,6 +100,17 @@ class BackgroundTickSafetyTests(unittest.TestCase):
         self.assertIn('sensor.heating_heartbeat',app.published)
         self.assertGreaterEqual(len(app.sample_calls),3)
 
+    def test_pending_tick_reuses_the_already_computed_upper_coast(self):
+        from heating_model import coast_trajectory
+        app,actions=self.app()
+        # Count real trajectory executions, not mocked temperatures or actions.
+        with patch('heating_climate.coast_trajectory',wraps=coast_trajectory) as direct, \
+             patch('heating_model.coast_trajectory',wraps=coast_trajectory) as repeated:
+            self.tick(app)
+        self.assertEqual(direct.call_count,2)
+        self.assertEqual(repeated.call_count,0)
+        self.assertEqual(actions,['heat'])
+
     def test_power_loss_stops_heat_while_search_is_pending(self):
         app,actions=self.app();self.tick(app);app.grid_state=lambda:'off';self.tick(app)
         self.assertEqual(actions,['heat','off'])
