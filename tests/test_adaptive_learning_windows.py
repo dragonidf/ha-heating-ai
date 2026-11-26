@@ -470,6 +470,65 @@ class WindowsTest(unittest.TestCase):
                 weather_issue_at=stamp-60,solar_factor=0.,**{'return':23.}))
         return snapshot,rows
 
+    def test_solar_prospective_requires_new_issue_and_explicit_idle_evidence(self):
+        from heating_learning_windows import solar_prospective_evidence,qualify_frozen
+        from heating_environment import forecast_step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        archive=[]
+        certificate=dict(coefficient=.5,stored_at=BASE,identity=[6,1,"fixed_6"],
+                         ventilation_model={})
+        for day in range(6):
+            for hour in (8,12):
+                start=BASE+day*86400+hour*3600
+                at=datetime.fromtimestamp(start,timezone.utc)
+                date=at.date().isoformat()
+                noon=BASE+day*86400+12*3600
+                geometry=dict(latitude=50.,days={date:dict(noon=noon,sunrise=noon-21600,
+                    sunset=noon+21600,declination=-10.)})
+                settings=dict(environment=dict(astronomy=geometry,
+                    solar=dict(risk_coefficient=.5,validated=False)))
+                truth=dict(environment=dict(astronomy=geometry,
+                    solar=dict(risk_coefficient=.5,validated=True,coefficient=.5)))
+                weather=[dict(ts=start+i*3600,temperature=5.,condition="sunny") for i in range(4)]
+                states=[(21.,23.)]*3
+                guards=[];checks=[];points={}
+                for i in range(1,37):
+                    when=datetime.fromtimestamp(start+(i-1)*300,timezone.utc)
+                    for j,(room,floor) in enumerate(states):
+                        states[j]=forecast_step(room,floor,5.,0.,0.,model,1/12,when,weather,
+                            truth if j==2 else settings,upper=j==1)
+                    due=start+i*300
+                    old,upper,actual=[r[0] for r in states]
+                    guards.append([due,old,upper,15.,30.])
+                    if i in (12,36):
+                        h=i//12
+                        points[str(h)]=[due,old,upper,15.,30.,"День"]
+                        checks.append([h,due,old,upper,15.,30.,"День",actual,
+                            ["unexplained_gain"],0.,0.,0.,0.,{"solar_idle_qualified":True}])
+                snapshot=dict(start=start,model=model,identity=["boot","Вітальня",6,1,"fixed_6"],
+                    room=21.,floor=23.,outside=5.,fire=0.,segments=[],weather=weather,
+                    settings=settings,weather_known_until=start+14400,points=points,guards=guards)
+                archive.append(dict(snapshot=snapshot,checks=checks))
+        report=solar_prospective_evidence(certificate,archive,model,timezone.utc,{})
+        self.assertEqual(report["status"],"passed")
+        self.assertFalse(report["comfort_credit"])
+        self.assertGreaterEqual(report["metrics"]["1"]["new"]["n"],12)
+        self.assertEqual(solar_prospective_evidence({**certificate,"stored_at":BASE+7*86400},
+            archive,model,timezone.utc,{})["status"],"insufficient_data")
+        legacy=[dict(snapshot=i["snapshot"],checks=[r[:13] for r in i["checks"]]) for i in archive]
+        self.assertEqual(solar_prospective_evidence(certificate,legacy,model,timezone.utc,{})["status"],
+                         "insufficient_data")
+        snapshot,rows=self.asynchronous_report_fixture(0)
+        snapshot["settings"]["environment"]={"solar":{"risk_coefficient":.5}}
+        for row in rows:
+            row.update(solar_factor=.5,external_gain=.2)
+        checks=qualify_frozen(snapshot,rows,timezone.utc)
+        self.assertTrue(all(c[13]["solar_idle_qualified"] for c in checks))
+        for row in rows:
+            row.update(power=1.,interval_kw=1.)
+        self.assertTrue(all(len(c)==13 or not c[13].get("solar_idle_qualified")
+                            for c in qualify_frozen(snapshot,rows,timezone.utc)))
+
     def test_asynchronous_reports_use_actual_time_and_keep_guards(self):
         from heating_learning_windows import qualify_frozen,score_frozen
         for offset in (-240,-61,61,240,300):

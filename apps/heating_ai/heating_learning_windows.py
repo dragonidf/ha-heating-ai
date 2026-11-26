@@ -757,6 +757,14 @@ def _frozen_predictions(snapshot, tz, finish, *, evaluated_targets=()):
     models = (snapshot["model"],{**snapshot["model"],**(snapshot["candidate"] or {}).get("coefficients",{})})
     predictions, peaks = {}, [room,room]
     profile=(snapshot["candidate"] or {}).get("power_profile")
+    solar_candidate=number((snapshot["candidate"] or {}).get("solar_coefficient"))
+    candidate_settings=settings
+    if solar_candidate is not None:
+        # Shadow calculation only: do not modify the immutable issue snapshot.
+        environment=settings.get("environment") or {}
+        solar=environment.get("solar") or {}
+        candidate_settings={**settings,"environment":{**environment,
+            "solar":{**solar,"validated":True,"coefficient":solar_candidate}}}
     prior_upper=number(snapshot.get("power_upper_kw"))
     next_upper=certified_upper_power(profile) if profile else prior_upper
     risk=prior_upper is not None or next_upper is not None
@@ -771,14 +779,15 @@ def _frozen_predictions(snapshot, tz, finish, *, evaluated_targets=()):
         outside = outdoor_at(weather,when,snapshot["outside"])
         for i,(model, (r,f)) in enumerate(zip(models,states)):
             power=(modulation_power(f,profile) if i==1 and profile and segment is not None else kw)
-            states[i] = forecast_step(r,f,outside,power,fire,model,(b-a)/3600,when,weather,settings)
+            context=candidate_settings if i==1 else settings
+            states[i] = forecast_step(r,f,outside,power,fire,model,(b-a)/3600,when,weather,context)
             peaks[i] = max(peaks[i],states[i][0])
             if risk:
                 bound=(prior_upper,next_upper)[i]
                 upper_kw=max(power,bound) if segment is not None and bound is not None else power
                 ur,uf=upper_states[i]
                 upper_states[i]=forecast_step(ur,uf,outside,upper_kw,fire,model,(b-a)/3600,
-                                              when,weather,settings,upper=True)
+                                              when,weather,context,upper=True)
                 upper_peaks[i]=max(upper_peaks[i],upper_states[i][0])
                 if i==1 and segment is not None and upper_states[i][1]>50:
                     storage_ok=False
@@ -897,8 +906,21 @@ def qualify_frozen(snapshot, rows, tz):
             cursor=right
         check=(int(horizon), due, old, upper, low, high, zone, row["room"], sorted(reasons),
                planned_kwh,actual_kwh,planned_minutes,actual_minutes)
+        meta={}
         if command_verified:
-            check+=({"command_verified":True},)
+            meta["command_verified"]=True
+        solar=(snapshot.get("settings",{}).get("environment",{}).get("solar") or {})
+        # Store the distinct evidence at observation time; legacy checks
+        # cannot acquire this qualification retrospectively by default.
+        if (number(solar.get("risk_coefficient")) is not None and horizon in ("1","3")
+                and not reasons.difference({"unexplained_gain"}) and planned_kwh==0.
+                and actual_minutes==0 and steps and
+                all(number(kw) is not None and 0<=kw<=.05 and number(factor) is not None
+                    and 0<=factor<=1. for _,_,kw,factor,_ in steps)
+                and sum(s[0]*s[3] for s in steps)>.05*(due-start)):
+            meta["solar_idle_qualified"]=True
+        if meta:
+            check+=(meta,)
         checks.append(check)
     return checks
 
@@ -976,6 +998,73 @@ def independent_checks(rows, horizon):
                 and all(number(row.get(k)) is not None for k in ("old_error","shadow_error"))):
             yield row
             end=row["end"]
+
+
+def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
+    """Paired issue-time solar shadow; no command or comfort credit is granted.
+
+    Only observations issued AFTER the fixed candidate was stored qualify.
+    Existing risk bounds, real independent reports and measured idle inputs
+    are mandatory. Never reuse the coefficient-fitting holdout as this test.
+    """
+    coefficient=number(certificate.get("coefficient"))
+    stored=number(certificate.get("stored_at"))
+    identity=certificate.get("identity")
+    if (coefficient is None or not 0<coefficient<=.8 or stored is None
+            or not isinstance(identity,list) or len(identity)!=3
+            or certificate.get("ventilation_model")!=(ventilation or {})):
+        return dict(status="no_candidate",metrics={},comfort_credit=False)
+    scored=[]
+    for item in archive:
+        snapshot=item["snapshot"]
+        start=snapshot["start"]
+        climate=snapshot.get("settings") or {}
+        solar=(climate.get("environment") or {}).get("solar") or {}
+        if (start<stored or snapshot.get("model")!=model or snapshot.get("identity",[])[2:]!=identity
+                or solar.get("risk_coefficient")!=coefficient or solar.get("validated")
+                or (climate.get("ventilation_model") or {})!=(ventilation or {})):
+            continue
+        checks=[r for r in item["checks"] if r[0] in (1,3) and len(r)>13
+                and r[13].get("solar_idle_qualified") is True and not set(r[8]).difference({"unexplained_gain"})]
+        if not checks:
+            continue
+        proposed={**snapshot,"candidate":{"solar_coefficient":coefficient}}
+        deltas=_frozen_predictions(proposed,tz,max(r[1] for r in checks),
+                                   evaluated_targets=[r[1] for r in checks])
+        for check in checks:
+            h,due,old,upper,low,high,zone,actual,*_=check
+            if due<=start or due>snapshot["weather_known_until"] or due not in deltas:
+                continue
+            guards=[g for g in snapshot.get("guards",()) if g[0]<=due]
+            if guards and guards[-1][0]<due:
+                guards.append([due,old,upper,low,high])
+            guarded=bool(guards and guards[-1][0]==due and
+                all(0<b-a<=301 for a,b in zip([start]+[g[0] for g in guards],[g[0] for g in guards])))
+            # The candidate nominal trajectory must stay inside the already
+            # issued upper risk envelope and not worsen a lower-bound deficit.
+            guarded=guarded and all(t in deltas and bound is not None
+                and nominal+deltas[t][0]<=bound+1e-6
+                and max(0.,lo-nominal-deltas[t][0])<=max(0.,lo-nominal)+1e-6
+                for t,nominal,bound,lo,_ in guards)
+            delta=deltas[due][0]
+            scored.append(dict(start=start,end=due,day=_local_day(start,tz),horizon=h,
+                old_error=old-actual,shadow_error=old+delta-actual,valid=True,
+                guard_ok=guarded))
+    metrics={}
+    status="passed"
+    for horizon,minimum,days in ((1,12,3),(3,6,2)):
+        cohort=list(independent_checks(scored,horizon))
+        old,new=(_metrics([r[key] for r in cohort]) for key in ("old_error","shadow_error"))
+        count_days=len({r["day"] for r in cohort})
+        metrics[str(horizon)]=dict(old=old,new=new,days=count_days,
+            guard_failures=sum(not r["guard_ok"] for r in cohort))
+        if len(cohort)<minimum or count_days<days:
+            if status!="rejected":status="insufficient_data"
+        elif (old["mae"]-new["mae"]<max(.005,.1*old["mae"]) or new["p95"]>old["p95"]
+                or abs(new["bias"])>abs(old["bias"]) or any(not r["guard_ok"] for r in cohort)):
+            status="rejected"
+    return dict(status=status,metrics=metrics,coefficient=coefficient,
+                issued_after=stored,comfort_credit=False)
 
 
 def promotion_evidence(rows):
@@ -1196,7 +1285,8 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                     analysis_status=previous_report.get("analysis_status","pending"),
                     analysis_blockers=previous_report.get("analysis_blockers",[]),
                     power_learning=previous_report.get("power_learning"),
-                    solar=previous_report.get("solar"))
+                    solar=previous_report.get("solar"),
+                    solar_prospective=previous_report.get("solar_prospective"))
     monitoring=checkpoint.get("monitoring")
     if monitoring and monitoring["version"]==model.get("version"):
         assessments={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
@@ -1249,8 +1339,11 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         baseline=number(active_solar.get("coefficient")) or 0.
         result["solar"]=evaluate_solar(solar_windows,model,commissioning=baseline,ventilation=ventilation)
         result["solar"]["identity"]=identity
+        result["solar_prospective"]=solar_prospective_evidence(active_solar,archive,model,now.tzinfo,ventilation)
+        # Freeze a candidate while it accumulates independent future checks.
         result["solar"]["risk_eligible"]=bool(eligible and not result.get("proposed")
-            and result["solar"]["status"]=="holdout_passed")
+            and result["solar"]["status"]=="holdout_passed"
+            and (not active_solar or result["solar_prospective"]["status"]=="rejected"))
         if power_context and not result.get("proposed"):
             power=qualify_power_candidate(power_context,archive,model,now.tzinfo,checkpoint.get("evidence_after",0.))
             result["power_learning"]={k:v for k,v in power.items() if k in ("status","reason","metrics")}
@@ -1261,6 +1354,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         "status":result["status"], "reason":result["reason"], "updated_at":stamp,
         "evidence_key":None if result.get("proposed") or result.get("proposed_power") or result.get("rollback") else evidence_key,
         "power_learning":result.get("power_learning"),"solar":result.get("solar"),
+        "solar_prospective":result.get("solar_prospective"),
         "analysis_status":result["analysis_status"],"analysis_blockers":result["analysis_blockers"],
         "independent_windows":len(windows), "qualified_minutes":result["qualified_minutes"]})
     # Keep more than a week of compact issue snapshots where the byte cap permits.
