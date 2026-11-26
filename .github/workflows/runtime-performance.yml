@@ -1,0 +1,35 @@
+name: Controlled runtime performance (0.5.24)
+on:
+  pull_request:
+    paths:
+      - 'tools/benchmark_adaptive_runtime.py'
+      - 'tools/benchmark_planner.py'
+      - '.github/workflows/runtime-performance.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  controlled:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r tests/requirements.txt
+      - name: Verify baseline and pin one logical CPU
+        run: |
+          git fetch --force origin refs/tags/v0.5.24:refs/tags/v0.5.24
+          test "$(git rev-parse 'v0.5.24^{commit}')" = ff95e14756f0bb6e7610fd87c459941b4b0ef4f0
+          git worktree add --detach "$RUNNER_TEMP/heating-baseline" ff95e14756f0bb6e7610fd87c459941b4b0ef4f0
+          CPU="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          PYTHONHASHSEED=0 taskset -c "$CPU" python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --controlled "$RUNNER_TEMP/heating-controlled-runtime.json" --repeat 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: controlled-runtime-raw
+          path: ${{ runner.temp }}/heating-controlled-runtime.json
+          retention-days: 14

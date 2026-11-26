@@ -10,6 +10,9 @@ import json
 import os
 from pathlib import Path
 import resource
+import random
+import statistics
+from itertools import permutations
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -20,7 +23,7 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/"tests"),str(ROOT/"apps"/"heating_ai")]
 
-from benchmark_planner import summary
+from benchmark_planner import summary, paired_statistics
 from replay_adaptive_learning import MODEL, TZ, fixture, frozen_fixture
 from test_background_control import BackgroundTickSafetyTests
 from test_native_v1_production import FakeHA, package
@@ -130,6 +133,12 @@ def measure_core(app, tick, mode, root):
                         for key,value in timings.items() if value}
     # Compare the complete action sequence, not wall timings/IDs in diagnostics.
     output["command_golden"]=action_output
+    output["raw_timings"]=timings
+    # The native tick includes capture on its sample ticks. Do not add the
+    # separately timed diagnostic aggregation a second time.
+    output["daily_tick_training_cpu_s"]=(
+        statistics.mean(row[0] for row in timings["tick"])*5760+
+        (2*statistics.mean(row[0] for row in timings["training"]) if timings["training"] else 0.))
     return output
 
 
@@ -142,12 +151,57 @@ async def child(package_path,mode,root):
         return measure_core(app,component.HeatingClimate.tick_inner,mode,root)
 
 
+def controlled_runtime(root,baseline,repeat):
+    if len(os.sched_getaffinity(0))!=1 or os.getenv("PYTHONHASHSEED")!="0":
+        raise ValueError("pin one CPU and set PYTHONHASHSEED=0")
+    if repeat<30 or repeat%6:
+        raise ValueError("repeat must be >=30 and divisible by six")
+    names=("baseline","control","candidate")
+    orders=list(permutations(names));rng=random.Random(518)
+    blocks=[]
+    for _ in range(repeat//6):
+        rng.shuffle(orders);blocks.extend(orders)
+    rows=[];golden=None
+    for index,order in enumerate([names,names[::-1],names,*blocks]):
+        block={}
+        for name in order:
+            result=json.loads(subprocess.check_output(
+                [sys.executable,__file__,str(baseline),"--child",str(root/name),"online"],text=True))
+            (root/"online_learning_v1.json").unlink()
+            actions=result.pop("command_golden")
+            if golden is None:golden=actions
+            if golden!=actions:raise AssertionError("Production command sequence changed")
+            block[name]=result
+        if index>=3:rows.append(block)
+        print(f"completed triplet {max(0,index-2)}/{repeat}",file=sys.stderr,flush=True)
+    operations={}
+    for label in ("tick","aggregation","training","daily_tick_training_cpu_s","peak_rss"):
+        def value(row,name):
+            item=row[name]
+            return item[label] if label in ("daily_tick_training_cpu_s","peak_rss") else item["cpu_wall"][label][0][1]
+        aa=paired_statistics([(value(row,"baseline"),value(row,"control")) for row in rows])
+        ab=paired_statistics([(value(row,"baseline"),value(row,"candidate")) for row in rows])
+        calibrated=aa["lower_95"]>=-.05 and aa["upper_95"]<=.05 and abs(aa["p95_change"])<=.05
+        gate=("inconclusive_noise" if not calibrated else
+              "pass" if ab["p95_change"]<=.05 and ab["upper_95"]<=.05 else
+              "regression" if ab["lower_95"]>.05 else "inconclusive_effect")
+        operations[label]=dict(a_a=aa,a_b=ab,gate=gate,
+            medians={name:statistics.median(value(row,name) for row in rows) for name in names})
+    return dict(scope="synthetic HA-free tick and training; excludes planner, real I/O and archive; block p95 distribution",
+        exact_command_match=True,affinity=sorted(os.sched_getaffinity(0)),repeat=repeat,
+        operations=operations,orders=blocks,samples=rows,
+        gate_pass=all(v["gate"]=="pass" for v in operations.values()))
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline",type=Path)
     parser.add_argument("--child",nargs=2)
     parser.add_argument("--both-online",action="store_true",help="Paired A/A and A/B of active learning against a release")
+    parser.add_argument("--controlled",type=Path,help="write randomized paired 30+ triplets, including raw measurements")
+    parser.add_argument("--repeat",type=int,default=30)
     opts=parser.parse_args()
+    if opts.controlled:opts.both_online=True
     if opts.child:
         path,mode=opts.child
         print(json.dumps(asyncio.run(child(Path(path),mode,Path(path).parent))))
@@ -163,6 +217,11 @@ def main():
                             "--output",str(archive)],cwd=source,check=True,stdout=subprocess.DEVNULL)
             with ZipFile(archive) as zf:
                 zf.extractall(target)
+        if opts.controlled:
+            report=controlled_runtime(root,baseline,opts.repeat)
+            opts.controlled.write_text(json.dumps(report,indent=2)+"\n")
+            print(json.dumps({k:v for k,v in report.items() if k not in ("samples","orders")},indent=2))
+            raise SystemExit(0 if report["gate_pass"] else 2)
         results={}
         variants=(("baseline","online"),("control","online"),("candidate","online")) if opts.both_online else (("baseline","legacy"),("candidate","online"))
         for name,mode in variants:
