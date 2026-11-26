@@ -547,15 +547,22 @@ def evaluate_solar(windows, model, commissioning=.283, ventilation=None):
                 and ventilation.get("model_version")==model.get("version"))]
     train, holdout = _split(windows)
     days = len({w["day"] for w in train})
-    result = dict(days=days,windows=len(train),comfort_credit=False,model_certificate_validated=False)
-    if days<3 or len(train)<12 or not holdout:
+    support=_coverage(holdout)
+    result = dict(days=days,windows=len(train),holdout_days=support["days"],
+                  holdout_windows=len(holdout),comfort_credit=False,model_certificate_validated=False)
+    if days<3 or len(train)<12 or support["days"]<2 or len(holdout)<6:
         return dict(result,status="insufficient_data")
     coefficient = min((.025*i for i in range(33)),key=lambda c:_score(train,model,c,ventilation)["mae"])
     zero, previous, shadow = (_score(holdout,model,c,ventilation) for c in (0.,commissioning,coefficient))
-    qualified = (shadow["mae"]<=.9*min(zero["mae"],previous["mae"])
-                 and shadow["p95"]<=min(zero["p95"],previous["p95"]))
+    qualified = (coefficient>0. and min(zero["mae"],previous["mae"])-shadow["mae"]>=
+                 max(.005,.1*min(zero["mae"],previous["mae"]))
+                 and shadow["p95"]<=min(zero["p95"],previous["p95"])
+                 and abs(shadow["bias"])<=min(abs(zero["bias"]),abs(previous["bias"])))
     return dict(result,status="holdout_passed" if qualified else "holdout_rejected",coefficient=coefficient,
-                zero=zero,commissioning=previous,shadow=shadow,holdout_days=len({w["day"] for w in holdout}))
+                zero=zero,commissioning=previous,shadow=shadow,
+                training_until=max(w["end"] for w in train),
+                holdout_start=min(w["start"] for w in holdout),
+                holdout_end=max(w["end"] for w in holdout))
 
 
 def solar_context_at(stamp, tz, weather, issue, geometry):
@@ -1188,7 +1195,8 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         return dict(result,status=previous_report["status"],reason=previous_report["reason"],
                     analysis_status=previous_report.get("analysis_status","pending"),
                     analysis_blockers=previous_report.get("analysis_blockers",[]),
-                    power_learning=previous_report.get("power_learning"))
+                    power_learning=previous_report.get("power_learning"),
+                    solar=previous_report.get("solar"))
     monitoring=checkpoint.get("monitoring")
     if monitoring and monitoring["version"]==model.get("version"):
         assessments={(r["start"],r["horizon"]):r for r in monitoring.get("checks",())}
@@ -1234,8 +1242,15 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
             if gate["status"]=="accepted" and eligible:
                 result.update(proposed=thermal["coefficients"],evidence=gate,
                               evidence_fingerprint=sha256(_encode(scored)).hexdigest())
-        result["solar"]=evaluate_solar([w for w in windows if w["equipment"][0]==model.get("version")],
-                                      model,ventilation=ventilation)
+        context=power_context or {}
+        identity=[model.get("version"),context.get("equipment"),context.get("mode")]
+        solar_windows=[w for w in windows if w["equipment"]==identity]
+        active_solar=context.get("solar_risk") or {}
+        baseline=number(active_solar.get("coefficient")) or 0.
+        result["solar"]=evaluate_solar(solar_windows,model,commissioning=baseline,ventilation=ventilation)
+        result["solar"]["identity"]=identity
+        result["solar"]["risk_eligible"]=bool(eligible and not result.get("proposed")
+            and result["solar"]["status"]=="holdout_passed")
         if power_context and not result.get("proposed"):
             power=qualify_power_candidate(power_context,archive,model,now.tzinfo,checkpoint.get("evidence_after",0.))
             result["power_learning"]={k:v for k,v in power.items() if k in ("status","reason","metrics")}
@@ -1245,7 +1260,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
     payload=dict(windows=windows,forecasts=archive,comparisons=[],report={
         "status":result["status"], "reason":result["reason"], "updated_at":stamp,
         "evidence_key":None if result.get("proposed") or result.get("proposed_power") or result.get("rollback") else evidence_key,
-        "power_learning":result.get("power_learning"),
+        "power_learning":result.get("power_learning"),"solar":result.get("solar"),
         "analysis_status":result["analysis_status"],"analysis_blockers":result["analysis_blockers"],
         "independent_windows":len(windows), "qualified_minutes":result["qualified_minutes"]})
     # Keep more than a week of compact issue snapshots where the byte cap permits.

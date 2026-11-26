@@ -367,6 +367,32 @@ class WindowsTest(unittest.TestCase):
                     row[field]+=offset
             self.assertEqual(build_observation_windows(rows,local)["eligible_minutes"],expected)
 
+    def test_solar_fit_uses_later_independent_days_and_real_baseline(self):
+        from heating_learning_windows import evaluate_solar
+        from heating_model import step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        rows=[]
+        for day in range(6):
+            for slot in range(4):
+                start=BASE+day*86400+slot*3600
+                sun=.3+.1*slot
+                room,floor=21.,23.
+                steps=[]
+                for _ in range(12):
+                    steps.append([300,8.,0.,sun,floor])
+                    next_room,next_floor=step(room,floor,8.,0.,0.,model,1/12)
+                    room,floor=next_room+.5*sun/12,next_floor
+                rows.append(dict(start=start,end=start+3600,day=f"2026-11-{day+1:02}",
+                    room_start=21.,room_end=room,floor=23.,steps=steps,
+                    heat=0,idle=3600,sun=sun,vent=[0.,0.],equipment=[6,1,"fixed_6"]))
+        fit=evaluate_solar(rows,model,commissioning=0.)
+        self.assertEqual(fit["status"],"holdout_passed")
+        self.assertAlmostEqual(fit["coefficient"],.5)
+        self.assertFalse(fit["comfort_credit"])
+        self.assertLessEqual(fit["training_until"],fit["holdout_start"])
+        self.assertEqual(evaluate_solar(rows,model,commissioning=.5)["status"],"holdout_rejected")
+        self.assertEqual(evaluate_solar(rows[:12],model,commissioning=0.)["status"],"insufficient_data")
+
     def test_solar_missing_condition_future_issue_and_missing_geometry(self):
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Kyiv")

@@ -445,7 +445,8 @@ class NativeController(HeatingClimate):
                 deepcopy(self.memory.get("online_learning") or {}),now,eligible,
                 dict(mode=self.cfg.get("boiler_power_mode","unconfirmed"),equipment=issued["equipment"],
                      calibrations=deepcopy(self.memory.get("power_calibrations") or {}),
-                     active=deepcopy(self.memory.get("kws_forecast_profile"))),
+                     active=deepcopy(self.memory.get("kws_forecast_profile")),
+                     solar_risk=deepcopy(self.active_solar_risk_certificate())),
                 callback=self._learning_finished,job_id=issued["id"])
         except Exception as exc:
             self._learning_job=None
@@ -464,14 +465,55 @@ class NativeController(HeatingClimate):
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
                                         "verified_reports","rejection_counts","current_reasons","eligibility_counts",
-                                        "analysis_status","analysis_blockers")}
+                                        "analysis_status","analysis_blockers","solar")}
         if result.get("power_learning") is not None:
             self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
         self._apply_learning_result(issued,result)
+        self._store_solar_risk_candidate(issued,result)
         if self._learning_status.get("status") not in ("accepted","rolled_back"):
             checkpoint=self.memory.setdefault("online_learning",{})
             checkpoint["changes_history"]=self._learning_history(
                 checkpoint,self._learning_status["status"],self._learning_status.get("reason"))
+
+    def active_solar_risk_certificate(self):
+        certificate=(self.memory.get("online_learning") or {}).get("solar_risk_candidate") or {}
+        identity=[self.model.get("version"),self.memory.get("equipment_version",0),
+                  self.cfg.get("boiler_power_mode","unconfirmed")]
+        coefficient=number(certificate.get("coefficient"))
+        if (certificate.get("identity")==identity and certificate.get("status")=="holdout_passed"
+                and certificate.get("ventilation_model")== (self.memory.get("ventilation_model") or {})
+                and certificate.get("comfort_credit") is False and coefficient is not None and 0<coefficient<=.8):
+            return certificate
+        return {}
+
+    def _store_solar_risk_candidate(self, issued, result):
+        """Persist evaluated solar evidence, not an authorization to heat less."""
+        solar=result.get("solar") or {}
+        if (result.get("proposed") or result.get("proposed_power") or result.get("rollback")
+                or solar.get("risk_eligible") is not True or solar.get("status")!="holdout_passed"
+                or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
+                or issued["equipment"]!=self.memory.get("equipment_version",0)
+                or time.monotonic()-issued["started"]>120 or not self._learning_eligible()):
+            return
+        identity=[self.model.get("version"),issued["equipment"],self.cfg.get("boiler_power_mode","unconfirmed")]
+        coefficient=number(solar.get("coefficient"))
+        if solar.get("identity")!=identity or coefficient is None or not 0<coefficient<=.8:
+            return
+        checkpoint=self.memory.setdefault("online_learning",{})
+        old=checkpoint.get("solar_risk_candidate")
+        if old and old.get("holdout_end",0)>=solar.get("holdout_end",0):
+            return
+        checkpoint["solar_risk_candidate"]={**solar,"comfort_credit":False,
+            "ventilation_model":deepcopy(self.memory.get("ventilation_model") or {}),
+            "stored_at":self.now().timestamp()}
+        try:
+            self.save()
+        except (OSError,TypeError,ValueError,MemoryError):
+            if old is None:checkpoint.pop("solar_risk_candidate",None)
+            else:checkpoint["solar_risk_candidate"]=old
+            self._learning_status["solar"]={**solar,"status":"storage_failed"}
+            return
+        self.next_compute=0
 
     def _apply_learning_result(self, issued, result):
         if not (result.get("proposed") or result.get("proposed_power") or result.get("rollback")):
