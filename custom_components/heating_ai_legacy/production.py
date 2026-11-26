@@ -459,7 +459,7 @@ class NativeController(HeatingClimate):
         eligible=self._learning_eligible()
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
                     generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
-                    solar_ventilation=deepcopy(self.memory.get("ventilation_model") or {}),
+                    solar_ventilation=deepcopy(self.active_ventilation_model()),
                     solar_risk=deepcopy(self.active_solar_risk_certificate()),
                     schedule=dict(day=now.date().isoformat(),slot=slot,
                                   room_report=self._learning_last_report,eligible_at_issue=eligible))
@@ -510,7 +510,7 @@ class NativeController(HeatingClimate):
                   self.cfg.get("boiler_power_mode","unconfirmed")]
         coefficient=number(certificate.get("coefficient"))
         if (certificate.get("identity")==identity and certificate.get("status")=="holdout_passed"
-                and certificate.get("ventilation_model")== (self.memory.get("ventilation_model") or {})
+                and certificate.get("ventilation_model")== self.active_ventilation_model()
                 and type(certificate.get("comfort_credit")) is bool
                 and number(certificate.get("stored_at")) is not None
                 and certificate["stored_at"]>=checkpoint.get("evidence_after",0)
@@ -529,7 +529,7 @@ class NativeController(HeatingClimate):
                 or solar.get("risk_eligible") is not True or solar.get("status")!="holdout_passed"
                 or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
                 or issued["equipment"]!=self.memory.get("equipment_version",0)
-                or issued.get("solar_ventilation")!=(self.memory.get("ventilation_model") or {})
+                or issued.get("solar_ventilation")!=self.active_ventilation_model()
                 or time.monotonic()-issued["started"]>120 or not self._learning_eligible()):
             return
         identity=[self.model.get("version"),issued["equipment"],self.cfg.get("boiler_power_mode","unconfirmed")]
@@ -543,7 +543,7 @@ class NativeController(HeatingClimate):
                     or old.get("nominal_revoked_at",0)>=solar.get("holdout_end",0)):
             return
         checkpoint["solar_risk_candidate"]={**solar,"comfort_credit":False,
-            "ventilation_model":deepcopy(self.memory.get("ventilation_model") or {}),
+            "ventilation_model":deepcopy(self.active_ventilation_model()),
             "stored_at":self.now().timestamp()}
         try:
             self.save()
@@ -561,7 +561,7 @@ class NativeController(HeatingClimate):
         if (not active or active!=issued.get("solar_risk")
                 or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
                 or issued["equipment"]!=self.memory.get("equipment_version",0)
-                or issued.get("solar_ventilation")!=(self.memory.get("ventilation_model") or {})
+                or issued.get("solar_ventilation")!=self.active_ventilation_model()
                 or time.monotonic()-issued["started"]>120
                 or self.memory.get("state_load_error") or getattr(self,"settings_transaction",False)
                 or report.get("identity")!=active["identity"]
@@ -650,8 +650,9 @@ class NativeController(HeatingClimate):
     def _commit_learning_model(self, model, checkpoint, status, reason):
         """Commit the model and its rollback evidence at one filesystem boundary."""
         ventilation=self.memory.get("ventilation_model")
-        active_vent=bool(ventilation and ventilation.get("validated")
-                         and ventilation.get("model_version")==self.model.get("version"))
+        qualified_ventilation=self.active_ventilation_model()
+        active_vent=bool(qualified_ventilation.get("validated")
+                         and qualified_ventilation.get("model_version")==self.model.get("version"))
         if status=="accepted" and active_vent and model.get("room_loss")!=self.model.get("room_loss"):
             self._learning_status.update(status="rejected",reason="room_loss_not_identifiable_with_ventilation")
             return False
