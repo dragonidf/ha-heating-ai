@@ -466,7 +466,7 @@ class NativeController(HeatingClimate):
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
                                         "verified_reports","rejection_counts","current_reasons","eligibility_counts",
-                                        "analysis_status","analysis_blockers","solar")}
+                                        "analysis_status","analysis_blockers","solar","solar_prospective")}
         if result.get("power_learning") is not None:
             self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
         self._apply_learning_result(issued,result)
@@ -1856,6 +1856,10 @@ class NativeController(HeatingClimate):
                 current_reasons=report.get("current_reasons",[]),
                 analysis_status=report.get("analysis_status","pending"),
                 analysis_blockers=report.get("analysis_blockers",[]),
+                solar_learning=report.get("solar") or {},
+                solar_prospective=report.get("solar_prospective") or {},
+                solar_risk_active={k:v for k,v in self.active_solar_risk_certificate().items()
+                    if k in ("coefficient","stored_at","holdout_days","holdout_windows","comfort_credit")},
                 candidate_holdout_mae_1h=metrics.get("1",{}).get("new",{}).get("mae"),
                 candidate_holdout_mae_3h=metrics.get("3",{}).get("new",{}).get("mae"),
                 active_version=self.model.get("version"),rollback_reason=checkpoint.get("rollback_reason"),
