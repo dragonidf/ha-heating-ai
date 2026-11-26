@@ -16,7 +16,7 @@ from copy import deepcopy
 from heating_fallback import (fallback_power,repair_samples,estimated_power,aligned_power,phase_residual,combine_power,integrate_observation,partial_balance_bounds,reserve_control_prior,inlet_power,inlet_entities,reconcile_energy)
 from heating_outages import blocked, signature as outage_signature
 from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast,
-                           nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,
+                           nominal_mode, decide, learn, validate_candidate, transitions, HeatingPowerEstimator,advisory_outlook_48,
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,retain_kws_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
@@ -1979,8 +1979,11 @@ class HeatingClimate(HeatingRecovery,Hass):
             self.memory['plan_reference']=reference
             self.memory['plan_execution']=dict(plan_id=forecast.get('plan_id'),calculated_at=now.timestamp(),status=plan_execution_state)
             panel_forecast=forecast_for_panel(forecast)
+            long_outlook=self.run_diagnostic('advisory_48h',advisory_outlook_48,
+                now,room,floor,outside,fire,self.model,usable_weather,settings,forecast,
+                default=dict(status='unavailable',reason='projection_failed',curve=[]))
             self.publish('sensor.heating_forecast_outlook','Прогноз температури',
-                **forecast_outlook_for_panel(forecast,now,settings))
+                advisory_48h=long_outlook,**forecast_outlook_for_panel(forecast,now,settings))
             self.publish("sensor.heating_forecast",forecast["minimum"],friendly_name="Клімат — мінімум прогнозу",
                          unit_of_measurement="°C",device_class="temperature",curve=panel_forecast["curve"],
                          actual_curve=[{"ts":r["ts"],"temperature":r["room"] if r.get('room_valid',r.get('quality')) else None} for r in self.samples[-1:]],

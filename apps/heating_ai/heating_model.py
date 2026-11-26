@@ -1097,6 +1097,110 @@ def plan(now, room, floor, outside, fire_delta, model, forecast, settings, power
     return result
 
 
+def advisory_outlook_48(now, room, floor, outside, fire, model, weather, settings, forecast):
+    """48 elapsed hours, read-only scenario on the existing model/plan.
+
+    Keep the complete operational trace. Beyond it repeat only already
+    calculated first-day heat intervals, as a conditional scenario, never
+    as new commands. Known interruptions veto hypothetical heat. Unknown
+    weather/supply remains marked, not silently certified.
+    """
+    start=now.timestamp(); finish=start+172800
+    rows=forecast.get('_calculation_curve') or forecast.get('curve') or []
+    if not rows or not weather:
+        return dict(status='unavailable',reason='exact_plan_and_weather_required',curve=[])
+    context=ForecastContext(now,weather,outside,model,settings)
+    data=availability(settings.get('outage_schedule') or {},start,finish)
+    outages=data.get('outages',[]) if data.get('valid') else []
+    # Unlike max(timestamp), this detects holes inside hourly weather coverage.
+    known=start
+    for ts in sorted(set(row['ts'] for row in weather if number(row.get('temperature')) is not None)):
+        if ts>known+.001:
+            break
+        known=max(known,ts+3600)
+    curve=[];cursor=start;r,f=room,floor
+    for row in rows:
+        end=number(row.get('ts'))
+        if end is None or end>finish:
+            break
+        fine=row.get('_fine') or []
+        if (not fine or abs(fine[-1]['ts']-end)>.001
+                or any(not 0<b-a<=301 for a,b in zip([cursor]+[p['ts'] for p in fine[:-1]],
+                                                     [p['ts'] for p in fine]))):
+            return dict(status='unavailable',reason='incomplete_operational_trace',curve=[])
+        r,f=number(fine[-1].get('temperature')),number(fine[-1].get('return'))
+        if r is None or f is None:
+            return dict(status='unavailable',reason='missing_terminal_state',curve=[])
+        target,lo,hi,_=comfort_at(datetime.fromtimestamp(end-.001,now.tzinfo),settings)
+        curve.append(dict(ts=end,temperature=round(r,2),lower=lo,upper=hi,target=target,
+                          basis='calculated_plan',weather_known=end<=known,
+                          schedule_known=schedule_covered(data,cursor,end)))
+        cursor=end
+    planned_until=cursor
+    if cursor<start+86400-.001:
+        return dict(status='unavailable',reason='less_than_24h_calculated_trace',curve=[])
+    pattern=[]
+    # Never assume a 24-hour elapsed shift represents the same local tariff
+    # window across a clock change. In that case use coast-only extension.
+    clock_change=any(datetime.fromtimestamp(start+h*3600,now.tzinfo).utcoffset()!=now.utcoffset()
+                     for h in range(49))
+    if not clock_change:
+        for row in rows:
+            for seg in row.get('heat_segments',[]):
+                a,b,kw=(number(seg.get(k)) for k in ('start','end','power_kw'))
+                if None in (a,b,kw) or not 0<=kw<=10.5 or b<=a:
+                    return dict(status='unavailable',reason='invalid_heat_pattern',curve=[])
+                a=max(start,a);b=min(start+86400,b)
+                if b>a:
+                    a=max(cursor,a+86400);b=min(finish,b+86400)
+                    if b>a:pattern.append((a,b,kw))
+    pattern.sort()
+    if any(a[1]>b[0]+.001 for a,b in zip(pattern,pattern[1:])):
+        return dict(status='unavailable',reason='overlapping_heat_pattern',curve=[])
+    # 15-minute maximum integration step, 60-minute output; use exact heat,
+    # outage and weather boundaries. No beam search or new daily schedule.
+    cuts={cursor,finish}
+    cuts.update(start+i*900 for i in range(1,192) if cursor<start+i*900<finish)
+    cuts.update(t for a,b,_ in pattern for t in (a,b) if cursor<t<finish)
+    cuts.update(t for row in outages for t in (row['start'],row['end']) if cursor<t<finish)
+    cuts.update(row['ts'] for row in weather if cursor<row['ts']<finish)
+    cuts=sorted(cuts)
+    assumed=0.;unknown_heat=0.;skipped=0.;index=0;report_start=cursor
+    for a,b in zip(cuts,cuts[1:]):
+        while index<len(pattern) and pattern[index][1]<=a+.001:index+=1
+        kw=pattern[index][2] if index<len(pattern) and pattern[index][0]<=a+.001 and b<=pattern[index][1]+.001 else 0.
+        when=datetime.fromtimestamp(a,now.tzinfo)
+        _,_,hi,zone=comfort_at(when,settings)
+        planned_kw=kw
+        if kw and (blocked(a,b,outages) or r>=safe_upper(hi,zone,settings) or f>=50):
+            kw=0.
+        _,elapsed,out,gains=context.at(when)
+        fire_gain=model['fire_gain']*max(0.,fire*math.exp(-elapsed/120))
+        dt=(b-a)/3600
+        nr,nf=context.integrate(r,f,out,kw,fire_gain,dt,gains[0])
+        if kw and (nf>50 or nr>safe_upper(hi,zone,settings)):
+            kw=0.;nr,nf=context.integrate(r,f,out,0.,fire_gain,dt,gains[0])
+        r,f=nr,nf
+        if not math.isfinite(r) or not math.isfinite(f):
+            return dict(status='unavailable',reason='nonfinite_projection',curve=[])
+        assumed+=kw*dt;skipped+=(planned_kw-kw)*dt
+        if not schedule_covered(data,a,b):
+            unknown_heat+=kw*dt
+        if abs((b-start)%3600)<.001 or b==finish:
+            target,lo,hi,_=comfort_at(datetime.fromtimestamp(b-.001,now.tzinfo),settings)
+            curve.append(dict(ts=b,temperature=round(r,2),lower=lo,upper=hi,target=target,
+                              basis='conditional_repeat' if not clock_change else 'conditional_coast',
+                              weather_known=b<=known,schedule_known=schedule_covered(data,report_start,b)))
+            report_start=b
+    return dict(status='conditional',horizon_hours=48.,calculated_until=planned_until,
+                weather_contiguous_until=known,weather_complete=known>=finish,
+                schedule_complete=schedule_covered(data,start,finish),
+                assumed_tail_kwh=round(assumed,3),unknown_supply_tail_kwh=round(unknown_heat,3),
+                omitted_tail_kwh=round(skipped,3),clock_change=clock_change,
+                assumption='repeat_first_day_heat_if_available_no_control_commands',
+                curve=curve)
+
+
 def solve(rows, outputs, prior):
     size=len(prior)
     a=[[sum(x[i]*x[j] for x in rows)+(1.0 if i==j else 0.) for j in range(size)] for i in range(size)]

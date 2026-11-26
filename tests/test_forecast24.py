@@ -36,3 +36,58 @@ class Forecast24Tests(unittest.TestCase):
         self.assertFalse(p['heat'])
         self.assertTrue(all(seg['start']>=start+3600 for seg in p['heat_segments']))
         self.assertEqual(p['conditional_heat_minutes'],0)
+
+
+class Advisory48Tests(unittest.TestCase):
+    def fixture(self):
+        from heating_model import forecast_step
+        now=datetime(2026,11,26,0,tzinfo=ZoneInfo("Europe/Kyiv"));start=now.timestamp()
+        settings=dict(start="23:00",end="07:00",strategy="Тільки в дозволені години",
+                      lower=20.,upper=40.,target=22.)
+        weather=[dict(ts=start+i*3600,temperature=5.,condition="cloudy") for i in range(48)]
+        room,floor=21.,23.;r,f=room,floor;rows=[]
+        for j in range(48):
+            fine=[];segments=[]
+            for i in range(6):
+                a=start+(j*6+i)*300;b=a+300
+                kw=3. if j<2 else 0.
+                r,f=forecast_step(r,f,5.,kw,0.,DEFAULT_MODEL,1/12,
+                                  datetime.fromtimestamp(a,now.tzinfo),weather,settings)
+                fine.append(dict(ts=b,temperature=r,**{"return":f}))
+                if kw:segments.append(dict(start=a,end=b,power_kw=kw,kwh=kw/12))
+            rows.append(dict(ts=b,temperature=r,**{"return":f},_fine=fine,heat_segments=segments))
+        return now,room,floor,weather,settings,dict(curve=rows,_calculation_curve=rows)
+
+    def test_advisory_48_does_not_mutate_plan_and_marks_unknown(self):
+        from heating_model import advisory_outlook_48
+        from copy import deepcopy
+        now,r,f,weather,settings,forecast=self.fixture();start=now.timestamp()
+        before=deepcopy(forecast)
+        result=advisory_outlook_48(now,r,f,5.,0.,DEFAULT_MODEL,weather,settings,forecast)
+        self.assertEqual(result["status"],"conditional")
+        self.assertEqual(result["curve"][-1]["ts"],start+172800)
+        self.assertEqual(result["calculated_until"],start+86400)
+        self.assertEqual(result["assumed_tail_kwh"],3.)
+        self.assertEqual(result["unknown_supply_tail_kwh"],3.)
+        self.assertTrue(result["weather_complete"])
+        self.assertFalse(result["schedule_complete"])
+        self.assertEqual(forecast,before)
+        self.assertTrue(all(p["basis"]=="calculated_plan" for p in result["curve"][:48]))
+        self.assertTrue(all(p["basis"]=="conditional_repeat" for p in result["curve"][48:]))
+
+    def test_advisory_respects_published_off_and_internal_weather_gap(self):
+        from heating_model import advisory_outlook_48
+        now,r,f,weather,settings,forecast=self.fixture();start=now.timestamp()
+        settings["outage_schedule"]=dict(valid=True,mode="scheduled",
+            outages=[dict(start=start+86400,end=start+90000)],
+            slots=[dict(start=start,end=start+86400,off=False),
+                   dict(start=start+86400,end=start+90000,off=True),
+                   dict(start=start+90000,end=start+172800,off=False)])
+        result=advisory_outlook_48(now,r,f,5.,0.,DEFAULT_MODEL,
+            [row for i,row in enumerate(weather) if i!=30],settings,forecast)
+        self.assertEqual(result["assumed_tail_kwh"],0.)
+        self.assertEqual(result["omitted_tail_kwh"],3.)
+        self.assertEqual(result["weather_contiguous_until"],start+30*3600)
+        self.assertFalse(result["weather_complete"])
+        self.assertFalse(result["curve"][-1]["weather_known"])
+        self.assertEqual(advisory_outlook_48(now,r,f,5.,0.,DEFAULT_MODEL,[],settings,forecast)["status"],"unavailable")
