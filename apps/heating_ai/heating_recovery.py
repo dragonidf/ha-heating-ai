@@ -1947,46 +1947,66 @@ class DecisionJournal:
             return dict(status='staged',pack=key,snapshots=len(ids),packed_bytes=total_bytes,
                         legacy_bytes=legacy_bytes)
 
-    def promote_snapshot_pack(self,key,*,allow_remove=False):
-        """Explicit offline promotion; verify all references before any removal.
+    def _prepare_pack_promotion(self,key):
+        """Verify immutable block, pointers and original bytes outside the lock."""
+        if not self._valid_digest(key):raise ValueError('Invalid pack identifier')
+        folder=self.directory/'packed_v1'
+        manifest=folder/(key+'.pack.json');blob=folder/(key+'.xz')
+        fences={p:self._snapshot_stat(p) for p in (manifest,blob)}
+        ids,rows,packed_bytes=self._load_snapshot_pack(key)
+        header=json.loads(manifest.read_bytes())
+        legacy_bytes=header.get('legacy_bytes')
+        if type(legacy_bytes) is not int or legacy_bytes<=0:
+            raise ValueError('Missing original archive byte count')
+        originals=[];remaining_bytes=0;absent=[]
+        for digest,raw in zip(ids,rows):
+            pointer=self.directory/(digest+'.snapshot-ref')
+            fences[pointer]=self._snapshot_stat(pointer)
+            if self._pack_pointer(pointer)!=key:raise ValueError('Snapshot pointer differs')
+            packed_bytes+=fences[pointer][2]
+            path=self.directory/(digest+'.json.gz')
+            try:info=self._snapshot_stat(path)
+            except FileNotFoundError:
+                absent.append(path);continue
+            with gzip.open(path,'rb') as stream:source=stream.read(self.PACK_RAW_LIMIT+1)
+            if source!=raw:raise ValueError('Original snapshot differs')
+            fences[path]=info
+            originals.append((path,pointer,max(info[3],fences[pointer][3])))
+            remaining_bytes+=info[2]
+        if packed_bytes*2>legacy_bytes or remaining_bytes>legacy_bytes:
+            raise ValueError('Packed snapshot savings below required 50%')
+        if any(self._snapshot_stat(p)!=info for p,info in fences.items()) or any(p.exists() for p in absent):
+            raise ValueError('Archive changed during promotion verification')
+        return dict(ids=ids,fences=fences,absent=absent,originals=originals,
+                    remaining_bytes=remaining_bytes,packed_bytes=packed_bytes,legacy_bytes=legacy_bytes)
 
-        Once the verified pack and all references are durable, interruption
-        between unlinks leaves a readable mixed archive. Repeating promotion
-        verifies the remaining originals and removes only exact duplicates.
-        Never called by the control loop.
+    def promote_snapshot_pack(self,key,*,allow_remove=False):
+        """Explicit promotion, never invoked by the control loop.
+
+        The expensive decode and full byte comparison run outside the lock.
+        All source fingerprints and absent files are rechecked before removal.
+        Durable pointer mtimes and fsync still require a bounded I/O section.
+        Interrupted unlinks leave verified readable mixed storage.
         """
         if allow_remove is not True:
             raise PermissionError('Packed archive promotion requires explicit opt-in')
+        prepared=self._prepare_pack_promotion(key)
         with self.lock:
-            ids,rows,packed_bytes=self._load_snapshot_pack(key)
-            folder=self.directory/'packed_v1'
-            header=json.loads((folder/(key+'.pack.json')).read_bytes())
-            legacy_bytes=header.get('legacy_bytes')
-            if type(legacy_bytes) is not int or legacy_bytes<=0:
-                raise ValueError('Missing original archive byte count')
-            originals=[];remaining_bytes=0
-            for digest,raw in zip(ids,rows):
-                pointer=self.directory/(digest+'.snapshot-ref')
-                if self._pack_pointer(pointer)!=key:raise ValueError('Snapshot pointer differs')
-                packed_bytes+=pointer.stat().st_size
-                path=self.directory/(digest+'.json.gz')
-                if path.exists():
-                    with gzip.open(path,'rb') as stream:source=stream.read(self.PACK_RAW_LIMIT+1)
-                    if source!=raw:raise ValueError('Original snapshot differs')
-                    latest=max(path.stat().st_mtime,pointer.stat().st_mtime)
-                    os.utime(pointer,(latest,latest))
+            if (any(self._snapshot_stat(p)!=info for p,info in prepared['fences'].items())
+                    or any(p.exists() for p in prepared['absent'])):
+                raise ValueError('Archive changed before promotion')
+            originals=prepared['originals']
+            for path,pointer,latest in originals:
+                if latest>prepared['fences'][pointer][3]:
+                    os.utime(pointer,ns=(latest,latest))
                     with pointer.open('rb') as stream:os.fsync(stream.fileno())
-                    originals.append(path);remaining_bytes+=path.stat().st_size
-            if packed_bytes*2>legacy_bytes or remaining_bytes>legacy_bytes:
-                raise ValueError('Packed snapshot savings below required 50%')
-            # All pointers, block and manifest were checked and made durable
-            # before removal. No pointer or block is deleted in this operation.
-            self._sync_directory(folder);self._sync_directory(self.directory)
+            self._sync_directory(self.directory/'packed_v1');self._sync_directory(self.directory)
             self.used_bytes=None
-            for path in originals:path.unlink()
+            for path,_,_ in originals:path.unlink()
             self._sync_directory(self.directory)
-            return dict(status='promoted',pack=key,snapshots=len(ids),removed=len(originals),
-                        removed_bytes=remaining_bytes,packed_bytes=packed_bytes,legacy_bytes=legacy_bytes)
+            return dict(status='promoted',pack=key,snapshots=len(prepared['ids']),removed=len(originals),
+                        removed_bytes=prepared['remaining_bytes'],packed_bytes=prepared['packed_bytes'],
+                        legacy_bytes=prepared['legacy_bytes'])
 
     def read_snapshot(self,digest):
         if not self._valid_digest(digest):

@@ -171,6 +171,39 @@ class DecisionHistoryTests(unittest.TestCase):
             self.assertFalse((journal.directory/'packed_v1').exists())
             self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),2)
 
+    def test_promotion_verification_outside_lock_rejects_concurrent_reuse(self):
+        from unittest.mock import patch
+        from threading import Thread,Event
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            values=[dict(i=i,data=list(range(5000))) for i in range(8)]
+            ids=[journal.snapshot(v,stamp) for v in values]
+            key=journal.stage_snapshot_pack(ids,require_savings=True)['pack']
+            original=journal._prepare_pack_promotion
+            prepared=Event();release=Event();errors=[]
+            def slow_prepare(pack):
+                result=original(pack);prepared.set()
+                if not release.wait(5):raise RuntimeError('test timeout')
+                return result
+            def promote():
+                try:journal.promote_snapshot_pack(key,allow_remove=True)
+                except Exception as exc:errors.append(exc)
+            with patch.object(journal,'_prepare_pack_promotion',side_effect=slow_prepare):
+                worker=Thread(target=promote);worker.start()
+                try:
+                    self.assertTrue(prepared.wait(5))
+                    self.assertTrue(journal.lock.acquire(timeout=1))
+                    try:journal.snapshot(values[0],stamp+60)
+                    finally:journal.lock.release()
+                finally:
+                    release.set();worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors),1)
+            self.assertIsInstance(errors[0],ValueError)
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),8)
+            for key,value in zip(ids,values):self.assertEqual(journal.read_snapshot(key),value)
+
     def test_pack_savings_gate_keeps_tiny_originals(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)
