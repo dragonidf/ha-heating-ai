@@ -302,6 +302,33 @@ class DecisionHistoryTests(unittest.TestCase):
             self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
             for key,value in zip(ids,values):self.assertEqual(journal.read_snapshot(key),value)
 
+    def test_cold_scan_stops_without_publishing_partial_selection(self):
+        from threading import Event
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            stop=Event()
+            visited=[]
+            class Entries:
+                def __enter__(self):return self
+                def __exit__(self,*args):return False
+                def __iter__(self):
+                    for i in range(100000):
+                        visited.append(i)
+                        if i==3:stop.set()
+                        yield SimpleNamespace(name=('%064x'%i)+'.json.gz',
+                            is_file=lambda **kw:True,stat=lambda **kw:
+                            SimpleNamespace(st_mtime=stamp-4*86400,st_size=32768))
+            with patch('heating_recovery.os.scandir',return_value=Entries()), \
+                 patch.object(journal,'stage_snapshot_pack') as stage:
+                result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=stop)
+            self.assertEqual(result['status'],'stopped')
+            self.assertEqual(len(visited),4)
+            stage.assert_not_called()
+            self.assertEqual(journal.cold_pack_candidates(stamp,stop=stop),[])
+
     def test_cold_publication_rejects_recently_reused_source(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)

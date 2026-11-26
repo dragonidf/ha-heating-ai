@@ -2117,7 +2117,7 @@ class DecisionJournal:
     COLD_PACK_MAX_BYTES=256*1024
     COLD_PACK_RECENT_FAILURES=64
 
-    def cold_pack_candidates(self,stamp,*,skip=()):
+    def cold_pack_candidates(self,stamp,*,skip=(),stop=None):
         """Bounded selection from cold, large, unreferenced legacy snapshots.
 
         Scan without the shared lock; keep only the eight oldest candidates.
@@ -2128,20 +2128,37 @@ class DecisionJournal:
         from heapq import nsmallest
         rejected=set(skip)
         def candidates():
-            for path in self.directory.glob('*.json.gz'):
-                digest=path.name[:-8]
-                if not self._valid_digest(digest) or digest in rejected:
-                    continue
-                try:
-                    info=path.stat()
-                    if not (stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE
-                            and self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES):
-                        continue
-                    if (self.directory/(digest+'.snapshot-ref')).exists():continue
-                    yield (info.st_mtime,digest)
-                except FileNotFoundError:
-                    continue
-        return [digest for _,digest in nsmallest(self.PACK_ROWS,candidates())]
+            if stop is not None and stop.is_set():
+                return
+            try:
+                # Path.glob may materialize the directory listing before the
+                # first yield. Stream it, observing shutdown on each entry.
+                with os.scandir(self.directory) as entries:
+                    for entry in entries:
+                        if stop is not None and stop.is_set():
+                            return
+                        if not entry.name.endswith('.json.gz'):
+                            continue
+                        digest=entry.name[:-8]
+                        if not self._valid_digest(digest) or digest in rejected:
+                            continue
+                        try:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            info=entry.stat(follow_symlinks=False)
+                            if not (stamp-self.retention<=info.st_mtime<=stamp-self.COLD_PACK_MIN_AGE
+                                    and self.COLD_PACK_MIN_BYTES<=info.st_size<=self.COLD_PACK_MAX_BYTES):
+                                continue
+                            if (self.directory/(digest+'.snapshot-ref')).exists():continue
+                            yield (info.st_mtime,digest)
+                        except FileNotFoundError:
+                            continue
+            except FileNotFoundError:
+                return
+        selected=nsmallest(self.PACK_ROWS,candidates())
+        if stop is not None and stop.is_set():
+            return []
+        return [digest for _,digest in selected]
 
     def compact_cold_snapshot_batch(self,stamp,*,allow_remove=False,stop=None):
         """One bounded maintenance attempt on a backup or native executor.
@@ -2154,7 +2171,8 @@ class DecisionJournal:
             raise PermissionError('Cold archive compaction requires explicit opt-in')
         if stop is not None and stop.is_set():return dict(status='stopped',snapshots=0)
         skipped=list(getattr(self,'_cold_pack_skipped',()))
-        ids=self.cold_pack_candidates(stamp,skip=skipped)
+        ids=self.cold_pack_candidates(stamp,skip=skipped,stop=stop)
+        if stop is not None and stop.is_set():return dict(status='stopped',snapshots=0)
         if len(ids)<2:return dict(status='no_eligible_batch',snapshots=0)
         try:
             # The source-age fence is also checked inside staging publication.
