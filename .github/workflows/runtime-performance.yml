@@ -10,6 +10,10 @@ permissions:
   contents: read
 jobs:
   controlled:
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: [small-ring, full-ring]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -20,16 +24,20 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r tests/requirements.txt
-      - name: Verify baseline and pin one logical CPU
+      - name: Verify baseline and measure ${{ matrix.workload }}
+        env:
+          WORKLOAD: ${{ matrix.workload }}
         run: |
           git fetch --force origin refs/tags/v0.5.24:refs/tags/v0.5.24
           test "$(git rev-parse 'v0.5.24^{commit}')" = ff95e14756f0bb6e7610fd87c459941b4b0ef4f0
           git worktree add --detach "$RUNNER_TEMP/heating-baseline" ff95e14756f0bb6e7610fd87c459941b4b0ef4f0
           CPU="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
-          PYTHONHASHSEED=0 taskset -c "$CPU" python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --controlled "$RUNNER_TEMP/heating-controlled-runtime.json" --repeat 30
+          args=()
+          if [[ "$WORKLOAD" == "full-ring" ]]; then args+=(--full-ring); fi
+          PYTHONHASHSEED=0 taskset -c "$CPU" python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --controlled "$RUNNER_TEMP/heating-controlled-runtime.json" --repeat 30 "${args[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: controlled-runtime-raw
+          name: controlled-runtime-raw-${{ matrix.workload }}
           path: ${{ runner.temp }}/heating-controlled-runtime.json
           retention-days: 14
