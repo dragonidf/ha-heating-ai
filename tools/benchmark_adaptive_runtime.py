@@ -33,7 +33,7 @@ def rss_kib():
     return int(Path("/proc/self/statm").read_text().split()[1])*os.sysconf("SC_PAGE_SIZE")//1024
 
 
-def measure_core(app, tick, mode, root, *, full_ring=False, profile=False):
+def measure_core(app, tick, mode, root, *, full_ring=False, profile=False, groups=10):
     initial_rss=rss_kib()
     history=fixture(58)
     # Legacy sample ring is 4032 rows. The sidecar job processes its 400-row
@@ -103,9 +103,9 @@ def measure_core(app, tick, mode, root, *, full_ring=False, profile=False):
     output["sample_ring_size"]=len(app.samples)
     output["resident_after_ring"]=rss_kib()
     time_module=sys.modules[tick.__module__].time
-    # All 10 warm groups include 19 ordinary ticks and one aggregation slot.
+    # Each measured group includes 19 ordinary ticks and one aggregation slot.
     # Each tick uses the packaged core; disk/controller writes are fixture mocks.
-    for batch in range(11):
+    for batch in range(groups+1):
         batch_times=[]
         for i in range(20):
             stamp=issue+(batch*20+i+1)*15
@@ -141,7 +141,7 @@ def measure_core(app, tick, mode, root, *, full_ring=False, profile=False):
         if batch:
             timings["tick"].extend(batch_times)
     output["resident_after_tick"]=rss_kib()
-    for i in range(11) if active else ():
+    for i in range(groups+1) if active else ():
         wall,cpu=perf_counter(),process_time()
         args=(sidecar,recent,(),MODEL,{},{},now,True)
         result=(profiles["training"].runcall(adaptive.run_learning,*args) if profile else
@@ -160,6 +160,9 @@ def measure_core(app, tick, mode, root, *, full_ring=False, profile=False):
     # Compare the complete action sequence, not wall timings/IDs in diagnostics.
     output["command_golden"]=action_output
     output["raw_timings"]=timings
+    assert len(timings["tick"])==groups*20
+    if active:
+        assert len(timings["aggregation"])==len(timings["training"])==groups
     # The native tick includes capture on its sample ticks. Do not add the
     # separately timed diagnostic aggregation a second time.
     output["daily_tick_training_cpu_s"]=(
@@ -173,16 +176,16 @@ def measure_core(app, tick, mode, root, *, full_ring=False, profile=False):
     return output
 
 
-async def child(package_path,mode,root,*,full_ring=False,profile=False):
+async def child(package_path,mode,root,*,full_ring=False,profile=False,groups=10):
     with package(package_path) as (component,_):
         fixture_app,_=BackgroundTickSafetyTests().app()
         app=component.NativeController(FakeHA(),{})
         app.__dict__.update(fixture_app.__dict__)
         app.__dict__.pop("sample",None)
-        return measure_core(app,component.HeatingClimate.tick_inner,mode,root,full_ring=full_ring,profile=profile)
+        return measure_core(app,component.HeatingClimate.tick_inner,mode,root,full_ring=full_ring,profile=profile,groups=groups)
 
 
-def controlled_runtime(root,baseline,repeat,*,full_ring=False):
+def controlled_runtime(root,baseline,repeat,*,full_ring=False,groups=50):
     if len(os.sched_getaffinity(0))!=1 or os.getenv("PYTHONHASHSEED")!="0":
         raise ValueError("pin one CPU and set PYTHONHASHSEED=0")
     if repeat<30 or repeat%6:
@@ -197,7 +200,7 @@ def controlled_runtime(root,baseline,repeat,*,full_ring=False):
         block={}
         for name in order:
             result=json.loads(subprocess.check_output(
-                [sys.executable,__file__,str(baseline),"--child",str(root/name),"online"]+
+                [sys.executable,__file__,str(baseline),"--child",str(root/name),"online","--groups",str(groups)]+
                 (["--full-ring"] if full_ring else []),text=True))
             (root/"online_learning_v1.json").unlink()
             actions=result.pop("command_golden")
@@ -221,6 +224,7 @@ def controlled_runtime(root,baseline,repeat,*,full_ring=False):
             medians={name:statistics.median(value(row,name) for row in rows) for name in names})
     return dict(scope="synthetic HA-free tick and training; excludes planner, real I/O and archive; block p95 distribution",
         exact_command_match=True,affinity=sorted(os.sched_getaffinity(0)),repeat=repeat,full_ring=full_ring,
+        measurement_groups=groups, samples_per_process=dict(tick=groups*20,aggregation=groups,training=groups),
         operations=operations,orders=blocks,samples=rows,
         gate_pass=all(v["gate"]=="pass" for v in operations.values()))
 
@@ -232,9 +236,12 @@ def main():
     parser.add_argument("--both-online",action="store_true",help="Paired A/A and A/B of active learning against a release")
     parser.add_argument("--controlled",type=Path,help="write randomized paired 30+ triplets, including raw measurements")
     parser.add_argument("--repeat",type=int,default=30)
+    parser.add_argument("--groups",type=int,choices=(10,50),default=None,
+                        help="measured groups per process; controlled default 50, diagnostic default 10")
     parser.add_argument("--full-ring",action="store_true",help="keep the full 4032-row historical sample buffer")
     parser.add_argument("--profile",action="store_true",help="separate CPU hotspot diagnostic; not valid for timed acceptance")
     opts=parser.parse_args()
+    groups=opts.groups if opts.groups is not None else (50 if opts.controlled else 10)
     if opts.profile and opts.controlled:
         parser.error("profiling must not contaminate controlled timings")
     if opts.profile or opts.controlled:opts.both_online=True
@@ -243,7 +250,7 @@ def main():
         if opts.profile:
             print(f"CPU profile package: {Path(path).name}",file=sys.stderr)
         result=asyncio.run(child(Path(path),mode,Path(path).parent,
-                                 full_ring=opts.full_ring,profile=opts.profile))
+                                 full_ring=opts.full_ring,profile=opts.profile,groups=groups))
         print(json.dumps(result))
         return
     with TemporaryDirectory() as folder:
@@ -258,7 +265,7 @@ def main():
             with ZipFile(archive) as zf:
                 zf.extractall(target)
         if opts.controlled:
-            report=controlled_runtime(root,baseline,opts.repeat,full_ring=opts.full_ring)
+            report=controlled_runtime(root,baseline,opts.repeat,full_ring=opts.full_ring,groups=groups)
             opts.controlled.write_text(json.dumps(report,indent=2)+"\n")
             print(json.dumps({k:v for k,v in report.items() if k not in ("samples","orders")},indent=2))
             raise SystemExit(0 if report["gate_pass"] else 2)
@@ -266,7 +273,7 @@ def main():
         variants=(("baseline","online"),("control","online"),("candidate","online")) if opts.both_online else (("baseline","legacy"),("candidate","online"))
         for name,mode in variants:
             result=json.loads(subprocess.check_output(
-                [sys.executable,__file__,str(baseline),"--child",str(root/name),mode]+
+                [sys.executable,__file__,str(baseline),"--child",str(root/name),mode,"--groups",str(groups)]+
                 (["--full-ring"] if opts.full_ring else [])+
                 (["--profile"] if opts.profile else []),text=True))
             if mode=="online":

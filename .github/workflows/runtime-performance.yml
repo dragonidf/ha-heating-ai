@@ -34,7 +34,7 @@ jobs:
           CPU="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
           args=()
           if [[ "$WORKLOAD" == "full-ring" ]]; then args+=(--full-ring); fi
-          PYTHONHASHSEED=0 taskset -c "$CPU" python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --controlled "$RUNNER_TEMP/heating-controlled-runtime.json" --repeat 30 "${args[@]}"
+          PYTHONHASHSEED=0 taskset -c "$CPU" python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --controlled "$RUNNER_TEMP/heating-controlled-runtime.json" --repeat 30 --groups 50 "${args[@]}"
       - name: Separate CPU hotspot diagnostic
         if: always()
         env:
