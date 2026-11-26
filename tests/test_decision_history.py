@@ -265,6 +265,27 @@ class DecisionHistoryTests(unittest.TestCase):
             for key,value in zip(ids,values):
                 self.assertEqual(json.loads(gzip.decompress((target/(key+'.json.gz')).read_bytes())),value)
 
+    def test_hourly_inventory_streams_without_path_list_and_preserves_retention(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,max_bytes=32*1024*1024)
+            stamp=time.time()
+            journal.directory.mkdir()
+            hot=journal.directory/('a'*64+'.json.gz')
+            old=journal.directory/('b'*64+'.json.gz')
+            cold=journal.directory/('c'*64+'.json.gz')
+            for path,size,age in ((hot,1000,0),(old,2000,15),(cold,32768,4)):
+                path.write_bytes(b'x'*size)
+                os.utime(path,(stamp-age*86400,stamp-age*86400))
+            with patch.object(Path,'iterdir',side_effect=AssertionError('materialized directory listing')):
+                journal._prepare(stamp)
+            self.assertFalse(old.exists())
+            self.assertTrue(hot.exists())
+            self.assertTrue(cold.exists())
+            self.assertEqual(journal.used_bytes,33768)
+            self.assertEqual(journal.snapshot_count,2)
+            self.assertEqual(journal._cold_queue,('c'*64,))
+
     def test_online_batches_reuse_hourly_scan_and_do_not_rescan_empty_queue(self):
         from random import Random
         from threading import Event
