@@ -1,7 +1,7 @@
 """Private evidence and bounded policy for the single scheduled learner."""
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 import json
 import math
@@ -424,18 +424,32 @@ def advisory_validation_summary(state, identity, tz, stamp):
     """Current identity only; keep conditional cohorts distinct."""
     state=state or {};groups={}
     for p in state.get("completed",[]):
-        if p.get("identity")!=list(identity) or p["reported"]<stamp-30*86400:
+        if p.get("identity")!=list(identity) or not stamp-30*86400<=p["reported"]<=stamp:
             continue
         key=(p["horizon"],p["basis"],p["weather_known"],p["schedule_known"])
         groups.setdefault(key,[]).append(p)
     metrics=[]
     for (h,basis,weather,schedule),rows in sorted(groups.items()):
         ordered=sorted(rows,key=lambda p:p["reported"])
-        independent=[];end=-math.inf
-        for p in ordered:
-            if p["issued"]>=end:
-                independent.append(p);end=p["reported"]
-        metrics.append(dict(horizon=h,basis=basis,weather_known=weather,schedule_known=schedule,
+        def independent_rows(items):
+            accepted=[];end=-math.inf
+            for p in items:
+                if p["issued"]>=end:
+                    accepted.append(p);end=p["reported"]
+            return accepted
+        independent=independent_rows(ordered)
+        today=datetime.fromtimestamp(stamp,tz).date()
+        dated=[(datetime.fromtimestamp(p["reported"],tz).date(),p) for p in ordered]
+        periods={}
+        for days in (7,14,30):
+            start=today-timedelta(days=days-1)
+            selected=[p for day,p in dated if day>=start]
+            unique=independent_rows(selected)
+            covered=len({day for day,p in dated if day>=start})
+            stats=_metrics([p["error"] for p in unique])
+            periods[str(days)]=dict(count=stats["n"],all_count=len(selected),days=covered,
+                missing_days=days-covered,mae=stats["mae"],bias=stats["bias"])
+        metrics.append(dict(horizon=h,basis=basis,weather_known=weather,schedule_known=schedule,periods=periods,
             days=len({_local_day(p["reported"],tz) for p in ordered}),
             all_reports=_metrics([p["error"] for p in ordered]),
             independent=_metrics([p["error"] for p in independent]),

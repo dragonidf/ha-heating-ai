@@ -360,7 +360,8 @@ class NativeController(HeatingClimate):
         now=self.now();stamp=now.timestamp()
         cached=getattr(self,"_advisory_view_cache",None)
         if (cached is not None and cached[0] is state and cached[1]==identity
-                and cached[2]==now.tzinfo and cached[3]<=stamp<=cached[4]):
+                and cached[2]==now.tzinfo and cached[3]<=stamp<=cached[4]
+                and datetime.fromtimestamp(cached[3],now.tzinfo).date()==now.date()):
             return cached[5]
         result=learning.advisory_validation_summary(state,identity,now.tzinfo,stamp)
         next_expiry=min((p["reported"]+30*86400 for p in (state or {}).get("completed",[])

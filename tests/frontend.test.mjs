@@ -801,7 +801,7 @@ test('accuracy period table compares the same cohort, preserves gaps and signed 
   const cohort={horizon:6,model_version:6,equipment_version:2,physical_mode:'fixed_6',
     basis:'sensor_report',weather_known:true,schedule_known:false,
     periods:{7:{count:2,days:1,missing_days:6,mae:.125,bias:-.125},14:{count:4,days:3,missing_days:11,mae:.25,bias:0},30:{count:8,days:5,missing_days:25,mae:.375,bias:.2}}};
-  p.attrs=()=>({accuracy_periods:{groups:[cohort,{...cohort,equipment_version:null,
+  p.attrs=()=>({advisory_validation:{groups:[{horizon:48,basis:'conditional_repeat',weather_known:false,schedule_known:false,periods:{7:{count:2,days:3,missing_days:4,mae:.625,bias:-.25}}}]},accuracy_periods:{groups:[cohort,{...cohort,equipment_version:null,
     periods:{7:{count:0,days:0,missing_days:7,mae:null,bias:null},30:{count:1,days:1,missing_days:29,mae:1.2,bias:1.2}}}],as_of:1795708800}});
   const markup=p.controllerQuality();
   assert.match(markup,/Точність за 7\/14\/30 діб/);
@@ -810,6 +810,7 @@ test('accuracy period table compares the same cohort, preserves gaps and signed 
   assert.match(markup,/6 без даних/);
   assert.match(markup,/Обладнання невідоме/);
   assert.match(markup,/v6/);assert.match(markup,/6 год/);
+  assert.match(markup,/48 год · Умовний повтор нагріву/);assert.match(markup,/0,625/);
   assert.doesNotMatch(markup,/NaN|undefined|покращилася/);
   p.attrs=()=>({});assert.match(p.controllerQuality(),/Немає зіставних перевірок/);
 });
