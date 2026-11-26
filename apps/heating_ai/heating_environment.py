@@ -360,6 +360,32 @@ def _ventilation_adjustment(fit,base_loss,expected):
     return effective-base_loss
 
 
+def effective_ventilation_duty(evidence):
+    """Observed powered duty, not commanded relay fraction; unknown is None.
+
+    Mixed duty is usable for a mean ventilation estimate, but not by the
+    constant-duty adaptive window fitter. Legacy ON without supply evidence
+    is never promoted to measured airflow. This measures powered operation,
+    not the actual volume of air exchanged.
+    """
+    if not isinstance(evidence,dict) or (finite(evidence.get('seconds')) or 0)<240:
+        return None
+    if 'effective_on_fraction' in evidence or 'effective_unknown_fraction' in evidence:
+        duty=finite(evidence.get('effective_on_fraction'))
+        return duty if duty is not None and 0<=duty<=1 and finite(evidence.get('effective_unknown_fraction'))==0 else None
+    on=finite(evidence.get('on_fraction'))
+    unknown=finite(evidence.get('unknown_fraction'))
+    supply_unknown=finite(evidence.get('supply_unknown_fraction'))
+    powered=finite(evidence.get('powered_relay_on_fraction'))
+    if supply_unknown==0 and finite(evidence.get('supply_on_fraction'))==0 and powered==0:
+        return 0.
+    if unknown!=0 or on is None or not 0<=on<=1:
+        return None
+    if on==0:
+        return 0.
+    return powered if supply_unknown==0 and powered is not None and 0<=powered<=on+.001 and powered<=1 else None
+
+
 def fit_ventilation(samples,model,timezone=None):
     """Joint base/recuperator/bath effective loss, independent held-out days.
 
@@ -385,8 +411,9 @@ def fit_ventilation(samples,model,timezone=None):
         u={};valid=True
         for key in ('recuperator','bath'):
             vals=[(r.get('ventilation') or {}).get(key) or {} for r in chunk[1:]]
-            if any(finite(v.get('on_fraction')) is None or v.get('unknown_fraction',1)>.05 for v in vals):valid=False;break
-            u[key]=statistics.mean(v['on_fraction'] for v in vals)
+            duties=[effective_ventilation_duty(v) for v in vals]
+            if any(d is None for d in duties):valid=False;break
+            u[key]=statistics.mean(duties)
         if not valid:continue
         delta=room-outside;rate=(b['room']-room)/dt
         drive=model['floor_air']*(floor-room)+model['fire_gain']*a.get('fire',0)
@@ -422,8 +449,12 @@ def ventilation_expectation(samples,current):
     result={};support={}
     for key in ('recuperator','bath'):
         rows=[(r.get('ventilation') or {}).get(key) or {} for r in samples[-288:]]
-        known=[v['on_fraction'] for v in rows if finite(v.get('on_fraction')) is not None and v.get('unknown_fraction',1)<=.05]
+        device=current.get(key) or {}
+        entity=device.get('entity')
+        known=[d for v in rows if (not entity or v.get('entity')==entity)
+               and (d:=effective_ventilation_duty(v)) is not None]
         result[key]=statistics.mean(known) if len(known)>=12 else None
         support[key]=dict(intervals=len(known),unknown_fraction=1-len(known)/len(rows) if rows else 1,
-            current=(current.get(key) or {}).get('relay','unknown'),future='empirical_duty' if len(known)>=12 else 'unknown')
+            current=device.get('relay','unknown'),effective_duty=device.get('effective_duty'),
+            future='empirical_powered_duty' if len(known)>=12 else 'unknown')
     return result,support

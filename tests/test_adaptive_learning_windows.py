@@ -215,6 +215,17 @@ class WindowsTest(unittest.TestCase):
                 rows[-1 if 'report_verified' in fields else 5].update(fields)
                 self.assertFalse(build_observation_windows(rows, timezone.utc)["windows"])
 
+    def test_internal_circulation_does_not_block_no_fire_windows(self):
+        rows=samples(60)
+        for row in rows:
+            row.update(circulation_active=True,circulation_role="internal_redistribution")
+        self.assertEqual(len(build_observation_windows(rows,timezone.utc)["windows"]),1)
+        for field,value in (("fire_active",True),("fire_valid",False),
+                            ("room_source_disagreement",True),("circulation_role","unknown")):
+            altered=[dict(row) for row in rows]
+            altered[5][field]=value
+            self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"])
+
     def test_large_gap_and_shared_endpoint_are_not_counted(self):
         rows = samples(120)
         self.assertEqual(build_observation_windows(rows, timezone.utc)["eligible_minutes"], 60)

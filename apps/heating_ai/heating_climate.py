@@ -20,7 +20,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,retain_kws_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
-from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,room_reporting_limits,gain_at,
+from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,effective_ventilation_duty,room_reporting_limits,gain_at,
                                  solar_context,room_source_check,observe_residual,residual_at,ENVIRONMENT_POLICY_VERSION)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
@@ -1774,9 +1774,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         ventilation=getattr(self,'ventilation_states',{})
         recent_ventilation=(self.samples[-1].get('ventilation') or {}) if self.samples else {}
         totals=getattr(self,'ventilation_totals',{})
-        quiet_ventilation=all((ventilation.get(k) or {}).get('relay')=='off' and
-            not any((totals.get(k) or {}).get(field,0)>0 for field in ('on','unknown')) and
-            all((recent_ventilation.get(k) or {}).get(field)==0 for field in ('on_fraction','unknown_fraction'))
+        quiet_ventilation=all((ventilation.get(k) or {}).get('effective_duty')==0 and
+            not any((totals.get(k) or {}).get(field,0)>0 for field in ('effective_on','effective_unknown')) and
+            effective_ventilation_duty(recent_ventilation.get(k))==0
             for k,v in (self.cfg.get('ventilation') or {}).items() if isinstance(v,dict) and v.get('entity'))
         equipment=getattr(self,'equipment_status',{}) or {}
         if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason=settings['control_power_basis'])

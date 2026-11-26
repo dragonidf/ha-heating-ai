@@ -11,7 +11,7 @@ from statistics import median
 from tempfile import NamedTemporaryFile
 from threading import Lock
 
-from heating_environment import daylight, forecast_step, weather_factor
+from heating_environment import daylight, forecast_step, weather_factor, effective_ventilation_duty
 from heating_model import BOUNDS, comfort_at, number, outdoor_at, transitions, modulation_power, certified_upper_power
 
 SCHEMA = 1
@@ -54,39 +54,9 @@ def ventilation_current_qualified(devices):
 
 
 def ventilation_interval_duty(evidence):
-    """Return observed 5-minute duty, or None for an uncertain interval."""
-    if not isinstance(evidence, dict):
-        return None
-    seconds = number(evidence.get("seconds"))
-    on = number(evidence.get("on_fraction"))
-    unknown = number(evidence.get("unknown_fraction"))
-    if seconds is None or seconds < 240:
-        return None
-    # New records carry physical duty separately from raw relay and supply.
-    # A partial or mixed interval remains unsuitable for this constant-duty fitter.
-    if "effective_on_fraction" in evidence or "effective_unknown_fraction" in evidence:
-        effective = number(evidence.get("effective_on_fraction"))
-        return effective if number(evidence.get("effective_unknown_fraction")) == 0. and effective in (0., 1.) else None
-    # Only full, independently observed zero supply proves zero powered duty
-    # even when the relay cannot report. A coverage gap, missing supply
-    # fraction, or contradictory powered-on evidence cannot establish this.
-    if (number(evidence.get("supply_unknown_fraction")) == 0.
-            and number(evidence.get("supply_on_fraction")) == 0.
-            and number(evidence.get("powered_relay_on_fraction")) == 0.):
-        return 0.
-    if unknown != 0 or on is None:
-        return None
-    # A relay that is always OFF contributes zero ventilation regardless
-    # of supply evidence. An ON relay must have independently known supply.
-    if on == 0:
-        return 0.
-    powered = number(evidence.get("powered_relay_on_fraction"))
-    supply_unknown = number(evidence.get("supply_unknown_fraction"))
-    if supply_unknown != 0 or powered is None or powered > on + 0.001:
-        return None
-    # The existing fitter assumes constant duty across an observation.
-    # Reject mixed intervals rather than pretending to know their airflow.
-    return powered if powered in (0., 1.) else None
+    """Constant powered duty required by the adaptive window fitter."""
+    duty = effective_ventilation_duty(evidence)
+    return duty if duty in (0., 1.) else None
 
 
 def row_reasons(row, *, strict, physics=False):
@@ -129,7 +99,10 @@ def row_reasons(row, *, strict, physics=False):
         reasons.add("fireplace")
     if row.get("shadow_ventilation") is None:
         reasons.add("unknown_ventilation")
-    if strict and row.get("circulation_active"):
+    # The reserve-powered circulation fan redistributes indoor heat. Only
+    # legacy/unclassified circulation remains a blanket exclusion; actual
+    # fireplace activity or conflicting room measurements are checked above.
+    if strict and row.get("circulation_active") and row.get("circulation_role")!="internal_redistribution":
         reasons.add("circulation")
     if (number(row.get("external_gain")) or 0.) > .1 or abs(number(row.get("residual_gain")) or 0.) > .1:
         reasons.add("unexplained_gain")

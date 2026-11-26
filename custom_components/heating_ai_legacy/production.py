@@ -163,9 +163,9 @@ class NativeController(HeatingClimate):
         if ((number(fire) or 0.)>.2 or self.memory.get("fire_phase")=="Датчик недоступний"
                 or (self.memory.get("fire_circulation") or {}).get("active")):
             reasons.add("fireplace")
-        fan = self.raw("fan") if self.cfg.get("fan") else None
-        if fan!="off":
-            reasons.add("circulation_or_unknown")
+        # Internal circulation is not external airflow or a heat source.
+        # Fireplace activity/unknown temperature and room conflicts retain
+        # their own independent qualification gates above.
         sensed = getattr(self, "ventilation_states", {})
         if not learning.ventilation_current_qualified(sensed):
             reasons.add("unknown_ventilation")
@@ -291,7 +291,9 @@ class NativeController(HeatingClimate):
         issue = number(self.memory.get("weather_at"))
         solar = learning.solar_context_at(stamp,self.climate_tz,self.weather,issue,
                                          getattr(self,"solar_geometry",{}))
-        compact.update(report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
+        compact.update(circulation_role="internal_redistribution",
+            circulation_active=self.raw("fan")=="on" if self.cfg.get("fan") else None,
+            report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
             voltage_qualified=voltage,
             shadow_ventilation=ventilation, epoch=self._learning_epoch, weather_issue_at=issue,
             solar_factor=solar, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
