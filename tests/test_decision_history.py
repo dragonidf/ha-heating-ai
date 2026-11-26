@@ -265,6 +265,29 @@ class DecisionHistoryTests(unittest.TestCase):
             for key,value in zip(ids,values):
                 self.assertEqual(json.loads(gzip.decompress((target/(key+'.json.gz')).read_bytes())),value)
 
+    def test_online_batches_reuse_hourly_scan_and_do_not_rescan_empty_queue(self):
+        from random import Random
+        from threading import Event
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,max_bytes=32*1024*1024)
+            stamp=time.time()
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            values=[dict(i=i,values=shared) for i in range(16)]
+            ids=[journal.snapshot(value,stamp-4*86400+i) for i,value in enumerate(values)]
+            journal._prepare(stamp)
+            with patch.object(journal,'cold_pack_candidates',side_effect=AssertionError('redundant scan')):
+                for _ in range(2):
+                    result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=Event())
+                    self.assertEqual(result['status'],'promoted',result)
+                    self.assertEqual(result['removed'],8)
+                result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=Event())
+                self.assertEqual(result['status'],'no_eligible_batch',result)
+            for key,value in zip(ids,values):
+                self.assertEqual(journal.read_snapshot(key),value)
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+
     def test_online_stop_fences_publication_and_removal(self):
         from random import Random
         from threading import Event
