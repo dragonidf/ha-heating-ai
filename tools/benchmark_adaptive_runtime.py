@@ -33,7 +33,7 @@ def rss_kib():
     return int(Path("/proc/self/statm").read_text().split()[1])*os.sysconf("SC_PAGE_SIZE")//1024
 
 
-def measure_core(app, tick, mode, root):
+def measure_core(app, tick, mode, root, *, full_ring=False):
     initial_rss=rss_kib()
     history=fixture(58)
     # Legacy sample ring is 4032 rows. The sidecar job processes its 400-row
@@ -81,8 +81,21 @@ def measure_core(app, tick, mode, root):
         del windows,state
         # Retain the recent sample ring, exercise fitting and recording at cap.
         app._learning_rows.extend(recent)
-    output["resident_after_ring"]=rss_kib()
     app.samples=[]
+    if full_ring:
+        # Same measured-OFF duty semantics on both revisions; the workload
+        # changes ring size only, not the command or thermal safety policy.
+        for i in range(4032):
+            at=issue-(4032-i)*300
+            row=dict(history[i%len(history)],ts=at,room_reported_at=at,
+                     ventilation={k:dict(seconds=300,unknown_fraction=0.,supply_unknown_fraction=0.,
+                         powered_relay_on_fraction=0.,on_fraction=0.,supply_on_fraction=1.,
+                         effective_on_fraction=0.,effective_unknown_fraction=0.,
+                         grid_on_fraction=1.,grid_unknown_fraction=0.)
+                         for k in ("recuperator","bath")})
+            app.samples.append(row)
+    output["sample_ring_size"]=len(app.samples)
+    output["resident_after_ring"]=rss_kib()
     time_module=sys.modules[tick.__module__].time
     # All 10 warm groups include 19 ordinary ticks and one aggregation slot.
     # Each tick uses the packaged core; disk/controller writes are fixture mocks.
@@ -100,7 +113,10 @@ def measure_core(app, tick, mode, root):
             def fake_sample(*args,**kwargs):
                 if due:
                     app.last_sample=stamp
-                    app.samples[:]=[sample]
+                    if full_ring:
+                        app.samples=(app.samples+[sample])[-4032:]
+                    else:
+                        app.samples[:]=[sample]
             with patch.object(time_module,"time",return_value=stamp), patch.object(
                     type(app).__mro__[1],"sample",side_effect=fake_sample):
                 wall,cpu=perf_counter(),process_time()
@@ -142,16 +158,16 @@ def measure_core(app, tick, mode, root):
     return output
 
 
-async def child(package_path,mode,root):
+async def child(package_path,mode,root,*,full_ring=False):
     with package(package_path) as (component,_):
         fixture_app,_=BackgroundTickSafetyTests().app()
         app=component.NativeController(FakeHA(),{})
         app.__dict__.update(fixture_app.__dict__)
         app.__dict__.pop("sample",None)
-        return measure_core(app,component.HeatingClimate.tick_inner,mode,root)
+        return measure_core(app,component.HeatingClimate.tick_inner,mode,root,full_ring=full_ring)
 
 
-def controlled_runtime(root,baseline,repeat):
+def controlled_runtime(root,baseline,repeat,*,full_ring=False):
     if len(os.sched_getaffinity(0))!=1 or os.getenv("PYTHONHASHSEED")!="0":
         raise ValueError("pin one CPU and set PYTHONHASHSEED=0")
     if repeat<30 or repeat%6:
@@ -166,7 +182,8 @@ def controlled_runtime(root,baseline,repeat):
         block={}
         for name in order:
             result=json.loads(subprocess.check_output(
-                [sys.executable,__file__,str(baseline),"--child",str(root/name),"online"],text=True))
+                [sys.executable,__file__,str(baseline),"--child",str(root/name),"online"]+
+                (["--full-ring"] if full_ring else []),text=True))
             (root/"online_learning_v1.json").unlink()
             actions=result.pop("command_golden")
             if golden is None:golden=actions
@@ -188,7 +205,7 @@ def controlled_runtime(root,baseline,repeat):
         operations[label]=dict(a_a=aa,a_b=ab,gate=gate,
             medians={name:statistics.median(value(row,name) for row in rows) for name in names})
     return dict(scope="synthetic HA-free tick and training; excludes planner, real I/O and archive; block p95 distribution",
-        exact_command_match=True,affinity=sorted(os.sched_getaffinity(0)),repeat=repeat,
+        exact_command_match=True,affinity=sorted(os.sched_getaffinity(0)),repeat=repeat,full_ring=full_ring,
         operations=operations,orders=blocks,samples=rows,
         gate_pass=all(v["gate"]=="pass" for v in operations.values()))
 
@@ -200,11 +217,12 @@ def main():
     parser.add_argument("--both-online",action="store_true",help="Paired A/A and A/B of active learning against a release")
     parser.add_argument("--controlled",type=Path,help="write randomized paired 30+ triplets, including raw measurements")
     parser.add_argument("--repeat",type=int,default=30)
+    parser.add_argument("--full-ring",action="store_true",help="keep the full 4032-row historical sample buffer")
     opts=parser.parse_args()
     if opts.controlled:opts.both_online=True
     if opts.child:
         path,mode=opts.child
-        print(json.dumps(asyncio.run(child(Path(path),mode,Path(path).parent))))
+        print(json.dumps(asyncio.run(child(Path(path),mode,Path(path).parent,full_ring=opts.full_ring))))
         return
     with TemporaryDirectory() as folder:
         root=Path(folder)
@@ -218,7 +236,7 @@ def main():
             with ZipFile(archive) as zf:
                 zf.extractall(target)
         if opts.controlled:
-            report=controlled_runtime(root,baseline,opts.repeat)
+            report=controlled_runtime(root,baseline,opts.repeat,full_ring=opts.full_ring)
             opts.controlled.write_text(json.dumps(report,indent=2)+"\n")
             print(json.dumps({k:v for k,v in report.items() if k not in ("samples","orders")},indent=2))
             raise SystemExit(0 if report["gate_pass"] else 2)
@@ -226,7 +244,8 @@ def main():
         variants=(("baseline","online"),("control","online"),("candidate","online")) if opts.both_online else (("baseline","legacy"),("candidate","online"))
         for name,mode in variants:
             result=json.loads(subprocess.check_output(
-                [sys.executable,__file__,str(baseline),"--child",str(root/name),mode],text=True))
+                [sys.executable,__file__,str(baseline),"--child",str(root/name),mode]+
+                (["--full-ring"] if opts.full_ring else []),text=True))
             if mode=="online":
                 (root/"online_learning_v1.json").unlink()
             actions=result.pop("command_golden")
@@ -247,7 +266,7 @@ def main():
                     ab_percent=round((changed/base-1)*100,2))
             comparison["rss_kib"]=dict(baseline=baseline["peak_rss"],control=control["peak_rss"],
                                         candidate=candidate["peak_rss"])
-            print(json.dumps(dict(comparison=comparison,exact_command_match=True),indent=2))
+            print(json.dumps(dict(comparison=comparison,exact_command_match=True,full_ring=opts.full_ring),indent=2))
         else:
             print(json.dumps(results,indent=2))
 
