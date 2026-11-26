@@ -1086,6 +1086,27 @@ export class HeatingAIPanel extends HTMLElement {
     }).join('');
     return `<details class="card cycle-history"><summary>Завершені цикли за обраний період · ${cycles.length}</summary>${body||'<p class="muted note">Завершених циклів із збереженим енергетичним обліком за цей період немає.</p>'}</details>`;
   }
+  parameterEvidence(a) {
+    const support=a.parameter_support||{};
+    const names={floor_air:'Передача тепла в кімнату',room_loss:'Тепловтрати',floor_decay:'Охолодження підлоги',heat_gain:'Потужність нагріву підлоги'};
+    const statuses={not_identifiable_with_ventilation:'Не відокремлено від вентиляції',candidate_evaluated:'Кандидат оцінено',not_selected:'Не обрано для кандидата',insufficient_support:'Недостатньо доказів'};
+    const bases={thermal_windows:'Теплові вікна',warm_idle:'Охолодження теплої підлоги',measured_heat:'Виміряний нагрів'};
+    const counts=row=>row?`${fmt(row.windows,0)} / ${fmt(row.minutes,0)} / ${fmt(row.days,0)}`:'—';
+    const rows=Object.entries(names).map(([key,name])=>{
+      const item=support[key]||{};
+      return `<tr><td><strong>${h(name)}</strong><div class="muted">${h(bases[item.basis]||'')}</div></td><td>${fmt(a.parameters?.[key],5)}</td><td>${counts(item.available)}</td><td>${counts(item.training)}</td><td>${counts(item.holdout)}</td><td>${h(statuses[item.status]||'Ще не оцінено')}</td></tr>`;
+    }).join('');
+    return `<details class="learning-evidence"><summary>Докази за коефіцієнтами</summary><p class="muted note">Вікна / хвилини / дні. Оцінка кандидата не означає застосування; активні значення наведено окремо.</p><div class="table-scroll validation-table"><table><thead><tr><th>Коефіцієнт</th><th>Активний</th><th>Придатні</th><th>Навчання</th><th>Перевірка</th><th>Стан</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  }
+  advisoryAccuracy(q) {
+    const v=q.advisory_validation||{},rows=Array.isArray(v.groups)?v.groups:[];
+    const yesNo=value=>value===true||value==='true'?'підтв.':value===false||value==='false'?'невідомо':'—';
+    const basis={calculated_plan:'Розрахований план',conditional:'Умовний сценарій',known:'Відомі умови',conditional_heat_pattern:'Умовний повтор нагріву',conditional_coast:'Умовне охолодження'};
+    const table=rows.map(r=>`<tr><td>${fmt(r.horizon,0)} год<div class="muted">${h(basis[r.basis]||r.basis||'—')}</div></td><td>${yesNo(r.weather_known)} / ${yesNo(r.schedule_known)}</td><td>${fmt(r.independent?.mae,3)}</td><td>${fmt(r.independent?.bias,3)}</td><td>${fmt(r.independent?.n,0)} / ${fmt(r.all_reports?.n,0)} / ${fmt(r.days,0)}</td><td>${fmt(r.minimum_lead_hours,1)}–${fmt(r.maximum_lead_hours,1)}</td></tr>`).join('');
+    const pending=[24,36,48].map(hours=>`${hours} год: ${fmt(v.pending?.[hours],0)}`).join(' · ');
+    const expired=[24,36,48].map(hours=>`${hours} год: ${fmt(v.expired?.[hours],0)}`).join(' · ');
+    return `<details class="learning-evidence"><summary>Дорадчий прогноз · 24–48 год</summary><p class="muted note">Окремий прогноз не керує котлом. Останні 30 діб, лише поточна модель й обладнання; умовні сценарії не об’єднуються з підтвердженими умовами. MAE та зміщення (прогноз мінус факт) — за незалежними перевірками.</p><div class="table-scroll validation-table"><table><thead><tr><th>Горизонт / сценарій</th><th>Погода / графік</th><th>MAE °C</th><th>Зміщення °C</th><th>Незал. / усі / днів</th><th>Випередження, год</th></tr></thead><tbody>${table||'<tr><td colspan="6">Завершених незалежних перевірок ще немає.</td></tr>'}</tbody></table></div><p class="muted note">Очікують: ${pending}. Прострочені без спостереження (накопичено): ${expired}.</p></details>`;
+  }
   controllerQuality() {
     const metric=(label,value,unit='')=>this.compactMetric(label,value,unit,'controller_quality');
     const q=this.attrs('controller_quality'),last=q.last_completed_cycle,horizons=Array.isArray(q.horizons)?q.horizons:[];
@@ -1096,7 +1117,7 @@ export class HeatingAIPanel extends HTMLElement {
     const storage=used!==null&&limit>0?`<p class="${isTrue(archive.pressure)?'warn':'muted'} note">Архів: ${fmt(used/limit*100,1)}% ліміту · ${fmt(used/1048576,1)} / ${fmt(limit/1048576,1)} МіБ. ${isTrue(archive.pressure)?'Наближається ліміт журналу; захищена історія зберігається. ':''}Вільно на диску: ${fmt(numeric(archive.free_bytes)===null?null:archive.free_bytes/1073741824,1)} ГіБ.${archiveBreakdown} Ліміт архіву не є розміром диска.</p>`:'';
     const table=`<div class="table-scroll"><table><thead><tr><th>Горизонт</th><th>Похибка °C</th><th>Перевірок / днів</th><th>Похибка кВт·год</th></tr></thead><tbody>${(horizons.length?horizons:[1,3,6,12,24].map(hours=>({hours}))).map(r=>`<tr><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.hours,0)} год</button></td><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.temperature_mae,3)}</button></td><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.count??0,0)} / ${fmt(r.days??0,0)}${r.pending?` · очікує ${fmt(r.pending,0)}`:''}</button></td><td><button class="table-value" data-info="${h(this.id('controller_quality'))}">${fmt(r.energy_mae,2)}</button></td></tr>`).join('')}</tbody></table></div>`;
     const report=last?`<p class="muted note">Цикл ${h(this.time(Number(last.start),true))} — ${h(this.time(Number(last.end),true))}</p><div class="fact-grid">${metric('Відхилення енергії',(isTrue(last.energy_error_is_lower_bound)&&numeric(last.energy_error_percent)!==null?'≥ ':'')+fmt(last.energy_error_percent,1),'%')}${metric('Поза комфортом',fmt(last.comfort_violation_minutes,1),'хв')}${metric('Перегрів',fmt(last.overheat_minutes,1),'хв')}${metric('Покриття датчика',numeric(last.sensor_coverage)===null?'—':fmt(last.sensor_coverage*100,0),'%')}</div><p class="muted note">${h(last.attribution||'Причина відхилення не встановлена')}${isTrue(last.energy_complete)?'':' · енергія врахована частково'}. ${last.significant_replans===null||last.significant_replans===undefined?'Історію перепланувань цього циклу не збережено.':`Суттєвих змін плану: ${fmt(last.significant_replans,0)}.`}</p>`:'<p class="muted note">Щоденний підсумок з’явиться після завершення циклу збереження даних.</p>';
-    return this.section('Точність і якість роботи',table+`<p class="muted note">Незалежні перевірки виданих прогнозів. «—» означає, що спостережень ще недостатньо. Підтвердження короткого горизонту не доводить точності на добу.</p>`+report+storage,'controller-quality');
+    return this.section('Точність і якість роботи',table+`<p class="muted note">Незалежні перевірки виданих прогнозів. «—» означає, що спостережень ще недостатньо. Підтвердження короткого горизонту не доводить точності на добу.</p>`+this.advisoryAccuracy(q)+report+storage,'controller-quality');
   }
   learningProgress() {
     const a=this.attrs('model')||{},status=a.learning_status;
@@ -1167,7 +1188,7 @@ export class HeatingAIPanel extends HTMLElement {
       holdout_passed:'Перевірка теплових коефіцієнтів пройдена',rejected:'Пропозицію не підтверджено',
       accepted:'Підтверджена пропозиція',frozen:'Оцінювання призупинено'};
     const acceptedChanges=Array.isArray(a.last_accepted_changes)?a.last_accepted_changes:[];
-    const changeNames={floor_air:'Передача тепла в кімнату',room_loss:'Тепловтрати'};
+    const changeNames={floor_air:'Передача тепла в кімнату',room_loss:'Тепловтрати',floor_decay:'Охолодження підлоги',heat_gain:'Потужність нагріву підлоги'};
     const archived=acceptedChanges.length?
       `<p class="muted note">Останні застосовані коефіцієнти: ${acceptedChanges.map(x=>
         `${h(changeNames[x.parameter]||x.parameter)} ${h(fmt(x.before,5))} → ${h(fmt(x.after,5))}`).join(' · ')}</p>`:'';
@@ -1210,7 +1231,7 @@ export class HeatingAIPanel extends HTMLElement {
       (drift?'<p class="muted note">Накопичені зміни коефіцієнтів<br>'+drift+'</p>':'')+
       '<details><summary>Раніші записи · до 30 діб</summary><ul>'+
       (eventList(events.filter(e=>e.at<recent))||'<li>Раніших записів немає.</li>')+'</ul></details></details>':'';
-    return this.section('Самонавчання моделі',progress+coverage+archived+historicMAE+diag+learningHistory+historic,'learning-progress');
+    return this.section('Самонавчання моделі',progress+coverage+this.parameterEvidence(a)+archived+historicMAE+diag+learningHistory+historic,'learning-progress');
   }
   model() {
     const a=this.attrs('model'),env=this.attrs('environment'),p=a.power_learning||{},s=this.attrs('summary').last_24h||{},f=this.attrs('forecast');
