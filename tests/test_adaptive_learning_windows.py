@@ -470,6 +470,55 @@ class WindowsTest(unittest.TestCase):
                 weather_issue_at=stamp-60,solar_factor=0.,**{'return':23.}))
         return snapshot,rows
 
+    def test_conditional_solar_projection_keeps_control_plan_and_freezes_actual_issue(self):
+        from copy import deepcopy
+        from heating_learning_windows import project_solar_nominal,freeze_forecast
+        from heating_environment import forecast_step
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        start=BASE+9*3600
+        now=datetime.fromtimestamp(start,timezone.utc)
+        noon=start+3*3600
+        geometry=dict(latitude=50.,days={now.date().isoformat():dict(
+            noon=noon,sunrise=noon-21600,sunset=noon+21600,declination=-10.)})
+        settings=dict(target=22.,lower=19.,upper=25.,equipment_version=1,
+            modulation_profile={"physical_mode":"fixed_6"},
+            environment=dict(astronomy=geometry,solar=dict(validated=True,coefficient=.5,
+                risk_coefficient=.5,control_no_sun=True)))
+        weather=[dict(ts=start+i*3600,temperature=5.,condition="sunny") for i in range(7)]
+        room,floor=21.,23.
+        control=(room,floor);upper=(room,floor)
+        blocks=[];segments=[]
+        for j in range(12):
+            fine=[];heat=[]
+            for i in range(6):
+                a=start+(j*6+i)*300;b=a+300
+                when=datetime.fromtimestamp(a,timezone.utc)
+                kw=6. if j==0 else 0.
+                control=forecast_step(*control,5.,kw,0.,model,1/12,when,weather,settings)
+                upper=forecast_step(*upper,5.,kw,0.,model,1/12,when,weather,settings,upper=True)
+                fine.append(dict(ts=b,temperature=control[0],upper_temperature=upper[0]))
+                if kw:
+                    heat.append(dict(start=a,end=b,power_kw=kw))
+            segments+=heat
+            blocks.append(dict(ts=b,temperature=control[0],_fine=fine,heat_segments=heat))
+        forecast=dict(curve=blocks,heat_segments=segments)
+        original=deepcopy(forecast)
+        self.assertIsNone(freeze_forecast(now,room,floor,5.,0.,weather,start-60,settings,
+            forecast,model,None,"boot"))
+        projection=project_solar_nominal(now,room,floor,5.,0.,weather,settings,forecast,model)
+        self.assertEqual(forecast,original)
+        self.assertEqual(len(projection["curve"]),12)
+        self.assertTrue(all(p["temperature"]>=p["no_sun_temperature"]-.005 for p in projection["curve"]))
+        self.assertGreater(projection["curve"][5]["temperature"],blocks[5]["temperature"])
+        forecast["_solar_nominal_fine"]=projection["fine"]
+        snapshot=freeze_forecast(now,room,floor,5.,0.,weather,start-60,settings,forecast,model,None,"boot")
+        self.assertFalse(snapshot["settings"]["environment"]["solar"]["control_no_sun"])
+        self.assertTrue(settings["environment"]["solar"]["control_no_sun"])
+        self.assertEqual(snapshot["points"]["3"][1],projection["fine"][35]["temperature"])
+        self.assertEqual(snapshot["segments"],[[s["start"],s["end"],s["power_kw"]] for s in segments])
+        bad=deepcopy(original);bad["curve"][0].pop("_fine")
+        self.assertIsNone(project_solar_nominal(now,room,floor,5.,0.,weather,settings,bad,model))
+
     def test_solar_prospective_requires_new_issue_and_explicit_idle_evidence(self):
         from heating_learning_windows import solar_prospective_evidence,qualify_frozen
         from heating_environment import forecast_step

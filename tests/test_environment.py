@@ -244,6 +244,26 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(gain_at(when,[],{'environment':{'astronomy':solar_geometry(when),
                     'solar':dict(risk_coefficient=.5)}},upper=True),0.)
 
+    def test_solar_credit_does_not_change_control_gain_or_search(self):
+        from heating_model import _plan,ForecastContext
+        from copy import deepcopy
+        when=self.at.replace(hour=12)
+        weather=[dict(ts=when.timestamp()+i*3600,temperature=5.,condition='sunny') for i in range(4)]
+        settings=dict(target=22.,lower=20.,upper=25.,start='00:00',end='23:59',
+            strategy='Комфорт протягом доби',morning_min_minutes=0,night_price=1.,day_price=2.,
+            environment={'astronomy':solar_geometry(when),
+                'solar':dict(coefficient=.5,validated=False,risk_coefficient=.5)})
+        credited=deepcopy(settings)
+        credited['environment']['solar'].update(validated=True,control_no_sun=True)
+        self.assertEqual(gain_at(when,weather,credited),0.)
+        self.assertEqual(gain_at(when,weather,credited,upper=True),gain_at(when,weather,settings,upper=True))
+        self.assertEqual(ForecastContext(when,weather,5.,self.model,credited).at(when)[-1],
+                         ForecastContext(when,weather,5.,self.model,settings).at(when)[-1])
+        before=_plan(when,21.,23.,5.,0.,self.model,weather,settings,6.,hours_override=3.)
+        after=_plan(when,21.,23.,5.,0.,self.model,weather,credited,6.,hours_override=3.)
+        self.assertIsNotNone(before)
+        self.assertEqual(before,after)
+
     def test_learned_gain_is_zero_at_night_and_unknown_weather(self):
         settings={'environment':{'solar':dict(coefficient=.6,validated=True)}}
         self.assertEqual(gain_at(self.at.replace(hour=0),[],settings),0)

@@ -372,6 +372,18 @@ class NativeController(HeatingClimate):
 
     def remember_plan_inputs(self, now, room, floor, outside, fire, weather, settings, forecast, previous):
         result = super().remember_plan_inputs(now,room,floor,outside,fire,weather,settings,forecast,previous)
+        if isinstance(forecast,dict) and learning.solar_nominal_settings(settings) is not None:
+            try:
+                nominal=learning.project_solar_nominal(now,room,floor,outside,fire,weather,settings,forecast,self.model)
+                if nominal is not None:
+                    forecast["_solar_nominal_fine"]=nominal["fine"]
+                    forecast["solar_nominal_curve"]=nominal["curve"]
+                    forecast["solar_nominal_assumption"]="conditional_solar_same_plan_no_control_credit"
+                else:
+                    forecast["solar_nominal_assumption"]="unavailable_exact_trace_required"
+            except (ValueError,TypeError,KeyError,ArithmeticError,MemoryError) as exc:
+                forecast["solar_nominal_assumption"]="unavailable_projection_failed"
+                self.log("Conditional solar outlook skipped: %s",type(exc).__name__,level="WARNING")
         stamp = now.timestamp()
         if self._learning_current_ok and stamp-self._learning_last_issue>=10920:
             try:
