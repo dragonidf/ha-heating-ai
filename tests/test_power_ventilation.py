@@ -88,6 +88,60 @@ class SettingsAndLatency(unittest.TestCase):
             self.assertEqual(r['watts'],0.)
 
 class CalibrationContracts(unittest.TestCase):
+    def kws_sessions(self):
+        result=[]
+        for day in range(3):
+            start=1793055600.+day*86400
+            for i in range(13):
+                result.append(dict(ts=start+i*300,quality=False,room=21.,measurement_version=3,
+                    power_source='kws_phases',power_quality='measured',power=4.5,
+                    measured_interval_kw=4.5,grid='on',heating_requested=True,
+                    heat_command_at=start-120,boiler_power_mode='fixed_6',boiler_mode_confirmed=True,
+                    equipment_version=1,**{'return':27.}))
+            result.append(dict(result[-1],ts=start+13*300,heating_requested=False,heat_command_at=None))
+        return result
+
+    def test_kws_electrical_validation_never_implies_thermal_approval(self):
+        from heating_model import DEFAULT_MODEL,power_profile
+        result=learn_power_modes(self.kws_sessions(),DEFAULT_MODEL)
+        p=result['candidates']['fixed_6']
+        self.assertTrue(p['electrical_validated'])
+        self.assertFalse(p['validated'])
+        self.assertEqual(p['holdout_minutes'],60)
+        self.assertIsNone(p['holdout_temperature_mae'])
+        self.assertEqual(p['thermal_validation_status'],'independent_temperature_holdout_required')
+        self.assertFalse(result['profiles'])
+        self.assertTrue(power_profile('fixed_6',result,{})['assumed'])
+
+    def test_kws_holdout_rejects_bad_measurements_and_grid(self):
+        r=self.kws_sessions()
+        r[-10]['recovery_id']='x';r[-9]['grid']='off';r[-8]['measurement_version']=2
+        r[-7]['return']=60;r[-4]['grid']='unknown'
+        p=learn_power_modes(r)['candidates']['fixed_6']
+        self.assertFalse(p['electrical_validated'])
+        self.assertLess(p['holdout_minutes'],30)
+
+    def test_kws_calibration_does_not_bridge_filtered_rows(self):
+        r=self.kws_sessions()
+        r.insert(5,dict(r[4],ts=r[4]['ts']+60,power_quality='unknown'))
+        p=learn_power_modes(r)['candidates']['fixed_6']
+        self.assertEqual(p['intervals'],23)
+
+    def test_kws_without_established_command_is_not_a_duty_interval(self):
+        from heating_model import modulation_interval
+        r=self.kws_sessions()
+        r[1].pop('heating_requested')
+        self.assertIsNone(modulation_interval(r[0],r[1],'kws_phases'))
+
+    def test_kws_unseen_return_range_uses_fixed_mode_nominal_prior(self):
+        r=self.kws_sessions()
+        for v in r[-14:]:
+            v['return']=45.;v['measured_interval_kw']=6.
+        p=learn_power_modes(r)['candidates']['fixed_6']
+        self.assertEqual(p['baseline_mae_kw'],0)
+        self.assertEqual(p['holdout_mae_kw'],0)
+        self.assertFalse(p['electrical_validated'])
+
     def test_kws_calibration_uses_measured_intervals_without_room_reports(self):
         from heating_model import learn_modulation
 

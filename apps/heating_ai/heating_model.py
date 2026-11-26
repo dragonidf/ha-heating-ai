@@ -149,7 +149,37 @@ def boiler_power_interval(a,b,power_source):
     return None
 
 
-def learn_modulation(samples, *, power_source='balance', prior_kw=3.):
+def modulation_interval(a,b,power_source):
+    """Qualify one adjacent physical interval for training and evaluation."""
+    dt=(b['ts']-a['ts'])/60
+    if not 3<=dt<=7:
+        return None
+    if any((r.get('power_quality')!='measured' if power_source=='kws_phases' else not r.get('quality'))
+           or r.get('measurement_version')!=3 or
+           r.get('power_source')!=power_source or r.get('power_estimated') or
+           r.get('recovery_id') for r in (a,b)):
+        return None
+    ra,rb=number(a.get('return')),number(b.get('return'))
+    pa,pb=number(a.get('power')),number(b.get('power'))
+    if None in (ra,rb,pa,pb) or not (0<ra<65 and 0<rb<65) or abs(rb-ra)>3:
+        return None
+    tracked='heating_requested' in a and 'heating_requested' in b
+    if tracked:
+        if not (a['heating_requested'] and b['heating_requested'] and
+                a.get('grid')=='on' and b.get('grid')=='on' and
+                a.get('heat_command_at')==b.get('heat_command_at') and
+                number(a.get('heat_command_at')) is not None and
+                a['ts']-a['heat_command_at']>=90):
+            return None
+    elif power_source=='kws_phases' or min(pa,pb)<2:
+        return None
+    kw=boiler_power_interval(a,b,power_source)
+    if kw is None or not 0<=kw<=10.5 or (not tracked and kw<2):
+        return None
+    return dt,ra,rb,pb,kw
+
+
+def learn_modulation(samples, *, power_source='balance', prior_kw=3., pairs=None):
     """Fit effective demand power in 2°C return bands from trustworthy intervals.
 
     Rebuilt from the rolling telemetry, so reloads cannot double-count evidence.
@@ -158,32 +188,11 @@ def learn_modulation(samples, *, power_source='balance', prior_kw=3.):
     Legacy rows require confirmed heating at both ends (no inferred off duty).
     """
     bands = {}
-    for a,b in zip(samples,samples[1:]):
-        dt=(b['ts']-a['ts'])/60
-        if not 3<=dt<=7:
+    for a,b in pairs if pairs is not None else zip(samples,samples[1:]):
+        interval=modulation_interval(a,b,power_source)
+        if interval is None:
             continue
-        if any((r.get('power_quality')!='measured' if power_source=='kws_phases' else not r.get('quality'))
-               or r.get('measurement_version')!=3 or
-               r.get('power_source')!=power_source or r.get('power_estimated') or
-               r.get('recovery_id') for r in (a,b)):
-            continue
-        ra,rb=number(a.get('return')),number(b.get('return'))
-        pa,pb=number(a.get('power')),number(b.get('power'))
-        if None in (ra,rb,pa,pb) or not (0<ra<65 and 0<rb<65) or abs(rb-ra)>3:
-            continue
-        tracked='heating_requested' in a and 'heating_requested' in b
-        if tracked:
-            if not (a['heating_requested'] and b['heating_requested'] and
-                    a.get('grid')=='on' and b.get('grid')=='on' and
-                    a.get('heat_command_at')==b.get('heat_command_at') and
-                    number(a.get('heat_command_at')) is not None and
-                    a['ts']-a['heat_command_at']>=90):
-                continue
-        elif min(pa,pb)<2:
-            continue
-        kw=boiler_power_interval(a,b,power_source)
-        if kw is None or not 0<=kw<=10.5 or (not tracked and kw<2):
-            continue
+        dt,ra,rb,pb,kw=interval
         key=int(math.floor((ra+rb)/4))*2
         band=bands.setdefault(key,dict(minutes=0.,kwh=0.,intervals=0,stages={'3':0.,'6':0.,'9':0.}))
         band['minutes']+=dt
@@ -1297,29 +1306,42 @@ def learn_power_modes(samples,model=None):
                      if r.get('power_source') in ('balance','kws_phases')),'balance')
         rows=[r for r in rows if r.get('power_source')==source]
         sessions=sorted({r.get('heat_command_at') for r in rows if number(r.get('heat_command_at')) is not None})
+        physical_pairs=None
+        if source=='kws_phases':
+            # Never bridge an excluded row by zipping a filtered time series.
+            # Both endpoints must belong to the same qualified equipment/session.
+            selected={id(r) for r in rows}
+            physical_pairs=[(a,b) for a,b in zip(samples,samples[1:])
+                            if id(a) in selected and id(b) in selected and
+                            modulation_interval(a,b,source) is not None]
+            sessions=sorted({a['heat_command_at'] for a,b in physical_pairs})
         if len(sessions)<3:continue
         split=sessions[-1];train=[r for r in rows if r.get('heat_command_at')!=split];test=[r for r in rows if r.get('heat_command_at')==split]
         evaluation_model=(test[0].get('thermal_model') or model) if test else model
         baseline=3. if mode=='auto' else float(mode[-1])
-        candidate=learn_modulation(train,power_source=source,prior_kw=baseline if source=='kws_phases' else 3.)
-        errors=[];base=[];thermal=[];base_thermal=[]
+        training_pairs=None if physical_pairs is None else [(a,b) for a,b in physical_pairs if a['heat_command_at']!=split]
+        testing_pairs=zip(test,test[1:]) if physical_pairs is None else [(a,b) for a,b in physical_pairs if a['heat_command_at']==split]
+        candidate=learn_modulation(train,power_source=source,prior_kw=baseline if source=='kws_phases' else 3.,pairs=training_pairs)
+        errors=[];base=[];thermal=[];base_thermal=[];holdout_minutes=0.
         simulated=None;reference=None
-        for a,b in zip(test,test[1:]):
+        for a,b in testing_pairs:
             dt=(b['ts']-a['ts'])/3600
             if not 3/60<=dt<=7/60 or not a.get('heating_requested') or a.get('heat_command_at')!=b.get('heat_command_at'):continue
             actual=boiler_power_interval(a,b,source)
             if actual is None or not 0<=actual<=10.5:continue
-            predicted=modulation_power(a['return'],candidate)
+            predicted=modulation_power(a['return'],candidate,baseline if source=='kws_phases' else 3.)
             errors.append(abs(predicted-actual));base.append(abs(baseline-actual))
+            holdout_minutes+=dt*60
             # Replay the held-out complete session from one measured thermal state;
             # long-horizon validation is still reported separately.
-            if evaluation_model and all(number(r.get(k)) is not None for r in (a,b) for k in ('room','return','outside')):
+            if source!='kws_phases' and evaluation_model and all(number(r.get(k)) is not None for r in (a,b) for k in ('room','return','outside')):
                 if simulated is None:simulated=(a['room'],a.get('floor_estimate',a['return']));reference=simulated
                 simulated=step(*simulated,a['outside'],predicted,a.get('fire',0.),evaluation_model,dt)
                 reference=step(*reference,a['outside'],baseline,a.get('fire',0.),evaluation_model,dt)
                 thermal.append(abs(simulated[0]-b['room']));base_thermal.append(abs(reference[0]-b['room']))
-        days=len({datetime.fromtimestamp(r['ts']).date() for r in rows})
+        days=len({datetime.fromtimestamp(r['ts']).date() for r in rows}) if physical_pairs is None else len({datetime.fromtimestamp(a['ts']).date() for a,b in physical_pairs})
         electrical_ok=(days>=2 and len(errors)>=6 and candidate['minutes']>=60
+                       and (source!='kws_phases' or holdout_minutes>=30-1e-9)
                        and statistics.mean(errors)<statistics.mean(base)*.95)
         thermal_ok=bool(thermal) and statistics.mean(thermal)<=statistics.mean(base_thermal)
         accepted=electrical_ok and source!='kws_phases' and thermal_ok
@@ -1327,7 +1349,9 @@ def learn_power_modes(samples,model=None):
         known=sum(stage_seconds[k] for k in ('off','3','6','9'))
         probabilities={k:stage_seconds[k]/known for k in ('off','3','6','9')} if known else None
         candidate.update(physical_mode=mode,validated=accepted,equipment_version=latest,sessions=len(sessions),days=days,
-            electrical_validated=electrical_ok,
+            electrical_validated=electrical_ok,holdout_minutes=round(holdout_minutes,1),
+            thermal_validation_status=('independent_temperature_holdout_required' if source=='kws_phases' else
+                                       'passed' if thermal_ok else 'not_validated'),
             holdout_samples=len(errors),holdout_mae_kw=statistics.mean(errors) if errors else None,
             baseline_mae_kw=statistics.mean(base) if base else None,
             holdout_temperature_mae=statistics.mean(thermal) if thermal else None,
