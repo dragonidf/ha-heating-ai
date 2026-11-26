@@ -1,6 +1,7 @@
 """One-time, read-only compatibility discovery of the running V1 controller."""
 from __future__ import annotations
 
+import re
 import voluptuous as vol
 from pathlib import Path
 from uuid import uuid4
@@ -190,7 +191,13 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
                         for entity in grid_only) or len(set(grid_only))!=len(grid_only)):
                 return self.async_show_form(step_id="init", data_schema=self._schema(user_input),
                                             errors={"base": "invalid_ventilation_topology"})
+            isolated=user_input.get("boiler_outage_isolation_relay",
+                                      self._entry.options.get("boiler_outage_isolation_relay",""))
+            if not isinstance(isolated,str) or isolated and not re.fullmatch(r"switch\.[a-z0-9_]+",isolated):
+                return self.async_show_form(step_id="init",data_schema=self._schema(user_input),
+                                            errors={"base":"invalid_boiler_isolation"})
             return self.async_create_entry(title="", data={
+                "boiler_outage_isolation_relay": isolated,
                 "grid_only_ventilation_entities": grid_only,
                 "min_voltage_v": minimum,
                 "max_voltage_v": maximum,
@@ -204,6 +211,8 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
     @staticmethod
     def _schema(current):
         return vol.Schema({
+            vol.Optional("boiler_outage_isolation_relay",
+                         default=current.get("boiler_outage_isolation_relay","")): str,
             vol.Optional("grid_only_ventilation_entities",
                          default=current.get("grid_only_ventilation_entities", [])):
                 selector.EntitySelector(selector.EntitySelectorConfig(

@@ -192,6 +192,42 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             boot_id="fixture-boot",owner_epoch=1,fenced=False))
         return hass, app
 
+    async def test_outage_zero_heat_needs_exact_topology_and_no_conflicting_evidence(self):
+        with package(self.root / "package") as (component, _):
+            hass,app=self.controller(component)
+            app.cfg.update(power_accounting_method="kws",kws_relay="switch.kws")
+            app.planning_grid_state="off"
+            hass.rows["sensor.grid"].state="Відсутня мережа"
+            app.voltage_status={"phases_v":[None,None,None]}
+            app.power_quality="unknown"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.cfg["boiler_outage_isolation_relay"]="switch.kws"
+            self.assertTrue(app._learning_proven_zero_heat(None))
+            self.assertFalse(app._learning_proven_zero_heat(3.))
+            app.voltage_status={"phases_v":[230.,None,None]}
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.voltage_status={"phases_v":[None,None,None]}
+            hass.rows["sensor.grid"].state="Наявна мережа"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            hass.rows["sensor.grid"].state="Відсутня мережа"
+            app.planning_grid_state="unknown"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.planning_grid_state="off"
+            app.cfg["kws_relay"]="switch.other"
+            self.assertFalse(app._learning_proven_zero_heat(None))
+            app.cfg["kws_relay"]="switch.kws"
+            with patch.object(component.time,"time",return_value=1000.):
+                self.assertTrue(app._capture_sample_power(None))
+            with patch.object(component.time,"time",return_value=1015.):
+                self.assertFalse(app._capture_sample_power(None))
+            self.assertEqual(app._learning_zero_seconds,15.)
+            self.assertEqual(app._learning_kw_seconds,0.)
+            self.assertIsNone(app.measured_sample_power(1000.,1015.))
+            with patch.object(component.time,"time",return_value=1070.):
+                self.assertTrue(app._capture_sample_power(None))
+            self.assertEqual(app._learning_zero_seconds,15.)
+            hass.services.async_call.assert_not_called()
+
     async def test_single_scheduled_learning_job_keeps_v6_without_evidence(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)

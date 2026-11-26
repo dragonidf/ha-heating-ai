@@ -172,6 +172,8 @@ class NativeController(HeatingClimate):
             reasons.add("equipment_not_ready")
         if not quality or source != "Вітальня":
             reasons.add("unavailable_physical_input")
+        if self._learning_zero_now and not getattr(self,"_learning_thermal_inputs_ok",False):
+            reasons.add("unavailable_thermal_input")
         if (self.memory.get("room_source_check") or {}).get("status") in ("pending","room_source_disagreement"):
             reasons.add("room_conflict")
         try:
@@ -1895,6 +1897,7 @@ async def async_setup_production(hass, entry):
     # Keep the confirmation bound to the exact entity selected in native
     # options. Empty or legacy options do not infer any supply topology.
     cfg["grid_only_ventilation_entities"] = entry.options.get("grid_only_ventilation_entities", [])
+    cfg["boiler_outage_isolation_relay"] = entry.options.get("boiler_outage_isolation_relay","")
     missing = [cfg[key] for key in ("thermostat", "room", "return", "mode", "armed")
                if hass.states.get(cfg[key]) is None]
     if missing:
