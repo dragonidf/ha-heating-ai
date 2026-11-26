@@ -708,6 +708,8 @@ def solar_weather_evidence(stamp, tz, weather, issue, geometry, current_state=No
     """
     result=dict(forecast_factor=None,forecast_basis="unknown",current_factor=None,
                 current_basis="unknown",current_cloud=None,forecast_cloud=None)
+    if not geometry:
+        return result
     when=datetime.fromtimestamp(stamp,tz)
     day=((geometry or {}).get("days") or {}).get(when.date().isoformat()) or {}
     latitude=number((geometry or {}).get("latitude"))

@@ -413,14 +413,16 @@ def effective_ventilation_duty(evidence):
         return duty if duty is not None and 0<=duty<=1 and finite(evidence.get('effective_unknown_fraction'))==0 else None
     on=finite(evidence.get('on_fraction'))
     unknown=finite(evidence.get('unknown_fraction'))
+    # A confirmed OFF relay throughout the interval has zero powered duty,
+    # independently of supply. Preserve the separate proven-isolation path.
+    if on==0 and unknown==0:
+        return 0.
     supply_unknown=finite(evidence.get('supply_unknown_fraction'))
     powered=finite(evidence.get('powered_relay_on_fraction'))
     if supply_unknown==0 and finite(evidence.get('supply_on_fraction'))==0 and powered==0:
         return 0.
     if unknown!=0 or on is None or not 0<=on<=1:
         return None
-    if on==0:
-        return 0.
     return powered if supply_unknown==0 and powered is not None and 0<=powered<=on+.001 and powered<=1 else None
 
 
