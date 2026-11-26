@@ -1920,8 +1920,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         if forecast_quality and valid:
             guard_floor=max(floor,probe) if reserve_active else floor
             peak=max(r['temperature'] for r in coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings))
-            upper_peak=max(r['temperature'] for r in coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings,upper=True))
-            coast_overheat=coast_exceeds_profile(now,room,guard_floor,outside,fire,self.model,settings)
+            upper_rows=coast_trajectory(now,room,guard_floor,outside,fire,self.model,settings,upper=True)
+            upper_peak=max(r['temperature'] for r in upper_rows)
+            coast_overheat=coast_exceeds_profile(now,room,guard_floor,outside,fire,self.model,settings,
+                                                upper_rows=upper_rows)
         manual_requested=bool(getattr(self,'manual_extra_demand',lambda *_:False)(
             now.timestamp(),grid,outage_now,room,upper,coast_overheat,permitted))
         manual_ending=bool(getattr(self,'_manual_energy_ending',False)

@@ -118,8 +118,12 @@ def coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours=3,up
     return rows
 
 
-def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours=3):
-    for row in coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours,upper=True)[1:]:
+def coast_exceeds_profile(now,room,floor,outside,fire_delta,model,settings,hours=3,*,upper_rows=None):
+    # The control tick already calculates this exact risk trajectory for its peak.
+    # Reuse only within that tick; callers without rows keep the original path.
+    if upper_rows is None:
+        upper_rows=coast_trajectory(now,room,floor,outside,fire_delta,model,settings,hours,upper=True)
+    for row in upper_rows[1:]:
         profile=comfort_at(datetime.fromtimestamp(row['ts'],now.tzinfo),settings)
         if row['temperature']>=safe_upper(profile[2],profile[3],settings):return True
     return False

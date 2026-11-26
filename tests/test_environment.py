@@ -99,6 +99,7 @@ class AdaptiveSolarRegressions(unittest.TestCase):
         self.assertLess(max(r['temperature'] for r in normal),settings['upper'])
         self.assertGreater(max(r['temperature'] for r in upper),settings['upper'])
         self.assertTrue(coast_exceeds_profile(at,21.1,22.,8.,0.,model,settings))
+        self.assertTrue(coast_exceeds_profile(at,21.1,22.,8.,0.,model,settings,upper_rows=upper))
         self.assertIsNone(replay(at,21.1,22.,8.,0.,model,[],settings,
             [dict(start=at.timestamp(),end=at.timestamp()+900)],False,3.))
     def test_missing_observation_preserves_qualified_solar_not_pending_gain(self):
