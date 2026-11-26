@@ -231,6 +231,77 @@ class DecisionHistoryTests(unittest.TestCase):
                 self.assertTrue((journal.directory/(key+'.json.gz')).exists())
             self.assertEqual(journal.compact_cold_snapshot_batch(stamp,allow_remove=True)['status'],'no_eligible_batch')
 
+    def test_online_cold_pack_updates_accounting_and_preserves_rollback(self):
+        from random import Random
+        from threading import Event
+        from unittest.mock import patch
+        from tools.pack_decision_archive import restore_mixed_archive
+        with tempfile.TemporaryDirectory() as directory:
+            stamp=time.time()
+            journal=DecisionJournal(directory,retention_days=14,max_bytes=32*1024*1024)
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            values=[dict(i=i,values=shared) for i in range(8)]
+            ids=[journal.snapshot(value,stamp-4*86400+i) for i,value in enumerate(values)]
+            journal._prepare(stamp)
+            before=journal.used_bytes
+            # No whole-directory scan under the online publication lock.
+            with patch.object(Path,'iterdir',side_effect=AssertionError('online rescan')):
+                result=journal.compact_cold_snapshot_batch(stamp,allow_remove=True,stop=Event())
+            self.assertEqual(result['status'],'promoted',result)
+            self.assertEqual(result['removed'],8)
+            self.assertEqual(journal.used_bytes,before-result['removed_bytes']+result['packed_bytes'])
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+            self.assertEqual(journal.snapshot_bytes,journal.used_bytes)
+            self.assertEqual(journal.packed_bytes,journal.used_bytes)
+            self.assertEqual(journal.snapshot_count,8)
+            self.assertEqual(journal.packed_snapshot_count,8)
+            self.assertEqual(journal.packed_blocks,1)
+            restored=DecisionJournal(directory)
+            for key,value in zip(ids,values):
+                self.assertEqual(restored.read_snapshot(key),value)
+            target=Path(directory)/'legacy'
+            self.assertEqual(restore_mixed_archive(journal.directory,target)['restored_packed_snapshots'],8)
+            for key,value in zip(ids,values):
+                self.assertEqual(json.loads(gzip.decompress((target/(key+'.json.gz')).read_bytes())),value)
+
+    def test_online_stop_fences_publication_and_removal(self):
+        from random import Random
+        from threading import Event
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            stamp=time.time()
+            journal=DecisionJournal(directory,retention_days=14,max_bytes=32*1024*1024)
+            rng=Random(42)
+            shared=[rng.random() for _ in range(6000)]
+            values=[dict(i=i,values=shared) for i in range(8)]
+            ids=[journal.snapshot(value,stamp-4*86400+i) for i,value in enumerate(values)]
+            journal._prepare(stamp)
+            original=journal._prepare_snapshot_pack
+            stop=Event()
+            def prepare(keys):
+                result=original(keys)
+                stop.set()
+                return result
+            with patch.object(journal,'_prepare_snapshot_pack',side_effect=prepare):
+                with self.assertRaisesRegex(ValueError,'stopped'):
+                    journal.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp,stop=stop)
+            self.assertFalse(list(journal.directory.glob('*.snapshot-ref')))
+            stop.clear()
+            staged=journal.stage_snapshot_pack(ids,require_savings=True,cold_at=stamp,stop=stop)
+            self.assertEqual(staged['status'],'staged')
+            verify=journal._prepare_pack_promotion
+            def prepare_promotion(key):
+                result=verify(key)
+                stop.set()
+                return result
+            with patch.object(journal,'_prepare_pack_promotion',side_effect=prepare_promotion):
+                with self.assertRaisesRegex(ValueError,'stopped'):
+                    journal.promote_snapshot_pack(staged['pack'],allow_remove=True,stop=stop)
+            self.assertEqual(len(list(journal.directory.glob('*.json.gz'))),8)
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+            for key,value in zip(ids,values):self.assertEqual(journal.read_snapshot(key),value)
+
     def test_cold_publication_rejects_recently_reused_source(self):
         with tempfile.TemporaryDirectory() as directory:
             journal=DecisionJournal(directory)
