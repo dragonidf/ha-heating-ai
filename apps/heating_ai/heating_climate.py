@@ -502,7 +502,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 entities.extend(inlet_entities(config.get('power_inlet_config') or {}))
                 if any(self.get_state(entity,attribute='all') is None for entity in entities):raise ValueError('Сутність не існує в Home Assistant')
             before=deepcopy((self.cfg,self.model,self.memory,self.next_compute))
-            volatile=('ventilation_totals','ventilation_at','stage_totals','inlet_accounting_started','inlet_stage_candidate','inlet_power_window')
+            volatile=('ventilation_totals','ventilation_at','ventilation_states','stage_totals','inlet_accounting_started','inlet_stage_candidate','inlet_power_window')
             previous_runtime={k:deepcopy(getattr(self,k)) for k in volatile if hasattr(self,k)}
             estimator=deepcopy(self.power_estimator.__dict__) if hasattr(self,'power_estimator') else None
             self.settings_transaction=True
@@ -515,7 +515,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 self.decision_event('equipment_change',reason='Змінено опис фізичного обладнання',force=True,
                     snapshot=dict(previous={k:self.cfg.get(k) for k in changed},values=changed,pending_hourly=self.memory.get('predictions',[])))
                 self.memory['predictions']=[]
-                self.ventilation_totals={};self.ventilation_at=time.time();self.stage_totals={}
+                self.ventilation_totals={};self.ventilation_states={};self.ventilation_at=time.time();self.stage_totals={}
                 history=self.memory.setdefault('equipment_history',[])
                 history.append(dict(at=self.now().isoformat(),previous={k:self.cfg.get(k,'unconfirmed') for k in changed},values=changed))
                 del history[:-32]
@@ -934,29 +934,53 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.ventilation_tick()
     def ventilation_tick(self,stamp=None):
         stamp=time.time() if stamp is None else stamp
-        states=getattr(self,'ventilation_states',{})
-        elapsed=max(0.,stamp-getattr(self,'ventilation_at',stamp))
+        previous_at=getattr(self,'ventilation_at',stamp)
+        if stamp<previous_at:
+            return  # late callback must not move the integration clock backwards
+        old_states=getattr(self,'ventilation_states',{})
+        elapsed=stamp-previous_at
         totals=getattr(self,'ventilation_totals',{})
-        for name,old in states.items():
-            row=totals.setdefault(name,dict(seconds=0.,on=0.,unknown=0.,supply_on=0.,supply_unknown=0.,
-                                            powered_on=0.,grid_on=0.,grid_unknown=0.))
-            row['seconds']+=elapsed
-            known=elapsed<=45
-            row['on']+=elapsed if known and old['relay']=='on' else 0.
-            row['unknown']+=elapsed if not known or old['relay'] not in ('on','off') else 0.
-            row['supply_on']+=elapsed if known and old['supply']=='on' else 0.
-            row['supply_unknown']+=elapsed if not known or old['supply'] not in ('on','off') else 0.
-            row['powered_on']+=elapsed if known and old['relay']=='on' and old['supply']=='on' else 0.
-            row['grid_on']+=elapsed if known and old['grid']=='on' else 0.
-            row['grid_unknown']+=elapsed if not known or old['grid']=='unknown' else 0.
         bindings=self.cfg.get('ventilation',{})
         states={}
-        if isinstance(bindings,dict):
+        if isinstance(bindings,dict) and bindings:
+            grid=self.grid_state()
             for name,binding in bindings.items():
                 if not isinstance(binding,dict) or not isinstance(binding.get('entity'),str):continue
-                states[name]=dict(relay=self.get_state(binding['entity']),
-                    supply=self.get_state(binding['power_entity']) if isinstance(binding.get('power_entity'),str) else 'unknown',
-                    grid=self.grid_state(),entity=binding['entity'])
+                # An explicit supply sensor has priority. Grid-only topology is
+                # opt-in per physical binding; never infer it from a relay name.
+                power_entity=binding.get('power_entity')
+                if isinstance(power_entity,str):
+                    supply=self.get_state(power_entity);provenance='supply_sensor'
+                elif binding.get('supply_kind')=='grid_only':
+                    supply=grid;provenance='verified_grid_topology'
+                else:
+                    supply='unknown';provenance='unknown'
+                relay=self.get_state(binding['entity'])
+                duty=0. if supply=='off' or relay=='off' else 1. if supply=='on' and relay=='on' else None
+                states[name]=dict(relay=relay,supply=supply,grid=grid,entity=binding['entity'],
+                                  supply_provenance=provenance,effective_duty=duty)
+        for name,old in old_states.items():
+            row=totals.setdefault(name,dict(seconds=0.,on=0.,unknown=0.,supply_on=0.,supply_unknown=0.,
+                                            powered_on=0.,grid_on=0.,grid_unknown=0.,effective_on=0.,effective_unknown=0.))
+            row['seconds']+=elapsed
+            known=elapsed<=45
+            current=states.get(name) or {}
+            # Grid transitions observed by polling are not timestamped airflow
+            # events. Do not assign the entire preceding interval to either side.
+            supply_known=known and not (old.get('supply_provenance')=='verified_grid_topology'
+                                        and old['grid']!=current.get('grid'))
+            row['on']+=elapsed if known and old['relay']=='on' else 0.
+            row['unknown']+=elapsed if not known or old['relay'] not in ('on','off') else 0.
+            row['supply_on']+=elapsed if supply_known and old['supply']=='on' else 0.
+            row['supply_unknown']+=elapsed if not supply_known or old['supply'] not in ('on','off') else 0.
+            row['powered_on']+=elapsed if supply_known and old['relay']=='on' and old['supply']=='on' else 0.
+            row['grid_on']+=elapsed if known and old['grid']=='on' else 0.
+            row['grid_unknown']+=elapsed if not known or old['grid']=='unknown' else 0.
+            duty=old.get('effective_duty')
+            if not known or (not supply_known and old['relay']!='off'):
+                duty=None
+            row['effective_on']+=elapsed if duty==1. else 0.
+            row['effective_unknown']+=elapsed if duty is None else 0.
         self.ventilation_states=states;self.ventilation_totals=totals;self.ventilation_at=stamp
     def ventilation_sample(self,stamp):
         self.ventilation_tick(stamp)
@@ -970,7 +994,9 @@ class HeatingClimate(HeatingRecovery,Hass):
                 supply_unknown_fraction=round(row['supply_unknown']/seconds,4) if seconds else None,
                 powered_relay_on_fraction=round(row['powered_on']/seconds,4) if seconds and row['supply_unknown']==0 else None,
                 grid_on_fraction=round(row['grid_on']/seconds,4) if seconds else None,
-                grid_unknown_fraction=round(row['grid_unknown']/seconds,4) if seconds else None)
+                grid_unknown_fraction=round(row['grid_unknown']/seconds,4) if seconds else None,
+                effective_on_fraction=round(row['effective_on']/seconds,4) if seconds else None,
+                effective_unknown_fraction=round(row['effective_unknown']/seconds,4) if seconds else None)
         self.ventilation_totals={}
         return result
 

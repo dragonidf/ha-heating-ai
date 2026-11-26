@@ -62,6 +62,11 @@ def ventilation_interval_duty(evidence):
     unknown = number(evidence.get("unknown_fraction"))
     if seconds is None or seconds < 240:
         return None
+    # New records carry physical duty separately from raw relay and supply.
+    # A partial or mixed interval remains unsuitable for this constant-duty fitter.
+    if "effective_on_fraction" in evidence or "effective_unknown_fraction" in evidence:
+        effective = number(evidence.get("effective_on_fraction"))
+        return effective if number(evidence.get("effective_unknown_fraction")) == 0. and effective in (0., 1.) else None
     # Only full, independently observed zero supply proves zero powered duty
     # even when the relay cannot report. A coverage gap, missing supply
     # fraction, or contradictory powered-on evidence cannot establish this.
