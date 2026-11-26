@@ -424,7 +424,42 @@ def effective_ventilation_duty(evidence):
     return powered if supply_unknown==0 and powered is not None and 0<=powered<=on+.001 and powered<=1 else None
 
 
-def fit_ventilation(samples,model,timezone=None):
+VENTILATION_DUTY_POLICY=2
+
+
+def ventilation_binding_identity(cfg):
+    """Stable physical identity; no dependence on temporary relay/supply state."""
+    result={}
+    bindings=cfg.get('ventilation') or {}
+    confirmed=cfg.get('grid_only_ventilation_entities')
+    for key in ('recuperator','bath'):
+        binding=bindings.get(key) or {}
+        entity=binding.get('entity')
+        if not isinstance(entity,str):continue
+        power=binding.get('power_entity')
+        if isinstance(power,str):
+            provenance='supply_sensor'
+        elif binding.get('supply_kind')=='grid_only' or isinstance(confirmed,(list,tuple)) and entity in confirmed:
+            provenance='verified_grid_topology';power=None
+        else:
+            provenance='unknown';power=None
+        result[key]=dict(entity=entity,supply_provenance=provenance,power_entity=power)
+    return result
+
+
+def compatible_ventilation_fit(fit,bindings):
+    if not fit:
+        return {}
+    # Legacy fits remain readable. Do not reinterpret their averaged relay
+    # coefficient as a certified physical topology after explicit opt-in.
+    if fit.get('duty_policy')==VENTILATION_DUTY_POLICY:
+        return fit if fit.get('binding_identity')==bindings else {}
+    if any(v.get('supply_provenance')=='verified_grid_topology' for v in bindings.values()):
+        return {}
+    return fit
+
+
+def fit_ventilation(samples,model,timezone=None,bindings=None):
     """Joint base/recuperator/bath effective loss, independent held-out days.
 
     Unknown duty, correlated relays and daylight/fire disturbances cannot
@@ -449,6 +484,11 @@ def fit_ventilation(samples,model,timezone=None):
         u={};valid=True
         for key in ('recuperator','bath'):
             vals=[(r.get('ventilation') or {}).get(key) or {} for r in chunk[1:]]
+            if bindings is not None:
+                identity=bindings.get(key)
+                if not identity or any(v.get('duty_policy')!=VENTILATION_DUTY_POLICY
+                        or any(v.get(k)!=value for k,value in identity.items()) for v in vals):
+                    valid=False;break
             duties=[effective_ventilation_duty(v) for v in vals]
             if any(d is None for d in duties):valid=False;break
             u[key]=statistics.mean(duties)
@@ -460,6 +500,8 @@ def fit_ventilation(samples,model,timezone=None):
     days=sorted(day for day in {r['day'] for r in records} if sum(r['day']==day for r in records)>=6)
     records=[r for r in records if r['day'] in days]
     result=dict(validated=False,model_version=model.get('version'),days=len(days),samples=len(records),reason='insufficient_independent_days')
+    if bindings is not None:
+        result.update(duty_policy=VENTILATION_DUTY_POLICY,binding_identity=bindings)
     if len(days)<3:return result
     train=[r for r in records if r['day']!=days[-1]];hold=[r for r in records if r['day']==days[-1]]
     if len(train)<12 or len(hold)<6:return result

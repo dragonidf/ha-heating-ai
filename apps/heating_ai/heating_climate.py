@@ -20,7 +20,7 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,retain_kws_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
-from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,ventilation_powered_expectation,effective_ventilation_duty,room_reporting_limits,gain_at,
+from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,ventilation_powered_expectation,effective_ventilation_duty,ventilation_binding_identity,compatible_ventilation_fit,VENTILATION_DUTY_POLICY,room_reporting_limits,gain_at,
                                  solar_context,room_source_check,observe_residual,residual_at,ENVIRONMENT_POLICY_VERSION)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
@@ -619,12 +619,23 @@ class HeatingClimate(HeatingRecovery,Hass):
                 if entity not in tracked:tracked[entity]=self.listen_state(self.ventilation_changed,entity)
             self.equipment_listeners=tracked
 
+    def active_ventilation_model(self):
+        return compatible_ventilation_fit(self.memory.get('ventilation_model') or {},
+                                         ventilation_binding_identity(self.cfg))
+
     def refresh_equipment_models(self):
         self.memory['power_calibrations']=retain_kws_profile(learn_power_modes(self.samples,self.model),
             self.memory.get('kws_forecast_profile'),self.model,self.memory.get('equipment_version',0))
-        fit=fit_ventilation(self.samples,self.model,self.climate_tz)
-        previous=self.memory.get('ventilation_model') or {}
+        bindings=ventilation_binding_identity(self.cfg)
+        fit=fit_ventilation(self.samples,self.model,self.climate_tz,bindings or None)
+        stored=self.memory.get('ventilation_model') or {}
+        previous=self.active_ventilation_model()
         today=self.now().date().isoformat()
+        if stored.get('validated') and not previous and not fit.get('validated'):
+            # Preserve the old certificate and expose the migration blocker.
+            # Until independently fitted, the controller uses its base model.
+            self.memory['ventilation_candidate']=fit
+            return
         if previous.get('validated') and previous.get('model_version')==self.model.get('version'):
             if not fit['validated'] or previous.get('fit_day')==today:return
             clipped=False
@@ -637,6 +648,10 @@ class HeatingClimate(HeatingRecovery,Hass):
                 fit.update(validated=False,reason='daily_bound_requires_revalidation')
                 self.memory['ventilation_candidate']=fit;return
         self.memory['ventilation_model']=dict(fit,fit_day=today)
+        if fit.get('validated'):
+            self.memory.pop('ventilation_candidate',None)
+            if stored.get('validated') and not previous:
+                self.memory['ventilation_legacy_certificate']=stored
 
     def read_power_snapshot(self,entities):
         template="""{% set ns=namespace(rows={}) %}{% for id in entities %}{% set s=states[id] %}{% if s is not none %}{% set ns.rows=dict(ns.rows,**{id:dict(value=s.state,at=as_timestamp(s.last_reported if s.last_reported is defined else s.last_updated,none),unit=s.attributes.get('unit_of_measurement'),temperature=s.attributes.get('current_temperature'),target=s.attributes.get('temperature'),kind='active')}) %}{% endif %}{% endfor %}{{ ns.rows|tojson }}"""
@@ -833,9 +848,13 @@ class HeatingClimate(HeatingRecovery,Hass):
             recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
             energy=self.memory.get('kws_energy') if self.cfg.get('power_accounting_method')=='kws' else self.memory.get('inlet_energy') if self.cfg.get('power_accounting_method')=='inlet' else self.memory.get('power_observation_ledger'),
             accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')))
-        self.publish('sensor.heating_ventilation','Враховано' if (self.memory.get('ventilation_model') or {}).get('validated') else 'Навчання; чинна базова модель',
+        active_ventilation=self.active_ventilation_model()
+        self.publish('sensor.heating_ventilation','Враховано' if active_ventilation.get('validated') else 'Навчання; чинна базова модель',
             **wire(dict(friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
-            model=self.memory.get('ventilation_model') or {},candidate=self.memory.get('ventilation_candidate'),
+            model=active_ventilation,candidate=self.memory.get('ventilation_candidate'),
+            stored_certificate_compatible=bool(active_ventilation),
+            legacy_certificate_retained=bool(self.memory.get('ventilation_legacy_certificate') or
+                self.memory.get('ventilation_model') and not active_ventilation),
             note='Реле не доводить витрату повітря; майбутній duty — сценарій, не точний розклад')))
 
     def ai_report_changed(self,entity,attribute,old,new,kwargs=None,**extra):
@@ -989,7 +1008,8 @@ class HeatingClimate(HeatingRecovery,Hass):
         result={}
         for name,row in self.ventilation_totals.items():
             seconds=row['seconds']
-            result[name]=dict(entity=self.ventilation_states.get(name,{}).get('entity'),seconds=round(seconds,1),
+            identity=ventilation_binding_identity(self.cfg).get(name) or {}
+            result[name]=dict(**identity,duty_policy=VENTILATION_DUTY_POLICY,seconds=round(seconds,1),
                 on_fraction=round(row['on']/seconds,4) if seconds else None,
                 unknown_fraction=round(row['unknown']/seconds,4) if seconds else None,
                 supply_on_fraction=round(row['supply_on']/seconds,4) if seconds else None,
@@ -1770,7 +1790,7 @@ class HeatingClimate(HeatingRecovery,Hass):
             settings['unknown_power_components']=list(self.control_power_bounds.get('unknown_components',[]))
         settings['equipment_version']=self.memory.get('equipment_version',0)
         settings['thermal_model_version']=self.model.get('version')
-        settings['ventilation_model']=self.memory.get('ventilation_model') or {}
+        settings['ventilation_model']=self.active_ventilation_model()
         settings['ventilation_expected'],ventilation_support=ventilation_expectation(self.samples,getattr(self,'ventilation_states',{}))
         settings['ventilation_grid_only']=ventilation_powered_expectation(self.samples,getattr(self,'ventilation_states',{}))
         floor=forecast_probe

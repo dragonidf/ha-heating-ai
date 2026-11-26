@@ -215,6 +215,31 @@ class CalibrationContracts(unittest.TestCase):
                 equilibrium=(air*floor+coefficient*10)/(air+coefficient)
                 room=equilibrium+(room-equilibrium)*math.exp(-(air+coefficient)/12)
         return rows
+    def test_physical_ventilation_fit_cannot_inherit_old_or_changed_binding(self):
+        from heating_environment import ventilation_binding_identity,compatible_ventilation_fit,VENTILATION_DUTY_POLICY
+        from heating_model import DEFAULT_MODEL
+        model=dict(DEFAULT_MODEL,version=6,room_loss=.02)
+        cfg=dict(ventilation={"recuperator":{"entity":"switch.recup"},"bath":{"entity":"switch.bath"}},
+                 grid_only_ventilation_entities=["switch.recup"])
+        bindings=ventilation_binding_identity(cfg)
+        rows=self.ventilation_rows()
+        old=fit_ventilation(rows,model)
+        self.assertTrue(old["validated"])
+        self.assertEqual(compatible_ventilation_fit(old,bindings),{})
+        self.assertFalse(fit_ventilation(rows,model,bindings=bindings)["validated"])
+        for row in rows:
+            for key,identity in bindings.items():
+                row["ventilation"][key].update(identity,duty_policy=VENTILATION_DUTY_POLICY)
+        new=fit_ventilation(rows,model,bindings=bindings)
+        self.assertTrue(new["validated"],new)
+        self.assertEqual(compatible_ventilation_fit(new,bindings),new)
+        changed=copy.deepcopy(cfg);changed["ventilation"]["bath"]["entity"]="switch.other"
+        self.assertEqual(compatible_ventilation_fit(new,ventilation_binding_identity(changed)),{})
+        self.assertFalse(fit_ventilation(rows,model,bindings=ventilation_binding_identity(changed))["validated"])
+        cfg["ventilation"]["recuperator"]["power_entity"]="binary_sensor.supply"
+        self.assertEqual(ventilation_binding_identity(cfg)["recuperator"]["supply_provenance"],"supply_sensor")
+        self.assertEqual(compatible_ventilation_fit(new,ventilation_binding_identity(cfg)),{})
+
     def test_ventilation_needs_independent_states_and_whole_heldout_days(self):
         from heating_model import DEFAULT_MODEL
         model=dict(DEFAULT_MODEL,version=6,room_loss=.02)
