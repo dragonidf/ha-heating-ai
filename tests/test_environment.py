@@ -29,6 +29,23 @@ class AdaptiveSolarRegressions(unittest.TestCase):
         summer=self.at.replace(month=6,day=21,hour=20)
         self.assertGreater(daylight(summer,solar_geometry(summer)),0.)
         self.assertEqual(daylight(self.at,{}),0.)
+    def test_solar_heat_stays_in_existing_thermal_states_after_sunset(self):
+        from heating_environment import forecast_step
+        start=self.at.replace(hour=12)
+        weather=[dict(ts=start.timestamp()+i*3600,temperature=5.,condition="sunny",cloud_coverage=0) for i in range(9)]
+        base={"environment":{"astronomy":self.geometry,"solar":{"validated":False,"coefficient":.5}}}
+        sunny={"environment":{"astronomy":self.geometry,"solar":{"validated":True,"coefficient":.5}}}
+        cold=warm=(21.,23.)
+        for i in range(8*12):
+            when=start+timedelta(minutes=i*5)
+            cold=forecast_step(*cold,5.,0.,0.,DEFAULT_MODEL,1/12,when,weather,base)
+            warm=forecast_step(*warm,5.,0.,0.,DEFAULT_MODEL,1/12,when,weather,sunny)
+            if when.hour>=17:
+                self.assertEqual(gain_at(when,weather,sunny),0.)
+                self.assertGreater(warm[0],cold[0])
+                self.assertGreater(warm[1],cold[1])
+        self.assertGreater(warm[0],cold[0])
+
     def test_clouds_are_smooth_and_do_not_cross_hourly_coverage(self):
         from heating_environment import weather_factor
         values=[weather_factor('sunny',x) for x in (0,10,50,90,100)]

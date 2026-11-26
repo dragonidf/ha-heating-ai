@@ -330,6 +330,14 @@ def build_observation_windows(samples, tz):
         if not issues and not row_reasons(row,strict=True):
             anchor_at = at
     observation = rows[-1] if rows else {}
+    weather_pairs=[r["solar_weather"] for r in rows if isinstance(r.get("solar_weather"),dict)
+                   and number(r["solar_weather"].get("forecast_factor")) is not None
+                   and number(r["solar_weather"].get("current_factor")) is not None]
+    weather_deltas=[p["forecast_factor"]-p["current_factor"] for p in weather_pairs
+                    if max(p["forecast_factor"],p["current_factor"])>.05]
+    weather_report=dict(latest=observation.get("solar_weather") or {},
+        paired_daylight_samples=len(weather_deltas),factor_mae=(round(sum(map(abs,weather_deltas))/len(weather_deltas),4)
+            if weather_deltas else None),basis="provider_current_estimate_not_irradiance")
     eligibility_counts = dict(manual_physics_windows=sum(w["manual"] and not w.get("solar_only") for w in windows),
                               automatic_physics_windows=sum(not w["manual"] and not w.get("solar_only") for w in windows),
                               outage_physics_windows=sum(bool(w.get("outage_physics")) for w in windows),
@@ -342,7 +350,7 @@ def build_observation_windows(samples, tz):
                                   and (kw:=number(r.get("interval_kw"))) is not None
                                   and 0<=kw<=10.5 for r in rows))
     return dict(windows=windows,rejection_counts=dict(counts),unique_primary_reports=len(reports),
-                eligibility_counts=eligibility_counts,
+                eligibility_counts=eligibility_counts,solar_weather=weather_report,
                 last_verified_anchor=anchor_at,
                 current_observation_quality={
                     "primary_fresh": observation.get("primary_fresh",False),
@@ -565,22 +573,50 @@ def evaluate_solar(windows, model, commissioning=.283, ventilation=None):
                 holdout_end=max(w["end"] for w in holdout))
 
 
+def solar_weather_evidence(stamp, tz, weather, issue, geometry, current_state=None):
+    """Separate issue-time hourly predictor from current provider estimate.
+
+    Neither cloud estimate is a physical irradiance measurement. The current
+    estimate is diagnostics only; do not substitute it into frozen forecasts.
+    """
+    result=dict(forecast_factor=None,forecast_basis="unknown",current_factor=None,
+                current_basis="unknown",current_cloud=None,forecast_cloud=None)
+    when=datetime.fromtimestamp(stamp,tz)
+    day=((geometry or {}).get("days") or {}).get(when.date().isoformat()) or {}
+    latitude=number((geometry or {}).get("latitude"))
+    sunrise,sunset,noon,declination=(number(day.get(k)) for k in
+                                     ("sunrise","sunset","noon","declination"))
+    if (latitude is None or not -90<=latitude<=90 or None in (sunrise,sunset,noon,declination)
+            or not sunrise<noon<sunset or not -90<=declination<=90):
+        return result
+    sun=daylight(when,geometry)
+    def factor(condition,cloud):
+        if cloud is not None and 0<=cloud<=100:
+            return sun*weather_factor(condition,cloud),"cloud_coverage"
+        if condition in ("sunny","clear","clear-night","partlycloudy","cloudy","rainy","pouring","snowy"):
+            return sun*weather_factor(condition,None),"condition"
+        return (0.,"astronomical_night") if sun==0. else (None,"unknown")
+    if weather and issue is not None and 0<=stamp-issue<=MAX_WEATHER_AGE:
+        current=next((r for r in reversed(weather) if 0<=stamp-r["ts"]<3600),None)
+        if current is not None:
+            cloud=number(current.get("cloud_coverage"))
+            result["forecast_factor"],result["forecast_basis"]=factor(current.get("condition"),cloud)
+            result["forecast_cloud"]=cloud if cloud is not None and 0<=cloud<=100 else None
+    if isinstance(current_state,dict) and current_state.get("state") not in (None,"unknown","unavailable"):
+        try:
+            at=datetime.fromisoformat(current_state.get("last_reported") or current_state["last_updated"])
+            age=stamp-at.timestamp() if at.tzinfo is not None else math.inf
+        except (KeyError,ValueError,TypeError,OverflowError):
+            age=math.inf
+        if 0<=age<=MAX_WEATHER_AGE:
+            cloud=number((current_state.get("attributes") or {}).get("cloud_coverage"))
+            result["current_factor"],result["current_basis"]=factor(current_state.get("state"),cloud)
+            result["current_cloud"]=cloud if cloud is not None and 0<=cloud<=100 else None
+    return result
+
+
 def solar_context_at(stamp, tz, weather, issue, geometry):
-    if (not weather or not geometry or issue is None or not 0<=stamp-issue<=MAX_WEATHER_AGE):
-        return None
-    current = next((r for r in reversed(weather) if 0<=stamp-r["ts"]<3600),None)
-    if current is None:
-        return None
-    when = datetime.fromtimestamp(stamp,tz)
-    if when.date().isoformat() not in (geometry.get("days") or {}):
-        return None
-    sun = daylight(when,geometry)
-    clouds = number(current.get("cloud_coverage"))
-    if (sun and not (clouds is not None and 0<=clouds<=100)
-            and current.get("condition") not in
-            ("sunny","clear","clear-night","partlycloudy","cloudy","rainy","pouring","snowy")):
-        return None
-    return sun*weather_factor(current.get("condition"),current.get("cloud_coverage"))
+    return solar_weather_evidence(stamp,tz,weather,issue,geometry)["forecast_factor"]
 
 
 def prospective_gate(rows, *, issued_at, now, observation_days=None):
@@ -1359,6 +1395,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                 rejection_counts=dict(sorted(window_report["rejection_counts"].items(),
                                              key=lambda item:(-item[1],item[0]))[:12]),
                 current_reasons=window_report["current_observation_quality"]["reasons"],
+                solar_weather=window_report.get("solar_weather",{}),
                 analysis_status="pending", analysis_blockers=[])
     evidence_key = sha256(_encode([now.date().isoformat(),model,eligible,cooldown,power_context,
                                   [(w['start'],w['end']) for w in windows],

@@ -327,8 +327,10 @@ class NativeController(HeatingClimate):
                 break
             ventilation.append(duty)
         issue = number(self.memory.get("weather_at"))
-        solar = learning.solar_context_at(stamp,self.climate_tz,self.weather,issue,
-                                         getattr(self,"solar_geometry",{}))
+        weather_state=self.raw("weather",attribute="all") if self.cfg.get("weather") else None
+        solar_weather=learning.solar_weather_evidence(stamp,self.climate_tz,self.weather,issue,
+                                getattr(self,"solar_geometry",{}),weather_state)
+        solar=solar_weather["forecast_factor"]
         compact.update(zero_heat_provenance="verified_mains_isolation" if self._learning_zero_now else None,
             zero_heat_interval_verified=self._learning_zero_interval,
             thermal_inputs_ok=getattr(self,"_learning_thermal_inputs_ok",False) is True,
@@ -337,7 +339,7 @@ class NativeController(HeatingClimate):
             report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
             voltage_qualified=voltage,
             shadow_ventilation=ventilation, epoch=self._learning_epoch, weather_issue_at=issue,
-            solar_factor=solar, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
+            solar_factor=solar, solar_weather=solar_weather, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
         self._learning_rows.append(compact)
         if verified:
@@ -479,7 +481,7 @@ class NativeController(HeatingClimate):
         self._learning_status={k:v for k,v in result.items()
                                if k in ("status","reason","metrics","independent_windows","qualified_minutes",
                                         "verified_reports","rejection_counts","current_reasons","eligibility_counts",
-                                        "analysis_status","analysis_blockers","solar","solar_prospective")}
+                                        "analysis_status","analysis_blockers","solar","solar_prospective","solar_weather")}
         if result.get("power_learning") is not None:
             self.memory.setdefault("online_learning",{})["power_learning"]=result["power_learning"]
         self._apply_learning_result(issued,result)
@@ -1924,6 +1926,7 @@ class NativeController(HeatingClimate):
                 analysis_blockers=report.get("analysis_blockers",[]),
                 solar_learning=report.get("solar") or {},
                 solar_prospective=report.get("solar_prospective") or {},
+                solar_weather=report.get("solar_weather") or {},
                 solar_risk_active={k:v for k,v in self.active_solar_risk_certificate().items()
                     if k in ("coefficient","stored_at","holdout_days","holdout_windows","comfort_credit",
                              "nominal_at","nominal_revoked_at","nominal_frozen_until","nominal_rollback_reason")},

@@ -393,6 +393,25 @@ class WindowsTest(unittest.TestCase):
         self.assertEqual(evaluate_solar(rows,model,commissioning=.5)["status"],"holdout_rejected")
         self.assertEqual(evaluate_solar(rows[:12],model,commissioning=0.)["status"],"insufficient_data")
 
+    def test_solar_weather_keeps_current_estimate_separate_from_issued_predictor(self):
+        from heating_learning_windows import solar_weather_evidence
+        at=datetime(2026,11,1,12,tzinfo=timezone.utc);stamp=at.timestamp()
+        geometry={"latitude":50.,"days":{at.date().isoformat():{"noon":stamp,
+                   "sunrise":stamp-18000,"sunset":stamp+18000,"declination":-12.}}}
+        weather=[dict(ts=stamp,condition="sunny",cloud_coverage=5)]
+        current={"state":"cloudy","last_reported":at.isoformat(),"attributes":{"cloud_coverage":95}}
+        report=solar_weather_evidence(stamp,timezone.utc,weather,stamp,geometry,current)
+        self.assertGreater(report["forecast_factor"],report["current_factor"])
+        self.assertEqual(report["forecast_basis"],"cloud_coverage")
+        self.assertEqual(report["current_cloud"],95)
+        self.assertEqual(report["forecast_cloud"],5)
+        future={**current,"last_reported":datetime.fromtimestamp(stamp+1,timezone.utc).isoformat()}
+        self.assertIsNone(solar_weather_evidence(stamp,timezone.utc,weather,stamp,geometry,future)["current_factor"])
+        stale={**current,"last_reported":datetime.fromtimestamp(stamp-10801,timezone.utc).isoformat()}
+        self.assertIsNone(solar_weather_evidence(stamp,timezone.utc,weather,stamp,geometry,stale)["current_factor"])
+        self.assertIsNone(solar_weather_evidence(stamp,timezone.utc,weather,stamp+1,geometry,current)["forecast_factor"])
+        self.assertIsNone(solar_context_at(stamp,timezone.utc,weather,stamp,{"days":geometry["days"]}))
+
     def test_solar_missing_condition_future_issue_and_missing_geometry(self):
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Kyiv")
