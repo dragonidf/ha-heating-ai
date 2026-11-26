@@ -350,8 +350,24 @@ def check_compact_tabs(page):
     page.evaluate("""setHeatingScenario({'sensor.heating_model':{attributes:{forecast_validation:{
         groups:[{kind:'measured_inputs',horizon:'required',minimum_hours:39,maximum_hours:39,
             count:10,days:8,mae:0.2,age_hours:2}],rejected:{measurement_gap:3}}}}})""")
-    assert 'Потрібний' in page.locator('.validation-table').inner_text()
-    assert '10 / 8' in page.locator('.validation-table').inner_text()
+    assert 'Потрібний' in page.locator('.model-advanced .validation-table').inner_text()
+    assert '10 / 8' in page.locator('.model-advanced .validation-table').inner_text()
+    page.evaluate("""setHeatingScenario({'sensor.heating_controller_quality':{attributes:{
+        accuracy_periods:{as_of:1795708800,groups:[{horizon:6,model_version:6,equipment_version:2,physical_mode:'fixed_6',
+            basis:'sensor_report',weather_known:true,schedule_known:false,periods:{
+              7:{count:2,days:1,missing_days:6,mae:0.125,bias:-0.125},
+              14:{count:4,days:3,missing_days:11,mae:0.25,bias:0},
+              30:{count:8,days:5,missing_days:25,mae:0.375,bias:0.2}}}]},
+        advisory_validation:{groups:[{horizon:48,basis:'conditional_repeat',weather_known:false,schedule_known:false,
+            independent:{n:2,mae:0.65,bias:-0.25},all_reports:{n:16},days:3}],pending:{48:3}}}}})""")
+    page.locator('.accuracy-periods summary').click()
+    assert '0,125' in page.locator('.accuracy-periods').inner_text()
+    assert '6 без даних' in page.locator('.accuracy-periods').inner_text()
+    assert '0,375' in page.locator('.accuracy-periods').inner_text()
+    page.locator('.advisory-accuracy summary').click()
+    assert 'Умовний повтор нагріву' in page.locator('.advisory-accuracy').inner_text()
+    assert '0,650' in page.locator('.advisory-accuracy').inner_text()
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     assert 'Прогалина — 3' in page.locator('.model-advanced').inner_text()
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
     page.locator('.model-advanced summary').click()
