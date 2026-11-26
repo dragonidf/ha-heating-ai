@@ -234,6 +234,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             hass,app=self.controller(component)
             app.cfg["boiler_power_mode"]="fixed_6"
             app.memory["equipment_version"]=1
+            app.climate_tz=timezone.utc
             app._learning_eligible=Mock(return_value=True)
             issued=dict(model=dict(app.model),equipment=1,generation=app._learning_generation,
                         solar_ventilation={},started=time.monotonic())
