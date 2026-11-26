@@ -33,6 +33,55 @@ def samples(minutes=120, report_every=60, *, day=0, power=0.):
     return rows
 
 
+class StorageLearningTest(unittest.TestCase):
+    model=dict(__import__('heating_model').DEFAULT_MODEL,version=6,validated=True,
+               floor_air=.055,room_loss=.022,floor_decay=.38,heat_gain=1.0368)
+
+    def windows(self,field,days=10,shift=.01):
+        from heating_model import step
+        truth={**self.model,field:self.model[field]*(1+shift)}
+        output=[]
+        for day in range(days):
+            for j,(floor,kw,seconds) in enumerate(((33.+day%8,0.,7200),
+                    (22.+day%3,7.+day%3,7200),(40.+day%4,0.,1800),(21.+day%3,5.,3600))):
+                start=BASE+day*86400+j*10800
+                room,f=21.,floor
+                steps=[]
+                for i in range(seconds//300):
+                    outside=-6+2*day%17
+                    steps.append([300,outside,kw,0.,f])
+                    room,f=step(room,f,outside,kw,0.,truth,1/12)
+                output.append(dict(start=start,end=start+seconds,day=f'2026-11-{day+1:02}',
+                    room_start=21.,room_end=room,floor=floor,steps=steps,
+                    heat=seconds if kw else 0,idle=0 if kw else seconds,sun=0.,
+                    equipment=[6,1,'fixed_6'],vent=[0.,0.]))
+        return output
+
+    def test_storage_coefficients_need_excitation_and_later_independent_holdout(self):
+        from heating_learning_windows import evaluate_windows,promotion_allowed
+        now=datetime(2026,11,11,tzinfo=timezone.utc)
+        for field in ('floor_decay','heat_gain'):
+            with self.subTest(field=field):
+                result=evaluate_windows(self.windows(field),self.model)
+                self.assertEqual(result['status'],'holdout_passed')
+                self.assertEqual(result['coefficients'],{field:self.model[field]*1.01})
+                self.assertTrue(promotion_allowed(self.model,self.model,result['coefficients'],
+                    {'status':'accepted'},{},now))
+                self.assertFalse(promotion_allowed(self.model,self.model,result['coefficients'],
+                    {'status':'rejected'},{},now))
+
+    def test_storage_fit_rejects_weak_support_and_conflicting_later_days(self):
+        from heating_learning_windows import _storage_candidate,evaluate_windows
+        self.assertIsNone(_storage_candidate(self.windows('heat_gain',days=2),self.model,self.model,None))
+        self.assertIsNone(_storage_candidate([w for w in self.windows('heat_gain') if w['heat']],
+                                             self.model,self.model,None))
+        rows=self.windows('heat_gain')
+        rows[-8:]=self.windows('heat_gain',shift=-.01)[-8:]
+        result=evaluate_windows(rows,self.model)
+        self.assertEqual(result['status'],'holdout_rejected')
+        self.assertIsNone(result['coefficients'])
+
+
 class WindowsTest(unittest.TestCase):
     def test_rolling_drift_blocks_small_changes_when_path_budget_is_used(self):
         from heating_learning_windows import promotion_allowed

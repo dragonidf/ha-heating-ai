@@ -21,7 +21,8 @@ RETENTION = 60 * 86400
 MAX_WEATHER_AGE = 3 * 3600
 REPORT_ALIGNMENT_SECONDS = 300
 IDENTITY = ("epoch", "source", "thermal_model_version", "equipment_version", "boiler_power_mode")
-FIT_FIELDS = ("floor_air", "room_loss")
+BASE_FIT_FIELDS = ("floor_air", "room_loss")
+FIT_FIELDS = BASE_FIT_FIELDS + ("floor_decay", "heat_gain")
 DRIFT_LIMITS = ((7, .05), (30, .12))
 _JOB_LOCK = Lock()
 
@@ -319,7 +320,7 @@ def _metrics(errors):
                 median=median(absolute),p95=absolute[math.ceil(.95*len(errors))-1])
 
 
-def _score(windows, coefficients, solar=0., ventilation=None):
+def _errors(windows, coefficients, solar=0., ventilation=None):
     errors = []
     floor_air, loss = coefficients["floor_air"], coefficients["room_loss"]
     heat_gain, decay = coefficients["heat_gain"], coefficients["floor_decay"]
@@ -335,7 +336,11 @@ def _score(windows, coefficients, solar=0., ventilation=None):
             room += (floor_air*difference-ventilation_loss*(room-outside)+solar*sun)*hours
             floor += (heat_gain*kw-decay*difference)*hours
         errors.append(room-window["room_end"])
-    return _metrics(errors)
+    return errors
+
+
+def _score(windows, coefficients, solar=0., ventilation=None):
+    return _metrics(_errors(windows,coefficients,solar,ventilation))
 
 
 def _split(windows):
@@ -353,6 +358,59 @@ def _coverage(windows):
                 heat=sum(w["heat"] for w in windows), idle=sum(w["idle"] for w in windows),
                 heat_days=len({w["day"] for w in windows if w["heat"]}),
                 idle_days=len({w["day"] for w in windows if w["idle"]}))
+
+
+def _storage_candidate(train, model, base_best, ventilation):
+    """One-coordinate update only with independent excitation and sensitivity.
+
+    Return is a proxy, not a direct floor measurement. Fit on actual room
+    endpoints, never the simulated floor or cached temperature as a target.
+    A weak or collinear parameter must remain unchanged.
+    """
+    coverage=_coverage(train)
+    if coverage["days"]<4 or coverage["seconds"]<12*3600:
+        return None
+    warm=[w for w in train if w["end"]-w["start"]>=1800 and
+          w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.]
+    heat=[w for w in train if w["end"]-w["start"]>=1800 and
+          w["heat"]>=.75*(w["end"]-w["start"])]
+    if any(_coverage(rows)["days"]<3 or _coverage(rows)["seconds"]<3*3600 for rows in (warm,heat)):
+        return None
+    base=_errors(train,model,ventilation=ventilation)
+    best_error=_score(train,base_best,ventilation=ventilation)["mae"]
+    sensitivity={}
+    options=[]
+    for field in FIT_FIELDS:
+        trial={**model,field:model[field]*1.01}
+        if not BOUNDS[field][0]<=trial[field]<=BOUNDS[field][1]:
+            continue
+        vector=[b-a for a,b in zip(base,_errors(train,trial,ventilation=ventilation))]
+        magnitude=math.sqrt(sum(v*v for v in vector))
+        if magnitude>1e-9:
+            sensitivity[field]=(vector,magnitude)
+    for field,cohort in (("floor_decay",warm),("heat_gain",heat)):
+        if field not in sensitivity:
+            continue
+        vector,norm=sensitivity[field]
+        if norm/math.sqrt(len(vector))<.001:
+            continue
+        if any(abs(sum(a*b for a,b in zip(vector,other)))/(norm*size)>=.985
+               for key,(other,size) in sensitivity.items() if key!=field):
+            continue
+        cohort_old=_score(cohort,model,ventilation=ventilation)["mae"]
+        for scale in (.99,1.01):
+            candidate={**model,field:model[field]*scale}
+            if not BOUNDS[field][0]<=candidate[field]<=BOUNDS[field][1]:
+                continue
+            objective=_score(train,candidate,ventilation=ventilation)["mae"]
+            cohort_error=_score(cohort,candidate,ventilation=ventilation)["mae"]
+            if (best_error-objective>=max(.001,.02*best_error) and
+                    cohort_old-cohort_error>=max(.001,.02*cohort_old)):
+                options.append((objective,field,candidate))
+    if not options:
+        return None
+    _,field,candidate=min(options,key=lambda x:(x[0],x[1]))
+    return field,candidate
 
 
 def evaluate_windows(windows, model, ventilation=None):
@@ -386,7 +444,7 @@ def evaluate_windows(windows, model, ventilation=None):
         blockers.append("independent_holdout")
     # A qualified ventilation fit replaces room_loss in _score; that parameter
     # is not identifiable from these windows. Never select an arbitrary tied value.
-    fields = ("floor_air",) if qualified_vent else FIT_FIELDS
+    fields = ("floor_air",) if qualified_vent else BASE_FIT_FIELDS
     if blockers:
         cooling = [w for w in thermal if w["idle"]>=w["end"]-w["start"]
                    and abs(w["floor"]-w["room_start"])<=1.5
@@ -410,9 +468,28 @@ def evaluate_windows(windows, model, ventilation=None):
             score = _score(train,candidate,ventilation=ventilation)["mae"]
             if score<objective:
                 best,objective=candidate,score
+    # Select using training only; never fall back to a different candidate
+    # after looking at the later holdout.
+    storage = _storage_candidate(train,model,best,ventilation) if not blockers else None
+    if storage:
+        field,best=storage
+        fields=(field,)
     baseline = _score(holdout,model,ventilation=ventilation)
     shadow = _score(holdout,best,ventilation=ventilation)
     qualified = best!=model and shadow["mae"]<baseline["mae"] and shadow["p95"]<=baseline["p95"]
+    if storage:
+        cohort=[w for w in holdout if w["end"]-w["start"]>=1800 and (
+            w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.
+            if field=="floor_decay" else w["heat"]>=.75*(w["end"]-w["start"]))]
+        support=_coverage(cohort)
+        prior=_score(cohort,model,ventilation=ventilation)
+        changed=_score(cohort,best,ventilation=ventilation)
+        qualified=bool(qualified and support["days"]>=2 and support["seconds"]>=2*3600
+            and baseline["mae"]-shadow["mae"]>=max(.001,.02*baseline["mae"])
+            and abs(shadow["bias"])<=abs(baseline["bias"])
+            and prior["mae"]-changed["mae"]>=max(.001,.02*prior["mae"])
+            and changed["p95"]<=prior["p95"])
+
     return dict(status="holdout_passed" if qualified else "holdout_rejected",
                 blockers=[] if qualified else ["held_out_no_improvement"],
                 coverage=coverage, train_windows=len(train), holdout_days=len({w["day"] for w in holdout}),

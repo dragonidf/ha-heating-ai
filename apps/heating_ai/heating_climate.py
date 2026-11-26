@@ -601,12 +601,18 @@ class HeatingClimate(HeatingRecovery,Hass):
         for key,name in (('recuperator_entity','recuperator'),('bath_entity','bath')):
             if key in self.cfg:
                 entity=self.cfg[key]
-                if entity:bindings[name]=dict(entity=entity)
+                if entity:
+                    previous=bindings.get(name)
+                    # A relay selection is not permission to transfer a power
+                    # binding to another physical appliance.
+                    if not isinstance(previous,dict) or previous.get('entity')!=entity:
+                        bindings[name]=dict(entity=entity)
                 else:bindings.pop(name,None)
         self.cfg['ventilation']=bindings
         if getattr(self,'runtime_ready',False) and not getattr(self,'settings_transaction',False):
             tracked=getattr(self,'equipment_listeners',{})
-            wanted={b.get('entity') for b in bindings.values() if isinstance(b,dict)}-{None}
+            wanted={b.get(key) for b in bindings.values() if isinstance(b,dict)
+                    for key in ('entity','power_entity')}-{None}
             for entity in list(tracked):
                 if entity not in wanted:self.cancel_listen_state(tracked.pop(entity))
             for entity in wanted:
