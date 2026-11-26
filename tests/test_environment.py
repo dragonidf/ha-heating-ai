@@ -84,6 +84,26 @@ class AdaptiveSolarRegressions(unittest.TestCase):
         self.assertTrue(coast_exceeds_profile(at,21.1,22.,8.,0.,model,settings))
         self.assertIsNone(replay(at,21.1,22.,8.,0.,model,[],settings,
             [dict(start=at.timestamp(),end=at.timestamp()+900)],False,3.))
+    def test_missing_observation_preserves_qualified_solar_not_pending_gain(self):
+        from heating_environment import ENVIRONMENT_POLICY_VERSION
+        t=self.at.timestamp()
+        prior=dict(coefficient=.3,validated=True,commissioned=True,days=4,
+                   factor_policy=ENVIRONMENT_POLICY_VERSION,last={'at':t-900},
+                   pending_gain={'at':t-600},observed_gain=.2,observed_at=t-600)
+        for fit in (False,True):
+            state=observe_gain(prior,t,22.,22.,8.,0.,False,DEFAULT_MODEL,
+                               self.at.tzinfo,quality=False,fit_coefficients=fit)
+            self.assertTrue(state['validated'])
+            self.assertFalse(state['observation_quality'])
+            self.assertEqual(state['coefficient'],.3)
+            self.assertEqual(state['days'],4)
+            self.assertNotIn('last',state)
+            self.assertNotIn('pending_gain',state)
+        for invalid in ({**prior,'validated':False},{**prior,'factor_policy':-1}):
+            state=observe_gain(invalid,t,22.,22.,8.,0.,False,DEFAULT_MODEL,
+                               self.at.tzinfo,quality=False,fit_coefficients=False)
+            self.assertFalse(state['validated'])
+
     def test_solar_candidate_cannot_replace_a_better_current_holdout(self):
         t=self.at.timestamp();rows=[]
         for day in range(3):

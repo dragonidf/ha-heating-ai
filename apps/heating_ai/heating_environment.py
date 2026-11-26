@@ -114,9 +114,14 @@ def observe_gain(previous, stamp, room, floor, outside, fire, heating,
                  astronomy=None,cloud_coverage=None,quality=True,settings=None,fit_coefficients=True):
     state=dict(previous or {})
     state.setdefault('days',0);state.setdefault('coefficient',0.)
+    # A temporary observation outage cannot revoke a previously qualified
+    # coefficient. Do not bridge the gap or promote a provisional estimate.
+    # An incompatible factor policy still invalidates the old certificate.
+    state['observation_quality']=bool(quality)
     if not quality:
         state.pop('last',None);state.pop('pending_gain',None)
-        state['validated']=False
+        state['validated']=bool(state.get('validated') is True and
+                                state.get('factor_policy')==ENVIRONMENT_POLICY_VERSION)
         return state
     observations=list(state.get('observations',[]))
     last=state.get('last')
