@@ -3,7 +3,7 @@
     "heating_climate.py": "b03a849c4b6dc1156f78bfd864b542fab54ec83a2598dfa000bf4a8e431233f9",
     "heating_environment.py": "78c11a44b37f9181ef8cb6669189b0b66aafe3360ccc94350616ee62207e0b6a",
     "heating_fallback.py": "da872cbf269bbae62eb2ee79dd2b4ace6fe00cce9e23f8a2a792024ac8c34389",
-    "heating_learning_windows.py": "70656e4e264d4568b2777b12b0064d11198b2f5fe4430435b4d0db3177841ba8",
+    "heating_learning_windows.py": "2ffccecad47611ff8bfb97deda4bea09bf350d846cf9f84376202fcfac6fc067",
     "heating_model.py": "3593e6410e301618922385e48e45a645c836ef6e89618d1a2ef53a8bb34b41d1",
     "heating_outages.py": "dd48e1176cc99303072cdb0052bac5493ed72d36fbcc6bbbf054d5e166465122",
     "heating_recovery.py": "7fc8732a9500d7a9f6127e709d82b93271687b8d19af8b76f05d5a373e81a13b",

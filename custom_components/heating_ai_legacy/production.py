@@ -295,7 +295,8 @@ class NativeController(HeatingClimate):
             return
         candidates=[record for record in self._learning_forecasts
                     if record["model"]==self.model and record["start"]>=monitoring["at"]
-                    and any(abs(reported-point[0])<=60 for key,point in record["points"].items()
+                    and any(abs(reported-point[0])<=min(learning.REPORT_ALIGNMENT_SECONDS,
+                            record.get("report_alignment_seconds",60)) for key,point in record["points"].items()
                             if key in ("1","3"))]
         if not candidates:
             return

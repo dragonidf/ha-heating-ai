@@ -19,6 +19,7 @@ SCHEMA = 1
 MAX_BYTES = 512 * 1024
 RETENTION = 60 * 86400
 MAX_WEATHER_AGE = 3 * 3600
+REPORT_ALIGNMENT_SECONDS = 300
 IDENTITY = ("epoch", "source", "thermal_model_version", "equipment_version", "boiler_power_mode")
 FIT_FIELDS = ("floor_air", "room_loss")
 DRIFT_LIMITS = ((7, .05), (30, .12))
@@ -589,7 +590,7 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
                 point.get("upper_temperature",point["temperature"]),low,high,zone]
     if not points:
         return None
-    last = max(p[0] for p in points.values())
+    last = min(max(p[0] for p in points.values())+REPORT_ALIGNMENT_SECONDS,known,fine[-1]["ts"])
     segments = [[max(start,s["start"]),min(last,s["end"]),s["power_kw"]]
                 for s in forecast.get("heat_segments",[]) if s["end"]>start and s["start"]<last]
     climate = {k:settings[k] for k in ("environment","thermal_model_version","ventilation_model",
@@ -599,11 +600,14 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
     climate = json.loads(_encode(climate))
     guards = []
     for point in fine:
-        if start<point["ts"]<=min(last,start+10860):
+        if start<point["ts"]<=min(last,start+10860+REPORT_ALIGNMENT_SECONDS):
             at=datetime.fromtimestamp(point["ts"]-.001,now.tzinfo)
             _,low,high,_=comfort_at(at,settings)
             guards.append([point["ts"],point["temperature"],point.get("upper_temperature"),low,high])
     return dict(start=start, issue_at=issue, provider="heating_weather_forecast",
+                report_alignment_seconds=REPORT_ALIGNMENT_SECONDS,
+                comfort_profile={k:settings[k] for k in ("target","lower","upper","night_target",
+                    "night_lower","night_upper","sleep_start","sleep_end") if k in settings},
                 weather=relevant, weather_known_until=known,
                 room=room,floor=floor,outside=outside,fire=fire, settings=climate,
                 model=dict(model),candidate=candidate,epoch=epoch,points=points,
@@ -611,10 +615,11 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
                     settings.get("equipment_version"),(settings.get("modulation_profile") or {}).get("physical_mode")])
 
 
-def _frozen_predictions(snapshot, tz, finish):
+def _frozen_predictions(snapshot, tz, finish, *, evaluated_targets=()):
     start, segments = snapshot["start"], snapshot["segments"]
     weather, settings = snapshot["weather"], snapshot["settings"]
     horizon_targets = {v[0] for v in snapshot["points"].values() if v[0]<=finish}
+    horizon_targets.update(t for t in evaluated_targets if start<t<=finish)
     guard_targets = {v[0] for v in snapshot.get("guards",()) if v[0]<=finish}
     boundaries = sorted({start,finish,*horizon_targets,*guard_targets,
                          *(start+i*300 for i in range(1,math.ceil((finish-start)/300))),
@@ -636,6 +641,32 @@ def _frozen_predictions(snapshot, tz, finish):
     return predictions
 
 
+def _aligned_forecast_point(snapshot, horizon, at, tz):
+    """Evaluate the issue-time trajectory at a real report, never interpolate the measurement."""
+    due,old,upper,low,high,zone = snapshot["points"][horizon]
+    if at==due:
+        return due,old,upper,low,high,zone
+    if not snapshot.get("report_alignment_seconds") or horizon not in ("1","3"):
+        return None
+    guards=snapshot.get("guards",())
+    if not guards or not snapshot["start"]<at<=snapshot["weather_known_until"]:
+        return None
+    times=[g[0] for g in guards]
+    index=bisect_left(times,at)
+    if index>=len(guards) or index==0:
+        return None
+    a,b=guards[index-1],guards[index]
+    if not 0<b[0]-a[0]<=301 or a[2] is None or b[2] is None:
+        return None
+    fraction=(at-a[0])/(b[0]-a[0])
+    # Only the already issued model curve is interpolated; the physical report
+    # remains untouched. Retain a conservative upper envelope of the bracket.
+    nominal=a[1]+fraction*(b[1]-a[1])
+    upper=max(a[2],b[2])
+    _,low,high,zone=comfort_at(datetime.fromtimestamp(at-.001,tz),snapshot["comfort_profile"])
+    return at,nominal,upper,low,high,zone
+
+
 def qualify_frozen(snapshot, rows, tz):
     """Evaluate the frozen plan against qualified reports and measured execution."""
     times = [r["ts"] for r in rows]
@@ -645,14 +676,24 @@ def qualify_frozen(snapshot, rows, tz):
         return []
     checks = []
     for horizon,(due,old,upper,low,high,zone) in snapshot["points"].items():
-        if due>snapshot["weather_known_until"] or due>times[-1]:
+        alignment=(min(REPORT_ALIGNMENT_SECONDS,snapshot.get("report_alignment_seconds",0))
+                   if horizon in ("1","3") else 0)
+        tolerance=alignment or 60
+        if due>snapshot["weather_known_until"] or (not alignment and due>times[-1]):
             continue
-        candidates = ((at,r) for r in rows[bisect_left(times,due-300):bisect_right(times,due+600)]
-                      if (at:=report_time(r)) is not None and abs(at-due)<=60)
-        chosen = min(candidates,key=lambda pair:abs(pair[0]-due),default=None)
+        candidates = ((at,r) for r in rows[bisect_left(times,due-max(300,tolerance)):
+                                           bisect_right(times,due+tolerance+300)]
+                      if (at:=report_time(r)) is not None and abs(at-due)<=tolerance)
+        aligned=[]
+        for at,row in candidates:
+            point=_aligned_forecast_point(snapshot,horizon,at,tz) if alignment else (due,old,upper,low,high,zone)
+            if point is not None and point[0]<=times[-1]:
+                aligned.append((abs(at-due),at,row,point))
+        chosen=min(aligned,key=lambda item:(item[0],item[1]),default=None)
         if chosen is None:
             continue
-        at,row = chosen
+        _,at,row,point=chosen
+        due,old,upper,low,high,zone=point
         steps,reasons = _continuous(rows,times,start,due,tuple(snapshot["identity"]))
         reasons |= row_reasons(row, strict=True)
         actual_kwh = sum(seconds*kw/3600 for seconds,_,kw,_,_ in steps if kw is not None)
@@ -683,12 +724,16 @@ def score_frozen(snapshot, checks, tz):
     if not checks:
         return []
     start = snapshot["start"]
-    predictions = (_frozen_predictions(snapshot,tz,max(check[1] for check in checks))
+    predictions = (_frozen_predictions(snapshot,tz,max(check[1] for check in checks),
+                                      evaluated_targets=[check[1] for check in checks])
                    if snapshot["candidate"] else {})
     results=[]
     for h,due,old,upper,low,high,zone,actual,reasons,plan_kwh,actual_kwh,plan_min,actual_min in checks:
         delta,peak_delta = predictions.get(due,(0.,0.))
         guards = [g for g in snapshot.get("guards",()) if g[0]<=due]
+        if (guards and guards[-1][0]<due and snapshot.get("report_alignment_seconds")
+                and h in (1,3) and _aligned_forecast_point(snapshot,str(h),due,tz) is not None):
+            guards.append([due,old,upper,low,high])
         trajectory_ok = bool(guards and guards[-1][0]==due
             and all(0<b-a<=301 for a,b in zip([start]+[g[0] for g in guards], [g[0] for g in guards])))
         if trajectory_ok and predictions:

@@ -287,6 +287,70 @@ class WindowsTest(unittest.TestCase):
                      manual_approval=True,evidence=True,degraded=False)["review_eligible"])
 
 
+    def asynchronous_report_fixture(self, offset):
+        from heating_learning_windows import freeze_forecast
+        model=dict(DEFAULT_MODEL,version=6,validated=True)
+        now=datetime.fromtimestamp(BASE,timezone.utc)
+        settings=dict(target=22.,lower=19.,upper=24.,equipment_version=1,
+                      modulation_profile={'physical_mode':'fixed_6'})
+        weather=[dict(ts=BASE+i*3600,temperature=5.,condition='cloudy') for i in range(7)]
+        fine=[dict(ts=BASE+i*300,temperature=21-i*.01,upper_temperature=21.1-i*.01)
+              for i in range(1,73)]
+        snapshot=freeze_forecast(now,21.,23.,5.,0.,weather,BASE-60,settings,
+            dict(curve=fine,heat_segments=[]),model,
+            {'coefficients':{'floor_air':model['floor_air']*1.001}},'boot')
+        rows=[]
+        for i in range(75):
+            stamp=BASE+i*300
+            report=next((BASE+3600*h+offset for h in (1,3)
+                         if 0<=stamp-(BASE+3600*h+offset)<300),None)
+            rows.append(dict(ts=stamp,room=20.8,room_valid=True,source='Вітальня',
+                room_reported_at=report,report_verified=report is not None,grid='on',
+                voltage_qualified=True,power_source='kws_phases',power_quality='measured',
+                power=0.,interval_kw=0.,execution='idle',manual_extra_active=False,
+                outside=5.,fire=0.,fire_valid=True,fire_active=False,shadow_ventilation=[0.,0.],
+                epoch='boot',thermal_model_version=6,equipment_version=1,boiler_power_mode='fixed_6',
+                weather_issue_at=stamp-60,solar_factor=0.,**{'return':23.}))
+        return snapshot,rows
+
+    def test_asynchronous_reports_use_actual_time_and_keep_guards(self):
+        from heating_learning_windows import qualify_frozen,score_frozen
+        for offset in (-240,-61,61,240,300):
+            with self.subTest(offset=offset):
+                snapshot,rows=self.asynchronous_report_fixture(offset)
+                checks=qualify_frozen(snapshot,rows,timezone.utc)
+                self.assertEqual(len(checks),2)
+                for h,due,old,upper,lo,hi,zone,actual,reasons,*rest in checks:
+                    self.assertEqual(due,BASE+3600*h+offset)
+                    self.assertAlmostEqual(old,21-(due-BASE)/300*.01)
+                    self.assertEqual(actual,20.8)
+                    self.assertFalse(reasons)
+                self.assertTrue(all(x['trajectory_guard_ok'] for x in
+                                    score_frozen(snapshot,checks,timezone.utc)))
+
+    def test_asynchronous_reports_do_not_extrapolate_or_change_legacy_archive(self):
+        from heating_learning_windows import qualify_frozen
+        snapshot,rows=self.asynchronous_report_fixture(301)
+        self.assertEqual(qualify_frozen(snapshot,rows,timezone.utc),[])
+        snapshot,rows=self.asynchronous_report_fixture(240)
+        snapshot.pop('report_alignment_seconds')
+        self.assertEqual(qualify_frozen(snapshot,rows,timezone.utc),[])
+        snapshot,rows=self.asynchronous_report_fixture(240)
+        snapshot['guards']=[g for g in snapshot['guards'] if not BASE+3600<=g[0]<=BASE+3900]
+        self.assertFalse(any(x[0]==1 for x in qualify_frozen(snapshot,rows,timezone.utc)))
+
+    def test_asynchronous_exact_and_early_report(self):
+        from heating_learning_windows import qualify_frozen,score_frozen
+        snapshot,rows=self.asynchronous_report_fixture(0)
+        checks=qualify_frozen(snapshot,rows,timezone.utc)
+        self.assertEqual(checks[0][1],BASE+3600)
+        self.assertEqual(checks[0][2],snapshot['points']['1'][1])
+        self.assertTrue(all(x['trajectory_guard_ok'] for x in
+                            score_frozen(snapshot,checks,timezone.utc)))
+        snapshot,rows=self.asynchronous_report_fixture(-300)
+        checks=qualify_frozen(snapshot,rows[:12],timezone.utc)
+        self.assertEqual(checks[0][1],BASE+3300)
+
     def test_frozen_weather_snapshot_rejects_lookahead_and_internal_gaps(self):
         from heating_learning_windows import freeze_forecast
         from tools.replay_adaptive_learning import MODEL, TZ
