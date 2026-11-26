@@ -35,9 +35,21 @@ jobs:
           args=()
           if [[ "$WORKLOAD" == "full-ring" ]]; then args+=(--full-ring); fi
           PYTHONHASHSEED=0 taskset -c "$CPU" python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --controlled "$RUNNER_TEMP/heating-controlled-runtime.json" --repeat 30 "${args[@]}"
+      - name: Separate CPU hotspot diagnostic
+        if: always()
+        env:
+          WORKLOAD: ${{ matrix.workload }}
+        run: |
+          test -d "$RUNNER_TEMP/heating-baseline"
+          CPU="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          args=()
+          if [[ "$WORKLOAD" == "full-ring" ]]; then args+=(--full-ring); fi
+          PYTHONHASHSEED=0 taskset -c "$CPU" python tools/benchmark_adaptive_runtime.py "$RUNNER_TEMP/heating-baseline" --profile "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/heating-runtime-profile.txt"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: controlled-runtime-raw-${{ matrix.workload }}
-          path: ${{ runner.temp }}/heating-controlled-runtime.json
+          path: |
+            ${{ runner.temp }}/heating-controlled-runtime.json
+            ${{ runner.temp }}/heating-runtime-profile.txt
           retention-days: 14
