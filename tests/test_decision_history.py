@@ -111,6 +111,46 @@ class DecisionHistoryTests(unittest.TestCase):
             # A damaged staged copy never makes existing originals unreadable.
             self.assertEqual(restored.read_snapshot(ids[1]),values[1])
 
+    def test_packed_retention_accounts_for_shared_block_and_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory,retention_days=7,max_bytes=8*1024*1024)
+            stamp=time.time()
+            values=[dict(i=i,data=list(range(500))) for i in range(2)]
+            ids=[journal.snapshot(v,stamp) for v in values]
+            result=journal.stage_snapshot_pack(ids)
+            folder=journal.directory/'packed_v1'
+            # Simulate authorized future promotion: both originals removed.
+            for key in ids:(journal.directory/(key+'.json.gz')).unlink()
+            journal._prepare(stamp)
+            self.assertEqual(journal.snapshot_count,2)
+            self.assertEqual(journal.packed_snapshot_count,2)
+            self.assertEqual(journal.used_bytes,sum(p.stat().st_size for p in journal.directory.rglob('*') if p.is_file()))
+            self.assertEqual(journal.snapshot_bytes,journal.used_bytes)
+            refreshed=stamp+6*86400
+            self.assertEqual(journal.snapshot(values[0],refreshed),ids[0])
+            self.assertFalse((journal.directory/(ids[0]+'.json.gz')).exists())
+            journal._prepare(stamp+8*86400)
+            self.assertEqual(journal.read_snapshot(ids[0]),values[0])
+            self.assertTrue((folder/(result['pack']+'.xz')).exists())
+            self.assertFalse((journal.directory/(ids[1]+'.snapshot-ref')).exists())
+            self.assertEqual(journal.snapshot_count,1)
+            journal._prepare(stamp+14*86400)
+            self.assertFalse((folder/(result['pack']+'.xz')).exists())
+            self.assertEqual(journal.used_bytes,0)
+
+    def test_packed_gc_fails_closed_on_invalid_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=DecisionJournal(directory)
+            stamp=time.time()
+            ids=[journal.snapshot(dict(i=i),stamp) for i in range(2)]
+            result=journal.stage_snapshot_pack(ids)
+            pointer=journal.directory/(ids[0]+'.snapshot-ref')
+            pointer.write_text('broken')
+            journal._prepare(stamp+16*86400)
+            self.assertTrue(journal.packed_gc_error)
+            self.assertTrue((journal.directory/'packed_v1'/(result['pack']+'.xz')).exists())
+            self.assertTrue(pointer.exists())
+
     def test_staging_failure_keeps_all_legacy_snapshots(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:

@@ -1605,6 +1605,10 @@ class DecisionJournal:
         return dict(cached,used_bytes=self.used_bytes,max_bytes=self.max_bytes,
             snapshot_bytes=self.snapshot_bytes,daily_log_bytes=self.daily_log_bytes,
             snapshot_count=self.snapshot_count,
+            packed_bytes=getattr(self,'packed_bytes',0),
+            packed_snapshot_count=getattr(self,'packed_snapshot_count',0),
+            packed_blocks=getattr(self,'packed_blocks',0),
+            packed_gc_error=getattr(self,'packed_gc_error',None),
             pressure=self.used_bytes is not None and self.used_bytes>=self.max_bytes*.9,
             retention_days=self.retention/86400,protected_days=7,last_compaction=self.last_compaction,error=self.error,
             capacity_policy='retention_headroom' if self.auto_capacity else 'fixed',
@@ -1632,8 +1636,14 @@ class DecisionJournal:
     def _prepare(self,stamp):
         self.directory.mkdir(parents=True,exist_ok=True)
         if self.used_bytes is None or stamp-self.last_rotation>3600:
+            # Reference lifetime belongs to each digest, not to its shared block.
+            # Reconcile references before legacy rotation so a newer gzip mtime
+            # can protect an older staged pointer.
+            self._rotate_packed(stamp)
             for p in self.directory.iterdir():
-                if p.is_file() and p.stat().st_mtime<stamp-self.retention:
+                if (p.is_file() and not p.name.endswith('.snapshot-ref')
+                        and not (self.packed_gc_error and p.name.endswith('.json.gz'))
+                        and p.stat().st_mtime<stamp-self.retention):
                     p.unlink()
             self.last_rotation=stamp
             # Single streaming scan: do not retain thousands of Path/stat pairs
@@ -1651,6 +1661,23 @@ class DecisionJournal:
                     self.snapshot_count+=1
                 elif path.name.endswith(('.jsonl','.jsonl.gz')):
                     self.daily_log_bytes+=info.st_size
+                elif path.name.endswith('.snapshot-ref'):
+                    self.snapshot_bytes+=info.st_size
+                    if not (self.directory/(path.name[:-13]+'.json.gz')).exists():
+                        self.snapshot_count+=1
+            folder=self.directory/'packed_v1'
+            self.packed_bytes=self.packed_snapshot_count=self.packed_blocks=0
+            if folder.is_dir():
+                for path in folder.iterdir():
+                    if path.is_file():
+                        self.packed_bytes+=path.stat().st_size
+                        self.packed_blocks+=int(path.name.endswith('.xz'))
+                for path in self.directory.glob('*.snapshot-ref'):
+                    self.packed_bytes+=path.stat().st_size
+                    self.packed_snapshot_count+=1
+                # Pointers already counted in the top-level scan.
+                block_bytes=sum(path.stat().st_size for path in folder.iterdir() if path.is_file())
+                self.used_bytes+=block_bytes;self.snapshot_bytes+=block_bytes
         # On a restart the archive may already exceed the 256 MiB initial
         # budget. Restore a safe disk-backed headroom limit *before* treating
         # that transient budget as critical; otherwise all closed days get
@@ -1711,6 +1738,19 @@ class DecisionJournal:
         raw=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')
         digest=hashlib.sha256(raw).hexdigest()
         path=self.directory/(digest+'.json.gz')
+        pointer=self.directory/(digest+'.snapshot-ref')
+        if pointer.exists():
+            try:
+                if self._packed_snapshot(digest)!=raw:raise ValueError('Packed snapshot differs')
+                # Never shorten the lifetime of existing evidence.
+                latest=max(stamp,pointer.stat().st_mtime,path.stat().st_mtime if path.exists() else 0.)
+                os.utime(pointer,(latest,latest))
+                if path.exists():os.utime(path,(latest,latest))
+                return digest
+            except (OSError,ValueError,TypeError):
+                # A damaged staged copy must not prevent safe legacy writes.
+                # Keep its reference for diagnosis; a valid gzip wins on read.
+                pass
         if not path.exists():
             self._prepare(stamp)
             compressed=gzip.compress(raw,mtime=0)
@@ -1771,13 +1811,48 @@ class DecisionJournal:
             raise ValueError('Snapshot pack checksum mismatch')
         return rows
 
-    def _packed_snapshot(self,digest):
-        pointer=self.directory/(digest+'.snapshot-ref')
+    def _pack_pointer(self,pointer):
         if pointer.stat().st_size>2048:raise ValueError('Oversized snapshot pointer')
         ref=json.loads(pointer.read_bytes())
+        if not isinstance(ref,dict):raise ValueError('Invalid snapshot pointer')
         key=ref.get('pack')
         if ref.get('schema')!=1 or not self._valid_digest(key):
             raise ValueError('Invalid snapshot pointer')
+        return key
+
+    def _rotate_packed(self,stamp):
+        folder=self.directory/'packed_v1'
+        self.packed_gc_error=None
+        if not folder.is_dir():return
+        live=set();expired=[]
+        try:
+            # Validate every pointer before deleting any shared block. On
+            # malformed evidence fail conservatively and retain all packs.
+            for pointer in self.directory.glob('*.snapshot-ref'):
+                digest=pointer.name[:-13]
+                if not self._valid_digest(digest):raise ValueError('Invalid snapshot pointer name')
+                key=self._pack_pointer(pointer)
+                legacy=self.directory/(digest+'.json.gz')
+                latest=max(pointer.stat().st_mtime,legacy.stat().st_mtime if legacy.exists() else 0.)
+                if latest>=stamp-self.retention:
+                    live.add(key)
+                    if pointer.stat().st_mtime<latest:os.utime(pointer,(latest,latest))
+                else:expired.append(pointer)
+            for pointer in expired:pointer.unlink()
+            if expired:self._sync_directory(self.directory)
+            # A valid pointer is the only shared-block ownership reference.
+            # Grace period preserves recently interrupted additive stages.
+            for path in folder.iterdir():
+                if not path.is_file() or path.stat().st_mtime>=stamp-self.retention:continue
+                key=path.name[:-10] if path.name.endswith('.pack.json') else path.name[:-3] if path.name.endswith('.xz') else None
+                if self._valid_digest(key) and key not in live:path.unlink()
+            self._sync_directory(folder)
+        except (OSError,ValueError,TypeError) as exc:
+            self.packed_gc_error=str(exc)
+
+    def _packed_snapshot(self,digest):
+        pointer=self.directory/(digest+'.snapshot-ref')
+        key=self._pack_pointer(pointer)
         folder=self.directory/'packed_v1'
         manifest=folder/(key+'.pack.json')
         blob_path=folder/(key+'.xz')
@@ -1813,7 +1888,19 @@ class DecisionJournal:
             blob=lzma.compress(b'\n'.join(rows)+b'\n',format=lzma.FORMAT_XZ,preset=1)
             if self._decode_snapshot_pack(blob,ids)!=rows:raise ValueError('Snapshot pack roundtrip mismatch')
             key=hashlib.sha256(blob).hexdigest()
-            folder=self.directory/'packed_v1';folder.mkdir(exist_ok=True)
+            # Staging is opt-in; include temporary duplicate bytes in the
+            # existing archive/disk budget without rotating source evidence.
+            folder=self.directory/'packed_v1'
+            existing_bytes=sum(p.stat().st_size for p in self.directory.iterdir() if p.is_file())
+            if folder.is_dir():existing_bytes+=sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
+            space=self.health()
+            extra=len(blob)+16384+2048*len(ids)
+            reserve=max(self.MIN_FREE_BYTES,int((space.get('disk_total_bytes') or 0)*.1))
+            if existing_bytes+extra>self.max_bytes or (space.get('free_bytes') is not None
+                    and space['free_bytes']-extra<reserve):
+                raise OSError('Insufficient staging headroom; original snapshots retained')
+            self.used_bytes=None
+            folder.mkdir(exist_ok=True)
             self._sync_directory(self.directory)
             encode=lambda v:json.dumps(v,sort_keys=True,separators=(',',':')).encode()
             manifest=encode(dict(schema=1,sha256=key,snapshots=ids))
