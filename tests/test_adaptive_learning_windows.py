@@ -513,6 +513,26 @@ class WindowsTest(unittest.TestCase):
         self.assertEqual(report["status"],"passed")
         self.assertFalse(report["comfort_credit"])
         self.assertGreaterEqual(report["metrics"]["1"]["new"]["n"],12)
+        # Monitor only the forecasts actually issued after activation with
+        # credit, against the same plan and zero-credit counterfactual.
+        from copy import deepcopy
+        active={**certificate,"comfort_credit":True,"nominal_at":BASE}
+        credited=deepcopy(archive)
+        for item in credited:
+            solar=item["snapshot"]["settings"]["environment"]["solar"]
+            solar.update(validated=True,coefficient=.5)
+            for check in item["checks"]:
+                check[2]=check[7]  # truth was generated with this exact credit
+        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc,{})["status"],"stable")
+        for item,original in zip(credited,archive):
+            for check,prior in zip(item["checks"],original["checks"]):
+                check[7]=prior[2]  # actual now follows the zero-credit trajectory
+        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc,{})["status"],
+                         "rollback_required")
+        self.assertEqual(solar_prospective_evidence({**active,"nominal_at":BASE+7*86400},credited,
+            model,timezone.utc,{})["status"],"monitoring")
+        self.assertEqual(solar_prospective_evidence({**certificate,"nominal_revoked_at":BASE},archive,
+            model,timezone.utc,{})["status"],"rejected")
         self.assertEqual(solar_prospective_evidence({**certificate,"stored_at":BASE+7*86400},
             archive,model,timezone.utc,{})["status"],"insufficient_data")
         legacy=[dict(snapshot=i["snapshot"],checks=[r[:13] for r in i["checks"]]) for i in archive]

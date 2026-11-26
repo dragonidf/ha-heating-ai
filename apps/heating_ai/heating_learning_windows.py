@@ -1008,7 +1008,10 @@ def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
     are mandatory. Never reuse the coefficient-fitting holdout as this test.
     """
     coefficient=number(certificate.get("coefficient"))
-    stored=number(certificate.get("stored_at"))
+    monitoring=certificate.get("comfort_credit") is True
+    if certificate.get("nominal_revoked_at") is not None and not monitoring:
+        return dict(status="rejected",reason="nominal_revoked",metrics={},comfort_credit=False)
+    stored=number(certificate.get("nominal_at" if monitoring else "stored_at"))
     identity=certificate.get("identity")
     if (coefficient is None or not 0<coefficient<=.8 or stored is None
             or not isinstance(identity,list) or len(identity)!=3
@@ -1021,14 +1024,16 @@ def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
         climate=snapshot.get("settings") or {}
         solar=(climate.get("environment") or {}).get("solar") or {}
         if (start<stored or snapshot.get("model")!=model or snapshot.get("identity",[])[2:]!=identity
-                or solar.get("risk_coefficient")!=coefficient or solar.get("validated")
+                or solar.get("risk_coefficient")!=coefficient
+                or bool(solar.get("validated"))!=monitoring
+                or monitoring and solar.get("coefficient")!=coefficient
                 or (climate.get("ventilation_model") or {})!=(ventilation or {})):
             continue
         checks=[r for r in item["checks"] if r[0] in (1,3) and len(r)>13
                 and r[13].get("solar_idle_qualified") is True and not set(r[8]).difference({"unexplained_gain"})]
         if not checks:
             continue
-        proposed={**snapshot,"candidate":{"solar_coefficient":coefficient}}
+        proposed={**snapshot,"candidate":{"solar_coefficient":0. if monitoring else coefficient}}
         deltas=_frozen_predictions(proposed,tz,max(r[1] for r in checks),
                                    evaluated_targets=[r[1] for r in checks])
         for check in checks:
@@ -1049,22 +1054,36 @@ def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
             delta=deltas[due][0]
             scored.append(dict(start=start,end=due,day=_local_day(start,tz),horizon=h,
                 old_error=old-actual,shadow_error=old+delta-actual,valid=True,
-                guard_ok=guarded))
+                guard_ok=guarded,comfort_miss=bool(monitoring and actual<low-.2
+                    and old>=low-.1 and old+delta<low-.1)))
     metrics={}
-    status="passed"
+    status="stable" if monitoring else "passed"
+    rollback_reason=None
     for horizon,minimum,days in ((1,12,3),(3,6,2)):
         cohort=list(independent_checks(scored,horizon))
         old,new=(_metrics([r[key] for r in cohort]) for key in ("old_error","shadow_error"))
         count_days=len({r["day"] for r in cohort})
         metrics[str(horizon)]=dict(old=old,new=new,days=count_days,
             guard_failures=sum(not r["guard_ok"] for r in cohort))
-        if len(cohort)<minimum or count_days<days:
-            if status!="rejected":status="insufficient_data"
+        misses=[r for r in cohort if r["comfort_miss"]]
+        metrics[str(horizon)]["comfort_misses"]=len(misses)
+        if monitoring and len({r["day"] for r in misses})>=2:
+            status="rollback_required";rollback_reason="measured_comfort_deficit"
+        elif len(cohort)<minimum or count_days<days:
+            if status not in ("rejected","rollback_required"):
+                status="monitoring" if monitoring else "insufficient_data"
+        elif monitoring:
+            # Here old is the actually issued credited forecast, new is
+            # its zero-credit counterfactual; do not use pre-activation checks.
+            if (old["mae"]-new["mae"]>=max(.02,.1*new["mae"])
+                    or old["p95"]-new["p95"]>.10 or old["bias"]-new["bias"]>.15 and old["bias"]>.15):
+                status="rollback_required";rollback_reason=rollback_reason or "forecast_quality_regression"
         elif (old["mae"]-new["mae"]<max(.005,.1*old["mae"]) or new["p95"]>old["p95"]
                 or abs(new["bias"])>abs(old["bias"]) or any(not r["guard_ok"] for r in cohort)):
             status="rejected"
     return dict(status=status,metrics=metrics,coefficient=coefficient,
-                issued_after=stored,comfort_credit=False)
+                issued_after=stored,comfort_credit=monitoring,rollback_reason=rollback_reason,
+                identity=identity)
 
 
 def promotion_evidence(rows):
@@ -1343,7 +1362,8 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         # Freeze a candidate while it accumulates independent future checks.
         result["solar"]["risk_eligible"]=bool(eligible and not result.get("proposed")
             and result["solar"]["status"]=="holdout_passed"
-            and (not active_solar or result["solar_prospective"]["status"]=="rejected"))
+            and (not active_solar or result["solar_prospective"]["status"]=="rejected")
+            and stamp>=active_solar.get("nominal_frozen_until",0))
         if power_context and not result.get("proposed"):
             power=qualify_power_candidate(power_context,archive,model,now.tzinfo,checkpoint.get("evidence_after",0.))
             result["power_learning"]={k:v for k,v in power.items() if k in ("status","reason","metrics")}
