@@ -3,7 +3,7 @@
     return `<button class="metric card" ${key?`data-info="${h(this.id(key))}"`:''}><span class="eyebrow">${h(title)}</span><strong>${h(value)} <small>${h(unit)}</small></strong><span class="muted">${h(detail)}</span></button>`;
   }
   row(label,value,entity='') {
-    const sources={'Фізичний режим':'power_model','Точність потужності':'power_model','Метод A':'power_model','Метод B':'power_model','Залишок на вводі':'power_model','Перевірка фаз':'power_model','Якість':'power_model','Незалежних днів':'ventilation','Причина статусу':'ventilation','Відхилення від початкового':'plan_history','Невизначені інтервали':'plan_history','Без автоматичного запиту':'plan_history','Вентиляція':'ventilation','Корисне тепло':'fireplace_active','Зміна різниці':'fireplace_status','Режим циркуляції':'fan_mode','Рівень циркуляції':'fan_status','Швидкість за планом':'fan_status','До вимкнення':'fireplace_status','Контролер':'controller','Команди':'permitted','Одноразовий запит':'restore_status'};
+    const sources={'Фізичний режим':'power_model','Точність потужності':'power_model','Метод A':'power_model','Метод B':'power_model','Залишок на вводі':'power_model','Перевірка фаз':'power_model','Якість':'power_model','Відхилення від початкового':'plan_history','Невизначені інтервали':'plan_history','Без автоматичного запиту':'plan_history','Корисне тепло':'fireplace_active','Зміна різниці':'fireplace_status','Режим циркуляції':'fan_mode','Рівень циркуляції':'fan_status','Швидкість за планом':'fan_status','До вимкнення':'fireplace_status','Контролер':'controller','Команди':'permitted','Одноразовий запит':'restore_status'};
     const key=entity||sources[label];
     return `<div class="row"><span class="muted">${h(label)}</span>${key?`<button data-info="${h(this.id(key))}"><strong>${h(value)}</strong></button>`:`<strong>${h(value)}</strong>`}</div>`;
   }
@@ -159,18 +159,8 @@
     if(field.kind==='json'&&value&&typeof value==='object')value={...value,verified:isTrue(value.verified)};
     const common=`data-system-key="${h(field.key)}" aria-label="${h(field.label)}" ${this.systemPending?'disabled':''}`;
     if(field.kind==='json')return `<textarea ${common} data-json rows="5" spellcheck="false">${h(JSON.stringify(value,null,2))}</textarea>`;
-    let options=field.options||{};
-    if(field.kind==='entity') {
-      options={'':'Не підключено'};
-      const relays=Object.entries(this.hass?.states||{}).filter(([id])=>/^(switch|fan)\./.test(id));
-      const name=([id,row])=>row.attributes?.friendly_name||id;
-      relays.sort((a,b)=>name(a).localeCompare(name(b),'uk'));
-      const names=new Map();for(const relay of relays)names.set(name(relay),(names.get(name(relay))||0)+1);
-      for(const [id,row] of relays){const label=name([id,row]);options[id]=`${label}${names.get(label)>1?' · '+id:''}${['unavailable','unknown'].includes(row.state)?' · недоступний':''}`;}
-      if(value&&!Object.hasOwn(options,value))options[value]=value+' · недоступний';
-    }
-    if(['select','entity'].includes(field.kind))return `<span class="equipment-select"><select ${common}>${Object.entries(options).map(([key,label])=>`<option value="${h(key)}" ${key===value?'selected':''}>${h(label)}</option>`).join('')}</select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>`;
-    return `<input type="text" ${common} value="${h(value)}" placeholder="switch.…" autocapitalize="none" spellcheck="false">`;
+    const options=field.options||{};
+    return `<span class="equipment-select"><select ${common}>${Object.entries(options).map(([key,label])=>`<option value="${h(key)}" ${key===value?'selected':''}>${h(label)}</option>`).join('')}</select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>`;
   }
   equipmentFields(keys) {
     return this.systemFields().filter(f=>keys.includes(f.key)).map(f=>`<label class="field"><span>${h(f.label)} <button type="button" class="system-help" data-system-help="${h(f.key)}" aria-label="Підказка: ${h(f.label)}">?</button></span>${this.equipmentControl(f)}</label>`).join('');
@@ -181,8 +171,8 @@
   }
   powerDetails() {
     const metric=(label,value,unit='')=>this.compactMetric(label,value,unit,'power_model');
-    const p=this.attrs('power_model'),v=this.attrs('ventilation'),o=p.power_observation||{},energy=p.energy||{};
-    return this.section('Потужність і вентиляція',`${this.row('Фізичний режим',({fixed_3:'3 кВт',fixed_6:'6 кВт',fixed_9:'9 кВт',auto:'Авто',unconfirmed:'Не підтверджено'})[this.state('power_model')]||'—')}${this.row('Точність потужності',p.accuracy||'—')}${this.row(o.policy==='inlet'?'Залишок на вводі':'Метод A',fmt(o.a?.watts,0)+' Вт')}${o.policy==='inlet'?this.row('Перевірка фаз',({derived_group_balance:'Основний баланс груп',nominal_inlet_stage:'Резерв за окремими приладами',consumer_unavailable:'Немає свіжого виміру споживача',phase_stage_conflict:'Розподіл не відповідає ТЕНам',physical_mode_conflict:'Не відповідає режиму котла',power_without_demand:'Немає запиту нагріву',return_model_conflict:'Неузгоджено з моделлю обратки',stage_mismatch:'Залишок не відповідає 3/6/9 кВт'})[o.reason]||'Очікуємо узгоджених даних'):this.row('Метод B',fmt(o.b?.watts,0)+' Вт · '+(o.b?.reason==='topology_unconfirmed'?'схема фаз не підтверджена':o.b?.reason||'—'))}${this.row('Якість',({measured:'Виміряна',estimated:'Оцінена',unknown:'Невідома'})[o.quality]||'—')}<div class="plan-breakdown">${metric('Виміряно',fmt(energy.measured_kwh,3),'кВт·год')}${metric('Оцінено',fmt(energy.estimated_kwh,3),'кВт·год')}${metric('Невідомий час',fmt(numeric(energy.unknown_seconds)===null?null:energy.unknown_seconds/60,1),'хв')}</div><p class="muted note">Новий облік якості від ${this.time(energy.started_at,true)}. ${o.policy==='inlet'?'Основний баланс груп і резерв за приладами — розрахунок; незалежного лічильника котла немає.':'A/B можуть мати спільні джерела; це перевірка узгодженості.'}</p>${this.row('Вентиляція',this.state('ventilation'))}${this.row('Незалежних днів',fmt(v.model?.days,0))}${this.row('Причина статусу',({insufficient_independent_days:'Бракує незалежних днів',correlated_or_constant_relays:'Стани пристроїв не дозволяють розділити вплив',heldout_improvement:'Покращення на відкладеному дні',no_heldout_improvement:'Кандидат не покращив прогноз'})[v.model?.reason]||v.model?.reason||'—')}<p class="muted note">Реле показує живлення, а не виміряну витрату повітря. Старий прогноз діє, доки кандидат не пройде перевірку.</p>`);
+    const p=this.attrs('power_model'),o=p.power_observation||{},energy=p.energy||{};
+    return this.section('Потужність',`${this.row('Фізичний режим',({fixed_3:'3 кВт',fixed_6:'6 кВт',fixed_9:'9 кВт',auto:'Авто',unconfirmed:'Не підтверджено'})[this.state('power_model')]||'—')}${this.row('Точність потужності',p.accuracy||'—')}${this.row(o.policy==='inlet'?'Залишок на вводі':'Метод A',fmt(o.a?.watts,0)+' Вт')}${o.policy==='inlet'?this.row('Перевірка фаз',({derived_group_balance:'Основний баланс груп',nominal_inlet_stage:'Резерв за окремими приладами',consumer_unavailable:'Немає свіжого виміру споживача',phase_stage_conflict:'Розподіл не відповідає ТЕНам',physical_mode_conflict:'Не відповідає режиму котла',power_without_demand:'Немає запиту нагріву',return_model_conflict:'Неузгоджено з моделлю обратки',stage_mismatch:'Залишок не відповідає 3/6/9 кВт'})[o.reason]||'Очікуємо узгоджених даних'):this.row('Метод B',fmt(o.b?.watts,0)+' Вт · '+(o.b?.reason==='topology_unconfirmed'?'схема фаз не підтверджена':o.b?.reason||'—'))}${this.row('Якість',({measured:'Виміряна',estimated:'Оцінена',unknown:'Невідома'})[o.quality]||'—')}<div class="plan-breakdown">${metric('Виміряно',fmt(energy.measured_kwh,3),'кВт·год')}${metric('Оцінено',fmt(energy.estimated_kwh,3),'кВт·год')}${metric('Невідомий час',fmt(numeric(energy.unknown_seconds)===null?null:energy.unknown_seconds/60,1),'хв')}</div><p class="muted note">Новий облік якості від ${this.time(energy.started_at,true)}. ${o.policy==='inlet'?'Основний баланс груп і резерв за приладами — розрахунок; незалежного лічильника котла немає.':'A/B можуть мати спільні джерела; це перевірка узгодженості.'}</p>`);
   }
   selectedBoilerMode() {
     return this.attrs('system_settings').values?.boiler_power_mode||this.state('power_model');
@@ -478,21 +468,20 @@
     ${this.section('Комфорт',`<div class="comfort-groups"><fieldset><legend>День</legend><div class="control-grid thirds">${fields([['target','Ціль'],['lower','Мінімум'],['upper','Максимум']])}</div></fieldset><fieldset><legend>Під час сну</legend><div class="control-grid thirds">${fields([['night_target','Ціль'],['night_lower','Мінімум'],['night_upper','Максимум']])}</div><div class="control-grid">${fields([['sleep_start','Початок сну'],['sleep_end','Кінець сну']])}</div></fieldset></div>`, 'comfort-settings')}
     ${this.section('Години нагріву',`${this.field('strategy','Планування нагріву')}<div class="control-grid">${fields([['start','Дозволено з'],['end','Дозволено до']])}</div>${this.row('Одноразовий запит',this.state('restore_status'))}`)}
     ${this.section('Циркуляція',`<div class="circulation-config"><div class="control-grid circulation-mode">${fields([['fan_control','Автоматичні команди'],['fan_mode','Режим циркуляції']])}</div><div class="control-grid thirds circulation-levels">${fields([['fan_night_limit','1 · Ніч'],['fan_speed','2 · День стандарт'],['fan_intense_speed','3 · День інтенсив']])}</div></div><details class="inline-help"><summary>Коли змінюється рівень</summary><p>${h(tuning('fan_night_start','23:00'))}–${h(tuning('fan_night_end','07:00'))} — рівень 1. Удень при інтенсивному горінні — 3, за інших умов — 2. Нічна швидкість не перевищує стандартну, інтенсивна — не нижча за неї.</p><p>Запуск при різниці від ${fmt(tuning('fire_start_delta',5))} °C; нижче ${fmt(tuning('fire_stop_delta',3))} °C протягом ${fmt(tuning('fire_cooldown_seconds',300)/60)} хв — зупинка. При різниці нижче ${fmt(tuning('fire_fast_stop_delta',4))} °C і тренді ${fmt(tuning('fire_fast_stop_slope',-2))} °C/год або нижче — зупинка без затримки.</p></details>`, 'circulation-settings','fireplace-settings')}
-    </div><details class="card additional-settings"><summary>Додаткові налаштування · котел і вентиляція</summary><div class="settings-grid">    ${this.section('Котел',`<div class="control-grid">${this.equipmentFields(['boiler_power_mode'])}${this.field('native_setpoint','Уставка штатного резерву')}${fields([['monthly_budget','Місячний орієнтир'],['session_limit','Ліміт сеансу, хв']])}</div><p class="muted note">Вкажіть режим на самому котлі. Цей вибір не перемикає обладнання.</p>${this.equipmentSave()}`)}
-    ${this.section('Вентиляція',`<div class="control-grid">${this.equipmentFields(['recuperator_entity','bath_entity'])}</div><p class="muted note">Враховувати роботу цих пристроїв у прогнозі опалення.</p>${this.equipmentSave()}`)}
+    </div><details class="card additional-settings"><summary>Додаткові налаштування котла</summary><div class="settings-grid">    ${this.section('Котел',`<div class="control-grid">${this.equipmentFields(['boiler_power_mode'])}${this.field('native_setpoint','Уставка штатного резерву')}${fields([['monthly_budget','Місячний орієнтир'],['session_limit','Ліміт сеансу, хв']])}</div><p class="muted note">Вкажіть режим на самому котлі. Цей вибір не перемикає обладнання.</p>${this.equipmentSave()}`)}
     </div></details>${this.systemSettings()}</div>`;
   }
   systemSettings() {
     const a=this.attrs('system_settings'),query=(this.settingsQuery||'').trim().toLocaleLowerCase('uk-UA');
     const matches=(...values)=>!query||values.some(value=>String(value||'').toLocaleLowerCase('uk-UA').includes(query));
-    const fields=this.systemFields().filter(f=>!['boiler_power_mode','recuperator_entity','bath_entity'].includes(f.key)&&matches(f.key,f.label,f.group,f.help));
+    const fields=this.systemFields().filter(f=>f.key!=='boiler_power_mode'&&matches(f.key,f.label,f.group,f.help));
     this.syncSystemSettings();
     const groups=[...new Set(fields.map(f=>f.group))];
     const helpButton=(key,label)=>`<button type="button" class="system-help" data-system-help="${h(key)}" aria-label="Підказка: ${h(label)}">?</button>`;
     const rows=fields.map(f=>{
       const value=Object.hasOwn(this.systemDraft,f.key)?this.systemDraft[f.key]:f.value;
       const common=`data-system-key="${h(f.key)}" aria-label="${h(f.label)}" ${this.systemPending?'disabled':''}`;
-      const control=['select','entity','json'].includes(f.kind)?this.equipmentControl(f):f.kind==='readonly'?`<span class="system-fixed">${h(value)} ${h(f.unit||'')}</span>`:
+      const control=['select','json'].includes(f.kind)?this.equipmentControl(f):f.kind==='readonly'?`<span class="system-fixed">${h(value)} ${h(f.unit||'')}</span>`:
         `<div class="number"><input type="${f.kind==='time'?'time':'number'}" ${common} value="${h(value)}" ${f.kind==='time'?'':`min="${h(f.min)}" max="${h(f.max)}" step="${h(f.step)}"`}><span>${h(f.unit||'')}</span></div>`;
       return {group:f.group,html:`<div class="system-field"><div class="system-label"><label>${h(f.label)}</label>${helpButton(f.key,f.label)}</div>${control}</div>`};
     });
@@ -534,7 +523,7 @@
   parameterEvidence(a) {
     const support=a.parameter_support||{};
     const names={floor_air:'Передача тепла в кімнату',room_loss:'Тепловтрати',floor_decay:'Охолодження підлоги',heat_gain:'Потужність нагріву підлоги'};
-    const statuses={not_identifiable_with_ventilation:'Не відокремлено від вентиляції',candidate_evaluated:'Кандидат оцінено',not_selected:'Не обрано для кандидата',insufficient_support:'Недостатньо доказів'};
+    const statuses={candidate_evaluated:'Кандидат оцінено',not_selected:'Не обрано для кандидата',insufficient_support:'Недостатньо доказів'};
     const bases={thermal_windows:'Теплові вікна',warm_idle:'Охолодження теплої підлоги',measured_heat:'Виміряний нагрів'};
     const counts=row=>row?`${fmt(row.windows,0)} / ${fmt(row.minutes,0)} / ${fmt(row.days,0)}`:'—';
     const rows=Object.entries(names).map(([key,name])=>{
@@ -627,7 +616,7 @@
       <p class="muted note">Активна модель керує опаленням. Коефіцієнти змінюються автоматично лише після незалежних перевірок 1 і 3 годин.</p>`;
     const old=a.learning_attempt;
     const historic=old?`<details class="learning-legacy"><summary>Попередній алгоритм · історія спроб</summary><p class="muted note">${h(date(old.time))} · ${h(old.reason||old.status||'Немає пояснення')}</p></details>`:'';
-    const gates={unknown_ventilation:'Невідомий стан вентиляції',circulation_or_unknown:'Циркуляція або невідомий стан',
+    const gates={
       unknown_or_unqualified_voltage:'Напруга не підтверджена',unqualified_outage:'Відключення електромережі',
       unknown_grid:'Мережу не підтверджено',unqualified_kws:'Немає виміряної потужності KWS',
       missing_kws:'Немає фактичної потужності',missing_measured_interval:'Недостатньо вимірювань між звітами',
@@ -637,10 +626,10 @@
       stale_weather:'Застарілий прогноз погоди',no_windows:'Немає придатних інтервалів',
       independent_hours:'Замало годин',independent_days:'Замало незалежних днів',
       heating_coverage:'Замало підтвердженого нагріву',idle_coverage:'Замало підтвердженого охолодження',
-      return_excitation:'Замало змін обратки',independent_holdout:'Замало незалежних перевірок',
-      unknown_ventilation_supply:'Не підтверджено живлення вентиляції'};
-    const reject=Object.entries(a.rejection_counts||{}).filter(([,count])=>numeric(count)!==null&&count>0).sort((x,y)=>y[1]-x[1]).slice(0,8);
-    const current=Array.isArray(a.current_reasons)?a.current_reasons:[];
+      return_excitation:'Замало змін обратки',independent_holdout:'Замало незалежних перевірок'};
+    const retired=new Set(['unknown_ventilation','ventilation_changed','unknown_ventilation_supply','circulation','circulation_or_unknown']);
+    const reject=Object.entries(a.rejection_counts||{}).filter(([key,count])=>!retired.has(key)&&numeric(count)!==null&&count>0).sort((x,y)=>y[1]-x[1]).slice(0,8);
+    const current=Array.isArray(a.current_reasons)?a.current_reasons.filter(key=>!retired.has(key)):[];
     const blockers=Array.isArray(a.analysis_blockers)?a.analysis_blockers:[];
     const analysis={pending:'Ще не оцінено',insufficient_data:'Даних для покращення недостатньо',
       holdout_passed:'Перевірка теплових коефіцієнтів пройдена',rejected:'Пропозицію не підтверджено',
@@ -705,7 +694,7 @@
     <details class="card model-tools"><summary>Керування моделлю й діагностика</summary><div class="model-grid">${this.section('Дії',`<p class="muted note">Штатне самонавчання застосовує тільки перевірені коефіцієнти. Окремого перемикача для нього немає.</p><details class="learning-legacy-control"><summary>Спадковий параметр ШІ · не для самонавчання</summary>${this.field('ai_auto_apply','Автозастосування старих пропозицій')}<p class="muted note">Не впливає на автоматичне навчання поточної моделі; залишено для сумісності.</p></details><div class="action-buttons">${this.field('rollback','Попередня модель')}${this.field('weather_refresh','Оновити погоду')}</div><div class="report-meta muted">Погодинні дані до ${h(this.time(f.weather_known_until,true))}</div>`, 'model-actions')}
     <details class="card modulation-details"><summary>Модуляція котла</summary>${this.section('Модуляція котла',`<p class="model-meta muted">${h(a.power_learning_status||'')} · ${fmt(p.intervals,0)} інтервалів · ${fmt(p.minutes,0)} хв</p><div class="table-scroll"><table><thead><tr><th>Обратка</th><th>Потужність</th><th>Досвід</th></tr></thead><tbody>${(p.bands||[]).map(b=>`<tr><td><button class="table-value" data-info="${h(this.id('model'))}">${fmt(b.return_min,0)}–${fmt(b.return_max,0)} °C</button></td><td><button class="table-value" data-info="${h(this.id('model'))}">${fmt(b.measured_kw)} кВт</button></td><td><button class="table-value" data-info="${h(this.id('model'))}">${fmt(b.minutes,0)} хв</button></td></tr>`).join('')||'<tr><td colspan="3">Очікуємо підтверджених сеансів.</td></tr>'}</tbody></table></div>`)}</details>
     ${this.section('Підлога й погода',`<div class="fact-grid">${facts([['Виміряна обратка',fmt(env.raw_return),'°C'],['Зовнішній прогрів',fmt(env.external_gain_c_per_hour,3),'°C/год'],['Сонячна складова',isTrue(env.solar_validated)?'Перевірена':'Навчається'],['Днів спостережень',fmt(env.solar_learning_days,0)],['Поточна похибка',fmt(a.reliability?.recent_mae,2),'°C','model'],['Корекція погоди',fmt(f.local_weather_bias),'°C','forecast']], 'environment')}</div>${isTrue(a.reliability?.degraded)?`<p class="warn pill">Точність знижена · запас ${fmt(env.upper_margin)} °C</p>`:''}`)}
-    ${this.energyComparison(true)}<details class="card execution-details"><summary>План і виконання · докладно</summary>${this.heatingPlan(true)}</details><details class="card power-diagnostics"><summary>Вимірювання потужності й вентиляція</summary>${this.powerDetails()}</details>${this.section('Журнал рішень',`<div class="journal">${[...(a.journal||[])].reverse().map(r=>`<div class="entry"><time>${h(this.time(r.time,true))}</time><p>${h(r.reason)}</p></div>`).join('')||'<p class="empty">Журнал ще порожній.</p>'}</div>`, 'model-journal')}
+    ${this.energyComparison(true)}<details class="card execution-details"><summary>План і виконання · докладно</summary>${this.heatingPlan(true)}</details><details class="card power-diagnostics"><summary>Вимірювання потужності</summary>${this.powerDetails()}</details>${this.section('Журнал рішень',`<div class="journal">${[...(a.journal||[])].reverse().map(r=>`<div class="entry"><time>${h(this.time(r.time,true))}</time><p>${h(r.reason)}</p></div>`).join('')||'<p class="empty">Журнал ще порожній.</p>'}</div>`, 'model-journal')}
     ${this.section('Стан системи',this.diagnosticSummary(),'diagnostics-card')}<section class="card model-advanced"><details><summary>Параметри й діагностика</summary>${validation}<div class="parameter-grid">${Object.entries(a.parameters||{}).map(([key,value])=>this.row(key,typeof value==='number'?fmt(value,4):value,'model')).join('')}</div><div class="fact-grid controller-facts">${facts([['Процес AppDaemon',this.state('process')==='on'?'Працює':'Не підтверджено'],['Контур керування',this.attrs('diagnostics').control_health||'Немає даних'],['Команди',this.state('permitted')==='on'?'Дозволені':'Не дозволені'],['Останній цикл',this.time(this.state('heartbeat'),true)]])}</div><p class="muted note">${h(this.controllerHealth().details)}</p><p class="muted note">Внутрішній режим Tenko не читається через зовнішній термостат. Запас тепла — еквівалент, а не температура поверхні підлоги. Зовнішній прогрів сам по собі не доводить сонячний внесок.</p><p class="muted note">Прогноз враховує енергію та модуляцію; початкова оцінка для невивчених температур ${fmt(f.power_prior_kw)} кВт. Годинна похибка не підтверджує довгий горизонт; метод, кількість і вік оцінок наведено окремо.</p></details></section></div></details>
     </div></div>`;
   }

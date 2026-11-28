@@ -8,9 +8,8 @@ import math
 import statistics
 from datetime import datetime,timedelta
 from zoneinfo import ZoneInfo
-from heating_outages import schedule_covered, covered
 
-ENVIRONMENT_POLICY_VERSION=6
+ENVIRONMENT_POLICY_VERSION=7
 
 def room_reporting_limits(samples,max_age):
     reports=sorted({finite(r.get('room_reported_at')) for r in samples if finite(r.get('room_reported_at')) is not None})
@@ -152,7 +151,6 @@ def observe_gain(previous, stamp, room, floor, outside, fire, heating,
         if (.3<=hours<=1.5 and not heating and not last['heating'] and
                 fire<2 and last['fire']<2 and daylight(now,astronomy)>.1):
             predicted=model['floor_air']*(last['floor']-last['room'])-model['room_loss']*(last['room']-last['outside'])
-            predicted-=ventilation_loss(last['room'],last['outside'],model['room_loss'],settings or {})
             residual=(room-last['room'])/hours-predicted
             # Room devices report quantised changes; never fit 15-second jumps.
             residual=max(0.,min(.8,residual))
@@ -266,8 +264,7 @@ def observe_residual(previous,stamp,room,floor,outside,model,reported_at,quality
         return state
     if last and stamp-last['at']<300:
         return state
-    context={k:settings[k] for k in ('environment','ventilation_model','ventilation_expected','thermal_model_version') if k in settings}
-    context['environment']={**context.get('environment',{}),'residual':{}}
+    context={'environment':{**settings.get('environment',{}),'residual':{}}}
     current=dict(at=stamp,reported_at=reported_at,room=room,floor=floor,outside=outside,
                  weather=weather,settings=context,model=dict(model))
     state['last']=current
@@ -295,52 +292,14 @@ def observe_residual(previous,stamp,room,floor,outside,model,reported_at,quality
 
 def forecast_step(room,floor,outside,power,fire,model,hours,when,weather,settings,upper=False):
     gain=gain_at(when,weather,settings,upper=upper)
-    loss=ventilation_loss(room,outside,model['room_loss'],settings,upper=upper,
-                          interval=(when.timestamp(),when.timestamp()+hours*3600))
     return _integrate_forecast(room,floor,outside,power,model,hours,
-                               model['fire_gain']*max(0.,fire),gain,loss)
+                               model['fire_gain']*max(0.,fire),gain)
 
 
-def _integrate_forecast(room,floor,outside,power,model,hours,fire_gain,gain,loss):
-    dr=model['floor_air']*(floor-room)-model['room_loss']*(room-outside)+fire_gain+gain-loss
+def _integrate_forecast(room,floor,outside,power,model,hours,fire_gain,gain):
+    dr=model['floor_air']*(floor-room)-model['room_loss']*(room-outside)+fire_gain+gain
     df=model['heat_gain']*power-model['floor_decay']*(floor-room)
     return room+dr*hours,floor+df*hours
-
-
-def ventilation_for_interval(settings,data,start,end):
-    """Conditional airflow based on published physical slots, not boiler mask."""
-    duty=dict(settings.get('ventilation_expected') or {})
-    topology=settings.get('ventilation_grid_only') or {}
-    if not topology or not data.get('valid') or data.get('mode')!='scheduled':
-        return duty,'empirical'
-    if end<=start or not schedule_covered(data,start,end):
-        return duty,'unknown_supply_empirical'
-    slots=data.get('slots') or []
-    off=covered(start,end,[s for s in slots if s.get('off') is True])
-    on=covered(start,end,[s for s in slots if s.get('off') is False])
-    if not (off or on):
-        return duty,'mixed_supply_empirical'
-    for key in ('recuperator','bath'):
-        if key in topology:
-            duty[key]=0. if off else topology[key].get('when_powered')
-    return duty,'published_off' if off else 'published_on'
-
-
-def prepare_ventilation(base_loss,settings,interval=None):
-    fit=settings.get('ventilation_model') or {}
-    if not fit.get('validated') or fit.get('model_version')!=settings.get('thermal_model_version'):
-        return None,None,None
-    expected=settings.get('ventilation_expected') or {}
-    warm=dict(recuperator=1.,bath=1.)
-    if interval is not None and settings.get('ventilation_grid_only'):
-        expected,basis=ventilation_for_interval(settings,settings.get('outage_schedule') or {},*interval)
-        if basis=='published_off':
-            for key in warm:
-                if key in settings['ventilation_grid_only']:warm[key]=0.
-    nominal=(_ventilation_adjustment(fit,base_loss,expected)
-             if all(finite(expected.get(k)) is not None for k in ('recuperator','bath')) else None)
-    return (nominal,_ventilation_adjustment(fit,base_loss,dict(recuperator=0.,bath=0.)),
-            _ventilation_adjustment(fit,base_loss,warm))
 
 
 def has_upper_risk(settings):
@@ -350,7 +309,7 @@ def has_upper_risk(settings):
     return bool(profile.get('power_source')=='kws_phases' and profile.get('validated') is True and
                 profile.get('conservative_upper_kw') or solar.get('observed_gain') or solar.get('validated') and solar.get('coefficient') or
                 solar.get('risk_coefficient') or
-                (environment.get('residual') or {}).get('rate',0)>0 or (settings.get('ventilation_model') or {}).get('validated'))
+                (environment.get('residual') or {}).get('rate',0)>0)
 
 
 def safe_upper(upper, zone, settings):
@@ -381,184 +340,3 @@ def anchor_weather(weather, stamp, outside):
     corrected=[dict(r,temperature=r['temperature']+bias*math.exp(-max(0.,r['ts']-stamp)/10800))
                for r in weather]
     return corrected,bias
-
-
-
-def ventilation_loss(room,outside,base_loss,settings,upper=False,interval=None):
-    """Replace the previously averaged loss, rather than adding it twice."""
-    normal,cold,warm=prepare_ventilation(base_loss,settings,interval)
-    coefficient=(cold if room>=outside else warm) if upper else normal
-    return 0. if coefficient is None else coefficient*(room-outside)
-
-
-def _ventilation_adjustment(fit,base_loss,expected):
-    # Wider scenarios use maximal/minimal duty; relay ON is not measured airflow.
-    duty={k:max(0.,min(1.,expected[k])) for k in ('recuperator','bath')}
-    effective=fit['base_room_loss']+sum(fit[k]*duty[k] for k in duty)
-    return effective-base_loss
-
-
-def effective_ventilation_duty(evidence):
-    """Observed powered duty, not commanded relay fraction; unknown is None.
-
-    Mixed duty is usable for a mean ventilation estimate, but not by the
-    constant-duty adaptive window fitter. Legacy ON without supply evidence
-    is never promoted to measured airflow. This measures powered operation,
-    not the actual volume of air exchanged.
-    """
-    if not isinstance(evidence,dict) or (finite(evidence.get('seconds')) or 0)<240:
-        return None
-    if 'effective_on_fraction' in evidence or 'effective_unknown_fraction' in evidence:
-        duty=finite(evidence.get('effective_on_fraction'))
-        return duty if duty is not None and 0<=duty<=1 and finite(evidence.get('effective_unknown_fraction'))==0 else None
-    on=finite(evidence.get('on_fraction'))
-    unknown=finite(evidence.get('unknown_fraction'))
-    # A confirmed OFF relay throughout the interval has zero powered duty,
-    # independently of supply. Preserve the separate proven-isolation path.
-    if on==0 and unknown==0:
-        return 0.
-    supply_unknown=finite(evidence.get('supply_unknown_fraction'))
-    powered=finite(evidence.get('powered_relay_on_fraction'))
-    if supply_unknown==0 and finite(evidence.get('supply_on_fraction'))==0 and powered==0:
-        return 0.
-    if unknown!=0 or on is None or not 0<=on<=1:
-        return None
-    return powered if supply_unknown==0 and powered is not None and 0<=powered<=on+.001 and powered<=1 else None
-
-
-VENTILATION_DUTY_POLICY=2
-
-
-def ventilation_binding_identity(cfg):
-    """Stable physical identity; no dependence on temporary relay/supply state."""
-    result={}
-    bindings=cfg.get('ventilation') or {}
-    confirmed=cfg.get('grid_only_ventilation_entities')
-    for key in ('recuperator','bath'):
-        binding=bindings.get(key) or {}
-        entity=binding.get('entity')
-        if not isinstance(entity,str):continue
-        power=binding.get('power_entity')
-        if isinstance(power,str):
-            provenance='supply_sensor'
-        elif binding.get('supply_kind')=='grid_only' or isinstance(confirmed,(list,tuple)) and entity in confirmed:
-            provenance='verified_grid_topology';power=None
-        else:
-            provenance='unknown';power=None
-        result[key]=dict(entity=entity,supply_provenance=provenance,power_entity=power)
-    return result
-
-
-def compatible_ventilation_fit(fit,bindings):
-    if not fit:
-        return {}
-    # Legacy fits remain readable. Do not reinterpret their averaged relay
-    # coefficient as a certified physical topology after explicit opt-in.
-    if fit.get('duty_policy')==VENTILATION_DUTY_POLICY:
-        return fit if fit.get('binding_identity')==bindings else {}
-    if any(v.get('supply_provenance')=='verified_grid_topology' for v in bindings.values()):
-        return {}
-    return fit
-
-
-def fit_ventilation(samples,model,timezone=None,bindings=None):
-    """Joint base/recuperator/bath effective loss, independent held-out days.
-
-    Unknown duty, correlated relays and daylight/fire disturbances cannot
-    identify independent coefficients. The old model remains the fallback.
-    """
-    days_present=sorted({datetime.fromtimestamp(r['ts'],timezone).date().isoformat() for r in samples if isinstance(r.get('ts'),(int,float))})
-    first=next((r for r in samples if days_present and datetime.fromtimestamp(r['ts'],timezone).date().isoformat()==days_present[-1]),{})
-    frozen=first.get('thermal_model')
-    if frozen and frozen!=model:return dict(validated=False,model_version=model.get('version'),days=0,samples=0,reason='thermal_model_changed')
-    model=frozen or model
-    records=[]
-    for index in range(6,len(samples),6):
-        chunk=samples[index-6:index+1];a,b=chunk[0],chunk[-1]
-        dt=(b['ts']-a['ts'])/3600
-        if not .4<=dt<=.6:continue
-        if any(not r.get('quality') or r.get('room_source_disagreement') or r.get('room_sources_suspect') or abs(r.get('residual_gain',0))>.1 or
-               r.get('environment_version',0)>=6 and not r.get('astronomy_valid') or
-               r.get('power_estimated') or r.get('power_quality')!='measured' or
-               r.get('grid')!='on' or r.get('fire',0)>2 or r.get('daylight_weight',1)>.1 for r in chunk):continue
-        room=finite(a.get('room'));outside=finite(a.get('outside'));floor=finite(a.get('floor_estimate'))
-        if None in (room,outside,floor) or abs(room-outside)<5:continue
-        u={};valid=True
-        for key in ('recuperator','bath'):
-            vals=[(r.get('ventilation') or {}).get(key) or {} for r in chunk[1:]]
-            if bindings is not None:
-                identity=bindings.get(key)
-                if not identity or any(v.get('duty_policy')!=VENTILATION_DUTY_POLICY
-                        or any(v.get(k)!=value for k,value in identity.items()) for v in vals):
-                    valid=False;break
-            duties=[effective_ventilation_duty(v) for v in vals]
-            if any(d is None for d in duties):valid=False;break
-            u[key]=statistics.mean(duties)
-        if not valid:continue
-        delta=room-outside;rate=(b['room']-room)/dt
-        drive=model['floor_air']*(floor-room)+model['fire_gain']*a.get('fire',0)
-        records.append(dict(x=[1.,u['recuperator'],u['bath']],y=(drive-rate)/delta,
-            day=datetime.fromtimestamp(a['ts'],timezone).date().isoformat(),dt=dt,delta=delta,drive=drive,rate=rate))
-    days=sorted(day for day in {r['day'] for r in records} if sum(r['day']==day for r in records)>=6)
-    records=[r for r in records if r['day'] in days]
-    result=dict(validated=False,model_version=model.get('version'),days=len(days),samples=len(records),reason='insufficient_independent_days')
-    if bindings is not None:
-        result.update(duty_policy=VENTILATION_DUTY_POLICY,binding_identity=bindings)
-    if len(days)<3:return result
-    train=[r for r in records if r['day']!=days[-1]];hold=[r for r in records if r['day']==days[-1]]
-    if len(train)<12 or len(hold)<6:return result
-    matrix=[[sum(r['x'][i]*r['x'][j] for r in train) for j in range(3)]+[sum(r['x'][i]*r['y'] for r in train)] for i in range(3)]
-    for i in range(3):
-        pivot=max(range(i,3),key=lambda k:abs(matrix[k][i]));matrix[i],matrix[pivot]=matrix[pivot],matrix[i]
-        if abs(matrix[i][i])<1e-7:return dict(result,reason='correlated_or_constant_relays')
-        scale=matrix[i][i];matrix[i]=[v/scale for v in matrix[i]]
-        for j in range(3):
-            if j==i:continue
-            factor=matrix[j][i];matrix[j]=[a-factor*b for a,b in zip(matrix[j],matrix[i])]
-    coefficients=[matrix[i][3] for i in range(3)]
-    if not (max(.001,model['room_loss']*.8)<=coefficients[0]<=min(.15,model['room_loss']*1.2) and all(0<=v<=.05 for v in coefficients[1:])):
-        return dict(result,reason='coefficient_bounds')
-    error=[abs((sum(v*x for v,x in zip(coefficients,r['x']))-r['y'])*r['delta']*r['dt']) for r in hold]
-    baseline=[abs((model['room_loss']-r['y'])*r['delta']*r['dt']) for r in hold]
-    accepted=statistics.mean(baseline)>.01 and statistics.mean(error)<statistics.mean(baseline)*.95 and max(error)<=max(baseline)+.02
-    return dict(result,validated=accepted,reason='heldout_improvement' if accepted else 'no_heldout_improvement',
-        base_room_loss=coefficients[0],recuperator=coefficients[1],bath=coefficients[2],
-        holdout_mae=statistics.mean(error),baseline_mae=statistics.mean(baseline),holdout_day=days[-1])
-
-
-def ventilation_expectation(samples,current):
-    """Empirical duty scenarios, not invented future switching timestamps."""
-    result={};support={}
-    for key in ('recuperator','bath'):
-        rows=[(r.get('ventilation') or {}).get(key) or {} for r in samples[-288:]]
-        device=current.get(key) or {}
-        entity=device.get('entity')
-        known=[d for v in rows if (not entity or v.get('entity')==entity)
-               and (d:=effective_ventilation_duty(v)) is not None]
-        result[key]=statistics.mean(known) if len(known)>=12 else None
-        support[key]=dict(intervals=len(known),unknown_fraction=1-len(known)/len(rows) if rows else 1,
-            current=device.get('relay','unknown'),effective_duty=device.get('effective_duty'),
-            future='empirical_powered_duty' if len(known)>=12 else 'unknown')
-    return result,support
-
-
-def ventilation_powered_expectation(samples,current):
-    """Grid-only duty conditional on confirmed supply ON, not all-day duty."""
-    result={}
-    for key in ('recuperator','bath'):
-        device=current.get(key) or {}
-        if device.get('supply_provenance')!='verified_grid_topology' or not device.get('entity'):
-            continue
-        values=[]
-        for sample in samples[-288:]:
-            row=(sample.get('ventilation') or {}).get(key) or {}
-            if (row.get('entity')!=device['entity'] or finite(row.get('supply_on_fraction'))!=1.
-                    or finite(row.get('supply_unknown_fraction'))!=0.
-                    or finite(row.get('grid_on_fraction'))!=1.
-                    or finite(row.get('grid_unknown_fraction'))!=0.):
-                continue
-            duty=effective_ventilation_duty(row)
-            if duty is not None:values.append(duty)
-        result[key]=dict(entity=device['entity'],when_powered=statistics.mean(values) if len(values)>=12 else None,
-                         intervals=len(values))
-    return result

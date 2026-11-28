@@ -1,4 +1,4 @@
-"""Build V1 fireplace/fan/ventilation SHADOW input without any device calls."""
+"""Build V1 fireplace/fan SHADOW input without any device calls."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -63,14 +63,6 @@ def snapshot(hass: Any, roles: dict, sources: dict,
         standard=normal,night_limit=night,intense=intense,
         night_window=night_window,backup_qualified=False,
     )
-    ventilation={}
-    for role in ("recuperator","bath"):
-        source=sources.get(role)
-        raw=_fresh(hass,source,now,600)
-        ventilation[role] = (
-            raw.state if raw is not None and raw.state in ("on","off")
-            else "unknown"
-        )
     return result.state, dict(
         mode="SHADOW_FAN",
         state=result.phase,
@@ -82,8 +74,6 @@ def snapshot(hass: Any, roles: dict, sources: dict,
         manual_mode=mode,
         enabled=enabled,
         supply_qualified=safety.get("grid") is True,
-        recuperator=ventilation["recuperator"],
-        bathroom=ventilation["bath"],
         physical_commands_enabled=False,
         commands_sent=0,
     )

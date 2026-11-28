@@ -143,7 +143,9 @@ def measure_core(app, tick, mode, root, *, full_ring=False, profile=False, group
     output["resident_after_tick"]=rss_kib()
     for i in range(groups+1) if active else ():
         wall,cpu=perf_counter(),process_time()
-        args=(sidecar,recent,(),MODEL,{},{},now,True)
+        from inspect import signature
+        legacy_context=({},) if "ventilation" in signature(adaptive.run_learning).parameters else ()
+        args=(sidecar,recent,(),MODEL,*legacy_context,{},now,True)
         result=(profiles["training"].runcall(adaptive.run_learning,*args) if profile else
                 adaptive.run_learning(*args))
         elapsed=(process_time()-cpu,perf_counter()-wall)

@@ -168,7 +168,7 @@ class HeatingAIV1Flow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
-    """Configure voltage qualification and confirmed ventilation supply topology."""
+    """Configure voltage qualification and boiler isolation."""
 
     def __init__(self, config_entry):
         self._entry = config_entry
@@ -184,21 +184,14 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
                     data_schema=self._schema(user_input),
                     errors={"base": "invalid_voltage_band"},
                 )
-            grid_only = user_input.get("grid_only_ventilation_entities",
-                                       self._entry.options.get("grid_only_ventilation_entities", []))
-            if (not isinstance(grid_only, list) or len(grid_only)>2 or
-                    any(not isinstance(entity, str) or not entity.startswith(("switch.", "fan."))
-                        for entity in grid_only) or len(set(grid_only))!=len(grid_only)):
-                return self.async_show_form(step_id="init", data_schema=self._schema(user_input),
-                                            errors={"base": "invalid_ventilation_topology"})
             isolated=user_input.get("boiler_outage_isolation_relay",
                                       self._entry.options.get("boiler_outage_isolation_relay",""))
             if not isinstance(isolated,str) or isolated and not re.fullmatch(r"switch\.[a-z0-9_]+",isolated):
                 return self.async_show_form(step_id="init",data_schema=self._schema(user_input),
                                             errors={"base":"invalid_boiler_isolation"})
             return self.async_create_entry(title="", data={
+                **self._entry.options,
                 "boiler_outage_isolation_relay": isolated,
-                "grid_only_ventilation_entities": grid_only,
                 "min_voltage_v": minimum,
                 "max_voltage_v": maximum,
                 "voltage_recovery_seconds": recovery,
@@ -213,10 +206,6 @@ class HeatingAIV1OptionsFlow(config_entries.OptionsFlow):
         return vol.Schema({
             vol.Optional("boiler_outage_isolation_relay",
                          default=current.get("boiler_outage_isolation_relay","")): str,
-            vol.Optional("grid_only_ventilation_entities",
-                         default=current.get("grid_only_ventilation_entities", [])):
-                selector.EntitySelector(selector.EntitySelectorConfig(
-                    domain=["switch", "fan"], multiple=True)),
             vol.Required("min_voltage_v", default=current.get("min_voltage_v", 190)):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=140, max=235, step=1,

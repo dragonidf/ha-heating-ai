@@ -61,36 +61,6 @@ class CoverageAuditTests(unittest.TestCase):
         self.assertGreaterEqual(result['max_gap_seconds'],1800)
 
 
-class VentilationAuditTests(unittest.TestCase):
-    def app(self):
-        app=HeatingClimate();app.cfg=dict(ventilation=dict(recuperator=dict(entity='switch.recuperator'),
-            exhaust=dict(entity='switch.exhaust',power_entity='binary_sensor.exhaust_supply')))
-        app.states={'switch.recuperator':'on','switch.exhaust':'on','binary_sensor.exhaust_supply':'on'}
-        app.get_state=lambda entity:app.states.get(entity,'unknown');app.grid_state=lambda:'off'
-        return app
-    def test_on_off_unknown_and_supply_are_independent_fractional_inputs(self):
-        app=self.app();app.ventilation_tick(1000.)
-        for t in range(1015,1301,15):
-            if t==1105:app.states['switch.recuperator']='off'
-            if t==1210:app.states['switch.recuperator']='unavailable'
-            app.ventilation_tick(float(t))
-        rows=app.ventilation_sample(1300.)
-        self.assertEqual(rows['recuperator']['seconds'],300.)
-        self.assertAlmostEqual(rows['recuperator']['on_fraction'],.35)
-        self.assertAlmostEqual(rows['recuperator']['unknown_fraction'],.3)
-        self.assertIsNone(rows['recuperator']['powered_relay_on_fraction'])
-        self.assertEqual(rows['recuperator']['supply_unknown_fraction'],1.)
-        self.assertEqual(rows['exhaust']['powered_relay_on_fraction'],1.)
-        self.assertEqual(rows['exhaust']['grid_on_fraction'],0.)
-    def test_restart_and_long_unobserved_gap_do_not_integrate_cached_on_as_truth(self):
-        app=self.app();app.ventilation_tick(1000.);app.ventilation_tick(1600.)
-        row=app.ventilation_sample(1600.)['recuperator']
-        self.assertEqual(row['unknown_fraction'],1.);self.assertEqual(row['on_fraction'],0.)
-        restarted=self.app();restarted.ventilation_tick(2000.)
-        row=restarted.ventilation_sample(2000.)['recuperator']
-        self.assertEqual(row['seconds'],0.)
-        self.assertIsNone(row['on_fraction'])
-
 
 class LongHorizonAuditTests(unittest.TestCase):
     def app(self):

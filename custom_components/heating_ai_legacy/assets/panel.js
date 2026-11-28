@@ -147,7 +147,7 @@ class HeatingV1NativePanel extends HTMLElement {
       '<p class="note" id="native-status"></p></section>' +
       '<section class="notice" id="voltage-notice" aria-live="polite" hidden></section>' +
       '<section class="notice">V1+ поки працює лише в режимі спостереження. ' +
-      'Команди котлу, каміну та вентиляції вимкнені.</section></main>';
+      'Команди обладнанню вимкнені.</section></main>';
     // The main forecast belongs directly under room and target, not
     // below eight separate status cards on a narrow phone screen.
     const primary = this.shadowRoot.querySelector('.stats');

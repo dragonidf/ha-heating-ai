@@ -13,6 +13,7 @@ import inspect
 import logging
 import multiprocessing
 from pathlib import Path
+import re
 import site
 import threading
 import time
@@ -29,6 +30,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _POOL_CLOSE_TIMEOUT = 15
 _SERIAL_CLOSE_TIMEOUT = 5
+_ENTITY_ID = re.compile(r"[a-z_0-9]+\.[a-z_0-9]+")
 
 
 def _terminate_process_pool(pool):
@@ -60,6 +62,8 @@ async def _close_process_pool(hass, pool):
 
 class Hass:
     """The small I/O surface used by V1; no AppDaemon dependency."""
+
+    partial_tick_snapshot = True
 
     def __init__(self, hass, args):
         self.hass = hass
@@ -191,7 +195,16 @@ class Hass:
             def record(state):
                 return dict(state.as_dict(), last_reported=state.last_reported.isoformat())
             if entity_id is None:
-                return {s.entity_id: record(s) for s in self.hass.states.async_all()}
+                # Only the controller's bindings and published states enter
+                # the shared tick snapshot. Rare dynamic inputs are cached on
+                # first use by HeatingClimate.get_state.
+                entity_ids = self._published.copy()
+                for value in getattr(self, "cfg", self.args).values():
+                    values = value if isinstance(value, (list, tuple)) else (value,)
+                    entity_ids.update(item for item in values
+                                      if isinstance(item, str) and _ENTITY_ID.fullmatch(item))
+                return {key: record(row) if (row := self.hass.states.get(key)) is not None else None
+                        for key in entity_ids}
             row = self.hass.states.get(entity_id)
             if row is None:
                 return default

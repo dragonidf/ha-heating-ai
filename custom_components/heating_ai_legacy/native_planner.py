@@ -130,7 +130,7 @@ def provisional_plan(snapshot: dict[str, Any]) -> dict[str, Any]:
             day_price=None, night_price=None,
         )
         # All variables required by the original optimizer are immutable
-        # local numerical data. Ignore unverified solar/ventilation claims.
+        # local numerical data. Ignore unverified solar claims.
         result = plan(now,room,floor,outside,fire,coefficients,
                       normalized,reviewed,power_kw=watts)
         if not isinstance(result, dict):
@@ -157,7 +157,7 @@ def provisional_plan(snapshot: dict[str, Any]) -> dict[str, Any]:
             "computed_at": at,
             "source_assumptions": [
                 "nominal_thermal_model", "no_verified_solar_gain",
-                "ventilation_not_reproduced", "not_executable",
+                "not_executable",
             ],
         }
     except (KeyError, TypeError, ValueError, OverflowError):

@@ -548,7 +548,6 @@ class HeatingRecovery:
             record=dict(physical_mode=self.cfg.get('boiler_power_mode','unconfirmed'),
                 equipment_version=self.memory.get('equipment_version',0),
                 power_observation=observation,energy_quality=self.memory.get('power_observation_ledger'),
-                ventilation=getattr(self,'ventilation_states',{}),
                 execution_evidence=('physically_confirmed_by_balance' if command.get('action')=='heat' and command.get('status')=='confirmed' else 'unrequested_consumption') if actual is not None and actual>=500 and getattr(self,'power_quality','unknown')=='measured' else 'acknowledged' if command.get('status')=='confirmed' else command.get('status','calculated'),
                 event=event,timezone=str(self.climate_tz),app_version=getattr(self,'release_version',None),
                 plan_id=forecast.get('plan_id') or reference.get('plan_id'),
@@ -723,7 +722,7 @@ class HeatingRecovery:
                 if observed and observed['valid']:
                     results.append(dict(common,kind='measured_inputs',error=observed['room']-room,valid=True,
                         actual_request_minutes=observed['request_seconds']/60,
-                        note='Actual energy/weather/fire; unmeasured solar and ventilation remain disturbances'))
+                        note='Actual energy/weather/fire; unmeasured gains remain disturbances'))
                 for why in reasons:rejected[why]=rejected.get(why,0)+1
             elif not prediction['valid'] and not (observed and observed['valid']):
                 for why in reasons:rejected[why]=rejected.get(why,0)+1

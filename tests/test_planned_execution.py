@@ -8,7 +8,7 @@ from heating_model import DEFAULT_MODEL
 
 
 class PlannedExecutionTests(unittest.TestCase):
-    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None,probe_available=True,stored_floor=None,grid_sequence=None,real_planner=False,mode='Автоматичне керування'):
+    def cycle(self, planned=True, room=21.5, peak=21.5, overheat=False, grid='on', once=False,weather_missing=42,outage_sequence=None,weather_age=None,missing_policy=None,measured_power=0,reserve_prior=None,probe_available=True,stored_floor=None,grid_sequence=None,real_planner=False,mode='Автоматичне керування',migration_margin=None,hour_errors=()):
         app=HeatingClimate()
         self.created_app=app
         app.control_power_prior=reserve_prior
@@ -19,6 +19,9 @@ class PlannedExecutionTests(unittest.TestCase):
         app.cfg=dict(allow_actuation=True,return_heartbeat=[],monthly_energy='monthly',night_target='night')
         if missing_policy:app.cfg['outage_missing_policy']=missing_policy
         app.memory=dict(modulation_profile=dict(bands=[],intervals=0,minutes=0))
+        if migration_margin is not None:
+            app.memory['house_loss_migration']={'upper_margin':migration_margin}
+        app.memory['hour_errors']=list(hour_errors)
         if stored_floor is not None:app.memory['floor_observer']=dict(at=at.timestamp()-900,estimate=stored_floor,power_kw=0.)
         app.model=dict(DEFAULT_MODEL,validated=True,version=4)
         app.samples=[];app.weather=[];app.power_source='balance';app.next_compute=0
@@ -76,6 +79,16 @@ class PlannedExecutionTests(unittest.TestCase):
         self.forecast_status=app.published['sensor.heating_forecast']
         self.outage_status=app.published['sensor.heating_outage_schedule']
         return actions,app.published['sensor.heating_controller']
+
+    def test_migrated_model_keeps_existing_reserve_until_new_accuracy_is_reliable(self):
+        for errors, reserve, confirmed in (([],.2,False),([.1]*6,.2,False),
+                                           ([.1]*12,0.,True),([.36]*12,.2,False)):
+            with self.subTest(errors=len(errors), confirmed=confirmed):
+                self.cycle(migration_margin=.2,hour_errors=errors)
+                self.assertEqual(self.planner_settings['upper_margin'],reserve)
+                model=self.created_app.published['sensor.heating_model']
+                self.assertEqual(model['state']=='Є короткострокові перевірки',confirmed)
+                self.assertEqual(self.created_app.published['sensor.heating_coast_peak']['validated'],confirmed)
 
     def test_midnight_session_runs_at_night_target(self):
         actions,status=self.cycle()
