@@ -208,7 +208,7 @@ def planner_snapshot(hass: Any, baseline: dict[str, Any],
             "physical_boiler_mode": boiler_power_mode,
             "floor_is_derived_heat_storage": True,
             "fireplace_is_provisional": True,
-            "solar_and_ventilation_not_reproduced": True,
+            "solar_not_reproduced": True,
             "electricity_next_24h_qualified": (
                 settings["outage_schedule"]["valid"] and
                 (settings["outage_schedule"]["known_until"] or 0)

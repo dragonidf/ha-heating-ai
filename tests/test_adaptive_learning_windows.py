@@ -83,9 +83,9 @@ class StorageLearningTest(unittest.TestCase):
 
     def test_storage_fit_rejects_weak_support_and_conflicting_later_days(self):
         from heating_learning_windows import _storage_candidate,evaluate_windows
-        self.assertIsNone(_storage_candidate(self.windows('heat_gain',days=2),self.model,self.model,None))
+        self.assertIsNone(_storage_candidate(self.windows('heat_gain',days=2),self.model,self.model))
         self.assertIsNone(_storage_candidate([w for w in self.windows('heat_gain') if w['heat']],
-                                             self.model,self.model,None))
+                                             self.model,self.model))
         rows=self.windows('heat_gain')
         rows[-8:]=self.windows('heat_gain',shift=-.01)[-8:]
         result=evaluate_windows(rows,self.model)
@@ -94,6 +94,41 @@ class StorageLearningTest(unittest.TestCase):
 
 
 class WindowsTest(unittest.TestCase):
+    def test_forecast_uses_the_fitted_house_loss_with_or_without_a_legacy_ventilation_fit(self):
+        from heating_environment import forecast_step
+        from heating_model import ForecastContext
+
+        now = datetime.fromtimestamp(BASE, timezone.utc)
+        model = dict(DEFAULT_MODEL, room_loss=.008192, version=6)
+        fit = dict(validated=True, model_version=6, base_room_loss=.005,
+                   recuperator=.02, bath=.01)
+        for duty in ({}, {"recuperator": 0., "bath": 0.}, {"recuperator": 1., "bath": 1.}):
+            for upper in (False, True):
+                with self.subTest(duty=duty, upper=upper):
+                    settings = dict(thermal_model_version=6, ventilation_model=fit,
+                                    ventilation_expected=duty)
+                    expected = (21.-.008192*16, 21.)
+                    self.assertEqual(forecast_step(21.,21.,5.,0.,0.,model,1.,now,[],settings,upper),
+                                     expected)
+                    self.assertEqual(ForecastContext(now,[],5.,model,settings).integrate(
+                        21.,21.,5.,0.,0.,1.,0.), expected)
+
+    def test_hourly_reports_survive_retired_ventilation_and_circulation_inputs(self):
+        for duty, stale_reasons in (
+            (None, ("unknown_ventilation",)),
+            ([1., 0.], ()),
+            ([0., 1.], ("circulation",)),
+        ):
+            with self.subTest(duty=duty, stale_reasons=stale_reasons):
+                rows = samples(minutes=60)
+                for i, row in enumerate(rows):
+                    row.update(shadow_ventilation=duty if i < 6 else None,
+                               shadow_reasons=stale_reasons, circulation_active=i % 2 == 0)
+                observed = build_observation_windows(rows, timezone.utc)
+                self.assertEqual(observed["unique_primary_reports"], 2)
+                self.assertEqual(observed["eligible_minutes"], 60.)
+                self.assertEqual(len(observed["windows"]), 1)
+
     def test_rolling_drift_blocks_small_changes_when_path_budget_is_used(self):
         from heating_learning_windows import promotion_allowed
         now = datetime.fromtimestamp(BASE + 8*86400, timezone.utc)
@@ -106,29 +141,6 @@ class WindowsTest(unittest.TestCase):
                                            {"changes_history":history},now))
         self.assertTrue(promotion_allowed(active,active,proposed,{"status":"accepted"},
                                           {"changes_history":history[:3]},now))
-
-    def test_qualified_ventilation_does_not_change_unidentifiable_room_loss(self):
-        from heating_model import step
-        model=dict(DEFAULT_MODEL,version=6,validated=True)
-        ventilation=dict(validated=True,model_version=6,base_room_loss=.015,
-                         recuperator=.002,bath=.001)
-        truth=dict(model,floor_air=model["floor_air"]*1.01,room_loss=.017)
-        windows=[]
-        for day in range(6):
-            for j,kw in enumerate((0.,4.)):
-                room,floor=21.,22.+4*j
-                start=BASE+day*86400+j*7200
-                steps=[]
-                for i in range(12):
-                    steps.append([300,3.+day,kw,0.,floor])
-                    room,floor=step(room,floor,3.+day,kw,0.,truth,1/12)
-                windows.append(dict(start=start,end=start+3600,day=f"2026-11-{day+1:02}",
-                    room_start=21.,room_end=room,floor=steps[0][4],steps=steps,
-                    heat=3600 if kw else 0,idle=0 if kw else 3600,sun=0.,
-                    equipment=[6,1,"fixed_6"],vent=[1.,0.]))
-        report=evaluate_windows(windows,model,ventilation)
-        self.assertEqual(report["status"],"holdout_passed")
-        self.assertEqual(report["coefficients"],{"floor_air":truth["floor_air"]})
 
     def test_verified_manual_session_is_physics_only(self):
         from heating_learning_windows import _continuous, IDENTITY
@@ -147,52 +159,13 @@ class WindowsTest(unittest.TestCase):
         rows[5]["manual_measurement_id"] = BASE+10
         self.assertFalse(build_observation_windows(rows, timezone.utc)["windows"])
 
-    def test_off_ventilation_without_supply_can_be_observed(self):
-        from heating_learning_windows import ventilation_current_qualified, ventilation_interval_duty
-        off={"recuperator":{"relay":"off","supply":"unknown"},
-             "bath":{"relay":"off","supply":"unknown"}}
-        self.assertTrue(ventilation_current_qualified(off))
-        self.assertFalse(ventilation_current_qualified({
-            **off,"recuperator":{"relay":"on","supply":"unknown"}}))
-        self.assertTrue(ventilation_current_qualified({
-            **off,"recuperator":{"relay":"on","supply":"on"}}))
-        idle=dict(seconds=300,on_fraction=0.,unknown_fraction=0.,supply_unknown_fraction=1.,
-                  powered_relay_on_fraction=None,supply_on_fraction=0.)
-        self.assertEqual(ventilation_interval_duty(idle),0.)
-        for changed in ({"on_fraction":1.},{"unknown_fraction":.05},
-                        {"on_fraction":.5},{"seconds":100}):
-            self.assertIsNone(ventilation_interval_duty({**idle,**changed}))
-        active=dict(seconds=300,on_fraction=1.,unknown_fraction=0.,supply_unknown_fraction=0.,
-                    powered_relay_on_fraction=1.,supply_on_fraction=1.)
-        self.assertEqual(ventilation_interval_duty(active),1.)
-        self.assertIsNone(ventilation_interval_duty({**active,"supply_unknown_fraction":.2}))
-        self.assertIsNone(ventilation_interval_duty({**active,"powered_relay_on_fraction":.5}))
-
-    def test_verified_zero_ventilation_supply_with_unavailable_relay(self):
-        from heating_learning_windows import ventilation_current_qualified, ventilation_interval_duty
-        bath={"relay":"off","supply":"unknown"}
-        for relay in ("on","off","unavailable","unknown",None):
-            self.assertTrue(ventilation_current_qualified({
-                "recuperator":{"relay":relay,"supply":"off"}, "bath":bath}))
-        for supply in ("on","unknown",None):
-            self.assertFalse(ventilation_current_qualified({
-                "recuperator":{"relay":"unavailable","supply":supply}, "bath":bath}))
-        zero=dict(seconds=300,on_fraction=0.,unknown_fraction=1.,
-                  supply_unknown_fraction=0.,supply_on_fraction=0.,
-                  powered_relay_on_fraction=0.)
-        self.assertEqual(ventilation_interval_duty(zero),0.)
-        for changed in ({"supply_unknown_fraction":.1},{"supply_on_fraction":.1},
-                        {"powered_relay_on_fraction":.1},{"powered_relay_on_fraction":None},
-                        {"supply_on_fraction":None},{"seconds":100}):
-            self.assertIsNone(ventilation_interval_duty({**zero,**changed}))
-
     def test_blackout_evaluates_history_without_promoting_model(self):
         from tools.replay_adaptive_learning import MODEL, TZ, fixture
         rows=fixture(8)
         now=datetime.fromtimestamp(rows[-1]["ts"]+300,TZ)
         with TemporaryDirectory() as folder:
             path=Path(folder)/"online_learning_v1.json"
-            result=run_learning(path,rows,[],MODEL,{},{},now,False)
+            result=run_learning(path,rows,[],MODEL,{},now,False)
             self.assertEqual(result["status"],"frozen")
             self.assertEqual(result["reason"],"current_conditions_unqualified")
             self.assertNotIn("proposed",result)
@@ -216,7 +189,7 @@ class WindowsTest(unittest.TestCase):
     def test_republish_or_bad_intermediate_evidence_breaks_window(self):
         invalid = [
             dict(report_verified=False), dict(manual_extra_active=True), dict(power_quality="estimated"),
-            dict(grid="off"), dict(voltage_qualified=False), dict(shadow_ventilation=None),
+            dict(grid="off"), dict(voltage_qualified=False),
             dict(room_source_disagreement=True), dict(equipment_version=2), dict(epoch="reboot"),
             dict(fire_valid=False), dict(weather_issue_at=BASE+86400), dict(power=None),
         ]
@@ -232,7 +205,7 @@ class WindowsTest(unittest.TestCase):
             row.update(circulation_active=True,circulation_role="internal_redistribution")
         self.assertEqual(len(build_observation_windows(rows,timezone.utc)["windows"]),1)
         for field,value in (("fire_active",True),("fire_valid",False),
-                            ("room_source_disagreement",True),("circulation_role","unknown")):
+                            ("room_source_disagreement",True),("fire",1.)):
             altered=[dict(row) for row in rows]
             altered[5][field]=value
             self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"])
@@ -249,7 +222,7 @@ class WindowsTest(unittest.TestCase):
         self.assertEqual(result["eligibility_counts"]["solar_only_windows"],1)
         self.assertEqual(evaluate_windows(result["windows"],dict(DEFAULT_MODEL,version=6))["status"],"insufficient_data")
         for change in (dict(solar_factor=0.),dict(power=6.),dict(fire_active=True),
-                       dict(room_source_disagreement=True),dict(shadow_ventilation=None),
+                       dict(room_source_disagreement=True),
                        dict(power_quality="estimated"),dict(grid="unknown")):
             altered=[{**row,**change} for row in rows]
             self.assertFalse(build_observation_windows(altered,timezone.utc)["windows"],change)
@@ -284,7 +257,7 @@ class WindowsTest(unittest.TestCase):
         self.assertIn("unqualified_outage",row_reasons(rows[0],strict=True))
         for change in (dict(zero_heat_interval_verified=False),dict(zero_heat_provenance=None),
                        dict(grid="unknown"),dict(power=3.),dict(power_quality="contradictory"),
-                       dict(thermal_inputs_ok=False),dict(shadow_ventilation=None),
+                       dict(thermal_inputs_ok=False),
                        dict(fire_active=True),dict(shadow_reasons=["tick_gap_or_restart"])):
             altered=[dict(row) for row in rows]
             altered[5].update(change)
@@ -492,21 +465,6 @@ class WindowsTest(unittest.TestCase):
         self.assertEqual(result,expected)
         clock.fromtimestamp.assert_not_called()
 
-    def test_verified_off_legacy_relay_does_not_read_irrelevant_supply_values(self):
-        from heating_environment import effective_ventilation_duty
-        class Evidence(dict):
-            def get(self,key,default=None):
-                if key in ("supply_unknown_fraction","powered_relay_on_fraction","supply_on_fraction"):
-                    raise AssertionError("Supply is irrelevant to a confirmed OFF relay")
-                return super().get(key,default)
-        self.assertEqual(effective_ventilation_duty(Evidence(seconds=300,on_fraction=0.,
-                         unknown_fraction=0.)),0.)
-        self.assertIsNone(effective_ventilation_duty(dict(seconds=300,on_fraction=0.,
-                         unknown_fraction=1.)))
-        self.assertEqual(effective_ventilation_duty(dict(seconds=300,on_fraction=None,
-                         unknown_fraction=1.,supply_unknown_fraction=0.,
-                         supply_on_fraction=0.,powered_relay_on_fraction=0.)),0.)
-
     def test_solar_missing_condition_future_issue_and_missing_geometry(self):
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Kyiv")
@@ -532,16 +490,16 @@ class WindowsTest(unittest.TestCase):
             state=root/"state.json"
             ledger=root/"energy.json"
             for file in (state,ledger): file.write_bytes(b"legacy")
-            result=run_learning(path,rows,[],MODEL,{},{},now,False)
+            result=run_learning(path,rows,[],MODEL,{},now,False)
             self.assertEqual(result["status"],"frozen")
             count=len(load_evidence(path)["windows"])
-            run_learning(path,rows,[],MODEL,{},{},now,False)
+            run_learning(path,rows,[],MODEL,{},now,False)
             self.assertEqual(len(load_evidence(path)["windows"]),count)
             self.assertGreater(count,0)
             self.assertEqual(state.read_bytes(),b"legacy")
             self.assertEqual(ledger.read_bytes(),b"legacy")
             path.write_bytes(b"broken")
-            self.assertEqual(run_learning(path,rows,[],MODEL,{},{},now,True)["reason"],
+            self.assertEqual(run_learning(path,rows,[],MODEL,{},now,True)["reason"],
                              "learning_storage_or_data_error")
             self.assertEqual(path.read_bytes(),b"broken")
 
@@ -584,7 +542,7 @@ class WindowsTest(unittest.TestCase):
                 weather_issue_at=stamp-60,solar_factor=0.,**{'return':23.}))
         return snapshot,rows
 
-    def test_frozen_forecast_keeps_issued_ventilation_topology_and_relevant_slots(self):
+    def test_frozen_forecast_drops_legacy_airflow_and_copies_environment_at_issue(self):
         from copy import deepcopy
         from heating_learning_windows import freeze_forecast
         snapshot,rows=self.asynchronous_report_fixture(0)
@@ -592,6 +550,7 @@ class WindowsTest(unittest.TestCase):
         now=datetime.fromtimestamp(start,timezone.utc)
         settings=dict(target=22.,lower=19.,upper=25.,equipment_version=1,
             modulation_profile={"physical_mode":"fixed_6"},
+            environment={"solar":{"coefficient":.2}},
             ventilation_grid_only={"recuperator":{"entity":"switch.recup","when_powered":.8}},
             ventilation_expected={"recuperator":.4,"bath":.1},
             outage_schedule=dict(valid=True,mode="scheduled",slots=[
@@ -604,9 +563,9 @@ class WindowsTest(unittest.TestCase):
         frozen=freeze_forecast(now,21.,23.,5.,0.,weather,start-60,settings,forecast,
                                snapshot["model"],None,"boot")
         self.assertIsNotNone(frozen)
-        self.assertEqual(len(frozen["settings"]["outage_schedule"]["slots"]),2)
+        self.assertEqual(frozen["settings"],{"environment":{"solar":{"coefficient":.2}}})
         original=deepcopy(frozen)
-        settings["ventilation_grid_only"]["recuperator"]["when_powered"]=0.
+        settings["environment"]["solar"]["coefficient"]=0.
         settings["outage_schedule"]["slots"][1]["off"]=False
         self.assertEqual(frozen,original)
 
@@ -665,7 +624,7 @@ class WindowsTest(unittest.TestCase):
         model=dict(DEFAULT_MODEL,version=6,validated=True)
         archive=[]
         certificate=dict(coefficient=.5,stored_at=BASE,identity=[6,1,"fixed_6"],
-                         ventilation_model={})
+                         )
         for day in range(6):
             for hour in (8,12):
                 start=BASE+day*86400+hour*3600
@@ -698,7 +657,7 @@ class WindowsTest(unittest.TestCase):
                     room=21.,floor=23.,outside=5.,fire=0.,segments=[],weather=weather,
                     settings=settings,weather_known_until=start+14400,points=points,guards=guards)
                 archive.append(dict(snapshot=snapshot,checks=checks))
-        report=solar_prospective_evidence(certificate,archive,model,timezone.utc,{})
+        report=solar_prospective_evidence(certificate,archive,model,timezone.utc)
         self.assertEqual(report["status"],"passed")
         self.assertFalse(report["comfort_credit"])
         self.assertGreaterEqual(report["metrics"]["1"]["new"]["n"],12)
@@ -712,20 +671,20 @@ class WindowsTest(unittest.TestCase):
             solar.update(validated=True,coefficient=.5)
             for check in item["checks"]:
                 check[2]=check[7]  # truth was generated with this exact credit
-        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc,{})["status"],"stable")
+        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc)["status"],"stable")
         for item,original in zip(credited,archive):
             for check,prior in zip(item["checks"],original["checks"]):
                 check[7]=prior[2]  # actual now follows the zero-credit trajectory
-        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc,{})["status"],
+        self.assertEqual(solar_prospective_evidence(active,credited,model,timezone.utc)["status"],
                          "rollback_required")
         self.assertEqual(solar_prospective_evidence({**active,"nominal_at":BASE+7*86400},credited,
-            model,timezone.utc,{})["status"],"monitoring")
+            model,timezone.utc)["status"],"monitoring")
         self.assertEqual(solar_prospective_evidence({**certificate,"nominal_revoked_at":BASE},archive,
-            model,timezone.utc,{})["status"],"rejected")
+            model,timezone.utc)["status"],"rejected")
         self.assertEqual(solar_prospective_evidence({**certificate,"stored_at":BASE+7*86400},
-            archive,model,timezone.utc,{})["status"],"insufficient_data")
+            archive,model,timezone.utc)["status"],"insufficient_data")
         legacy=[dict(snapshot=i["snapshot"],checks=[r[:13] for r in i["checks"]]) for i in archive]
-        self.assertEqual(solar_prospective_evidence(certificate,legacy,model,timezone.utc,{})["status"],
+        self.assertEqual(solar_prospective_evidence(certificate,legacy,model,timezone.utc)["status"],
                          "insufficient_data")
         snapshot,rows=self.asynchronous_report_fixture(0)
         snapshot["settings"]["environment"]={"solar":{"risk_coefficient":.5}}

@@ -11,7 +11,7 @@ from statistics import median
 from tempfile import NamedTemporaryFile
 from threading import Lock
 
-from heating_environment import daylight, forecast_step, weather_factor, effective_ventilation_duty
+from heating_environment import daylight, forecast_step, weather_factor
 from heating_model import BOUNDS, comfort_at, number, outdoor_at, transitions, modulation_power, certified_upper_power
 
 SCHEMA = 1
@@ -37,28 +37,6 @@ def report_time(row):
     return None
 
 
-def ventilation_current_qualified(devices):
-    """Either a known OFF relay or a known OFF supply proves zero powered duty.
-
-    A running relay needs independent supply evidence; an unavailable relay
-    does not erase independently verified absence of supply. Unknown supply
-    and relay together are never interpreted as zero.
-    """
-    if not isinstance(devices, dict):
-        return False
-    return all(isinstance(devices.get(key), dict) and (
-        devices[key].get("supply") == "off" or
-        devices[key].get("relay") == "off" or (
-            devices[key].get("relay") == "on" and devices[key].get("supply") == "on")
-    ) for key in ("recuperator", "bath"))
-
-
-def ventilation_interval_duty(evidence):
-    """Constant powered duty required by the adaptive window fitter."""
-    duty = effective_ventilation_duty(evidence)
-    return duty if duty in (0., 1.) else None
-
-
 def proven_outage_row(row):
     """Thermal-only zero input; never a KWS measurement."""
     power=number(row.get("power"))
@@ -69,7 +47,9 @@ def proven_outage_row(row):
 
 
 def row_reasons(row, *, strict, physics=False):
-    reasons = set(row.get("shadow_reasons") or ())
+    # Archived rows can carry reasons from the retired airflow inputs.
+    reasons = set(row.get("shadow_reasons") or ()).difference(
+        {"unknown_ventilation", "ventilation_changed", "circulation", "circulation_or_unknown"})
     power = number(row.get("power"))
     if power is None or not 0 <= power <= 10.5:
         reasons.add("missing_kws")
@@ -106,13 +86,6 @@ def row_reasons(row, *, strict, physics=False):
         reasons.add("unknown_fireplace")
     elif row.get("fire_active") or fire > (0.2 if strict else 2):
         reasons.add("fireplace")
-    if row.get("shadow_ventilation") is None:
-        reasons.add("unknown_ventilation")
-    # The reserve-powered circulation fan redistributes indoor heat. Only
-    # legacy/unclassified circulation remains a blanket exclusion; actual
-    # fireplace activity or conflicting room measurements are checked above.
-    if strict and row.get("circulation_active") and row.get("circulation_role")!="internal_redistribution":
-        reasons.add("circulation")
     if (number(row.get("external_gain")) or 0.) > .1 or abs(number(row.get("residual_gain")) or 0.) > .1:
         reasons.add("unexplained_gain")
     issue, stamp = number(row.get("weather_issue_at")), number(row.get("ts"))
@@ -219,8 +192,6 @@ def _continuous(rows, times, start, end, identity, *, physics=False):
             reasons.add("manual_session_boundary")
         if any(tuple(row.get(k) for k in IDENTITY) != identity for row in (a,b)):
             reasons.add("identity_changed")
-        if a.get("shadow_ventilation") != b.get("shadow_ventilation"):
-            reasons.add("ventilation_changed")
         if (number(a.get("return")) is not None and number(b.get("return")) is not None
                 and abs(b["return"]-a["return"])>5):
             reasons.add("return_jump")
@@ -317,7 +288,7 @@ def build_observation_windows(samples, tz):
         windows.append(dict(start=start,end=end,day=day,room_start=first["room"],room_end=row["room"],
                             floor=steps[0][4],steps=steps,heat=heating,idle=idle,sun=sun,
                             manual=first.get("manual_measurement_id") is not None,
-                            equipment=list(identity[2:]),vent=first["shadow_ventilation"]))
+                            equipment=list(identity[2:])))
         if solar_only:
             windows[-1]["solar_only"]=True
         if proven_outage_row(first) and proven_outage_row(row):
@@ -469,27 +440,23 @@ def _metrics(errors):
                 median=median(absolute),p95=absolute[math.ceil(.95*len(errors))-1])
 
 
-def _errors(windows, coefficients, solar=0., ventilation=None):
+def _errors(windows, coefficients, solar=0.):
     errors = []
     floor_air, loss = coefficients["floor_air"], coefficients["room_loss"]
     heat_gain, decay = coefficients["heat_gain"], coefficients["floor_decay"]
     for window in windows:
-        ventilation_loss = loss
-        if ventilation and ventilation.get("validated") and ventilation.get("model_version")==coefficients.get("version"):
-            ventilation_loss = (ventilation["base_room_loss"] + ventilation["recuperator"]*window["vent"][0]
-                                + ventilation["bath"]*window["vent"][1])
         room, floor = window["room_start"], window["floor"]
         for seconds, outside, kw, sun, _ in window["steps"]:
             hours = seconds/3600
             difference = floor-room
-            room += (floor_air*difference-ventilation_loss*(room-outside)+solar*sun)*hours
+            room += (floor_air*difference-loss*(room-outside)+solar*sun)*hours
             floor += (heat_gain*kw-decay*difference)*hours
         errors.append(room-window["room_end"])
     return errors
 
 
-def _score(windows, coefficients, solar=0., ventilation=None):
-    return _metrics(_errors(windows,coefficients,solar,ventilation))
+def _score(windows, coefficients, solar=0.):
+    return _metrics(_errors(windows,coefficients,solar))
 
 
 def _split(windows):
@@ -509,7 +476,7 @@ def _coverage(windows):
                 idle_days=len({w["day"] for w in windows if w["idle"]}))
 
 
-def _storage_candidate(train, model, base_best, ventilation):
+def _storage_candidate(train, model, base_best):
     """One-coordinate update only with independent excitation and sensitivity.
 
     Return is a proxy, not a direct floor measurement. Fit on actual room
@@ -525,15 +492,15 @@ def _storage_candidate(train, model, base_best, ventilation):
           w["heat"]>=.75*(w["end"]-w["start"])]
     if any(_coverage(rows)["days"]<3 or _coverage(rows)["seconds"]<3*3600 for rows in (warm,heat)):
         return None
-    base=_errors(train,model,ventilation=ventilation)
-    best_error=_score(train,base_best,ventilation=ventilation)["mae"]
+    base=_errors(train,model)
+    best_error=_score(train,base_best)["mae"]
     sensitivity={}
     options=[]
     for field in FIT_FIELDS:
         trial={**model,field:model[field]*1.01}
         if not BOUNDS[field][0]<=trial[field]<=BOUNDS[field][1]:
             continue
-        vector=[b-a for a,b in zip(base,_errors(train,trial,ventilation=ventilation))]
+        vector=[b-a for a,b in zip(base,_errors(train,trial))]
         magnitude=math.sqrt(sum(v*v for v in vector))
         if magnitude>1e-9:
             sensitivity[field]=(vector,magnitude)
@@ -546,13 +513,13 @@ def _storage_candidate(train, model, base_best, ventilation):
         if any(abs(sum(a*b for a,b in zip(vector,other)))/(norm*size)>=.985
                for key,(other,size) in sensitivity.items() if key!=field):
             continue
-        cohort_old=_score(cohort,model,ventilation=ventilation)["mae"]
+        cohort_old=_score(cohort,model)["mae"]
         for scale in (.99,1.01):
             candidate={**model,field:model[field]*scale}
             if not BOUNDS[field][0]<=candidate[field]<=BOUNDS[field][1]:
                 continue
-            objective=_score(train,candidate,ventilation=ventilation)["mae"]
-            cohort_error=_score(cohort,candidate,ventilation=ventilation)["mae"]
+            objective=_score(train,candidate)["mae"]
+            cohort_error=_score(cohort,candidate)["mae"]
             if (best_error-objective>=max(.001,.02*best_error) and
                     cohort_old-cohort_error>=max(.001,.02*cohort_old)):
                 options.append((objective,field,candidate))
@@ -562,7 +529,7 @@ def _storage_candidate(train, model, base_best, ventilation):
     return field,candidate
 
 
-def thermal_parameter_support(thermal, qualified_vent, train=(), holdout=(), selected=(), blockers=()):
+def thermal_parameter_support(thermal, train=(), holdout=(), selected=(), blockers=()):
     """Report the actual candidate cohorts, not sample counts as proof of fit."""
     def describe(rows):
         coverage=_coverage(rows)
@@ -576,29 +543,25 @@ def thermal_parameter_support(thermal, qualified_vent, train=(), holdout=(), sel
     result={}
     for field in FIT_FIELDS:
         cohort=warm if field=="floor_decay" else heat if field=="heat_gain" else lambda rows: rows
-        identified=not (field=="room_loss" and qualified_vent)
         active=field in selected
         result[field]=dict(available=describe(cohort(thermal)),
             training=describe(cohort(train)) if active else None,
             holdout=describe(cohort(holdout)) if active else None,
             selected_for_candidate=active,
-            status=("not_identifiable_with_ventilation" if not identified else
-                    "candidate_evaluated" if active else "not_selected" if not blockers else "insufficient_support"),
+            status=("candidate_evaluated" if active else "not_selected" if not blockers else "insufficient_support"),
             basis=("warm_idle" if field=="floor_decay" else "measured_heat" if field=="heat_gain" else "thermal_windows"))
     return result
 
 
-def evaluate_windows(windows, model, ventilation=None):
+def evaluate_windows(windows, model):
     """Bounded offline fit. Holdout is selected by whole, later local days."""
     # Fit v6 only with one current equipment and mode identity.
     if not windows or any(number(model.get(k)) is None for k in BOUNDS):
         return dict(status="insufficient_data", blockers=["no_windows"],
-                    parameter_support=thermal_parameter_support([],False,blockers=["no_windows"]))
+                    parameter_support=thermal_parameter_support([],blockers=["no_windows"]))
     latest = windows[-1]["equipment"]
     windows = [w for w in windows if w["equipment"] == latest and latest[0] == model.get("version")]
-    qualified_vent = ventilation and ventilation.get("validated") and ventilation.get("model_version")==model.get("version")
-    thermal = [w for w in windows if not w.get("solar_only") and w["sun"]<=.02 and
-               (qualified_vent or max(w["vent"])==0.)]
+    thermal = [w for w in windows if not w.get("solar_only") and w["sun"]<=.02]
     # Over short intervals sensor rounding can dominate the thermal response.
     # Prefer longer observations when they already cover both regimes and days.
     longer = [w for w in thermal if w["end"]-w["start"] >= 900]
@@ -618,9 +581,7 @@ def evaluate_windows(windows, model, ventilation=None):
     if (not train or not holdout or not any(w["heat"] for w in train) or not any(w["idle"] for w in train)
             or not any(w["heat"] for w in holdout) or not any(w["idle"] for w in holdout)):
         blockers.append("independent_holdout")
-    # A qualified ventilation fit replaces room_loss in _score; that parameter
-    # is not identifiable from these windows. Never select an arbitrary tied value.
-    fields = ("floor_air",) if qualified_vent else BASE_FIT_FIELDS
+    fields = BASE_FIT_FIELDS
     if blockers:
         cooling = [w for w in thermal if w["idle"]>=w["end"]-w["start"]
                    and abs(w["floor"]-w["room_start"])<=1.5
@@ -628,39 +589,39 @@ def evaluate_windows(windows, model, ventilation=None):
         train,holdout = _split(cooling)
         outside = [w["steps"][0][1] for w in cooling]
         support = _coverage(train)
-        if (qualified_vent or not holdout or support["seconds"]<8*3600 or support["days"]<2
+        if (not holdout or support["seconds"]<8*3600 or support["days"]<2
                 or not outside or max(outside)-min(outside)<2.):
             return dict(status="insufficient_data", blockers=blockers, coverage=coverage,
-                        parameter_support=thermal_parameter_support(thermal,qualified_vent,blockers=blockers))
+                        parameter_support=thermal_parameter_support(thermal,blockers=blockers))
         fields = ("room_loss",)
     # Bound both the grid and per-candidate displacement; widening belongs to a
     # separate qualification for equipment gain and decay.
-    old = _score(train,model,ventilation=ventilation)
+    old = _score(train,model)
     best, objective = model, old["mae"]
     for a in (-.01,0.,.01) if "floor_air" in fields else (0.,):
         for b in (-.01,0.,.01) if "room_loss" in fields else (0.,):
             candidate = {**model,"floor_air":model["floor_air"]*(1+a),"room_loss":model["room_loss"]*(1+b)}
             if not all(BOUNDS[k][0]<=candidate[k]<=BOUNDS[k][1] for k in FIT_FIELDS):
                 continue
-            score = _score(train,candidate,ventilation=ventilation)["mae"]
+            score = _score(train,candidate)["mae"]
             if score<objective:
                 best,objective=candidate,score
     # Select using training only; never fall back to a different candidate
     # after looking at the later holdout.
-    storage = _storage_candidate(train,model,best,ventilation) if not blockers else None
+    storage = _storage_candidate(train,model,best) if not blockers else None
     if storage:
         field,best=storage
         fields=(field,)
-    baseline = _score(holdout,model,ventilation=ventilation)
-    shadow = _score(holdout,best,ventilation=ventilation)
+    baseline = _score(holdout,model)
+    shadow = _score(holdout,best)
     qualified = best!=model and shadow["mae"]<baseline["mae"] and shadow["p95"]<=baseline["p95"]
     if storage:
         cohort=[w for w in holdout if w["end"]-w["start"]>=1800 and (
             w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.
             if field=="floor_decay" else w["heat"]>=.75*(w["end"]-w["start"]))]
         support=_coverage(cohort)
-        prior=_score(cohort,model,ventilation=ventilation)
-        changed=_score(cohort,best,ventilation=ventilation)
+        prior=_score(cohort,model)
+        changed=_score(cohort,best)
         qualified=bool(qualified and support["days"]>=2 and support["seconds"]>=2*3600
             and baseline["mae"]-shadow["mae"]>=max(.001,.02*baseline["mae"])
             and abs(shadow["bias"])<=abs(baseline["bias"])
@@ -673,13 +634,11 @@ def evaluate_windows(windows, model, ventilation=None):
                 holdout_start=min(w["day"] for w in holdout),
                 old=baseline,shadow=shadow, coefficients={k:best[k] for k in fields} if qualified else None,
                 equipment=latest,
-                parameter_support=thermal_parameter_support(thermal,qualified_vent,train,holdout,fields,blockers))
+                parameter_support=thermal_parameter_support(thermal,train,holdout,fields,blockers))
 
 
-def evaluate_solar(windows, model, commissioning=.283, ventilation=None):
-    windows = [w for w in windows if w["sun"]>0.05 and w["idle"]>=w["end"]-w["start"] and
-               (max(w["vent"])==0. or ventilation and ventilation.get("validated")
-                and ventilation.get("model_version")==model.get("version"))]
+def evaluate_solar(windows, model, commissioning=.283):
+    windows = [w for w in windows if w["sun"]>0.05 and w["idle"]>=w["end"]-w["start"]]
     train, holdout = _split(windows)
     days = len({w["day"] for w in train})
     support=_coverage(holdout)
@@ -687,8 +646,8 @@ def evaluate_solar(windows, model, commissioning=.283, ventilation=None):
                   holdout_windows=len(holdout),comfort_credit=False,model_certificate_validated=False)
     if days<3 or len(train)<12 or support["days"]<2 or len(holdout)<6:
         return dict(result,status="insufficient_data")
-    coefficient = min((.025*i for i in range(33)),key=lambda c:_score(train,model,c,ventilation)["mae"])
-    zero, previous, shadow = (_score(holdout,model,c,ventilation) for c in (0.,commissioning,coefficient))
+    coefficient = min((.025*i for i in range(33)),key=lambda c:_score(train,model,c)["mae"])
+    zero, previous, shadow = (_score(holdout,model,c) for c in (0.,commissioning,coefficient))
     qualified = (coefficient>0. and min(zero["mae"],previous["mae"])-shadow["mae"]>=
                  max(.005,.1*min(zero["mae"],previous["mae"]))
                  and shadow["p95"]<=min(zero["p95"],previous["p95"])
@@ -950,12 +909,7 @@ def freeze_forecast(now, room, floor, outside, fire, weather, issue, settings, f
     last = min(max(p[0] for p in points.values())+REPORT_ALIGNMENT_SECONDS,known,fine[-1]["ts"])
     segments = [[max(start,s["start"]),min(last,s["end"]),s["power_kw"]]
                 for s in forecast.get("heat_segments",[]) if s["end"]>start and s["start"]<last]
-    climate = {k:settings[k] for k in ("environment","thermal_model_version","ventilation_model",
-                                      "ventilation_expected","ventilation_grid_only") if k in settings}
-    if climate.get("ventilation_grid_only"):
-        schedule=settings.get("outage_schedule") or {}
-        climate["outage_schedule"]={k:schedule[k] for k in ("valid","mode","known_until","runtime_supply_override") if k in schedule}
-        climate["outage_schedule"]["slots"]=[s for s in schedule.get("slots",[]) if s["end"]>start and s["start"]<last]
+    climate = {k:settings[k] for k in ("environment","thermal_model_version") if k in settings}
     # Forecast/reference settings are immutable to the controller after issue.
     # Round-trip the small selected fields to keep the sidecar independent.
     climate = json.loads(_encode(climate))
@@ -1234,7 +1188,7 @@ def independent_checks(rows, horizon):
             end=row["end"]
 
 
-def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
+def solar_prospective_evidence(certificate, archive, model, tz):
     """Paired issue-time solar shadow; no command or comfort credit is granted.
 
     Only observations issued AFTER the fixed candidate was stored qualify.
@@ -1248,8 +1202,7 @@ def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
     stored=number(certificate.get("nominal_at" if monitoring else "stored_at"))
     identity=certificate.get("identity")
     if (coefficient is None or not 0<coefficient<=.8 or stored is None
-            or not isinstance(identity,list) or len(identity)!=3
-            or certificate.get("ventilation_model")!=(ventilation or {})):
+            or not isinstance(identity,list) or len(identity)!=3):
         return dict(status="no_candidate",metrics={},comfort_credit=False)
     scored=[]
     for item in archive:
@@ -1260,8 +1213,7 @@ def solar_prospective_evidence(certificate, archive, model, tz, ventilation):
         if (start<stored or snapshot.get("model")!=model or snapshot.get("identity",[])[2:]!=identity
                 or solar.get("risk_coefficient")!=coefficient
                 or bool(solar.get("validated"))!=monitoring
-                or monitoring and solar.get("coefficient")!=coefficient
-                or (climate.get("ventilation_model") or {})!=(ventilation or {})):
+                or monitoring and solar.get("coefficient")!=coefficient):
             continue
         checks=[r for r in item["checks"] if r[0] in (1,3) and len(r)>13
                 and r[13].get("solar_idle_qualified") is True and not set(r[8]).difference({"unexplained_gain"})]
@@ -1473,16 +1425,16 @@ def rollback_reason(rows, strata):
     return None
 
 
-def run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible, power_context=None):
+def run_learning(path, rows, forecasts, model, checkpoint, now, eligible, power_context=None):
     """One bounded executor task; return a proposal and never touch HA state."""
     with _JOB_LOCK:
         try:
-            return _run_learning(path,rows,forecasts,model,ventilation,checkpoint,now,eligible,power_context)
+            return _run_learning(path,rows,forecasts,model,checkpoint,now,eligible,power_context)
         except Exception as exc:
             return dict(status="frozen",reason="learning_storage_or_data_error",fault=type(exc).__name__)
 
 
-def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, eligible, power_context=None):
+def _run_learning(path, rows, forecasts, model, checkpoint, now, eligible, power_context=None):
     try:
         saved=load_evidence(path)
     except FileNotFoundError:
@@ -1530,7 +1482,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
                 current_reasons=window_report["current_observation_quality"]["reasons"],
                 solar_weather=window_report.get("solar_weather",{}),
                 analysis_status="pending", analysis_blockers=[])
-    evidence_key = sha256(_encode(["parameter_support_v1",now.date().isoformat(),model,eligible,cooldown,power_context,ventilation,
+    evidence_key = sha256(_encode(["whole_house_loss_v1",now.date().isoformat(),model,eligible,cooldown,power_context,
                                   [(w['start'],w['end']) for w in windows],
                                   [(f['snapshot']['start'],f['checks']) for f in archive]])).hexdigest()
     previous_report = saved["report"]
@@ -1565,7 +1517,7 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
             and checkpoint.get("promotion_day")!=now.date().isoformat()):
         # Scheduled analysis can examine historical data during a blackout.
         # Promotion still needs the unchanged real-time eligibility gate.
-        thermal=evaluate_windows(windows,model,ventilation)
+        thermal=evaluate_windows(windows,model)
         blockers=thermal.get("blockers",[])
         result.update(analysis_status=thermal["status"],analysis_blockers=blockers,
                       parameter_support=thermal.get("parameter_support",{}))
@@ -1593,9 +1545,9 @@ def _run_learning(path, rows, forecasts, model, ventilation, checkpoint, now, el
         solar_windows=[w for w in windows if w["equipment"]==identity]
         active_solar=context.get("solar_risk") or {}
         baseline=number(active_solar.get("coefficient")) or 0.
-        result["solar"]=evaluate_solar(solar_windows,model,commissioning=baseline,ventilation=ventilation)
+        result["solar"]=evaluate_solar(solar_windows,model,commissioning=baseline)
         result["solar"]["identity"]=identity
-        result["solar_prospective"]=solar_prospective_evidence(active_solar,archive,model,now.tzinfo,ventilation)
+        result["solar_prospective"]=solar_prospective_evidence(active_solar,archive,model,now.tzinfo)
         # Freeze a candidate while it accumulates independent future checks.
         result["solar"]["risk_eligible"]=bool(eligible and not result.get("proposed")
             and result["solar"]["status"]=="holdout_passed"

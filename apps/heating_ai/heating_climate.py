@@ -20,10 +20,13 @@ from heating_model import (DEFAULT_MODEL, BOUNDS, number, in_window, plan, coast
                            learn_modulation, modulation_power,comfort_at,coast_exceeds_profile,coast_trajectory,learn_power_modes,power_profile,retain_kws_profile,outdoor_at,SEARCH_FIELDS)
 from heating_recovery import HeatingRecovery,DecisionJournal,confirmed_morning,cycle_energy_allowance,wire_values
 from heating_stability import stable_plan,replay,stress_scenarios,recommend_power,policy as planning_policy,expected as expected_thermal,reference as plan_reference,approved_extensions,apply_search_diagnostics,day_insurance_window
-from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,fit_ventilation,ventilation_expectation,ventilation_powered_expectation,effective_ventilation_duty,ventilation_binding_identity,compatible_ventilation_fit,VENTILATION_DUTY_POLICY,room_reporting_limits,gain_at,
+from heating_environment import (observe_floor,observe_gain,reliability,daylight,anchor_weather,room_reporting_limits,gain_at,
                                  solar_context,room_source_check,observe_residual,residual_at,ENVIRONMENT_POLICY_VERSION)
 from heating_ui import (install_panel, project_fireplace, verify_installation,
                         system_fields, system_values, validate_system_settings,forecast_for_panel,forecast_outlook_for_panel)
+
+_RETIRED_VENTILATION_SETTINGS = {'ventilation','recuperator_entity','bath_entity','grid_only_ventilation_entities'}
+
 
 class HeatingClimate(HeatingRecovery,Hass):
     TELEMETRY_MAX_BYTES = 32 * 1024 * 1024
@@ -116,7 +119,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                 temporary.unlink(missing_ok=True)
 
     def initialize(self):
-        self.cfg=dict(self.args)
+        self.cfg={key:value for key,value in self.args.items() if key not in _RETIRED_VENTILATION_SETTINGS}
         if self.update_in_progress():
             self.run_in(self.initialize_after_update,5)
             return
@@ -192,13 +195,6 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.ai_summary_lock=RLock()
         self.ai_summary_attributes=None
         self.calculation_lock=RLock();self.calculation_jobs={}
-        ventilation=self.cfg.get('ventilation',{})
-        if isinstance(ventilation,dict):
-            for binding in ventilation.values():
-                if isinstance(binding,dict):
-                    for entity in {binding.get('entity'),binding.get('power_entity')}-{None}:
-                        if isinstance(entity,str):self.listen_state(self.ventilation_changed,entity)
-        self.ventilation_tick()
         self.listen_event(self.weather_event,"heating_weather_forecast")
         self.listen_event(self.night_event,"heating_fan_night_request")
         self.listen_event(self.system_settings_changed,'heating_system_settings')
@@ -340,6 +336,9 @@ class HeatingClimate(HeatingRecovery,Hass):
         snapshot=getattr(getattr(self,'_tick_read_local',None),'states',None)
         if snapshot is not None and namespace is None and not kwargs and ((entity_id is None and attribute is None) or (entity_id is not None and '.' in entity_id)):
             self._tick_read_local.hits=getattr(self._tick_read_local,'hits',0)+1
+            if (entity_id is not None and entity_id not in snapshot and
+                    getattr(self,'partial_tick_snapshot',False)):
+                snapshot[entity_id]=super().get_state(entity_id,attribute='all',copy=False)
             row=snapshot if entity_id is None else snapshot.get(entity_id)
             result=(row if entity_id is None or attribute=='all' else row.get('state') if attribute is None else
                     (row.get('attributes') or {}).get(attribute,row.get(attribute,default))) if row is not None else default
@@ -463,14 +462,15 @@ class HeatingClimate(HeatingRecovery,Hass):
         equipment=self.memory.get('equipment_settings') or {}
         if isinstance(equipment,dict):
             for key,value in sorted(equipment.items(),key=lambda pair:pair[0]=='power_accounting_method'):
-                if key not in ('boiler_power_mode','power_measurement_policy','power_phase_topology','power_accounting_method','power_inlet_config','recuperator_entity','bath_entity','outage_missing_policy'):continue
+                if key not in ('boiler_power_mode','power_measurement_policy','power_phase_topology','power_accounting_method','power_inlet_config','outage_missing_policy'):continue
                 try:
                     clean,_=validate_system_settings({key:value},self.cfg,self.model);self.cfg.update(clean)
                 except (ValueError,TypeError):self.log('Invalid saved equipment field: %s',key,level='WARNING')
-        self.configure_ventilation()
-        overrides=self.memory.get('system_settings',{})
+        overrides=self.memory.get('system_settings') or {}
         if overrides:
             try:
+                if isinstance(overrides,dict):
+                    overrides={k:v for k,v in overrides.items() if k not in _RETIRED_VENTILATION_SETTINGS}
                 config,_=validate_system_settings(overrides,self.cfg,self.model)
                 self.cfg.update(config)
             except (ValueError,TypeError):
@@ -496,33 +496,33 @@ class HeatingClimate(HeatingRecovery,Hass):
                 raise ValueError('Налаштування вже змінилися; оновіть панель')
             config,model=validate_system_settings(data.get('values'),self.cfg,self.model)
             if getattr(self,'runtime_ready',False):
-                entities=[config.get(k) for k in ('recuperator_entity','bath_entity') if config.get(k)]
+                entities=[]
                 for phase in (config.get('power_phase_topology') or {}).get('phases',[]):
                     entities.append(phase['input']);entities.extend(load['entity'] for load in phase['loads'])
                 entities.extend(inlet_entities(config.get('power_inlet_config') or {}))
                 if any(self.get_state(entity,attribute='all') is None for entity in entities):raise ValueError('Сутність не існує в Home Assistant')
             before=deepcopy((self.cfg,self.model,self.memory,self.next_compute))
-            volatile=('ventilation_totals','ventilation_at','ventilation_states','stage_totals','inlet_accounting_started','inlet_stage_candidate','inlet_power_window')
+            volatile=('stage_totals','inlet_accounting_started','inlet_stage_candidate','inlet_power_window')
             previous_runtime={k:deepcopy(getattr(self,k)) for k in volatile if hasattr(self,k)}
             estimator=deepcopy(self.power_estimator.__dict__) if hasattr(self,'power_estimator') else None
             self.settings_transaction=True
             if model and not self.consider({**self.model,**model},'Налаштування користувача',apply=True):
                 raise ValueError(self.memory.get('last_result','Модель не пройшла перевірку'))
-            equipment={k:v for k,v in config.items() if k in ('boiler_power_mode','power_measurement_policy','power_phase_topology','power_accounting_method','power_inlet_config','recuperator_entity','bath_entity','outage_missing_policy')}
+            equipment={k:v for k,v in config.items() if k in ('boiler_power_mode','power_measurement_policy','power_phase_topology','power_accounting_method','power_inlet_config','outage_missing_policy')}
             for k in equipment:config.pop(k,None)
             changed={k:v for k,v in equipment.items() if self.cfg.get(k)!=v}
             if changed:
                 self.decision_event('equipment_change',reason='Змінено опис фізичного обладнання',force=True,
                     snapshot=dict(previous={k:self.cfg.get(k) for k in changed},values=changed,pending_hourly=self.memory.get('predictions',[])))
                 self.memory['predictions']=[]
-                self.ventilation_totals={};self.ventilation_states={};self.ventilation_at=time.time();self.stage_totals={}
+                self.stage_totals={}
                 history=self.memory.setdefault('equipment_history',[])
                 history.append(dict(at=self.now().isoformat(),previous={k:self.cfg.get(k,'unconfirmed') for k in changed},values=changed))
                 del history[:-32]
                 self.memory['equipment_version']=self.memory.get('equipment_version',0)+1
                 self.memory['equipment_settings']={**(self.memory.get('equipment_settings') or {}),**equipment}
                 for k in equipment:config.pop(k,None)
-                self.cfg.update(equipment);self.configure_ventilation()
+                self.cfg.update(equipment)
                 if 'boiler_power_mode' in changed:
                     self.memory['planned_heat_segments']=[];self.memory['demand']=False
                     self.memory.pop('power_recommendation',None)
@@ -561,8 +561,6 @@ class HeatingClimate(HeatingRecovery,Hass):
             if not isinstance(exc,(ValueError,TypeError,OSError)):raise
             error=str(exc)
         finally:self.settings_transaction=False
-        if success and getattr(self,'runtime_ready',False):
-            self.run_diagnostic('equipment_listeners',self.configure_ventilation)
         self.system_settings_result=dict(last_request_id=request if isinstance(request,str) else None,
                                          last_success=success,last_error=error,model_pending=bool(self.memory.get('pending_model')))
         self.publish_system_settings()
@@ -590,88 +588,14 @@ class HeatingClimate(HeatingRecovery,Hass):
         configuration=backup/'configuration.json'
         if not configuration.exists():
             configuration.write_text(json.dumps(dict(settings=system_values(self.cfg),
-                sources={k:self.cfg.get(k) for k in ('power_balance','power_balance_sources','power_fault','power_phase_topology','ventilation')}),sort_keys=True))
+                sources={k:self.cfg.get(k) for k in ('power_balance','power_balance_sources','power_fault','power_phase_topology')}),sort_keys=True))
         hashes[configuration.name]=hashlib.sha256(configuration.read_bytes()).hexdigest()
         manifest.write_text(json.dumps(hashes,sort_keys=True))
         self.memory['equipment_schema']=1
 
-    def configure_ventilation(self):
-        raw=self.cfg.get('ventilation') or {}
-        bindings=dict(raw) if isinstance(raw,dict) else {}
-        for key,name in (('recuperator_entity','recuperator'),('bath_entity','bath')):
-            if key in self.cfg:
-                entity=self.cfg[key]
-                if entity:
-                    previous=bindings.get(name)
-                    # A relay selection is not permission to transfer a power
-                    # binding to another physical appliance.
-                    if not isinstance(previous,dict) or previous.get('entity')!=entity:
-                        bindings[name]=dict(entity=entity)
-                else:bindings.pop(name,None)
-        self.cfg['ventilation']=bindings
-        if getattr(self,'runtime_ready',False) and not getattr(self,'settings_transaction',False):
-            tracked=getattr(self,'equipment_listeners',{})
-            wanted={b.get(key) for b in bindings.values() if isinstance(b,dict)
-                    for key in ('entity','power_entity')}-{None}
-            for entity in list(tracked):
-                if entity not in wanted:self.cancel_listen_state(tracked.pop(entity))
-            for entity in wanted:
-                if entity not in tracked:tracked[entity]=self.listen_state(self.ventilation_changed,entity)
-            self.equipment_listeners=tracked
-
-    def ventilation_forecast_inputs(self):
-        """Memoize immutable sample-ring summaries, not live actuator evidence.
-
-        Sampling/recovery replaces the ring; live relay, entity and supply
-        changes are independent cache invalidators. No elapsed-time throttle.
-        """
-        samples=self.samples
-        states=getattr(self,'ventilation_states',{})
-        last=samples[-1] if samples else None
-        key=tuple((k,tuple((states.get(k) or {}).get(f) for f in
-                  ('entity','relay','effective_duty','supply_provenance'))) for k in ('recuperator','bath'))
-        cached=getattr(self,'_ventilation_forecast_cache',None)
-        if cached is not None and cached[0] is samples and cached[1]==len(samples) and cached[2] is last and cached[3]==key:
-            return cached[4]
-        expected,support=ventilation_expectation(samples,states)
-        powered=ventilation_powered_expectation(samples,states)
-        result=(expected,support,powered)
-        self._ventilation_forecast_cache=(samples,len(samples),last,key,result)
-        return result
-
-    def active_ventilation_model(self):
-        return compatible_ventilation_fit(self.memory.get('ventilation_model') or {},
-                                         ventilation_binding_identity(self.cfg))
-
     def refresh_equipment_models(self):
         self.memory['power_calibrations']=retain_kws_profile(learn_power_modes(self.samples,self.model),
             self.memory.get('kws_forecast_profile'),self.model,self.memory.get('equipment_version',0))
-        bindings=ventilation_binding_identity(self.cfg)
-        fit=fit_ventilation(self.samples,self.model,self.climate_tz,bindings or None)
-        stored=self.memory.get('ventilation_model') or {}
-        previous=self.active_ventilation_model()
-        today=self.now().date().isoformat()
-        if stored.get('validated') and not previous and not fit.get('validated'):
-            # Preserve the old certificate and expose the migration blocker.
-            # Until independently fitted, the controller uses its base model.
-            self.memory['ventilation_candidate']=fit
-            return
-        if previous.get('validated') and previous.get('model_version')==self.model.get('version'):
-            if not fit['validated'] or previous.get('fit_day')==today:return
-            clipped=False
-            for key in ('base_room_loss','recuperator','bath'):
-                limit=abs(previous[key])*.2
-                value=max(previous[key]-limit,min(previous[key]+limit,fit[key]))
-                clipped=clipped or value!=fit[key];fit[key]=value
-            # Clipping changes a fit: keep the candidate shadow until revalidated.
-            if clipped:
-                fit.update(validated=False,reason='daily_bound_requires_revalidation')
-                self.memory['ventilation_candidate']=fit;return
-        self.memory['ventilation_model']=dict(fit,fit_day=today)
-        if fit.get('validated'):
-            self.memory.pop('ventilation_candidate',None)
-            if stored.get('validated') and not previous:
-                self.memory['ventilation_legacy_certificate']=stored
 
     def read_power_snapshot(self,entities):
         template="""{% set ns=namespace(rows={}) %}{% for id in entities %}{% set s=states[id] %}{% if s is not none %}{% set ns.rows=dict(ns.rows,**{id:dict(value=s.state,at=as_timestamp(s.last_reported if s.last_reported is defined else s.last_updated,none),unit=s.attributes.get('unit_of_measurement'),temperature=s.attributes.get('current_temperature'),target=s.attributes.get('temperature'),kind='active')}) %}{% endif %}{% endfor %}{{ ns.rows|tojson }}"""
@@ -766,8 +690,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         if journal and stamp-getattr(self,'power_minute_at',stamp-60)>=60:
             journal.append(dict(event='power_minute',action=self.memory.get('last_command'),reason='power_quality_observation',
                 physical_mode=mode,equipment_version=self.memory.get('equipment_version',0),
-                power=assessment,energy=dict(ledger),instantaneous_stage_seconds=getattr(self,'stage_totals',{}),
-                ventilation=getattr(self,'ventilation_states',{})),stamp=stamp)
+                power=assessment,energy=dict(ledger),instantaneous_stage_seconds=getattr(self,'stage_totals',{})),stamp=stamp)
             self.power_minute_at=stamp
         self.power_observation=dict(assessment,controller_power_w=power,controller_source=getattr(self,'power_source','unknown'),
             policy=self.cfg.get('power_measurement_policy','legacy'))
@@ -798,7 +721,6 @@ class HeatingClimate(HeatingRecovery,Hass):
 
     def background_plan(self,now,room,floor,outside,fire,weather,settings,signature):
         policy=planning_policy(settings)
-        policy.pop('ventilation_expected',None)  # Rolling duty is replayed using fresh observations.
         schedule_key=signature[:2]+signature[3:] if isinstance(signature,(tuple,list)) and len(signature)==5 else signature
         key=(self.model,policy,schedule_key,self.raw('mode'),self.raw('armed'),self.planning_grid_state)
         args=(now,room,floor,outside,fire,self.model,weather,settings)
@@ -838,7 +760,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         self.calculation_rejection('plan')
         return fresh,plan_reference(now,room,floor,outside,fire,self.model,weather,settings,fresh)
 
-    def publish_equipment(self,ventilation_support=None):
+    def publish_equipment(self):
         # AppDaemon's nested attribute transport drops numeric zero/false.
         # Keep canonical counters numeric; stringify only these wire values.
         def wire(value):
@@ -868,14 +790,6 @@ class HeatingClimate(HeatingRecovery,Hass):
             recommendation=self.memory.get('power_recommendation'),power_observation=getattr(self,'power_observation',{}),
             energy=self.memory.get('kws_energy') if self.cfg.get('power_accounting_method')=='kws' else self.memory.get('inlet_energy') if self.cfg.get('power_accounting_method')=='inlet' else self.memory.get('power_observation_ledger'),
             accuracy='Перевіряється' if profile.get('assumed',True) else 'Перевірено на відкладених сеансах')))
-        active_ventilation=self.active_ventilation_model()
-        self.publish('sensor.heating_ventilation','Враховано' if active_ventilation.get('validated') else 'Навчання; чинна базова модель',
-            **wire(dict(friendly_name='Опалення — вентиляція',devices=getattr(self,'ventilation_states',{}),support=ventilation_support or {},
-            model=active_ventilation,candidate=self.memory.get('ventilation_candidate'),
-            stored_certificate_compatible=bool(active_ventilation),
-            legacy_certificate_retained=bool(self.memory.get('ventilation_legacy_certificate') or
-                self.memory.get('ventilation_model') and not active_ventilation),
-            note='Реле не доводить витрату повітря; майбутній duty — сценарій, не точний розклад')))
 
     def ai_report_changed(self,entity,attribute,old,new,kwargs=None,**extra):
         if old!=new:
@@ -969,80 +883,6 @@ class HeatingClimate(HeatingRecovery,Hass):
         if getattr(self,'temperature_source',result[1])!=result[1]:self.next_compute=0
         self.temperature_source=result[1]
         return result
-    def ventilation_changed(self,entity,attribute,old,new,kwargs=None,**extra):
-        self.ventilation_tick()
-    def ventilation_tick(self,stamp=None):
-        stamp=time.time() if stamp is None else stamp
-        previous_at=getattr(self,'ventilation_at',stamp)
-        if stamp<previous_at:
-            return  # late callback must not move the integration clock backwards
-        old_states=getattr(self,'ventilation_states',{})
-        elapsed=stamp-previous_at
-        totals=getattr(self,'ventilation_totals',{})
-        bindings=self.cfg.get('ventilation',{})
-        states={}
-        if isinstance(bindings,dict) and bindings:
-            grid=self.grid_state()
-            for name,binding in bindings.items():
-                if not isinstance(binding,dict) or not isinstance(binding.get('entity'),str):continue
-                # An explicit supply sensor has priority. Grid-only topology is
-                # opt-in per physical binding; never infer it from a relay name.
-                power_entity=binding.get('power_entity')
-                if isinstance(power_entity,str):
-                    supply=self.get_state(power_entity);provenance='supply_sensor'
-                elif (binding.get('supply_kind')=='grid_only' or
-                      isinstance(self.cfg.get('grid_only_ventilation_entities'),(list,tuple)) and
-                      binding['entity'] in self.cfg['grid_only_ventilation_entities']):
-                    supply=grid;provenance='verified_grid_topology'
-                else:
-                    supply='unknown';provenance='unknown'
-                relay=self.get_state(binding['entity'])
-                duty=0. if supply=='off' or relay=='off' else 1. if supply=='on' and relay=='on' else None
-                states[name]=dict(relay=relay,supply=supply,grid=grid,entity=binding['entity'],
-                                  supply_provenance=provenance,effective_duty=duty)
-        for name,old in old_states.items():
-            row=totals.setdefault(name,dict(seconds=0.,on=0.,unknown=0.,supply_on=0.,supply_unknown=0.,
-                                            powered_on=0.,grid_on=0.,grid_unknown=0.,effective_on=0.,effective_unknown=0.))
-            row['seconds']+=elapsed
-            known=elapsed<=45
-            current=states.get(name) or {}
-            # Grid transitions observed by polling are not timestamped airflow
-            # events. Do not assign the entire preceding interval to either side.
-            supply_known=known and not (old.get('supply_provenance')=='verified_grid_topology'
-                                        and old['grid']!=current.get('grid'))
-            row['on']+=elapsed if known and old['relay']=='on' else 0.
-            row['unknown']+=elapsed if not known or old['relay'] not in ('on','off') else 0.
-            row['supply_on']+=elapsed if supply_known and old['supply']=='on' else 0.
-            row['supply_unknown']+=elapsed if not supply_known or old['supply'] not in ('on','off') else 0.
-            row['powered_on']+=elapsed if supply_known and old['relay']=='on' and old['supply']=='on' else 0.
-            row['grid_on']+=elapsed if known and old['grid']=='on' else 0.
-            row['grid_unknown']+=elapsed if not known or old['grid']=='unknown' else 0.
-            duty=old.get('effective_duty')
-            if not known or (not supply_known and old['relay']!='off'):
-                duty=None
-            row['effective_on']+=elapsed if duty==1. else 0.
-            row['effective_unknown']+=elapsed if duty is None else 0.
-        self.ventilation_states=states;self.ventilation_totals=totals;self.ventilation_at=stamp
-    def ventilation_sample(self,stamp):
-        self.ventilation_tick(stamp)
-        result={}
-        bindings=ventilation_binding_identity(self.cfg)
-        for name,row in self.ventilation_totals.items():
-            seconds=row['seconds']
-            identity=bindings.get(name) or {}
-            result[name]=dict(**identity,duty_policy=VENTILATION_DUTY_POLICY,seconds=round(seconds,1),
-                on_fraction=round(row['on']/seconds,4) if seconds else None,
-                unknown_fraction=round(row['unknown']/seconds,4) if seconds else None,
-                supply_on_fraction=round(row['supply_on']/seconds,4) if seconds else None,
-                supply_unknown_fraction=round(row['supply_unknown']/seconds,4) if seconds else None,
-                powered_relay_on_fraction=round(row['powered_on']/seconds,4) if seconds and row['supply_unknown']==0 else None,
-                grid_on_fraction=round(row['grid_on']/seconds,4) if seconds else None,
-                grid_unknown_fraction=round(row['grid_unknown']/seconds,4) if seconds else None,
-                effective_on_fraction=round(row['effective_on']/seconds,4) if seconds else None,
-                effective_unknown_fraction=round(row['effective_unknown']/seconds,4) if seconds else None)
-        self.ventilation_totals={}
-        return result
-
     def measured_sample_power(self,start,end):
         return None
 
@@ -1098,7 +938,6 @@ class HeatingClimate(HeatingRecovery,Hass):
         row['fire_valid']=self.memory.get('fire_phase')!='Датчик недоступний'
         row['fire_phase']=self.memory.get('fire_phase','Неактивний')
         row['fire_active']=bool((self.memory.get('fire_circulation') or {}).get('active',False))
-        row['ventilation']=self.ventilation_sample(stamp)
         record=self.raw('room',attribute='all') if self.cfg.get('room') else None
         if isinstance(record,dict):
             reported=record.get('last_reported') or record.get('last_updated')
@@ -1193,7 +1032,7 @@ class HeatingClimate(HeatingRecovery,Hass):
         signal=round(delta,6);trend=round(slope,6)
         previous=self.memory.get("fire_phase","Неактивний")
         tracker=self.memory.get('fire_circulation',{})
-        was_active=tracker.get('active',self.memory.get('fan_owned',False) and previous in ('Горить','Згасає','Інтенсивно горить'))
+        was_active=tracker.get('active',previous in ('Горить','Згасає','Інтенсивно горить'))
         last_valid=number(tracker.get('last_valid'))
         continuous=last_valid is not None and 0<=stamp-last_valid<=p['fire_continuity_seconds']
         below=number(tracker.get('below_since')) if continuous else None
@@ -1654,7 +1493,6 @@ class HeatingClimate(HeatingRecovery,Hass):
 
     def tick_inner(self):
         now=self.now()
-        self.ventilation_tick(now.timestamp())
         self.schedule_learning(now)
         room,source,primary,thermostat=self.source_temperature()
         probe=self.val("return")
@@ -1811,17 +1649,8 @@ class HeatingClimate(HeatingRecovery,Hass):
             settings['unknown_power_components']=list(self.control_power_bounds.get('unknown_components',[]))
         settings['equipment_version']=self.memory.get('equipment_version',0)
         settings['thermal_model_version']=self.model.get('version')
-        settings['ventilation_model']=self.active_ventilation_model()
-        settings['ventilation_expected'],ventilation_support,settings['ventilation_grid_only']=self.ventilation_forecast_inputs()
         floor=forecast_probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
-        ventilation=getattr(self,'ventilation_states',{})
-        recent_ventilation=(self.samples[-1].get('ventilation') or {}) if self.samples else {}
-        totals=getattr(self,'ventilation_totals',{})
-        quiet_ventilation=all((ventilation.get(k) or {}).get('effective_duty')==0 and
-            not any((totals.get(k) or {}).get(field,0)>0 for field in ('effective_on','effective_unknown')) and
-            effective_ventilation_duty(recent_ventilation.get(k))==0
-            for k,v in (self.cfg.get('ventilation') or {}).items() if isinstance(v,dict) and v.get('entity'))
         equipment=getattr(self,'equipment_status',{}) or {}
         if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason=settings['control_power_basis'])
         elif getattr(self,'power_source','')=='fallback_inlet_stage':environment_quality=dict(environment_quality,degraded=True,input_reason='nominal_inlet_stage')
@@ -1847,7 +1676,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                                settings=settings,fit_coefficients=getattr(self,'_native_solar_fit',True),
                                quality=outside_fresh and source=='Вітальня' and reported is not None and 0<=now.timestamp()-reported<=300 and
                                    room_check['status'] not in ('pending','room_source_disagreement') and quality and not reserve_active and
-                                   grid=='on' and equipment.get('ready') is True and quiet_ventilation and
+                                   grid=='on' and equipment.get('ready') is True and
                                    self.memory.get('fire_phase')=='Неактивний')
             self.memory['solar_observer']=solar
             # Bind the read-only candidate to the current thermal/equipment
@@ -1906,13 +1735,13 @@ class HeatingClimate(HeatingRecovery,Hass):
         usable_weather,weather_bias=anchor_weather(usable_weather,now.timestamp(),outside) if outside is not None else ([],0.)
         settings['environment_weather']=usable_weather
         # Only independently corroborated, quiet, measured-OFF intervals may
-        # identify a short bias. Unknown wood/ventilation is not weather error.
+        # identify a short bias. Unknown fireplace heat is not weather error.
         residual=observe_residual(self.memory.get('weather_residual'),now.timestamp(),room,floor,outside,self.model,
             (getattr(self,'temperature_quality',{}) or {}).get('primary_reported_at'),
             outside_fresh and forecast_quality and quality and not reserve_active and source=='Вітальня' and
             room_check['status']=='agree' and grid=='on' and equipment.get('ready') is True and
             measured_power is not None and measured_power<500 and
-            self.memory.get('fire_phase')=='Неактивний' and quiet_ventilation and bool(usable_weather),
+            self.memory.get('fire_phase')=='Неактивний' and bool(usable_weather),
             usable_weather,settings)
         self.memory['weather_residual']=residual
         settings.setdefault('environment',{})['residual']={k:residual[k] for k in ('at','rate') if k in residual}
@@ -2011,7 +1840,6 @@ class HeatingClimate(HeatingRecovery,Hass):
                 grid={k:outage_data.get(k) for k in ('mode','valid','outages')},
                 thermal_state=dict(room=room,floor=floor,fire=fire,coast_peak=peak,
                     gain={k:((settings.get('environment') or {}).get('solar') or {}).get(k) for k in ('coefficient','validated','observed_gain')}),
-                ventilation=dict(model=settings.get('ventilation_model'),expected=settings.get('ventilation_expected')),
                 power=dict(physical_mode=profile.get('physical_mode'),equipment_version=settings.get('equipment_version'),bands=[{k:b.get(k) for k in ('return_min','return_max','measured_kw')} for b in profile.get('bands',[])],anchor=anchor),
                 manual=dict(mode=self.raw('mode'),armed=self.raw('armed')),
                 fallback=bool(self.memory.get('temporary_fallback')),model=self.model),default={})
@@ -2044,7 +1872,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          electrical_inputs_unavailable=measured_power is None,grid_state=grid,return_estimated=not probe_ok,
                          estimated_morning_request_minutes=settings.get('estimated_morning_request_minutes',0.),
                          validated=self.model.get("validated",False) and not environment_quality['degraded'] and not profile.get('assumed',True) and measured_power is not None,
-                         power_assumption=profile.get('assumption'),ventilation_validated=bool((settings.get('ventilation_model') or {}).get('validated')),
+                         power_assumption=profile.get('assumption'),
                          equipment_version=settings.get('equipment_version'),
                          structural_model_validated=self.model.get('validated',False),
                          reliability=environment_quality,estimated_floor=floor,
@@ -2164,7 +1992,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      power_learning=profile,
                      effective_power_kw=round(effective,3) if effective is not None else None,
                      power_learning_status='Навчання модуляції' if profile['intervals'] else 'Очікуємо підтверджений нагрів')
-        self.run_diagnostic('equipment_publish',self.publish_equipment,ventilation_support)
+        self.run_diagnostic('equipment_publish',self.publish_equipment)
         self.run_diagnostic('plan_history_publish',self.publish_plan_history)
         self.run_diagnostic('ai_summary',self.publish_ai_summary,refresh=True)
         self.memory["planned_heat_segments"]=forecast["heat_segments"] if forecast else []

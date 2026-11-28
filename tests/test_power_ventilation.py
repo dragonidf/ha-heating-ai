@@ -2,7 +2,6 @@
 import copy,math,unittest
 from heating_fallback import aligned_power,phase_residual,integrate_observation,combine_power
 from heating_model import modulation_power,learn_power_modes
-from heating_environment import ventilation_loss,fit_ventilation
 
 class MeasurementContracts(unittest.TestCase):
     def readings(self):return {k:dict(value=v,at=100.,unit='W',kind='active') for k,v in dict(a=3400,b=400,c=400,washer=400,inverter=0).items()}
@@ -40,38 +39,13 @@ class PhysicalModes(unittest.TestCase):
         result=learn_power_modes(samples)
         self.assertFalse(result['profiles']);self.assertIn('insufficient',result['status'])
 
-class VentilationContracts(unittest.TestCase):
-    def test_validated_increment_is_not_double_counted_and_warm_air_reverses_sign(self):
-        model=dict(validated=True,base_room_loss=.01,recuperator=.002,bath=.005,model_version=6)
-        settings=dict(ventilation_model=model,ventilation_expected=dict(recuperator=.5,bath=.2),thermal_model_version=6)
-        self.assertAlmostEqual(ventilation_loss(22,12,.02,settings),-.08)
-        self.assertAlmostEqual(ventilation_loss(12,22,.02,settings),.08)
-        model['validated']=False;self.assertEqual(ventilation_loss(22,12,.02,settings),0.)
-    def test_empirical_duty_is_physical_not_commanded_and_excludes_old_device(self):
-        from heating_environment import effective_ventilation_duty, ventilation_expectation
-        off=dict(seconds=300,on_fraction=1.,unknown_fraction=0.,
-                 effective_on_fraction=0.,effective_unknown_fraction=0.,entity='switch.recuperator')
-        self.assertEqual(effective_ventilation_duty(off),0.)
-        self.assertEqual(effective_ventilation_duty({**off,'effective_on_fraction':.5}),.5)
-        self.assertIsNone(effective_ventilation_duty({**off,'effective_unknown_fraction':.01}))
-        self.assertIsNone(effective_ventilation_duty(dict(seconds=300,on_fraction=1.,unknown_fraction=0.)))
-        self.assertEqual(effective_ventilation_duty(dict(seconds=300,on_fraction=0.,unknown_fraction=0.)),0.)
-        rows=[dict(ventilation={'recuperator':off}) for _ in range(12)]
-        rows += [dict(ventilation={'recuperator':{**off,'entity':'switch.old','effective_on_fraction':1.}}) for _ in range(12)]
-        expected,support=ventilation_expectation(rows,{'recuperator':{'entity':'switch.recuperator','relay':'on','effective_duty':0.}})
-        self.assertEqual(expected['recuperator'],0.)
-        self.assertIsNone(expected['bath'])
-        self.assertEqual(support['recuperator']['intervals'],12)
-
-    def test_empty_or_correlated_inputs_cannot_be_validated(self):
-        self.assertFalse(fit_ventilation([],{'version':6})['validated'])
 
 class SettingsAndLatency(unittest.TestCase):
     def test_description_survives_restart_without_commands_or_rollback_pollution(self):
         from test_system_settings import SystemSettingsTests
         from unittest.mock import Mock
         fixture=SystemSettingsTests();app=fixture.app();app.samples=[];app.climate_tz=app.now().tzinfo;app.call_service=Mock()
-        status=fixture.submit(app,dict(boiler_power_mode='fixed_6',recuperator_entity='switch.recuperator',outage_missing_policy='assume_available'))
+        status=fixture.submit(app,dict(boiler_power_mode='fixed_6',outage_missing_policy='assume_available'))
         self.assertTrue(status['last_success']);self.assertEqual(app.memory['equipment_version'],1)
         self.assertNotIn('boiler_power_mode',app.memory['system_settings']);app.call_service.assert_not_called()
         previous=copy.deepcopy(app.memory);fresh=fixture.app();fresh.memory=previous;fresh.restore_system_settings()
@@ -83,7 +57,7 @@ class SettingsAndLatency(unittest.TestCase):
     def test_schema_rejects_invalid_mode_malformed_phase_or_duplicate(self):
         from heating_ui import validate_system_settings
         from heating_model import DEFAULT_MODEL
-        for values in [dict(boiler_power_mode='heat'),dict(recuperator_entity='climate.any'),dict(power_phase_topology={'verified':True,'phases':[]}),dict(power_phase_topology={'verified':False,'phases':[],'token':'forbidden'})]:
+        for values in [dict(boiler_power_mode='heat'),dict(power_phase_topology={'verified':True,'phases':[]}),dict(power_phase_topology={'verified':False,'phases':[],'token':'forbidden'})]:
             with self.assertRaises(ValueError):validate_system_settings(values,{},DEFAULT_MODEL)
     def test_low_voltage_residual_and_sampling_delay_bound(self):
         from heating_model import HeatingPowerEstimator
@@ -172,16 +146,6 @@ class CalibrationContracts(unittest.TestCase):
         self.assertEqual(result['intervals'],11)
         self.assertAlmostEqual(result['bands'][0]['measured_kw'],4.5*10/11,places=3)
 
-    def test_validated_ventilation_can_advance_within_daily_bounds(self):
-        from test_system_settings import SystemSettingsTests
-        from unittest.mock import patch
-        app=SystemSettingsTests().app();app.samples=[];app.climate_tz=app.now().tzinfo
-        app.memory['ventilation_model']=dict(validated=True,model_version=app.model['version'],fit_day='2026-10-20',base_room_loss=.02,recuperator=.002,bath=.004)
-        candidate=dict(validated=True,model_version=app.model['version'],base_room_loss=.021,recuperator=.0021,bath=.0041)
-        with patch('heating_climate.fit_ventilation',return_value=candidate):app.refresh_equipment_models()
-        self.assertEqual(app.memory['ventilation_model']['fit_day'],'2026-10-21')
-        self.assertAlmostEqual(app.memory['ventilation_model']['base_room_loss'],.021)
-
     def test_separate_mode_sessions_and_average_are_not_an_instant_six_kw_stage(self):
         from heating_model import DEFAULT_MODEL,step
         rows=[];model=dict(DEFAULT_MODEL,version=6)
@@ -200,55 +164,6 @@ class CalibrationContracts(unittest.TestCase):
         p=result['profiles']['auto'];self.assertLess(p['holdout_mae_kw'],p['baseline_mae_kw'])
         self.assertEqual(p['stage_probabilities']['6'],0.)
         self.assertGreater(p['stage_probabilities']['3'],0.)
-    def ventilation_rows(self,correlated=False):
-        rows=[];loss=.018;kr=.003;kb=.007;air=.035
-        for day in range(3):
-            start=1793055600.+day*86400;room=22.;floor=25.
-            for i in range(73):
-                u=((max(0,i-1)//6)%4)//2;v=((max(0,i-1)//6)%2) if not correlated else u
-                rows.append(dict(ts=start+i*300,room=room,outside=10.,floor_estimate=floor,quality=True,power_quality='measured',
-                    grid='on',fire=0.,daylight_weight=0.,power_estimated=False,
-                    ventilation={k:dict(seconds=300,on_fraction=value,unknown_fraction=0.,
-                        effective_on_fraction=value,effective_unknown_fraction=0.) for k,value in [('recuperator',u),('bath',v)]}))
-                next_u=((i//6)%4)//2;next_v=((i//6)%2) if not correlated else next_u
-                coefficient=loss+kr*next_u+kb*next_v
-                equilibrium=(air*floor+coefficient*10)/(air+coefficient)
-                room=equilibrium+(room-equilibrium)*math.exp(-(air+coefficient)/12)
-        return rows
-    def test_physical_ventilation_fit_cannot_inherit_old_or_changed_binding(self):
-        from heating_environment import ventilation_binding_identity,compatible_ventilation_fit,VENTILATION_DUTY_POLICY
-        from heating_model import DEFAULT_MODEL
-        model=dict(DEFAULT_MODEL,version=6,room_loss=.02)
-        cfg=dict(ventilation={"recuperator":{"entity":"switch.recup"},"bath":{"entity":"switch.bath"}},
-                 grid_only_ventilation_entities=["switch.recup"])
-        bindings=ventilation_binding_identity(cfg)
-        rows=self.ventilation_rows()
-        old=fit_ventilation(rows,model)
-        self.assertTrue(old["validated"])
-        self.assertEqual(compatible_ventilation_fit(old,bindings),{})
-        self.assertFalse(fit_ventilation(rows,model,bindings=bindings)["validated"])
-        for row in rows:
-            for key,identity in bindings.items():
-                row["ventilation"][key].update(identity,duty_policy=VENTILATION_DUTY_POLICY)
-        new=fit_ventilation(rows,model,bindings=bindings)
-        self.assertTrue(new["validated"],new)
-        self.assertEqual(compatible_ventilation_fit(new,bindings),new)
-        changed=copy.deepcopy(cfg);changed["ventilation"]["bath"]["entity"]="switch.other"
-        self.assertEqual(compatible_ventilation_fit(new,ventilation_binding_identity(changed)),{})
-        self.assertFalse(fit_ventilation(rows,model,bindings=ventilation_binding_identity(changed))["validated"])
-        cfg["ventilation"]["recuperator"]["power_entity"]="binary_sensor.supply"
-        self.assertEqual(ventilation_binding_identity(cfg)["recuperator"]["supply_provenance"],"supply_sensor")
-        self.assertEqual(compatible_ventilation_fit(new,ventilation_binding_identity(cfg)),{})
-
-    def test_ventilation_needs_independent_states_and_whole_heldout_days(self):
-        from heating_model import DEFAULT_MODEL
-        model=dict(DEFAULT_MODEL,version=6,room_loss=.02)
-        fit=fit_ventilation(self.ventilation_rows(),model)
-        self.assertTrue(fit['validated'],fit)
-        self.assertLess(fit['holdout_mae'],fit['baseline_mae'])
-        self.assertFalse(fit_ventilation(self.ventilation_rows()[:146],model)['validated'])
-        bad=fit_ventilation(self.ventilation_rows(correlated=True),model)
-        self.assertFalse(bad['validated']);self.assertEqual(bad['reason'],'correlated_or_constant_relays')
 
 class AuditedAdapter(unittest.TestCase):
     def test_real_report_timestamps_override_unchanged_appdaemon_cache_without_relaxing_skew(self):

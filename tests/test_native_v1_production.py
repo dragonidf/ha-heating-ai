@@ -237,13 +237,13 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             app.climate_tz=timezone.utc
             app._learning_eligible=Mock(return_value=True)
             issued=dict(model=dict(app.model),equipment=1,generation=app._learning_generation,
-                        solar_ventilation={},started=time.monotonic())
+                        started=time.monotonic())
             outcome={"solar":dict(status="holdout_passed",risk_eligible=True,coefficient=.5,
                 identity=[6,1,"fixed_6"],holdout_end=1000.,holdout_days=2,holdout_windows=8)}
-            app.memory["ventilation_model"]={"validated":False,"reason":"changed"}
+            app.memory["equipment_version"]=2
             app._store_solar_risk_candidate(issued,outcome)
             self.assertEqual(app.active_solar_risk_certificate(),{})
-            app.memory["ventilation_model"]={}
+            app.memory["equipment_version"]=1
             with patch.object(app,"save",side_effect=OSError):
                 app._store_solar_risk_candidate(issued,outcome)
             self.assertEqual(app.active_solar_risk_certificate(),{})
@@ -276,7 +276,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                       comfort_credit=False,stored_at=1000.,holdout_end=900.,ventilation_model={})
             app.memory["online_learning"]={"solar_risk_candidate":deepcopy(risk)}
             issued=dict(model=dict(app.model),equipment=1,generation=app._learning_generation,
-                        solar_ventilation={},solar_risk=deepcopy(risk),started=time.monotonic())
+                        solar_risk=deepcopy(risk),started=time.monotonic())
             report=dict(status="passed",identity=risk["identity"],coefficient=.5,issued_after=1000.)
             app._update_solar_credit(issued,{"solar_prospective":{**report,"issued_after":999.}})
             self.assertFalse(app.active_solar_risk_certificate()["comfort_credit"])
@@ -318,7 +318,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             app.submit_to_executor.assert_called_once()
             function,path,*_ = app.submit_to_executor.call_args.args
             self.assertEqual(function.__name__,"run_learning")
-            self.assertEqual(path.name,"online_learning_v1.json")
+            self.assertEqual(path.name,"online_learning_house_loss.json")
             app._learning_finished({"job_id":app._learning_job["id"],
                                     "result":{"status":"insufficient_data"}})
             self.assertEqual(app.model,{"version":6})
@@ -361,6 +361,27 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
                 app.schedule_learning(date)
                 learn.assert_not_called()
 
+    async def test_whole_house_loss_migration_preserves_parameters_and_energy(self):
+        with package(self.root / "package") as (component, _):
+            _, app = self.controller(component)
+            baseline = {**__import__("heating_model").DEFAULT_MODEL,
+                        "version":6,"validated":True,"room_loss":.008192}
+            old_checkpoint = {"accepted_metrics":{"1":{"new":{"mae":.2}}},
+                              "frozen_until":1200.,"changes_history":[]}
+            state = {"model":baseline,"energy_last":{"total":100.},
+                     "online_learning":old_checkpoint,"hour_errors":[.2],
+                     "ventilation_model":{"validated":True,"model_version":6}}
+            app.statefile.write_text(json.dumps(state))
+            migrated = app.load_state()
+            self.assertEqual(migrated["model"],{**baseline,"version":7})
+            self.assertEqual(migrated["energy_last"],state["energy_last"])
+            self.assertEqual(migrated["online_learning"]["frozen_until"],1200.)
+            self.assertNotIn("accepted_metrics",migrated["online_learning"])
+            self.assertEqual(migrated["house_loss_migration"]["previous"]["model"],baseline)
+            self.assertEqual(json.loads(app.statefile.read_text()),state)
+            app.statefile.write_text(json.dumps(migrated))
+            self.assertEqual(app.load_state(),migrated)
+
     async def test_learning_commit_and_rollback_are_atomic_and_leave_control_ledgers(self):
         with package(self.root / "package") as (component, _):
             _, app = self.controller(component)
@@ -390,8 +411,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(app._learning_job)
             app._learning_finished({"job_id":app._learning_job["id"],"result":outcome})
             self.assertEqual(app.model["version"],7)
-            self.assertEqual(app.memory["ventilation_model"],{**ventilation,"model_version":7,
-                             "carried_from_model_version":6})
+            self.assertEqual(app.memory["ventilation_model"],ventilation)
             self.assertEqual(json.loads(app.statefile.read_text())["ventilation_model"],
                              app.memory["ventilation_model"])
             self.assertEqual(json.loads(app.statefile.read_text())["model"],app.model)

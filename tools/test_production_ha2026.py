@@ -8,6 +8,7 @@ import sys
 from tempfile import TemporaryDirectory
 import time
 import zipfile
+from unittest.mock import patch
 
 from build_marketplace import build, ROOT
 
@@ -91,7 +92,21 @@ async def exercise(directory):
         assert (await options.async_step_init())["type"] == "form"
         await controller.async_start(writer=True)
         assert controller.runtime_ready
-        assert controller.model["version"] == 6
+        migrated_model={**state["model"],"version":state["model"]["version"]+1}
+        assert controller.model == migrated_model
+        hass.states.async_set("sensor.heating_test_dynamic_input", "21")
+        def read_dynamic_input():
+            controller.refresh_tick_snapshot()
+            snapshot = controller._tick_read_local
+            try:
+                assert "sensor.heating_test_dynamic_input" not in snapshot.states
+                assert controller.get_state("sensor.heating_test_dynamic_input") == "21"
+                assert "sensor.heating_test_dynamic_input" in snapshot.states
+            finally:
+                snapshot.states = None
+        with patch.object(type(hass.states),"async_all",
+                          side_effect=AssertionError("Heating must only read its bound entities")):
+            await asyncio.to_thread(read_dynamic_input)
         assert controller.samples == [archived], controller.samples
         assert hass.states.get("sensor.heating_ui").attributes["release_verified"] is True
         assert hass.states.get("sensor.heating_ui").attributes["runtime"] == "native_v1"
@@ -148,7 +163,7 @@ async def exercise(directory):
         restarted = NativeController(hass,cfg)
         try:
             await restarted.async_start(writer=False)
-            assert restarted.runtime_ready and restarted.model == state["model"]
+            assert restarted.runtime_ready and restarted.model == migrated_model
             assert restarted.samples[0] == archived
             assert not restarted._learning_rows
             assert len(commands) == command_count

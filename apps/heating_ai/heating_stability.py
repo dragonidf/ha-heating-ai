@@ -20,10 +20,9 @@ from heating_environment import forecast_step,gain_at,safe_upper,has_upper_risk,
 def policy(settings):
     keys=('target','lower','upper','start','end','strategy','split_comfort',
           'morning_min_minutes','day_price','night_price','budget_multiplier',
-          'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin','equipment_version','ventilation_model','ventilation_expected',
+          'night_target','night_lower','night_upper','sleep_start','sleep_end','upper_margin','equipment_version',
           'day_insurance','day_insurance_kwh','day_insurance_start','day_insurance_end','day_insurance_deficit')
     return {**{k:settings.get(k) for k in keys},'environment_policy_version':ENVIRONMENT_POLICY_VERSION,
-            'ventilation_topology':{k:v.get('entity') for k,v in (settings.get('ventilation_grid_only') or {}).items()},
             'energy_budget_policy_version':1,
             'outage_mode':(settings.get('outage_schedule') or {}).get('mode'),
             'runtime_supply_override':(settings.get('outage_schedule') or {}).get('runtime_supply_override'),
@@ -177,9 +176,9 @@ def replay(now, room, floor, outside, fire, model, weather, settings, segments, 
                 _,_,out,gains=forecast.at(tm)
                 fire_gain=model['fire_gain']*max(0.,fire*math.exp(-(t-start)/7200))
                 delivered_kw=kw if active else 0.
-                r,f=forecast.integrate(r,f,out,delivered_kw,fire_gain,dt,gains[0],interval=(t,u))
+                r,f=forecast.integrate(r,f,out,delivered_kw,fire_gain,dt,gains[0])
                 risk_kw=max(delivered_kw,upper_power) if active and upper_power is not None else delivered_kw
-                ur,uf=(forecast.integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1],upper=True,interval=(t,u))
+                ur,uf=(forecast.integrate(ur,uf,out,risk_kw,fire_gain,dt,gains[1])
                        if risk_enabled else (r,f))
                 low=min(low,r); high=max(high,r)
                 fine.append(dict(ts=u,temperature=r,upper_temperature=max(r,ur),**{'return':f}))
@@ -577,7 +576,7 @@ def recommend_power(now,room,floor,outside,fire,model,weather,settings,calibrati
             stamp=end
         bound=dict(allowed_minutes=allowed_seconds/60,first_shortfall=first_shortfall,
             optimistic_maximum_kw=9.,upper_and_storage_limits_relaxed=True,
-            assumptions='Чинна теплова модель, задана погода й вентиляція; 9 кВт у кожний доступний інтервал; невідома мережа умовно доступна')
+            assumptions='Чинна теплова модель, задана погода; 9 кВт у кожний доступний інтервал; невідома мережа умовно доступна')
 
     return dict(created_at=now.isoformat(),mode=chosen['mode'] if chosen else None,
         status='feasible_found' if chosen else 'no_available_interval' if bound and not bound['allowed_minutes'] else 'model_bound_insufficient' if bound and bound['first_shortfall'] else 'search_not_found',

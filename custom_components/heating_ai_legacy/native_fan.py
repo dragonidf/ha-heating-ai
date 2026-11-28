@@ -1,7 +1,7 @@
 """Pure V1 fireplace/circulation projection, deliberately without device transport.
 
 Keeps the meaningful V1 ignition/stop continuity guards and the V2 principle
-of a pure demand reducer. No fan, recuperator or bath writes exist here.
+of a pure demand reducer. No equipment writes exist here.
 """
 from __future__ import annotations
 

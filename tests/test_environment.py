@@ -184,11 +184,10 @@ class AdaptiveSolarRegressions(unittest.TestCase):
         rows=coast_trajectory(at,21.,22.,8.,0.,DEFAULT_MODEL,settings,hours=1/12,upper=True)
         expected,_=forecast_step(21.,22.,8.,0.,0.,DEFAULT_MODEL,1/12,at,weather,settings,upper=True)
         self.assertAlmostEqual(rows[-1]['temperature'],expected)
-    def test_known_ventilation_difference_cannot_be_learned_as_sun(self):
+    def test_whole_house_cooling_is_not_learned_as_sun(self):
         t=self.at.timestamp()
-        settings=dict(thermal_model_version=1,ventilation_model=dict(validated=True,model_version=1,
-            base_room_loss=.001,recuperator=0.,bath=0.),ventilation_expected=dict(recuperator=0.,bath=0.))
-        model=dict(DEFAULT_MODEL,floor_air=0.)
+        settings={}
+        model=dict(DEFAULT_MODEL,floor_air=0.,room_loss=.001)
         state=observe_gain({},t,22.,22.,8.,0.,False,model,self.at.tzinfo,'sunny',
                            reported_at=t,astronomy=self.geometry,settings=settings)
         state=observe_gain(state,t+1800,21.993,22.,8.,0.,False,model,self.at.tzinfo,'sunny',
@@ -315,15 +314,15 @@ class EnvironmentTests(unittest.TestCase):
     def test_conservative_peak_more_than_three_hours_after_heat_is_checked(self):
         at = self.at.replace(hour=0,minute=0)
         segment = dict(start=at.timestamp(),end=at.timestamp()+7200)
-        settings = dict(self.settings,upper=21.8,night_upper=21.8,
-                        thermal_model_version=1,
-                        ventilation_model=dict(validated=True,model_version=1,
-                                               base_room_loss=.005,recuperator=.02,bath=.005),
-                        ventilation_expected=dict(recuperator=1.,bath=0.))
-        nominal = replay(at,21,21,10,0,self.model,[],dict(settings,upper=26,night_upper=26),
+        settings = dict(self.settings,upper=21.8,night_upper=21.8)
+        model = dict(self.model,room_loss=.005)
+        nominal = replay(at,21,21,10,0.,model,[],dict(settings,upper=26,night_upper=26),
                          [segment],True,6,reserve_checked=True)
-        self.assertLessEqual(nominal['maximum'],21.8)
-        self.assertIsNone(replay(at,21,21,10,0,self.model,[],settings,[segment],True,6,
+        trace=[p for row in nominal['_calculation_curve'] for p in row.get('_fine', [row])]
+        peak=max(trace,key=lambda row:row['temperature'])
+        self.assertGreater(peak['ts'],segment['end']+3*3600)
+        self.assertGreater(peak['temperature'],21.8)
+        self.assertIsNone(replay(at,21,21,10,0.,model,[],settings,[segment],True,6,
                                  reserve_checked=True))
     def test_daytime_and_outage_not_used_to_fit_floor_coefficients(self):
         a=dict(ts=100,room=22,return_=24,outside=12,power=0,quality=True,grid='off',

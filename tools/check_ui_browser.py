@@ -490,19 +490,18 @@ def check_equipment(page):
     page.evaluate('panel.hass=mockHass')
     page.locator('nav [data-tab="settings"]').click()
     headings=page.locator('.settings-grid>.card h2').all_text_contents()
-    assert headings==['Керування опаленням','Комфорт','Години нагріву','Циркуляція','Котел','Вентиляція'],headings
+    assert headings==['Керування опаленням','Комфорт','Години нагріву','Циркуляція','Котел'],headings
     page.locator('.additional-settings>summary').click()
     assert page.locator('[data-system-key="floor_air"]').evaluate('el=>el.validity.stepMismatch')
     page.evaluate("mockHass.states={...mockHass.states,'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},'fan.bath':{state:'unavailable',attributes:{friendly_name:'Витяжка ванної'}}};panel.hass={...mockHass}")
-    assert page.locator('[data-system-key="recuperator_entity"]').evaluate('el=>el.tagName')=='SELECT'
+    assert not page.locator('[data-system-key="recuperator_entity"],[data-system-key="bath_entity"]').count()
     page.locator('[data-system-key="boiler_power_mode"]').select_option('auto')
     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'), 'Long AUTO selection must fit a narrow settings column'
     page.locator('[data-system-key="boiler_power_mode"]').select_option('fixed_6')
     assert not page.evaluate('systemRequests.length')
-    page.locator('[data-system-key="recuperator_entity"]').select_option('switch.recuperator')
     page.locator('[data-system-save]').first.click()
     page.wait_for_function('systemRequests.length===1')
-    assert page.evaluate('systemRequests[0].data.values')=={'boiler_power_mode':'fixed_6','recuperator_entity':'switch.recuperator'}
+    assert page.evaluate('systemRequests[0].data.values')=={'boiler_power_mode':'fixed_6'}
     assert not page.evaluate('calls.length'), 'Describing equipment must not command a device'
     page.wait_for_function("!document.querySelector('heating-ai-panel').shadowRoot.querySelector('[data-system-key=boiler_power_mode]').disabled")
     page.evaluate('systemRequests=[];panel.hass=mockHass')

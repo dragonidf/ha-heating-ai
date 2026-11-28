@@ -199,15 +199,8 @@ class NativeController(HeatingClimate):
             reasons.add("manual_extra_request")
         if self.memory.get("temporary_fallback"):
             reasons.add("temporary_fallback")
-        if ((number(fire) or 0.)>.2 or self.memory.get("fire_phase")=="Датчик недоступний"
-                or (self.memory.get("fire_circulation") or {}).get("active")):
+        if (number(fire) or 0.)>.2 or self.memory.get("fire_phase")=="Датчик недоступний":
             reasons.add("fireplace")
-        # Internal circulation is not external airflow or a heat source.
-        # Fireplace activity/unknown temperature and room conflicts retain
-        # their own independent qualification gates above.
-        sensed = getattr(self, "ventilation_states", {})
-        if not learning.ventilation_current_qualified(sensed):
-            reasons.add("unknown_ventilation")
         self._learning_current_ok = not reasons
         if reasons:
             self._learning_generation += 1
@@ -325,14 +318,6 @@ class NativeController(HeatingClimate):
             self._learning_last_report = observed
             self._learning_last_value = temperature
             compact["room_reported_at"] = observed
-        ventilation = []
-        for key in ("recuperator","bath"):
-            evidence = (row.get("ventilation") or {}).get(key,{})
-            duty = learning.ventilation_interval_duty(evidence)
-            if duty is None:
-                ventilation = None
-                break
-            ventilation.append(duty)
         issue = number(self.memory.get("weather_at"))
         weather_state=self.raw("weather",attribute="all") if self.cfg.get("weather") else None
         solar_weather=learning.solar_weather_evidence(stamp,self.climate_tz,self.weather,issue,
@@ -341,11 +326,9 @@ class NativeController(HeatingClimate):
         compact.update(zero_heat_provenance="verified_mains_isolation" if self._learning_zero_now else None,
             zero_heat_interval_verified=self._learning_zero_interval,
             thermal_inputs_ok=getattr(self,"_learning_thermal_inputs_ok",False) is True,
-            circulation_role="internal_redistribution",
-            circulation_active=self.raw("fan")=="on" if self.cfg.get("fan") else None,
             report_verified=verified, primary_fresh=reported is not None and 0<=stamp-reported<=300,
             voltage_qualified=voltage,
-            shadow_ventilation=ventilation, epoch=self._learning_epoch, weather_issue_at=issue,
+            epoch=self._learning_epoch, weather_issue_at=issue,
             solar_factor=solar, solar_weather=solar_weather, shadow_reasons=tuple(sorted(reasons)), interval_kw=interval_kw,
             room_source_status=(self.memory.get("room_source_check") or {}).get("status"))
         self._learning_rows.append(compact)
@@ -483,16 +466,14 @@ class NativeController(HeatingClimate):
         eligible=self._learning_eligible()
         issued=dict(id=uuid4().hex,model=dict(self.model),started=time.monotonic(),
                     generation=self._learning_generation,equipment=self.memory.get("equipment_version",0),
-                    solar_ventilation=deepcopy(self.active_ventilation_model()),
                     solar_risk=deepcopy(self.active_solar_risk_certificate()),
                     schedule=dict(day=now.date().isoformat(),slot=slot,
                                   room_report=self._learning_last_report,eligible_at_issue=eligible))
         self._learning_job=issued
         self._learning_status.update(status="evaluating",reason="scheduled_evaluation")
         try:
-            self.submit_to_executor(learning.run_learning,self.directory/"online_learning_v1.json",
+            self.submit_to_executor(learning.run_learning,self.directory/"online_learning_house_loss.json",
                 tuple(self._learning_rows),tuple(self._learning_forecasts),issued["model"],
-                issued["solar_ventilation"],
                 deepcopy(self.memory.get("online_learning") or {}),now,eligible,
                 dict(mode=self.cfg.get("boiler_power_mode","unconfirmed"),equipment=issued["equipment"],
                      calibrations=deepcopy(self.memory.get("power_calibrations") or {}),
@@ -534,7 +515,6 @@ class NativeController(HeatingClimate):
                   self.cfg.get("boiler_power_mode","unconfirmed")]
         coefficient=number(certificate.get("coefficient"))
         if (certificate.get("identity")==identity and certificate.get("status")=="holdout_passed"
-                and certificate.get("ventilation_model")== self.active_ventilation_model()
                 and type(certificate.get("comfort_credit")) is bool
                 and number(certificate.get("stored_at")) is not None
                 and certificate["stored_at"]>=checkpoint.get("evidence_after",0)
@@ -553,7 +533,6 @@ class NativeController(HeatingClimate):
                 or solar.get("risk_eligible") is not True or solar.get("status")!="holdout_passed"
                 or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
                 or issued["equipment"]!=self.memory.get("equipment_version",0)
-                or issued.get("solar_ventilation")!=self.active_ventilation_model()
                 or time.monotonic()-issued["started"]>120 or not self._learning_eligible()):
             return
         identity=[self.model.get("version"),issued["equipment"],self.cfg.get("boiler_power_mode","unconfirmed")]
@@ -567,7 +546,6 @@ class NativeController(HeatingClimate):
                     or old.get("nominal_revoked_at",0)>=solar.get("holdout_end",0)):
             return
         checkpoint["solar_risk_candidate"]={**solar,"comfort_credit":False,
-            "ventilation_model":deepcopy(self.active_ventilation_model()),
             "stored_at":self.now().timestamp()}
         try:
             self.save()
@@ -585,7 +563,6 @@ class NativeController(HeatingClimate):
         if (not active or active!=issued.get("solar_risk")
                 or issued["model"]!=self.model or issued["generation"]!=self._learning_generation
                 or issued["equipment"]!=self.memory.get("equipment_version",0)
-                or issued.get("solar_ventilation")!=self.active_ventilation_model()
                 or time.monotonic()-issued["started"]>120
                 or self.memory.get("state_load_error") or getattr(self,"settings_transaction",False)
                 or report.get("identity")!=active["identity"]
@@ -673,27 +650,11 @@ class NativeController(HeatingClimate):
 
     def _commit_learning_model(self, model, checkpoint, status, reason):
         """Commit the model and its rollback evidence at one filesystem boundary."""
-        ventilation=self.memory.get("ventilation_model")
-        qualified_ventilation=self.active_ventilation_model()
-        active_vent=bool(qualified_ventilation.get("validated")
-                         and qualified_ventilation.get("model_version")==self.model.get("version"))
-        if status=="accepted" and active_vent and model.get("room_loss")!=self.model.get("room_loss"):
-            self._learning_status.update(status="rejected",reason="room_loss_not_identifiable_with_ventilation")
-            return False
         checkpoint={**checkpoint,"changes_history":self._learning_history(checkpoint,status,reason,model)}
         if status=="accepted":
-            checkpoint["prior_ventilation_model"]=deepcopy(ventilation)
             checkpoint["prior_kws_profile"]=deepcopy(self.memory.get("kws_forecast_profile"))
         values={**self.memory,"model":model,"weather":self.weather,"online_learning":checkpoint,
                 "previous_model":dict(self.model),"predictions":[],"hour_errors":[]}
-        # Validation used the existing qualified ventilation coefficients. Keep
-        # that exact physical context across a version-only rebind, and restore
-        # its previous snapshot on rollback, at the same atomic write boundary.
-        if status=="accepted" and active_vent:
-            values["ventilation_model"]={**ventilation,"model_version":model["version"],
-                                        "carried_from_model_version":self.model["version"]}
-        elif status=="rolled_back" and "prior_ventilation_model" in checkpoint:
-            values["ventilation_model"]=deepcopy(checkpoint.pop("prior_ventilation_model")) or {}
         profile=self.memory.get("kws_forecast_profile")
         if status=="accepted":
             profile=checkpoint.pop("pending_kws_profile",profile)
@@ -1059,6 +1020,28 @@ class NativeController(HeatingClimate):
         self.system_settings_changed("authenticated_native_api", data, {})
         return self.native_settings_snapshot()
 
+    def load_state(self):
+        state = super().load_state()
+        if state.get("state_load_error") or "model" not in state or "house_loss_migration" in state:
+            return state
+        model = state["model"]
+        checkpoint = state.get("online_learning") or {}
+        # The structural parameters are retained. A new numerical revision
+        # separates forecasts and validation made under the previous equation.
+        previous = {"model": model}
+        for key in ("previous_model", "online_learning", "adaptive_schedule", "learning_success",
+                    "hour_errors", "reserve_errors", "weather_residual", "solar_observer",
+                    "kws_forecast_profile"):
+            if key in state:
+                previous[key] = state.pop(key)
+        state["model"] = {**model, "version": model["version"] + 1}
+        state["online_learning"] = {key:checkpoint[key] for key in (
+            "changes_history", "frozen_until", "rollback_reason", "promotion_day",
+        ) if key in checkpoint}
+        state["house_loss_migration"] = {"previous": previous}
+        # The existing atomic state save commits both the marker and all fields.
+        return state
+
     def initialize(self):
         super().initialize()
         self.memory.pop("pending_model",None)
@@ -1096,9 +1079,7 @@ class NativeController(HeatingClimate):
         for entity in (self.args.get("fan_control"), self.args.get("fan_mode")):
             if entity:
                 self.listen_state(self.fan_permission_changed, entity, attribute="all")
-        for entity in (self.args["thermostat"], self.args.get("fan")):
-            if entity:
-                self.listen_state(self.command_echo_changed, entity, attribute="all")
+        self.listen_state(self.command_echo_changed, self.args["thermostat"], attribute="all")
         if self.args.get("fan"):
             self._remember_fan_snapshot(baseline=True)
             self.listen_state(self.fan_state_changed, self.args["fan"], attribute="all")
@@ -2133,9 +2114,6 @@ async def async_setup_production(hass, entry):
                voltage_entities=entry.data.get("voltage_entities", [SOURCE_HINTS[f"voltage_l{i}"] for i in (1,2,3)]))
     cfg.update({key: entry.options.get(key, default) for key, default in (
         ("min_voltage_v", 190), ("max_voltage_v", 260), ("voltage_recovery_seconds", 30))})
-    # Keep the confirmation bound to the exact entity selected in native
-    # options. Empty or legacy options do not infer any supply topology.
-    cfg["grid_only_ventilation_entities"] = entry.options.get("grid_only_ventilation_entities", [])
     cfg["boiler_outage_isolation_relay"] = entry.options.get("boiler_outage_isolation_relay","")
     missing = [cfg[key] for key in ("thermostat", "room", "return", "mode", "armed")
                if hass.states.get(cfg[key]) is None]

@@ -10,85 +10,17 @@ import heating_ui
 
 
 class SystemSettingsTests(unittest.TestCase):
-    def test_ventilation_supply_binding_survives_same_relay_only(self):
+    def test_old_ventilation_overrides_do_not_block_supported_settings(self):
         app=self.app()
-        app.cfg.update(recuperator_entity='switch.recuperator',
-            ventilation={'recuperator':{'entity':'switch.recuperator',
-                         'power_entity':'binary_sensor.recuperator_supply'}})
-        app.runtime_ready=True
-        app.listen_state=Mock(side_effect=lambda _,entity:entity)
-        app.cancel_listen_state=Mock()
-        app.configure_ventilation()
-        self.assertEqual(app.cfg['ventilation']['recuperator']['power_entity'],
-                         'binary_sensor.recuperator_supply')
-        self.assertEqual(set(app.equipment_listeners),
-                         {'switch.recuperator','binary_sensor.recuperator_supply'})
-        app.cfg['recuperator_entity']='switch.different'
-        app.configure_ventilation()
-        self.assertEqual(app.cfg['ventilation']['recuperator'],{'entity':'switch.different'})
-        self.assertEqual(set(app.equipment_listeners),{'switch.different'})
-        self.assertEqual(app.cancel_listen_state.call_count,2)
-        app.cfg['recuperator_entity']=''
-        app.configure_ventilation()
-        self.assertFalse(app.equipment_listeners)
-
-    def test_grid_only_ventilation_binding_and_interval_provenance(self):
-        from heating_learning_windows import ventilation_interval_duty
-        app=self.app()
-        app.cfg.update(recuperator_entity='switch.recuperator',bath_entity='switch.bath',
-            ventilation={'recuperator':{'entity':'switch.recuperator','supply_kind':'grid_only'},
-                         'bath':{'entity':'switch.bath'}})
-        app.configure_ventilation()
-        states={'switch.recuperator':'unavailable','switch.bath':'unavailable'}
-        app.get_state=lambda entity:states.get(entity)
-        grid=['off']
-        app.grid_state=lambda:grid[0]
-        for stamp in range(0,300,15):
-            app.ventilation_tick(stamp)
-        observed=app.ventilation_sample(300)
-        self.assertEqual(ventilation_interval_duty(observed['recuperator']),0.)
-        self.assertIsNone(ventilation_interval_duty(observed['bath']))
-        self.assertEqual(app.ventilation_states['recuperator']['supply_provenance'],'verified_grid_topology')
-        self.assertEqual(app.ventilation_states['bath']['supply'],'unknown')
-        grid[0]='on';states['switch.recuperator']='on'
-        for stamp in range(315,600,15):
-            app.ventilation_tick(stamp)
-        self.assertIsNone(ventilation_interval_duty(app.ventilation_sample(600)['recuperator']))
-        for stamp in range(615,900,15):
-            app.ventilation_tick(stamp)
-        self.assertEqual(ventilation_interval_duty(app.ventilation_sample(900)['recuperator']),1.)
-        app.ventilation_tick(885)
-        self.assertEqual(app.ventilation_at,900)
-        app.cfg['recuperator_entity']='switch.replacement'
-        app.configure_ventilation()
-        self.assertNotIn('supply_kind',app.cfg['ventilation']['recuperator'])
-
-    def test_persisted_grid_only_selection_is_exact_and_never_transferred(self):
-        app=self.app()
-        app.cfg.update(recuperator_entity='switch.recuperator',bath_entity='switch.bath',
-                       grid_only_ventilation_entities=['switch.recuperator'])
-        app.configure_ventilation()
-        app.get_state=lambda entity:'unavailable'
-        app.grid_state=lambda:'off'
-        app.ventilation_tick(0.)
-        self.assertEqual(app.ventilation_states['recuperator']['effective_duty'],0.)
-        self.assertIsNone(app.ventilation_states['bath']['effective_duty'])
-        app.cfg['recuperator_entity']='switch.replacement'
-        app.configure_ventilation()
-        app.ventilation_tick(15.)
-        self.assertEqual(app.ventilation_states['recuperator']['supply_provenance'],'unknown')
-        self.assertIsNone(app.ventilation_states['recuperator']['effective_duty'])
-
-    def test_grid_binding_never_overrides_explicit_supply_sensor(self):
-        app=self.app()
-        app.cfg['ventilation']={'recuperator':{'entity':'switch.recuperator','supply_kind':'grid_only',
-                                              'power_entity':'binary_sensor.supply'}}
-        app.grid_state=lambda:'off'
-        app.get_state=lambda entity:'on'
-        app.ventilation_tick(0.)
-        self.assertEqual(app.ventilation_states['recuperator']['supply'],'on')
-        self.assertEqual(app.ventilation_states['recuperator']['effective_duty'],1.)
-        self.assertEqual(app.ventilation_states['recuperator']['supply_provenance'],'supply_sensor')
+        old={"room_max_age":7200,"recuperator_entity":"switch.old","bath_entity":"switch.bath"}
+        app.memory["system_settings"]=dict(old)
+        app.restore_system_settings()
+        self.assertEqual(app.cfg["room_max_age"],7200)
+        self.assertNotIn("recuperator_entity",app.cfg)
+        self.assertNotIn("bath_entity",app.cfg)
+        self.assertEqual(app.memory["system_settings"],old)
+        self.assertTrue(self.submit(app,{"room_max_age":3600})["last_success"])
+        self.assertEqual(app.cfg["room_max_age"],3600)
 
     def test_saved_boiler_profile_is_published_immediately_and_old_sessions_invalidated(self):
         app=self.app();app.cfg['boiler_power_mode']='fixed_6'
@@ -124,30 +56,6 @@ class SystemSettingsTests(unittest.TestCase):
     def submit(self,app,values,revision=0):
         app.system_settings_changed('heating_system_settings',dict(request_id='request-1',revision=revision,values=values))
         return app.published['sensor.heating_system_settings']
-
-    def test_ventilation_summary_cache_invalidates_on_ring_and_live_identity(self):
-        from unittest.mock import patch
-        app=self.app()
-        app.samples=[]
-        app.ventilation_states={"recuperator":{"entity":"switch.recup","relay":"off",
-            "supply_provenance":"verified_grid_topology","effective_duty":0.}}
-        with patch("heating_climate.ventilation_expectation",return_value=({"recuperator":.2},{})) as mean, \
-             patch("heating_climate.ventilation_powered_expectation",return_value={}) as powered:
-            first=app.ventilation_forecast_inputs()
-            self.assertIs(first,app.ventilation_forecast_inputs())
-            self.assertEqual(mean.call_count,1)
-            app.ventilation_states["recuperator"]["relay"]="on"
-            app.ventilation_states["recuperator"]["effective_duty"]=1.
-            app.ventilation_forecast_inputs()
-            self.assertEqual(mean.call_count,2)
-            app.samples.append({"ts":1})
-            app.ventilation_forecast_inputs()
-            self.assertEqual(mean.call_count,3)
-            app.samples=list(app.samples)
-            app.ventilation_forecast_inputs()
-            self.assertEqual(mean.call_count,4)
-            self.assertEqual(powered.call_count,4)
-            self.assertEqual(app.next_compute,123456)
 
     def test_snapshot_does_not_modify_config_model_or_memory_or_export_secrets(self):
         app=self.app();app.cfg.update(token='PRIVATE',data_dir='/private/data',outage_max_age=7200)

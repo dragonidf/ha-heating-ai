@@ -240,7 +240,8 @@ test('expert settings search filters locally without dropping schema fields',()=
   assert.match(filtered,/data-settings-search/);assert.match(filtered,/data-system-key="fire_start_delta"/);
   assert.doesNotMatch(filtered,/data-system-key="room_loss"/);
   p.settingsQuery='';const all=p.systemSettings();
-  assert.equal(p.systemFields().length,52);assert.match(all,/data-system-key="kws_auto_restore"/);assert.ok((all.match(/data-system-key=/g)||[]).length>=35);
+  assert.equal(p.systemFields().length,50);
+  assert.doesNotMatch(all,/recuperator_entity|bath_entity|Витяжка ванної|Рекуператор/);assert.match(all,/data-system-key="kws_auto_restore"/);assert.ok((all.match(/data-system-key=/g)||[]).length>=35);
   assert.equal(p.systemFields().find(field=>field.key==='day_insurance').value,'disabled');
   assert.match(all,/data-system-key="day_insurance_kwh"/);
 });
@@ -699,7 +700,8 @@ test('online learner explains rejected evidence and retains last accepted result
   const html=p.learningProgress();
   assert.match(html,/Архівні вимірювання все одно аналізуються/);
   assert.match(html,/Незалежних температурних звітів.*23/);
-  assert.match(html,/Невідомий стан вентиляції — 12/);
+  assert.match(html,/Напруга не підтверджена — 4/);
+  assert.doesNotMatch(html,/unknown_ventilation|Невідомий стан вентиляції/);
   assert.match(html,/Замало незалежних днів/);
   assert.match(html,/Тепловтрати 0,00800 → 0,00790/);
   assert.match(html,/не поточний кандидат/);
@@ -767,7 +769,7 @@ test('learning reports real support for all four thermal coefficients without cl
   const p=Object.create(HeatingAIPanel.prototype);
   p.attrs=()=>({learning_status:'collecting',parameters:{floor_air:.044,room_loss:.0128,floor_decay:.12,heat_gain:.5},
     parameter_support:{floor_air:{available:{windows:12,minutes:180,days:3},training:{windows:8,minutes:120,days:2},holdout:{windows:4,minutes:60,days:1},selected_for_candidate:true,status:'candidate_evaluated',basis:'thermal_windows'},
-      room_loss:{available:{windows:12,minutes:180,days:3},status:'not_identifiable_with_ventilation',basis:'thermal_windows'},
+      room_loss:{available:{windows:12,minutes:180,days:3},status:'insufficient_support',basis:'thermal_windows'},
       floor_decay:{available:{windows:0,minutes:0,days:0},status:'insufficient_support',basis:'warm_idle'},
       heat_gain:{available:{windows:2,minutes:60,days:1},status:'not_selected',basis:'measured_heat'}}});
   p.section=(title,body)=>body;p.compactMetric=()=>'';p.time=()=> '12:00';
@@ -777,7 +779,7 @@ test('learning reports real support for all four thermal coefficients without cl
   assert.match(markup,/12 \/ 180 \/ 3/);
   assert.match(markup,/8 \/ 120 \/ 2/);
   assert.match(markup,/4 \/ 60 \/ 1/);
-  assert.match(markup,/Не відокремлено від вентиляції/);
+  assert.match(markup,/Недостатньо доказів/);
   assert.match(markup,/0 \/ 0 \/ 0/);
   assert.doesNotMatch(markup,/NaN|undefined|Коефіцієнти оновлено/);
 });

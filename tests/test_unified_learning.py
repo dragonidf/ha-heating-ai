@@ -72,11 +72,11 @@ class UnifiedLearningPolicyTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path=Path(directory)/"online_learning_v1.json"
             save_evidence(path,dict(windows=[],forecasts=archive,comparisons=[],report={}))
-            result=run_learning(path,rows,[],baseline,{},{},now,True)
+            result=run_learning(path,rows,[],baseline,{},now,True)
             self.assertEqual(result["status"],"accepted",result)
             self.assertEqual(set(result["proposed"]),{"floor_air","room_loss"})
             self.assertTrue(promotion_allowed(baseline,baseline,result["proposed"],result["evidence"],{},now))
-            frozen=run_learning(path,rows,[],baseline,{},{"frozen_until":now.timestamp()+1},now,True)
+            frozen=run_learning(path,rows,[],baseline,{"frozen_until":now.timestamp()+1},now,True)
             self.assertEqual(frozen["status"],"frozen")
             self.assertNotIn("proposed",frozen)
 
