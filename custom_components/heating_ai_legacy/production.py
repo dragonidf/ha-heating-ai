@@ -27,6 +27,7 @@ from homeassistant.helpers import entity_registry
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .native_controller.heating_climate import HeatingClimate
+from .native_controller.heating_environment import reliability
 from .native_controller import heating_learning_windows as learning
 from .native_controller.heating_model import comfort_at, number, retain_kws_profile
 from .native_controller.heating_ui import system_fields
@@ -1038,7 +1039,12 @@ class NativeController(HeatingClimate):
         state["online_learning"] = {key:checkpoint[key] for key in (
             "changes_history", "frozen_until", "rollback_reason", "promotion_day",
         ) if key in checkpoint}
-        state["house_loss_migration"] = {"previous": previous}
+        # Keep the last operational reserve while the new forecast builds
+        # its own evidence. Old errors stay outside current accuracy metrics.
+        state["house_loss_migration"] = {
+            "previous": previous,
+            "upper_margin": reliability(previous.get("hour_errors", []))["upper_margin"],
+        }
         # The existing atomic state save commits both the marker and all fields.
         return state
 

@@ -1651,6 +1651,10 @@ class HeatingClimate(HeatingRecovery,Hass):
         settings['thermal_model_version']=self.model.get('version')
         floor=forecast_probe
         environment_quality=reliability(self.memory.get('hour_errors',[]))
+        accuracy_confirmed=self.model.get('validated',False) and environment_quality['reliable']
+        if not accuracy_confirmed:
+            migration_margin=(self.memory.get('house_loss_migration') or {}).get('upper_margin',0.)
+            environment_quality['upper_margin']=max(migration_margin,environment_quality['upper_margin'])
         equipment=getattr(self,'equipment_status',{}) or {}
         if reserve_active:environment_quality=dict(environment_quality,degraded=True,input_reason=settings['control_power_basis'])
         elif getattr(self,'power_source','')=='fallback_inlet_stage':environment_quality=dict(environment_quality,degraded=True,input_reason='nominal_inlet_stage')
@@ -1871,7 +1875,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                          control_power_basis=settings['control_power_basis'] if reserve_active else getattr(self,'power_source','unknown'),
                          electrical_inputs_unavailable=measured_power is None,grid_state=grid,return_estimated=not probe_ok,
                          estimated_morning_request_minutes=settings.get('estimated_morning_request_minutes',0.),
-                         validated=self.model.get("validated",False) and not environment_quality['degraded'] and not profile.get('assumed',True) and measured_power is not None,
+                         validated=accuracy_confirmed and not environment_quality['degraded'] and not profile.get('assumed',True) and measured_power is not None,
                          power_assumption=profile.get('assumption'),
                          equipment_version=settings.get('equipment_version'),
                          structural_model_validated=self.model.get('validated',False),
@@ -1968,7 +1972,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      thermostat_bias=self.memory.get("thermostat_bias"),source_quality=getattr(self,'temperature_quality',{}))
         self.publish("sensor.heating_coast_peak",round(peak,2) if peak is not None else "unavailable",
                      friendly_name="Клімат — оцінка інерційного піку",unit_of_measurement="°C",
-                     device_class="temperature",validated=self.model.get("validated",False),
+                     device_class="temperature",validated=accuracy_confirmed and not environment_quality['degraded'],
                      upper_risk_peak=round(upper_peak,2) if upper_peak is not None else None,
                      room_source_check=room_check['status'])
         if forecast:self.memory['plan_execution'].update(
@@ -1979,7 +1983,7 @@ class HeatingClimate(HeatingRecovery,Hass):
                      outside_minutes=forecast["outside_minutes"] if forecast else 0,
                      comfort_shortfall=bool(forecast and forecast["comfort_shortfall"]),
                      minimum_heat_commit=committed_heat)
-        self.publish("sensor.heating_model","Точність знижена" if environment_quality['degraded'] else "Є короткострокові перевірки" if self.model.get("validated") else "Збір даних",
+        self.publish("sensor.heating_model","Точність знижена" if environment_quality['degraded'] else "Є короткострокові перевірки" if accuracy_confirmed else "Збір даних",
                      reliability=environment_quality,environment_version=1,
                      friendly_name="Клімат — модель",parameters=self.model,samples=len(self.samples),
                      usable_pairs=len(transitions(self.samples)),hour_mae=self.hour_mae(),

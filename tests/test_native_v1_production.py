@@ -369,7 +369,7 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             old_checkpoint = {"accepted_metrics":{"1":{"new":{"mae":.2}}},
                               "frozen_until":1200.,"changes_history":[]}
             state = {"model":baseline,"energy_last":{"total":100.},
-                     "online_learning":old_checkpoint,"hour_errors":[.2],
+                     "online_learning":old_checkpoint,"hour_errors":[.4]*6,
                      "ventilation_model":{"validated":True,"model_version":6}}
             app.statefile.write_text(json.dumps(state))
             migrated = app.load_state()
@@ -378,6 +378,8 @@ class ProductionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(migrated["online_learning"]["frozen_until"],1200.)
             self.assertNotIn("accepted_metrics",migrated["online_learning"])
             self.assertEqual(migrated["house_loss_migration"]["previous"]["model"],baseline)
+            self.assertAlmostEqual(migrated["house_loss_migration"]["upper_margin"],.2)
+            self.assertNotIn("hour_errors",migrated)
             self.assertEqual(json.loads(app.statefile.read_text()),state)
             app.statefile.write_text(json.dumps(migrated))
             self.assertEqual(app.load_state(),migrated)
