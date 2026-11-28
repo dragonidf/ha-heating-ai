@@ -490,7 +490,9 @@ def _storage_candidate(train, model, base_best):
           w["idle"]>=.95*(w["end"]-w["start"]) and w["floor"]-w["room_start"]>=3.]
     heat=[w for w in train if w["end"]-w["start"]>=1800 and
           w["heat"]>=.75*(w["end"]-w["start"])]
-    if any(_coverage(rows)["days"]<3 or _coverage(rows)["seconds"]<3*3600 for rows in (warm,heat)):
+    cohorts = [(field, cohort) for field, cohort in (("floor_decay",warm),("heat_gain",heat))
+               if (support := _coverage(cohort))["days"]>=3 and support["seconds"]>=3*3600]
+    if not cohorts:
         return None
     base=_errors(train,model)
     best_error=_score(train,base_best)["mae"]
@@ -504,7 +506,7 @@ def _storage_candidate(train, model, base_best):
         magnitude=math.sqrt(sum(v*v for v in vector))
         if magnitude>1e-9:
             sensitivity[field]=(vector,magnitude)
-    for field,cohort in (("floor_decay",warm),("heat_gain",heat)):
+    for field,cohort in cohorts:
         if field not in sensitivity:
             continue
         vector,norm=sensitivity[field]

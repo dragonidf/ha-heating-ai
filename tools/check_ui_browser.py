@@ -400,7 +400,7 @@ def check_system_settings(page):
     panel.locator(':scope>summary').click()
     assert page.evaluate('systemRequests.length')==0
     fields=page.locator('[data-system-key]')
-    assert fields.count()==44, fields.count()
+    assert fields.count()==42, fields.count()
     for key in ('kws_auto_restore','day_insurance','day_insurance_start','day_insurance_end',
                 'day_insurance_kwh','day_insurance_deficit'):
         assert page.locator(f'[data-system-key="{key}"]').count()==1, key

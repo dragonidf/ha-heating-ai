@@ -159,18 +159,8 @@
     if(field.kind==='json'&&value&&typeof value==='object')value={...value,verified:isTrue(value.verified)};
     const common=`data-system-key="${h(field.key)}" aria-label="${h(field.label)}" ${this.systemPending?'disabled':''}`;
     if(field.kind==='json')return `<textarea ${common} data-json rows="5" spellcheck="false">${h(JSON.stringify(value,null,2))}</textarea>`;
-    let options=field.options||{};
-    if(field.kind==='entity') {
-      options={'':'Не підключено'};
-      const relays=Object.entries(this.hass?.states||{}).filter(([id])=>/^(switch|fan)\./.test(id));
-      const name=([id,row])=>row.attributes?.friendly_name||id;
-      relays.sort((a,b)=>name(a).localeCompare(name(b),'uk'));
-      const names=new Map();for(const relay of relays)names.set(name(relay),(names.get(name(relay))||0)+1);
-      for(const [id,row] of relays){const label=name([id,row]);options[id]=`${label}${names.get(label)>1?' · '+id:''}${['unavailable','unknown'].includes(row.state)?' · недоступний':''}`;}
-      if(value&&!Object.hasOwn(options,value))options[value]=value+' · недоступний';
-    }
-    if(['select','entity'].includes(field.kind))return `<span class="equipment-select"><select ${common}>${Object.entries(options).map(([key,label])=>`<option value="${h(key)}" ${key===value?'selected':''}>${h(label)}</option>`).join('')}</select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>`;
-    return `<input type="text" ${common} value="${h(value)}" placeholder="switch.…" autocapitalize="none" spellcheck="false">`;
+    const options=field.options||{};
+    return `<span class="equipment-select"><select ${common}>${Object.entries(options).map(([key,label])=>`<option value="${h(key)}" ${key===value?'selected':''}>${h(label)}</option>`).join('')}</select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>`;
   }
   equipmentFields(keys) {
     return this.systemFields().filter(f=>keys.includes(f.key)).map(f=>`<label class="field"><span>${h(f.label)} <button type="button" class="system-help" data-system-help="${h(f.key)}" aria-label="Підказка: ${h(f.label)}">?</button></span>${this.equipmentControl(f)}</label>`).join('');
@@ -491,7 +481,7 @@
     const rows=fields.map(f=>{
       const value=Object.hasOwn(this.systemDraft,f.key)?this.systemDraft[f.key]:f.value;
       const common=`data-system-key="${h(f.key)}" aria-label="${h(f.label)}" ${this.systemPending?'disabled':''}`;
-      const control=['select','entity','json'].includes(f.kind)?this.equipmentControl(f):f.kind==='readonly'?`<span class="system-fixed">${h(value)} ${h(f.unit||'')}</span>`:
+      const control=['select','json'].includes(f.kind)?this.equipmentControl(f):f.kind==='readonly'?`<span class="system-fixed">${h(value)} ${h(f.unit||'')}</span>`:
         `<div class="number"><input type="${f.kind==='time'?'time':'number'}" ${common} value="${h(value)}" ${f.kind==='time'?'':`min="${h(f.min)}" max="${h(f.max)}" step="${h(f.step)}"`}><span>${h(f.unit||'')}</span></div>`;
       return {group:f.group,html:`<div class="system-field"><div class="system-label"><label>${h(f.label)}</label>${helpButton(f.key,f.label)}</div>${control}</div>`};
     });

@@ -336,14 +336,13 @@ test('native production settings use the versioned authenticated websocket API',
   assert.equal(request.entry_id,'native-entry');assert.equal(request.revision,4);
   assert.deepEqual(request.values,{boiler_power_mode:'fixed_6'});
 });
-test('device bindings use existing HA relay choices with friendly names',()=>{
-  const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={};panel._hass={states:{
-    'switch.recuperator':{state:'on',attributes:{friendly_name:'Рекуператор вітальні'}},
-    'fan.bath':{state:'unavailable',attributes:{friendly_name:'Витяжка ванної'}},
-    'sensor.unrelated':{state:'12',attributes:{friendly_name:'Не пристрій'}}}};
-  const html=panel.equipmentControl({kind:'entity',key:'recuperator_entity',label:'Рекуператор',value:'switch.recuperator'});
-  assert.match(html,/<select/);assert.doesNotMatch(html,/<input/);
-  assert.match(html,/Рекуператор вітальні/);assert.match(html,/Витяжка ванної/);assert.doesNotMatch(html,/sensor.unrelated/);
+test('equipment settings render allowed modes without enumerating Home Assistant devices',()=>{
+  const panel=Object.create(HeatingAIPanel.prototype);panel.systemDraft={};
+  panel._hass={states:new Proxy({}, {ownKeys(){throw Error('Unexpected entity enumeration');}})};
+  const html=panel.equipmentControl({kind:'select',key:'boiler_power_mode',label:'Режим на котлі',
+    value:'fixed_6',options:{fixed_3:'3 кВт',fixed_6:'6 кВт'}});
+  assert.match(html,/<option value="fixed_6" selected>6 кВт/);
+  assert.match(html,/<option value="fixed_3" >3 кВт/);
 });
 test('boiler advice remains visible when no mode can fully meet comfort',()=>{
   const p=Object.create(HeatingAIPanel.prototype);p.systemDraft={};p.pending=new Set();p.config={};p.state=k=>({power_model:'auto',power_confirmed:'0',boiler_active:'off'})[k];

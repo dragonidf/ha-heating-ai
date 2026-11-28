@@ -37,13 +37,15 @@ class StorageLearningTest(unittest.TestCase):
     model=dict(__import__('heating_model').DEFAULT_MODEL,version=6,validated=True,
                floor_air=.055,room_loss=.022,floor_decay=.38,heat_gain=1.0368)
 
-    def windows(self,field,days=10,shift=.01):
+    def windows(self,field,days=10,shift=.01, *, warm_idle=True):
         from heating_model import step
         truth={**self.model,field:self.model[field]*(1+shift)}
         output=[]
         for day in range(days):
             for j,(floor,kw,seconds) in enumerate(((33.+day%8,0.,7200),
                     (22.+day%3,7.+day%3,7200),(40.+day%4,0.,1800),(21.+day%3,5.,3600))):
+                if not warm_idle:
+                    floor=23.8-day%4*.1 if not kw else 19.+day%8
                 start=BASE+day*86400+j*10800
                 room,f=21.,floor
                 steps=[]
@@ -80,6 +82,12 @@ class StorageLearningTest(unittest.TestCase):
         self.assertFalse(support["heat_gain"]["selected_for_candidate"])
         self.assertIsNone(support["heat_gain"]["holdout"])
         self.assertEqual(evaluate_windows([],self.model)["parameter_support"]["floor_air"]["available"]["windows"],0)
+
+    def test_supported_heat_gain_can_fit_with_insufficient_warm_idle_for_decay(self):
+        result=evaluate_windows(self.windows("heat_gain",warm_idle=False),self.model)
+        self.assertEqual(result["status"],"holdout_passed")
+        self.assertEqual(result["coefficients"],{"heat_gain":self.model["heat_gain"]*1.01})
+        self.assertEqual(result["parameter_support"]["floor_decay"]["available"]["windows"],0)
 
     def test_storage_fit_rejects_weak_support_and_conflicting_later_days(self):
         from heating_learning_windows import _storage_candidate,evaluate_windows

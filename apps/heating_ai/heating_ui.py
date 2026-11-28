@@ -164,8 +164,6 @@ def validate_system_settings(values,cfg,model):
             value=validate_inlet_config(value) if key=='power_inlet_config' else validate_phase_topology(value)
         elif field['kind']=='select':
             if not isinstance(value,str) or value not in field['options']:raise ValueError('Невідомий режим котла')
-        elif field['kind']=='entity':
-            if not isinstance(value,str) or value and not re.fullmatch(r'(switch|fan)\.[a-z0-9_]+',value):raise ValueError('Потрібна сутність switch або fan')
         elif field['kind']=='time':
             if not isinstance(value,str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',value):
                 raise ValueError('Час має бути у форматі ГГ:ХХ')
